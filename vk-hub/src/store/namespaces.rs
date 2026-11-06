@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use vk_hub_proto::dispatch::Area;
 use vk_hub_proto::registry::PrefixRetention;
 use vk_hub_proto::token::{
-    ALIAS_ROOT, Grant, MAX_PREFIX_COMPONENTS, RESERVED_COMPONENTS, servable_prefix, valid_component,
+    ALIAS_ROOT, Grant, MAX_PREFIX_COMPONENTS, MAX_PREFIX_LEN, RESERVED_COMPONENTS, servable_prefix,
+    valid_component,
 };
 
 use super::registries::REGISTRIES;
@@ -108,17 +109,18 @@ impl NamespaceRow {
         if !super::keys::valid_name(&self.name) {
             return Err(format!("{:?} is not a namespace's name", self.name));
         }
-        let sample = sample_path(&self.path).ok_or_else(|| {
+        let longest = longest_path(&self.path).ok_or_else(|| {
             format!(
                 "{:?}: a path is a repository name, whose components may be {}",
                 self.path,
                 PLACEHOLDERS.join(", ")
             )
         })?;
-        if !servable_prefix(&sample) {
+        if !servable_prefix(&longest) {
             return Err(format!(
-                "{:?} is not a repository name the registry serves: lowercase components, at \
-                 most {MAX_PREFIX_COMPONENTS}, none of them {}",
+                "{:?} is not a repository name for every job: at its longest, {longest:?}, it \
+                 must be at most {MAX_PREFIX_LEN} characters and {MAX_PREFIX_COMPONENTS} \
+                 components of lowercase letters, digits and . _ -, none of them {}",
                 self.path,
                 RESERVED_COMPONENTS.join(", ")
             ));
@@ -241,17 +243,19 @@ fn check_alias(ns: &NamespaceRow, others: &[NamespaceRow]) -> Option<String> {
     })
 }
 
-/// `path` with each placeholder filled by a sample value, to check it makes a repository
-/// name; `None` when a component holds anything but one whole placeholder or none.
-fn sample_path(path: &str) -> Option<String> {
+/// Expand each placeholder to its maximum length to validate every job's path.
+/// `None` unless each component contains one whole placeholder or none.
+/// Placeholder values are valid components; only length, component count and fixed components
+/// can make the expanded path invalid.
+fn longest_path(path: &str) -> Option<String> {
     let mut out = Vec::new();
     for component in path.split('/') {
         out.push(match component {
-            "{gitlab}" => "gl",
-            "{project_id}" | "{pipeline_id}" => "1",
-            "{protection}" => "protected",
+            "{gitlab}" => "a".repeat(super::gitlabs::MAX_GITLAB_NAME),
+            "{project_id}" | "{pipeline_id}" => u64::MAX.to_string(),
+            "{protection}" => "unprotected".to_string(),
             other if other.contains(['{', '}']) => return None,
-            other => other,
+            other => other.to_string(),
         });
     }
     Some(out.join("/"))
@@ -588,6 +592,27 @@ mod tests {
         assert_eq!(render("p/x{project_id}", &c), None);
         assert_eq!(render("p/{project_path}", &c), None);
         assert_eq!(render("images", &c).as_deref(), Some("images"));
+    }
+
+    #[test]
+    fn a_path_is_checked_at_its_longest() {
+        use super::super::gitlabs::MAX_GITLAB_NAME;
+        // At their longest: {gitlab} 32 characters, {project_id} 20 digits, {protection} 11
+        // (`unprotected`), with the 3 slashes between them and the fixed part.
+        let tail = "{gitlab}/{project_id}/{protection}";
+        let fixed = "a".repeat(MAX_PREFIX_LEN - 3 - MAX_GITLAB_NAME - 20 - 11);
+        ns("x", &format!("{fixed}/{tail}"), &["r:*"], None)
+            .check()
+            .unwrap();
+        let deep = format!("{}/{{gitlab}}", vec!["a"; MAX_PREFIX_COMPONENTS].join("/"));
+        for path in [
+            format!("{fixed}a/{tail}"),
+            deep,
+            "p/tags/{gitlab}".to_string(),
+        ] {
+            let err = ns("x", &path, &["r:*"], None).check().unwrap_err();
+            assert!(err.contains("at its longest"), "{path}: {err}");
+        }
     }
 
     #[test]

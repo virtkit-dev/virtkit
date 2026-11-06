@@ -495,6 +495,10 @@ namespace ci-pipeline  path = "ci-pipeline/{gitlab}/{project_id}/{pipeline_id}" 
   - `{project_id}` and `{pipeline_id}`, GitLab's numeric IDs;
   - `{protection}`, which is `protected` or `unprotected`.
 
+  The hub checks a path at its longest filling against the registry's names (255
+  characters, 16 components, none named `tags`, `manifests` or `blobs`), so no job's filling
+  is refused for its length.
+
   Project paths select jobs but never name a namespace: they are not unique across GitLab
   instances, and a project's path changes when it is renamed or moved.
 - **Grants add up.** A namespace nested in another adds grants on its subtree and never

@@ -6,6 +6,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **vk-hub validates namespace paths for every job.** Paths that could exceed the registry's
+  limits with a job's identifiers are rejected when stored, instead of leaving that job
+  without access.
 - **vk-hub rejects unusable registry paths.** Namespace paths and operator token grants
   are rejected when stored or minted if they exceed 16 components or contain `tags`,
   `manifests` or `blobs` as a component. GitLab instances cannot use those names either.
