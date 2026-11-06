@@ -325,7 +325,7 @@ pub(crate) fn resolve(
         // A named file for one side; the other is stdio only when the command leaves it be.
         let input = match &opts.input {
             Some(p) => Some(Input::File(p.clone())),
-            None if opts.output.is_none() && !command_uses_stdio => Some(Input::Stdin),
+            None if !command_uses_stdio => Some(Input::Stdin),
             None => None,
         };
         let output = match &opts.output {
@@ -988,6 +988,14 @@ mod tests {
             resolve(&opts, true, true, true, true).unwrap(),
             View::Files {
                 input: None,
+                output: Some("screen.txt".into())
+            }
+        );
+        // With stdio free (`vk vga`, or a run without a command), keys come from stdin.
+        assert_eq!(
+            resolve(&opts, false, true, true, true).unwrap(),
+            View::Files {
+                input: Some(Input::Stdin),
                 output: Some("screen.txt".into())
             }
         );
