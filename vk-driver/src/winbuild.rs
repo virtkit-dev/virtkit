@@ -167,6 +167,9 @@ pub(crate) struct Options {
     /// The only media digests a medium outside the build context may have, for a placed job
     /// ([`crate::winiso::MediaSource::approved`]); `None` for any.
     pub approved_media: Option<Vec<String>>,
+    /// The local scope whose Windows cache holds this build's layers, bases and installs
+    /// ([`scope_root`]); `None` for the unscoped cache. Media stay in the unscoped cache.
+    pub scope: Option<String>,
     /// Whether to take layers from the build cache. When false, the build still locks and
     /// pushes its own layers and fetches install media.
     pub pull_layers: bool,
@@ -426,6 +429,15 @@ pub(crate) fn build(opts: &Options) -> Result<Vec<crate::cachelock::Guard>> {
     }
 }
 
+/// The Windows cache for local scope `scope`, under the unscoped cache at `shared`.
+/// It isolates a placed job's layers, bases and installs, using the unscoped cache's layout.
+pub(crate) fn scope_root(shared: &Path, scope: &str) -> PathBuf {
+    shared.join(SCOPES).join(scope)
+}
+
+/// Under the host's Windows cache: one cache per local scope ([`scope_root`]).
+pub(crate) const SCOPES: &str = "scopes";
+
 /// [`build`], once.
 fn build_with(opts: &Options) -> Result<Vec<crate::cachelock::Guard>> {
     let text = std::fs::read_to_string(&opts.dockerfile)
@@ -434,8 +446,12 @@ fn build_with(opts: &Options) -> Result<Vec<crate::cachelock::Guard>> {
         stages(parser::parse(&text)?).with_context(|| format!("{}", opts.dockerfile.display()))?;
     let target = target_index(&stages, opts.target.as_deref())
         .with_context(|| format!("{}", opts.dockerfile.display()))?;
-    let cache = crate::run::default_data_base()?.join("windows");
-    let media_dir = cache.join("winiso");
+    let shared = crate::run::default_data_base()?.join("windows");
+    let cache = match &opts.scope {
+        Some(scope) => scope_root(&shared, scope),
+        None => shared.clone(),
+    };
+    let media_dir = shared.join("winiso");
     let media = crate::winiso::MediaSource {
         dir: &media_dir,
         registry: opts.media_registry.as_ref(),
@@ -1775,6 +1791,7 @@ mod tests {
             registry: None,
             media_registry: None,
             approved_media: None,
+            scope: None,
             pull_layers: true,
             ceiling,
         };
@@ -2337,6 +2354,7 @@ mod tests {
             registry: None,
             media_registry: None,
             approved_media: None,
+            scope: None,
             pull_layers: true,
             ceiling: None,
         };

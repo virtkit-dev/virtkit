@@ -1328,10 +1328,19 @@ fn build_windows_unit(
     if out.join(crate::uefi::MANIFEST).is_file()
         && out.join(crate::winbuild::LAYER_RECORD).is_file()
     {
-        let root = crate::run::default_data_base()?.join("windows");
+        let root = job_windows_root(&ctx.cache_dest().local)?;
         let refs = crate::wincache::Refs::default();
         refs.reference_chain(&root, &disk)?;
-        return Ok((out, refs.into_guards()));
+        let guards = refs.into_guards();
+        // No references means the chain uses another cache than the job's now: its scope
+        // changed since prepare, or its token expired. Rebuild rather than leave it to the sweep.
+        if !guards.is_empty() {
+            return Ok((out, guards));
+        }
+        eprintln!(
+            "virtkit: {}: the prepared Windows build stands on another cache now, building it again",
+            unit.name
+        );
     }
     let cfg = &ctx.cfg;
     let (net, audit) = effective_build_egress(cfg, ctx)?;
@@ -1356,8 +1365,15 @@ fn build_windows_unit(
     if let Some(dir) = &ctx.egress_record {
         let _ = std::fs::write(dir.join(crate::egress_report::UNRECORDED_BUILD), b"");
     }
-    let registry = crate::windows_registry(None, false, &cfg.build)?;
-    let media_registry = registry.clone();
+    // Media are not project-specific: fetch them by digest from the node's own registry,
+    // regardless of the job's cache. Layers use the job's build cache.
+    let media_registry = crate::windows_registry(None, false, &cfg.build)?;
+    let job_cache = job_cache_dest(ctx);
+    let registry = match &job_cache.dest {
+        crate::build::CacheDest::Configured(_) => media_registry.clone(),
+        crate::build::CacheDest::Scoped(rg) => Some(rg.clone()),
+        crate::build::CacheDest::Off => None,
+    };
     let (cpus, mem) = crate::winbuild::default_size();
     let opts = crate::winbuild::Options {
         dockerfile: build.dockerfile.clone(),
@@ -1372,8 +1388,9 @@ fn build_windows_unit(
         media_registry,
         // A placed job on a node caching by scope takes only approved media from outside its
         // build context.
-        approved_media: (ctx.cache_dest().local != crate::jobctx::LocalScope::Unscoped)
+        approved_media: (job_cache.local != crate::jobctx::LocalScope::Unscoped)
             .then(|| cfg.executor.windows_media.clone()),
+        scope: job_cache.local.key().map(str::to_string),
         pull_layers: true,
         // A job's Dockerfile sizes its build guests no larger than its services.
         ceiling: Some(service_ceiling(cfg)?),
@@ -1385,11 +1402,50 @@ fn build_windows_unit(
         .map_err(|_| anyhow!("the Windows build panicked"))?
         .with_context(|| format!("service {}: building its Windows image", unit.name))?;
     // Bound what the host's Windows cache costs, holding this job's own chain.
-    crate::wincache::gc(
+    crate::wincache::gc_all(
         &crate::run::default_data_base()?.join("windows"),
         cfg.windows_cache_idle(),
     );
     Ok((out, refs))
+}
+
+/// The job's local Windows cache: scoped or unscoped.
+fn job_windows_root(local: &crate::jobctx::LocalScope) -> Result<PathBuf> {
+    Ok(windows_root_in(
+        &crate::run::default_data_base()?.join("windows"),
+        local,
+    ))
+}
+
+/// [`job_windows_root`] under the unscoped cache `shared`.
+fn windows_root_in(shared: &Path, local: &crate::jobctx::LocalScope) -> PathBuf {
+    match local.key() {
+        Some(scope) => crate::winbuild::scope_root(shared, scope),
+        None => shared.to_path_buf(),
+    }
+}
+
+/// Remove the Windows cache of a job's private scope, through descriptors as the build tier's
+/// entries go: no symlink inside followed, nothing mounted inside entered, nothing another user
+/// owns removed. Best-effort: entries left are the sweep's after the next Windows build.
+fn remove_windows_scope(root: &Path) {
+    use std::os::fd::AsFd;
+    let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
+        return;
+    };
+    let removed = vk_fs::open_dir(parent).and_then(|parent| {
+        let dir = vk_fs::open_dir_in(parent.as_fd(), name)?;
+        vk_fs::remove_tree_in(parent.as_fd(), name, dir.as_fd())
+    });
+    match removed {
+        Ok(done) if done.skipped.is_empty() => {}
+        Ok(_) => eprintln!(
+            "virtkit: {}: left in place what was mounted or another user's",
+            root.display()
+        ),
+        Err(e) if crate::cachelock::is_not_found(&e) => {}
+        Err(e) => eprintln!("virtkit: removing {}: {e:#}", root.display()),
+    }
 }
 
 /// In a Windows service's runtime dir: written by the supervisor once the service's
@@ -4333,6 +4389,12 @@ pub fn cleanup(ctx: &JobCtx) -> Result<()> {
     }
     // Before the job dir goes: the list of what it built in its private scope is in it.
     remove_private_builds(ctx.cfg.state_dir(), &ctx.job_dir);
+    let local = ctx.cache_dest().local;
+    if matches!(local, crate::jobctx::LocalScope::Private(_))
+        && let Ok(root) = job_windows_root(&local)
+    {
+        remove_windows_scope(&root);
+    }
     let removed = match std::fs::remove_dir_all(&ctx.job_dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -4953,6 +5015,34 @@ mod tests {
         // No job dir to mark: said each time rather than never.
         assert!(first_cache_off(&dir.join("absent")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job's Windows cache is scoped under the unscoped cache. Removing a private scope
+    /// removes its whole cache and nothing outside it.
+    #[test]
+    fn a_jobs_windows_cache_is_its_scopes() {
+        use crate::jobctx::LocalScope;
+        let tmp = std::env::temp_dir().join(format!("vk-win-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let shared = tmp.join("windows");
+        assert_eq!(windows_root_in(&shared, &LocalScope::Unscoped), shared);
+        let mine = windows_root_in(&shared, &LocalScope::Private("ab12".into()));
+        assert_eq!(mine, shared.join("scopes/ab12"));
+        assert_eq!(
+            windows_root_in(&shared, &LocalScope::Shared("cd34".into())),
+            shared.join("scopes/cd34")
+        );
+        let layer = mine.join("layers/k");
+        let kept = shared.join("layers/k");
+        for d in [&layer, &kept] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(layer.join("disk.qcow2"), b"x").unwrap();
+        remove_windows_scope(&mine);
+        assert!(!mine.exists() && kept.exists());
+        // Gone already: nothing to do.
+        remove_windows_scope(&mine);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A job's cleanup removes what it built in its private scope, and only build-tier

@@ -408,6 +408,21 @@ pub(crate) fn hold_chunks(root: &Path) -> Result<crate::cachelock::Guard> {
     )
 }
 
+/// [`gc`] on the host's Windows cache at `root` and on every local scope's under it
+/// ([`crate::winbuild::scope_root`]): each scope's chains stand on its own entries alone. A
+/// scope's directory stays once its entries are gone; it holds nothing then but empty kinds.
+pub(crate) fn gc_all(root: &Path, idle: std::time::Duration) {
+    gc(root, idle);
+    let Ok(scopes) = std::fs::read_dir(root.join(crate::winbuild::SCOPES)) else {
+        return;
+    };
+    for scope in scopes.flatten() {
+        if scope.file_type().is_ok_and(|t| t.is_dir()) {
+            gc(&scope.path(), idle);
+        }
+    }
+}
+
 /// Reclaim what the Windows cache rooted at `root` has not used for `idle`: entries nobody
 /// references ([`reference`]), never one a kept entry stands on, then the chunks no pulled
 /// layer still reads, what a process that is gone left unpublished, and the sidecars of
@@ -915,6 +930,32 @@ mod tests {
         assert!(crate::cachelock::reclaimed_eventually(|| {
             gc(&root, idle);
             !layers.join(key(1)).exists() && !pulled.exists()
+        }));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The host's sweep reaches every local scope's cache, as it does the unscoped one.
+    #[test]
+    fn a_sweep_reaches_every_scope() {
+        let root = std::env::temp_dir().join(format!("vk-wincache-scopes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let scoped = crate::winbuild::scope_root(&root, "ab12");
+        let entries = [
+            root.join("layers").join(key(1)),
+            scoped.join("layers").join(key(2)),
+        ];
+        for dir in &entries {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let idle = std::time::Duration::ZERO;
+        gc_all(&root, idle);
+        assert!(
+            entries.iter().all(|e| e.exists()),
+            "undated entries are dated first"
+        );
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            gc_all(&root, idle);
+            entries.iter().all(|e| !e.exists())
         }));
         let _ = std::fs::remove_dir_all(&root);
     }

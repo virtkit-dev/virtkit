@@ -5572,6 +5572,7 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
         media_registry: registry.clone(),
         registry,
         approved_media: None,
+        scope: None,
         pull_layers: true,
         ceiling: None,
     };

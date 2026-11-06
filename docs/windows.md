@@ -143,6 +143,10 @@ build shares its layers as Linux build steps do (`wincache`):
   scope ([build caches](build-cache-design.md)), takes a medium outside its build context only
   when `[executor] windows_media` lists its sha256, whether fetched or already in the host's
   media cache: the file store holds whatever anyone put there, and the job names the digest.
+- **Scopes.** Such a build keeps its installs, settled bases and layers in its local scope's
+  cache, `<data>/windows/scopes/<scope>`, laid out as the host's own, and takes layers from
+  its job's build cache, so no other project's or branch's build reuses them; media stay in
+  the host's media cache. The sweep after each Windows build walks every scope's cache.
 
 A store on disk — the builtin one, or a `cache_registry` naming a path — is not used: it would
 only hold a second copy of the host's own layer cache, and `--cache-registry` naming one is
