@@ -879,6 +879,16 @@ pub(super) async fn receive(
 
 /// The 200 a write answers: its `etag` (quoted) and the checksum that held.
 pub(super) fn written(etag: &str, echo: Option<(&'static str, String)>) -> Result<Response<Body>> {
+    written_of(etag, echo, None)
+}
+
+/// [`written`] for an object of `size` bytes, which the answer names (`x-amz-object-size`),
+/// as S3's PutObject does; a part's answer names none.
+fn written_of(
+    etag: &str,
+    echo: Option<(&'static str, String)>,
+    size: Option<u64>,
+) -> Result<Response<Body>> {
     let mut resp = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_LENGTH, "0")
@@ -892,8 +902,18 @@ pub(super) fn written(etag: &str, echo: Option<(&'static str, String)>) -> Resul
             &value,
         );
     }
+    if let Some(size) = size {
+        insert(
+            headers,
+            hyper::header::HeaderName::from_static(OBJECT_SIZE),
+            &size.to_string(),
+        );
+    }
     Ok(resp)
 }
+
+/// The header a PutObject's answer names the object's size in, which SDKs read back.
+const OBJECT_SIZE: &str = "x-amz-object-size";
 
 /// `PUT /s3/<bucket>/<key>`: stream the body into staging while hashing it, check it against
 /// what the request said of it ([`receive`]), then tag it under the namespace lock, with its
@@ -963,10 +983,11 @@ pub(super) async fn put(
     if let Some((name, value)) = kept.clone() {
         annotations.insert(name, value);
     }
+    let size = received.staged.size;
     let how = Commit {
         annotations,
         precondition: conditions.precondition(),
-        uncompressed: received.staged.size >= UNCOMPRESSED_FROM,
+        uncompressed: size >= UNCOMPRESSED_FROM,
     };
     let written = files::commit(Arc::clone(&state.store), segs, received.staged, how).await?;
     match written {
@@ -980,7 +1001,7 @@ pub(super) async fn put(
             ));
         }
     }
-    let mut resp = self::written(&format!("\"{md5_hex}\""), received.echo)?;
+    let mut resp = written_of(&format!("\"{md5_hex}\""), received.echo, Some(size))?;
     if kept.is_some() {
         resp.headers_mut().insert(
             checksum::TYPE_HEADER,
