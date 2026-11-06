@@ -19,8 +19,8 @@
 #   --vk PATH            the vk under test: the node runs it (default: $VK, else dist/vk)
 #   --vk-hub PATH        the vk-hub under test (default: beside --vk)
 #   --vk-registry PATH   vk-registry for the node's [registry] (default: beside --vk-hub);
-#                        without one the cache, registry and pipeline_build scenarios are
-#                        skipped
+#                        without one the cache, registry, pipeline_build and build_cache
+#                        scenarios are skipped
 #   --vk-gitlab PATH     the vk-gitlab under test (default: beside --vk-hub)
 #   --vk-boot PATH       the vk that boots GitLab (default: vk on PATH, else --vk)
 #   --scenario NAME      run only these (repeatable, or comma-separated); default: all
@@ -33,7 +33,8 @@
 # Environment: VK_GITLAB_E2E_CACHE (default ~/.cache/vk-gitlab-e2e) holds the GitLab
 # instance; GL_MEM (6G) and GL_CPUS (4) size its VM; GL_BOOT_TIMEOUT (1500 s). E2E_TOKENS=0
 # runs the fleet without hub registry tokens: the registry not enrolled, the node's own
-# credential for caches, and the `registry` and `pipeline_build` scenarios skipped.
+# credential for caches, and the `registry`, `pipeline_build` and `build_cache` scenarios
+# skipped.
 #
 # Needs: KVM, curl, jq, git, openssl, ss, ip, shuf, network to Docker Hub; about 9 GiB of free RAM
 # (GitLab 6 GiB, job VMs 1 GiB each) and 15 GiB of disk for the GitLab image and its state.
@@ -52,8 +53,8 @@ REPO=$(cd "$E2E/../.." && pwd)
 # shellcheck source=gitlab/scenarios.sh
 . "$E2E/scenarios.sh"
 
-ALL_SCENARIOS=(basic scripts variables exit_codes artifacts cache registry pipeline_build services
-  timeout cancel restart)
+ALL_SCENARIOS=(basic scripts variables exit_codes artifacts cache registry pipeline_build
+  build_cache services timeout cancel restart)
 
 usage() {
   sed -n '/^# Usage:/,/^# Needs:/p' "$0" | sed 's/^# \{0,1\}//' >&2
@@ -210,7 +211,7 @@ pids=()
 for s in "${SCENARIOS[@]}"; do
   case $s in
     restart) ;;
-    registry | pipeline_build)
+    registry | pipeline_build | build_cache)
       if [ -z "$VK_REGISTRY" ] || [ "$E2E_TOKENS" = 0 ]; then
         echo "SKIP|needs a vk-registry taking hub tokens" >"$RUN/results/$s"
       else

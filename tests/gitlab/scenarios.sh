@@ -26,11 +26,12 @@ bad() {
   SC_ERRORS=$((SC_ERRORS + 1))
 }
 
-# push_scenario <name> [suffix]: write the tree (README, e2e.txt, and the CI file from
-# stdin) and push it as branch e2e/<name>; prints the pipeline ID.
+# push_scenario <name> [suffix]: push README, e2e.txt, stdin as the CI file, and
+# $PUSH_FILES directory contents (if set) to branch e2e/<name>; print the pipeline ID.
 push_scenario() {
   local name=$1 suffix=${2:-} dir sha
   dir=$(mktemp -d "$RUN/tree.XXXXXX")
+  [ -z "${PUSH_FILES:-}" ] || cp -R "$PUSH_FILES/." "$dir/"
   cat >"$dir/.gitlab-ci.yml"
   printf 'vk-gitlab e2e %s\n' "$name" >"$dir/README.md"
   printf 'e2e-marker-%s-%s%s\n' "$name" "$RUN_ID" "$suffix" >"$dir/e2e.txt"
@@ -389,6 +390,89 @@ EOF
   trace_has "$j" "image pipeline/build/runner is not in this pipeline"
   trace_lacks "$j" never-marker
   SC_DETAIL="built in $p1 ($ref), refused in $p2"
+}
+
+# A job's builds are cached per project, protection and scope: a second pipeline of a branch
+# boots the layer the first built (`vk-agent build`), and a branch the ci-build namespace
+# isolates builds its own, though the Dockerfile is the same. The RUN step writes a random
+# stamp, which a later job of the pipeline prints: one stamp is one build. With one node, the
+# reuse may come from its local tier; each build job also checks that its scope's build-cache
+# in the registry holds a tag, and that its token reads and locks its own scope but not the
+# other. The hub's ci-build namespace stays replaced for the rest of the run; it keeps the
+# path, so every other branch's jobs still build in scope `all`.
+sc_build_cache() {
+  local files ci p1 p2 p3 b1 b3 s1 s2 s3 p want shared iso
+  shared="ci-build/e2e/$GL_PROJECT_ID/unprotected/all"
+  iso="ci-build/e2e/$GL_PROJECT_ID/unprotected/ref-e2e-build-cache-iso-$(
+    printf 'branch:e2e/build_cache_iso' | sha256sum | cut -c1-32
+  )"
+  hub namespaces add "$REG_ID" ci-build \
+    --path 'ci-build/{gitlab}/{project_id}/{protection}/{scope}' \
+    --retention-days 14 --isolate e2e/build_cache_iso --grant 'rwl:own project' \
+    >>"$LOGS/hub-cli.log" 2>&1 || {
+    bad "vk-hub namespaces add ci-build --isolate failed (see $LOGS/hub-cli.log)"
+    return 1
+  }
+  files=$(mktemp -d "$RUN/files.XXXXXX")
+  mkdir "$files/ctx"
+  printf 'FROM %s\nRUN head -c 8 /dev/urandom | od -An -tx1 | tr -d " \\n" > /build-stamp\n' \
+    "$JOB_IMAGE" >"$files/stamp.Dockerfile"
+  touch "$files/ctx/.keep"
+  # Each build job probes both scopes: its HTTP status reading and locking each scope's
+  # build-cache, and whether that repository holds a tag (the layers its build pushed).
+  ci=$({
+    ci_header
+    cat <<EOF
+stages: [build, test]
+build:
+  stage: build
+  script:
+    - vk-agent build -f stamp.Dockerfile --as stamp ctx
+    - code() { wget -S -q -O /dev/null "\$@" 2>&1 | awk '/^ *HTTP\//{c=\$2} END{print c}'; }
+    - tagged() { wget -q -O - "\$VK_REGISTRY/v2/\$1/build-cache/tags/list" 2>/dev/null | grep -c '"tags":\["'; }
+    - echo "read-shared=\$(code "\$VK_REGISTRY/v2/$shared/build-cache/tags/list")"
+    - echo "lock-shared=\$(code --post-data= "\$VK_REGISTRY/lock/acquire?name=$shared/build-cache:k&ttl=30&wait=0")"
+    - echo "tagged-shared=\$(tagged $shared)"
+    - echo "read-iso=\$(code "\$VK_REGISTRY/v2/$iso/build-cache/tags/list")"
+    - echo "lock-iso=\$(code --post-data= "\$VK_REGISTRY/lock/acquire?name=$iso/build-cache:k&ttl=30&wait=0")"
+    - echo "tagged-iso=\$(tagged $iso)"
+use:
+  stage: test
+  needs: [build]
+  variables:
+    MICROVM_IMAGE: pipeline/build/stamp
+  script:
+    - echo "stamp=\$(cat /build-stamp)"
+EOF
+  })
+  p1=$(PUSH_FILES=$files push_scenario build_cache <<<"$ci") || return 1
+  wait_pipeline "$p1" success || return 1
+  p2=$(PUSH_FILES=$files push_scenario build_cache -second <<<"$ci") || return 1
+  wait_pipeline "$p2" success || return 1
+  p3=$(PUSH_FILES=$files push_scenario build_cache_iso <<<"$ci") || return 1
+  wait_pipeline "$p3" success || return 1
+  rm -rf "$files"
+  s1=$(grep -oE "${LINE}stamp=[0-9a-f]{16}\$" "$RUN/jobs/$(job "$p1" use).log" | sed 's/.*=//')
+  s2=$(grep -oE "${LINE}stamp=[0-9a-f]{16}\$" "$RUN/jobs/$(job "$p2" use).log" | sed 's/.*=//')
+  s3=$(grep -oE "${LINE}stamp=[0-9a-f]{16}\$" "$RUN/jobs/$(job "$p3" use).log" | sed 's/.*=//')
+  if [ -z "$s1" ] || [ -z "$s2" ] || [ -z "$s3" ]; then
+    bad "a use job's trace lacks its 'stamp=' line ($s1/$s2/$s3)"
+    return 1
+  fi
+  [ "$s1" = "$s2" ] || bad "pipeline $p2 built again ($s2) instead of taking $p1's build ($s1)"
+  [ "$s3" != "$s1" ] || bad "the isolated branch took the shared scope's build ($s3)"
+  b1=$(job "$p1" build)
+  b3=$(job "$p3" build)
+  for want in read-shared=200 lock-shared=200 tagged-shared=1 read-iso=403 lock-iso=403; do
+    grep -qE "${LINE}${want}\$" "$RUN/jobs/$b1.log" || bad "job $b1's trace lacks a line '$want'"
+  done
+  for want in read-shared=403 lock-shared=403 read-iso=200 lock-iso=200 tagged-iso=1; do
+    grep -qE "${LINE}${want}\$" "$RUN/jobs/$b3.log" || bad "job $b3's trace lacks a line '$want'"
+  done
+  for p in "$b1" "$b3"; do
+    trace_lacks "$p" "building with no build cache" "not cached"
+  done
+  SC_DETAIL="built once for $p1 and $p2 ($s1), apart for the isolated branch ($s3)"
 }
 
 sc_services() {

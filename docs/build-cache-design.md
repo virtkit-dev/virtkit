@@ -1,6 +1,7 @@
 # Per-project build caches
 
-Status: **design**.
+Status: **implemented**, steps 1–6; step 7 in part (`build_cache` in
+`tests/gitlab/scenarios.sh`).
 
 On a fleet, a job's builds cache their layers in a registry repository of the job's project
 and protection, reached with the job's registry token, as `task-cache` scopes task-rs's
@@ -247,7 +248,10 @@ isolation does not hold, as for builds. sccache takes an area the same way.
    unprotected job cannot write the protected cache; a job with no token or no prefix builds
    with the cache off in a scope of its own; a Windows build with the cache off fetches its
    media cold; a namespace overlapping a reserved root is refused; `task-cache` with an
-   isolated branch.
+   isolated branch. So far `build_cache` covers two pipelines of a branch sharing a build
+   (possibly from the node's local tier) with their scope's layers in the registry, and an
+   isolated branch building its own, each token reading and locking its own scope's
+   build-cache and refused the other's; the rest of this list is still to do.
 
 ## Open points
 
