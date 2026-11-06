@@ -172,12 +172,12 @@ with the source `detected` where the host's size supplied or held down the value
   for up to the whole host. A job that asks for none gets `cpus`, held to `max_cpus` on any
   host. The default VM keeps 4 vCPUs, fewer on a smaller host.
 - **vCPUs in all.** An unset `cpu_overcommit` is 2, where on a host that is not enrolled it
-  means no vCPU gate: the admission ledger counts each job guest's vCPUs, against the online
-  CPUs times the ratio, rounded down. A job waits for vCPUs as it waits for memory, and a
-  node refuses an offer past them; a `MICROVM_CPUS` is held to the budget, and an unset
-  `cpus` too. The heartbeat reports vCPUs committed and the budget, `vk tune` counts only the
-  jobs both budgets have room for, and the hub places on a node no more vCPUs than its budget
-  has left, less those it has asked of the node since.
+  means no vCPU gate: the admission ledger counts the vCPUs of each job's guest and services,
+  against the online CPUs times the ratio, rounded down. A job waits for vCPUs as it waits for
+  memory, and a node refuses an offer past them; a `MICROVM_CPUS` is held to the budget, and an
+  unset `cpus` too. The heartbeat reports vCPUs committed and the budget, `vk tune` counts only
+  the jobs both budgets have room for, though at least one, and the hub places on a node no more vCPUs than its
+  budget has left, less those it has asked of the node since.
 - **Job network.** An unset `[net] mode` is `switch`, where on a host that is not enrolled it is
   `none`: jobs reach out through the per-job switch, held to the node's `[egress]` and the
   hub's [egress layer](#job-egress-from-the-hub), and their guests reach the registry proxy

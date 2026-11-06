@@ -920,8 +920,8 @@ could. A job's services count too, each at its `x-virtkit.mem`, else a Windows D
 exceed the whole budget are refused. Under `from_history` the job's history already holds its
 services, whose VMs are the supervisor's children, so it is capped at the guest's and the
 services' declared sizes together. With `host_checkout` and `net.mode = "switch"`, a
-`compose:` job's admission runs after the checkout, which holds its services: the clone
-itself is not admitted.
+`compose:` job is admitted against memory or vCPU budgets after checkout supplies its service
+definitions. The clone itself is not admitted.
 
 ### Reserving what jobs actually use
 
@@ -1178,8 +1178,8 @@ disk admission covers the host once every job it has running was prepared by thi
 ### Keeping vCPUs within the host's CPUs
 
 A guest's vCPUs are threads on the host, and many busy ones on few CPUs run every job slower.
-Set `cpu_overcommit` and a job also claims its guest's vCPUs, and waits while the jobs
-admitted, itself included, would hold more than that many per online CPU:
+With `cpu_overcommit`, each job claims its guest's and services' vCPUs. It waits if admitting
+it would exceed that many vCPUs per online CPU:
 
 ```toml
 [executor.schedule]
@@ -1188,11 +1188,13 @@ cpu_overcommit = 2        # vCPUs per online CPU, rounded down; 1.5 works too
 
 It shares the oldest-first queue and `wait_timeout_secs` with memory and disk admission, and
 needs neither. With a memory budget too, `vk tune` asks the runner for no more jobs of
-`[executor.vm] cpus` than the vCPUs left have room for. A `MICROVM_CPUS` above the whole budget is clamped to it, as a `MICROVM_MEM` is
-to the memory budget; an `[executor.vm] cpus` above it fails every job. Only the job's own
-guest counts, not its services, and a job prepared by an older `vk` counts none. Unset there is
-no vCPU gate — except on a [fleet node](fleet-design.md#defaults-on-an-enrolled-node), where it
-is 2.
+`[executor.vm] cpus` than the vCPUs left have room for, though never fewer than one. A
+`MICROVM_CPUS` above the whole budget is clamped to it, as a `MICROVM_MEM` is to the memory budget; an `[executor.vm] cpus` above it,
+unless `max_cpus` holds it under, fails every job that sets no `MICROVM_CPUS`. Services count as they do for memory, each at its `x-virtkit.cpus` or a Windows
+Dockerfile's `# vk: cpus=` held under the same ceilings, else the default; a job and services
+that together exceed the whole budget are refused. A job prepared by an older `vk` counts none.
+Unset there is no vCPU gate — except on a [fleet node](fleet-design.md#defaults-on-an-enrolled-node),
+where it is 2.
 
 ```
 virtkit: waiting for 4 of the host's budget of 32 vCPUs (30 committed, 0 job(s) asked first)

@@ -253,7 +253,7 @@ pub struct Schedule {
     pub disk_default: Option<String>,
     /// Wait if admitting this job would exceed the host's online CPUs times this positive
     /// ratio (rounded down, at least one): `2` allows twice as many vCPUs as host CPUs.
-    /// Counts each job's guest, not its services. Shares `mem_budget`'s queue and
+    /// Counts each job's guest and services. Shares `mem_budget`'s queue and
     /// `wait_timeout_secs`. Unset: no vCPU gate, except on an enrolled fleet node, where it is 2.
     pub cpu_overcommit: Option<f64>,
 }

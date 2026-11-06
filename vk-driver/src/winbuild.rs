@@ -388,15 +388,20 @@ fn guest_size(stage: &Stage, opts: &Options) -> Result<(u32, String)> {
     Ok((cpus.min(max_cpus), mem))
 }
 
-/// The memory the bundle `dockerfile`'s stage `target` builds boots with: its `# vk: mem=`,
-/// else `mem`, as [`build`] writes it into the bundle.
-pub(crate) fn target_mem(dockerfile: &Path, target: Option<&str>, mem: &str) -> Result<String> {
+/// The vCPUs and memory the bundle `dockerfile`'s stage `target` builds boots with: its
+/// `# vk: cpus=`/`mem=`, else `cpus`/`mem`: what [`build`] sizes before applying its ceiling,
+/// which the caller applies instead.
+pub(crate) fn target_size(
+    dockerfile: &Path,
+    target: Option<&str>,
+    (cpus, mem): (u32, &str),
+) -> Result<(u32, String)> {
     let text = std::fs::read_to_string(dockerfile)
         .with_context(|| format!("reading {}", dockerfile.display()))?;
     let stages =
         stages(parser::parse(&text)?).with_context(|| format!("{}", dockerfile.display()))?;
     let stage = &stages[target_index(&stages, target)?];
-    Ok(stage_mem(stage, mem))
+    Ok((stage.from.guest.cpus.unwrap_or(cpus), stage_mem(stage, mem)))
 }
 
 /// The memory of `stage`'s guests: its `# vk: mem=`, else `mem`.
