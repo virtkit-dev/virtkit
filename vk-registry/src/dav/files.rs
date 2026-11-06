@@ -351,7 +351,7 @@ async fn put(
             Written::Replaced => no_content(),
             Written::Refused(why) => put_refusal(why, href),
             // Unreachable: no precondition was asked for.
-            Written::PreconditionFailed => no_content(),
+            Written::PreconditionFailed { .. } => no_content(),
         },
     )
 }

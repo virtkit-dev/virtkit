@@ -30,6 +30,9 @@ pub(super) enum Source {
     /// one version of an object other than its [`NULL_VERSION`], which this registry does
     /// not keep
     Versioned,
+    /// a key of a bucket the store cannot name (`x-amz-copy-source` decoded), which holds no
+    /// object: a copy of it is a miss
+    Absent { bucket: String, key: String },
     /// nothing this view serves, and why
     Invalid(Refusal),
 }
@@ -61,21 +64,44 @@ pub(super) fn source(value: &str) -> Source {
     let Some(decoded) = crate::dav::decode_segment(raw) else {
         return invalid("Invalid copy source encoding", value);
     };
-    if decoded.contains('%') {
-        return invalid(
-            "a key's components are runs of A-Z a-z 0-9 . _ - only",
-            value,
-        );
-    }
     let decoded = decoded.strip_prefix('/').unwrap_or(&decoded);
+    let absent = || match decoded.split_once('/') {
+        Some((bucket, key)) if path::is_bucket(bucket) => Source::Absent {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+        },
+        _ => invalid("Invalid copy source bucket name", value),
+    };
+    // No key holds a `%`: it is not decoded twice.
+    if decoded.contains('%') {
+        return absent();
+    }
     match path::parse(&format!("/s3/{decoded}")) {
         Ok(path::Target::Object { segs, .. }) => Source::Object(segs),
         Ok(_) => invalid("Invalid copy source object key", value),
         Err(why) if why.code == Code::InvalidBucketName => {
             invalid("Invalid copy source bucket name", value)
         }
+        Err(why) if matches!(why.code, Code::InvalidArgument | Code::BadRequest) => absent(),
         Err(why) => Source::Invalid(why),
     }
+}
+
+/// The answer to a copy from `bucket`'s `key`, which the store cannot name: `NoSuchBucket` when
+/// the bucket is not there ([`super::bucket::missing`]), else `NoSuchKey`.
+pub(super) async fn absent_source(
+    state: &ServerState,
+    authz: &Authz<'_>,
+    bucket: &str,
+    key: &str,
+    ctx: &Ctx,
+) -> Result<Response<Body>> {
+    Ok(
+        match super::bucket::missing(state, authz, bucket, ctx).await? {
+            Some(resp) => resp,
+            None => ctx.error(Refusal::new(Code::NoSuchKey).with("Key", key)),
+        },
+    )
 }
 
 /// A copy source refused as S3 refuses one: `InvalidArgument` on `x-amz-copy-source`.
@@ -127,6 +153,10 @@ pub(super) async fn copy(
             let resp = ctx.error(Refusal::new(Code::NotImplemented).with("Header", COPY_SOURCE));
             return refuse(req, resp, ctx).await;
         }
+        Source::Absent { bucket, key } => {
+            let resp = absent_source(state, authz, &bucket, &key, ctx).await?;
+            return refuse(req, resp, ctx).await;
+        }
         Source::Invalid(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     if !admitted(authz, accounts::Action::Read, &src) {
@@ -147,6 +177,19 @@ pub(super) async fn copy(
             return refuse(req, resp, ctx).await;
         }
     };
+    // Tags are none either way, which is what every object has; another value is no
+    // directive.
+    if let Some(v) = headers
+        .get("x-amz-tagging-directive")
+        .filter(|v| !matches!(v.as_bytes(), b"COPY" | b"REPLACE"))
+    {
+        let resp = ctx.error(Refusal::argument(
+            "Unknown tagging directive.",
+            "x-amz-tagging-directive",
+            String::from_utf8_lossy(v.as_bytes()),
+        ));
+        return refuse(req, resp, ctx).await;
+    }
     if src == segs && !replace {
         let resp = ctx.error(Refusal::said(
             Code::InvalidRequest,
@@ -169,7 +212,7 @@ pub(super) async fn copy(
         Ok(written) => written,
         Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
-    let precondition = written.precondition();
+    let precondition = written.clone().precondition();
     // A copy has no body of its own; whatever came is read through first.
     if let Some(resp) = drain(req, ctx).await? {
         return Ok(resp);
@@ -208,7 +251,7 @@ pub(super) async fn copy(
         match files::link(store, &held, &segs, &obj.layer, obj.size, how)? {
             Written::Created | Written::Replaced => {}
             Written::Refused(why) => return Ok(unwritable(why, &ctx)),
-            Written::PreconditionFailed => return Ok(failed(&ctx)),
+            Written::PreconditionFailed { found } => return Ok(ctx.error(written.refusal(found))),
         }
         let modified = object_of(&segs)
             .and_then(|(repo, tag)| store.tag_target(&repo, tag))
@@ -267,22 +310,28 @@ mod tests {
             other => panic!("{value}: {other:?}"),
         };
         for bad in [
-            "",
-            "/",
-            "/b",
-            "b/",
-            "/b/",
-            "/b/k?acl",
-            "/b/a%2",
-            "/b/%FF",
-            "/b/a%2541",
-            "/b/a//k",
-            "/b/a b",
-            "/b/../k",
-            "/b/tags/k",
-            "//b/k",
+            "", "/", "/b", "b/", "/b/", "/b/k?acl", "/b/a%2", "/b/%FF", "//b/k",
         ] {
             assert_eq!(refusal(bad).code, Code::InvalidArgument, "{bad}");
+        }
+        // A key the store cannot name holds no object, as S3 finds none there.
+        for (missing, key) in [
+            ("/b/a%2541", "a%41"),
+            ("/b/a//k", "a//k"),
+            ("/b/a b", "a b"),
+            ("/b/../k", "../k"),
+            ("/b/tags/k", "tags/k"),
+            ("b/d/", "d/"),
+            ("b//", "/"),
+        ] {
+            assert_eq!(
+                source(missing),
+                Source::Absent {
+                    bucket: "b".into(),
+                    key: key.into()
+                },
+                "{missing}"
+            );
         }
         // In S3's words, naming the header and its value.
         let r = refusal("/b/a%2");

@@ -20,6 +20,7 @@ pub(crate) enum Code {
     AuthorizationHeaderMalformed,
     AuthorizationQueryParametersError,
     BadDigest,
+    BadRequest,
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
     EntityTooLarge,
@@ -28,7 +29,6 @@ pub(crate) enum Code {
     InvalidAccessKeyId,
     InvalidArgument,
     InvalidBucketName,
-    InvalidChunkSizeError,
     InvalidDigest,
     InvalidPart,
     InvalidPartNumber,
@@ -42,6 +42,7 @@ pub(crate) enum Code {
     MalformedTrailerError,
     MalformedXML,
     MetadataTooLarge,
+    MissingContentLength,
     NoSuchBucket,
     NoSuchBucketPolicy,
     NoSuchCORSConfiguration,
@@ -88,6 +89,11 @@ impl Code {
                 BAD,
                 "The Content-MD5 you specified did not match what we received.",
             ),
+            BadRequest => (
+                "BadRequest",
+                BAD,
+                "An error occurred when parsing the HTTP request.",
+            ),
             BucketAlreadyOwnedByYou => (
                 "BucketAlreadyOwnedByYou",
                 StatusCode::CONFLICT,
@@ -125,11 +131,6 @@ impl Code {
                 "InvalidBucketName",
                 BAD,
                 "The specified bucket is not valid.",
-            ),
-            InvalidChunkSizeError => (
-                "InvalidChunkSizeError",
-                BAD,
-                "Only the last chunk is allowed to have a size less than 8192 bytes",
             ),
             InvalidDigest => (
                 "InvalidDigest",
@@ -188,6 +189,11 @@ impl Code {
                 "MetadataTooLarge",
                 BAD,
                 "Your metadata headers exceed the maximum allowed metadata size",
+            ),
+            MissingContentLength => (
+                "MissingContentLength",
+                StatusCode::LENGTH_REQUIRED,
+                "You must provide the Content-Length HTTP header.",
             ),
             NoSuchBucket => ("NoSuchBucket", GONE, "The specified bucket does not exist."),
             NoSuchBucketPolicy => (

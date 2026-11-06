@@ -305,8 +305,8 @@ pub(crate) enum Written {
     /// written
     Refused(Unwritable),
     /// [`Commit::precondition`] refused the object found there, or its absence; nothing was
-    /// written
-    PreconditionFailed,
+    /// written. `found` says whether an object was there.
+    PreconditionFailed { found: bool },
 }
 
 /// Whether a [`commit`] goes ahead, given the object at its path or `None`.
@@ -398,7 +398,9 @@ fn admit(
     if let Some(precondition) = precondition
         && !precondition(existing.as_ref())
     {
-        return Ok(Err(Written::PreconditionFailed));
+        return Ok(Err(Written::PreconditionFailed {
+            found: existing.is_some(),
+        }));
     }
     Ok(Ok(existing.is_some()))
 }
@@ -621,7 +623,7 @@ mod tests {
         };
         assert!(matches!(
             write(b"two", how).await,
-            Written::PreconditionFailed
+            Written::PreconditionFailed { found: true }
         ));
         assert_eq!(store.tag_target("files/b", "k").unwrap().0, hex);
         let staged = std::fs::read_dir(dir.join("uploads"))
@@ -679,7 +681,7 @@ mod tests {
             ..Commit::default()
         };
         let written = link(&store, &held, &dst, &layer, 3, absent).unwrap();
-        assert!(matches!(written, Written::PreconditionFailed));
+        assert!(matches!(written, Written::PreconditionFailed { .. }));
         let below = segs(&["b", "k", "x"]);
         let written = link(&store, &held, &below, &layer, 3, Commit::default()).unwrap();
         assert!(matches!(written, Written::Refused(Unwritable::UnderObject)));

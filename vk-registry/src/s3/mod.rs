@@ -318,6 +318,21 @@ async fn operate(
 ) -> Result<Response<Body>> {
     let target = match path::parse(&ctx.path) {
         Ok(target) => target,
+        // A key the store cannot name holds no object: a read of one is a miss, as S3's is
+        // of a key it does not hold, once its bucket is found.
+        Err(why)
+            if why.code == Code::InvalidArgument
+                && matches!(req.method(), &Method::GET | &Method::HEAD) =>
+        {
+            let resp = match path::bucket_and_raw_key(&ctx.path) {
+                None => ctx.error(why),
+                Some((b, key)) => match bucket::missing(state, authz, &b, ctx).await? {
+                    Some(resp) => resp,
+                    None => ctx.error(Refusal::new(Code::NoSuchKey).with("Key", key)),
+                },
+            };
+            return refuse(req, resp, ctx).await;
+        }
         Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     let Some(query) = parse_query(req.uri().query().unwrap_or("")) else {
@@ -352,6 +367,17 @@ async fn operate(
     if let Some(b) = bucket_first
         && let Some(resp) = bucket::missing(state, authz, b, ctx).await?
     {
+        return refuse(req, resp, ctx).await;
+    }
+    // An object's version named by no id at all.
+    if matches!(target, path::Target::Object { .. })
+        && query.iter().any(|(n, v)| n == "versionId" && v.is_empty())
+    {
+        let resp = ctx.error(Refusal::argument(
+            "Version id cannot be the empty string",
+            "versionId",
+            "",
+        ));
         return refuse(req, resp, ctx).await;
     }
     let part = match part_asked(&query) {
@@ -441,9 +467,9 @@ async fn operate(
 
 /// Whether the `Authorization` header is SigV4's: `false` for none (the session cookie may
 /// stand in) or one of the schemes the other routes take, Basic and Bearer, which
-/// [`presented`] resolves; refused otherwise: a value with no scheme or of any other scheme
-/// is 400 `InvalidArgument`, as S3 answers a signature version it does not take rather than
-/// 403 as a credential it refused.
+/// [`presented`] resolves; refused otherwise, as S3 refuses it: a value with no scheme or of
+/// an unknown scheme is 400 `InvalidArgument`, a signature version S3 does not take rather
+/// than a credential it refused (403), and SigV2's `AWS` 400 `InvalidRequest`.
 fn scheme(headers: &HeaderMap) -> std::result::Result<bool, Refusal> {
     let invalid =
         |why| Refusal::said(Code::InvalidArgument, why).with("ArgumentName", "Authorization");
@@ -462,6 +488,12 @@ fn scheme(headers: &HeaderMap) -> std::result::Result<bool, Refusal> {
         Ok(true)
     } else if scheme.eq_ignore_ascii_case("basic") || scheme.eq_ignore_ascii_case("bearer") {
         Ok(false)
+    } else if scheme == "AWS" {
+        Err(Refusal::said(
+            Code::InvalidRequest,
+            "The authorization mechanism you have provided is not supported. Please use \
+             AWS4-HMAC-SHA256.",
+        ))
     } else {
         Err(invalid("Unsupported Authorization Type"))
     }
@@ -722,6 +754,10 @@ fn signed_by(
                 "Missing required header for this request: x-amz-content-sha256",
             )))
         })?;
+    // What the header may be is checked before what it signs, as S3 checks it.
+    if let Some(why) = object::content_sha256_refusal(payload_hash) {
+        return Err(Box::new(ctx.error(why)));
+    }
     let canonical = sigv4::canonical_request(
         req.method().as_str(),
         req.uri().path(),

@@ -308,7 +308,15 @@ pub(super) async fn attributes(
         "StorageClass",
         "ObjectSize",
     ];
-    if asked.is_empty() || asked.iter().any(|a| !known.contains(&a.as_str())) {
+    if asked.is_empty() {
+        let resp = ctx.error(Refusal::said(
+            Code::InvalidRequest,
+            "The x-amz-object-attributes header specifying the attributes to be retrieved is \
+             either missing or empty",
+        ));
+        return refuse(req, resp, ctx).await;
+    }
+    if asked.iter().any(|a| !known.contains(&a.as_str())) {
         let resp = ctx.error(Refusal::argument(
             "Invalid attribute name specified.",
             "x-amz-object-attributes",
@@ -466,15 +474,7 @@ fn payload(headers: &HeaderMap) -> std::result::Result<Payload, Refusal> {
             (Some(v.to_ascii_lowercase()), None)
         }
         Some(v) => {
-            return Err(Refusal::argument(
-                "x-amz-content-sha256 must be UNSIGNED-PAYLOAD, \
-                 STREAMING-UNSIGNED-PAYLOAD-TRAILER, STREAMING-AWS4-HMAC-SHA256-PAYLOAD, \
-                 STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER, \
-                 STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD, \
-                 STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER or a valid sha256 value.",
-                "x-amz-content-sha256",
-                v,
-            ));
+            return Err(content_sha256_refusal(v).unwrap_or(Refusal::new(Code::InvalidArgument)));
         }
     };
     let (mut chunked, mut other) = (false, false);
@@ -490,6 +490,15 @@ fn payload(headers: &HeaderMap) -> std::result::Result<Payload, Refusal> {
         } else if !encoding.eq_ignore_ascii_case("identity") {
             other = true;
         }
+    }
+    // An unsigned payload is the body as sent, which S3 does not take aws-chunked.
+    if chunked && value == Some("UNSIGNED-PAYLOAD") {
+        return Err(Refusal::argument(
+            "aws-chunked encoding is not supported when x-amz-content-sha256 UNSIGNED-PAYLOAD \
+             is supplied.",
+            "Content-Encoding",
+            "aws-chunked",
+        ));
     }
     let Some(mode) = streaming.or(chunked.then_some(chunked::Mode::Unsigned)) else {
         if headers.contains_key("x-amz-trailer") {
@@ -507,9 +516,7 @@ fn payload(headers: &HeaderMap) -> std::result::Result<Payload, Refusal> {
         .get(DECODED_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
-        .ok_or(invalid(
-            "an aws-chunked body needs x-amz-decoded-content-length, its decoded length",
-        ))?;
+        .ok_or(Refusal::new(Code::MissingContentLength))?;
     let trailer = match headers.get("x-amz-trailer") {
         None => None,
         Some(_) if !mode.trailer() => {
@@ -541,6 +548,25 @@ fn payload(headers: &HeaderMap) -> std::result::Result<Payload, Refusal> {
             declared,
             trailer,
         }),
+    })
+}
+
+/// Why `x-amz-content-sha256: value` is no value it takes, as S3 says it: `None` for
+/// `UNSIGNED-PAYLOAD`, a streaming mode (which [`chunked::Mode`] may still not serve) and a
+/// SHA-256 in hex.
+pub(super) fn content_sha256_refusal(value: &str) -> Option<Refusal> {
+    let fits = value == "UNSIGNED-PAYLOAD"
+        || value.starts_with("STREAMING-")
+        || (value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()));
+    (!fits).then(|| {
+        Refusal::argument(
+            "x-amz-content-sha256 must be UNSIGNED-PAYLOAD, STREAMING-UNSIGNED-PAYLOAD-TRAILER, \
+             STREAMING-AWS4-HMAC-SHA256-PAYLOAD, STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER, \
+             STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD, \
+             STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER or a valid sha256 value.",
+            "x-amz-content-sha256",
+            value,
+        )
     })
 }
 
@@ -577,6 +603,14 @@ fn expected(headers: &HeaderMap) -> std::result::Result<Expected, Refusal> {
     if checksum::not_computed(headers) {
         return Err(checksum::NOT_COMPUTED);
     }
+    // More than one is refused whatever they hold, as S3 refuses it.
+    let sent = checksum::ALGORITHMS
+        .iter()
+        .filter(|(name, _, _)| headers.contains_key(*name))
+        .count();
+    if sent > 1 {
+        return Err(ONE_CHECKSUM);
+    }
     let mut out = Expected {
         md5: content_md5(headers)?,
         ..Expected::default()
@@ -584,9 +618,6 @@ fn expected(headers: &HeaderMap) -> std::result::Result<Expected, Refusal> {
     for (name, _, len) in checksum::ALGORITHMS {
         let value = base64_header(headers, name, len).map_err(|()| checksum::invalid(name))?;
         if let Some((text, bytes)) = value {
-            if out.checksum.is_some() {
-                return Err(ONE_CHECKSUM);
-            }
             out.checksum = Some(Claim {
                 header: name,
                 text,
@@ -937,14 +968,14 @@ pub(super) async fn put(
     let size = received.staged.size;
     let how = Commit {
         annotations,
-        precondition: conditions.precondition(),
+        precondition: conditions.clone().precondition(),
         uncompressed: size >= UNCOMPRESSED_FROM,
     };
     let written = files::commit(Arc::clone(&state.store), segs, received.staged, how).await?;
     match written {
         Written::Created | Written::Replaced => {}
         Written::Refused(why) => return Ok(unwritable(why, ctx)),
-        Written::PreconditionFailed => return Ok(ctx.error(Code::PreconditionFailed)),
+        Written::PreconditionFailed { found } => return Ok(ctx.error(conditions.refusal(found))),
     }
     let mut resp = written_of(&format!("\"{md5_hex}\""), received.echo, Some(size))?;
     if kept.is_some() {
@@ -1126,7 +1157,7 @@ mod tests {
             );
             assert_eq!(
                 code(&[("x-amz-content-sha256", value)]),
-                Some("InvalidRequest"),
+                Some("MissingContentLength"),
                 "{value} without its decoded length"
             );
         }
@@ -1148,8 +1179,21 @@ mod tests {
                 ("content-encoding", "aws-chunked"),
                 ("x-amz-decoded-content-length", "-1")
             ]),
-            Some("InvalidRequest")
+            Some("MissingContentLength")
         );
+        // An unsigned payload is not aws-chunked, as S3 takes it.
+        for encoding in ["aws-chunked", "aws-chunked,gzip", "AWS-Chunked"] {
+            let pairs = [
+                ("content-encoding", encoding),
+                ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+                length,
+            ];
+            let r = payload(&headers(&pairs)).err().unwrap();
+            assert_eq!(r.code, Code::InvalidArgument, "{encoding}");
+            assert_eq!(r.element("ArgumentValue"), Some("aws-chunked"));
+        }
+        assert!(content_sha256_refusal("invalid_sha256").is_some());
+        assert!(content_sha256_refusal("UNSIGNED-PAYLOAD").is_none());
         assert_eq!(
             code(&[(
                 "x-amz-content-sha256",
@@ -1273,6 +1317,12 @@ mod tests {
             ]),
             Some("InvalidRequest")
         );
+        // Two are refused whatever they hold, as S3 refuses them.
+        let two = expected(&headers(&[
+            ("x-amz-checksum-sha256", "not base64"),
+            ("x-amz-checksum-crc32", "AAAAAA=="),
+        ]));
+        assert_eq!(two.err(), Some(ONE_CHECKSUM));
         // A header beside a trailer, of any algorithm.
         let crc = ("x-amz-trailer", "x-amz-checksum-crc32");
         let streaming = ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER");
