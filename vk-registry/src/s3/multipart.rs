@@ -1011,7 +1011,10 @@ async fn remove(dir: PathBuf) -> Result<()> {
     .context("removing an upload panicked")?
 }
 
-/// `DELETE /s3/<bucket>/<key>?uploadId=<id>`: the upload and its parts removed; 204.
+/// `DELETE /s3/<bucket>/<key>?uploadId=<id>`: the upload and its parts removed; 204. With
+/// `x-amz-if-match-initiated-time`, only an upload initiated in that second is: 412 for
+/// another, 400 for a value that is not a date. A time still to come is no condition, as S3
+/// takes it.
 async fn abort(
     state: &ServerState,
     authz: &Authz<'_>,
@@ -1023,12 +1026,32 @@ async fn abort(
     if !on_parent(authz, accounts::Action::Write, &segs) {
         return refuse(req, ctx.access_denied(), ctx).await;
     }
+    let initiated = match req.headers().get(conditional::IF_MATCH_INITIATED) {
+        None => None,
+        Some(v) => match v.to_str().ok().and_then(conditional::parse_time) {
+            Some(t) if t > SystemTime::now() => None,
+            Some(t) => Some(conditional::whole_seconds(t)),
+            None => {
+                let why = "x-amz-if-match-initiated-time is an HTTP date";
+                return refuse(req, invalid(ctx, why), ctx).await;
+            }
+        },
+    };
     if let Some(resp) = drain(req, ctx).await? {
         return Ok(resp);
     }
     let Some(up) = open_async(state, &id, &segs).await? else {
         return Ok(no_such_upload(ctx));
     };
+    // An upload's creation time never changes, so a concurrent abort or completion leaves
+    // nothing for the check to be wrong about.
+    if initiated.is_some_and(|t| t != up.meta.created) {
+        return Ok(ctx.error(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            conditional::PRECONDITION_FAILED,
+        ));
+    }
     remove(up.dir).await?;
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)

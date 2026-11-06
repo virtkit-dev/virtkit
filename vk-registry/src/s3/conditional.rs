@@ -1,7 +1,8 @@
 //! ETags and the conditional headers S3 takes on them: on a read, `If-Match`,
 //! `If-Unmodified-Since`, `If-None-Match` and `If-Modified-Since`, in RFC 9110's order (S3's
 //! too); on a write, `If-None-Match: *` (create only) and `If-Match` (replace only that
-//! object), checked where the tag is written.
+//! object), checked where the tag is written; on a delete, the object's ETag, modification
+//! time and size, checked where the tag is deleted.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -211,6 +212,113 @@ impl WriteConditions {
     }
 }
 
+/// What S3 says when a precondition does not hold.
+pub(crate) const PRECONDITION_FAILED: &str =
+    "At least one of the pre-conditions you specified did not hold";
+
+/// The header a DeleteObject names the object's modification time in.
+pub(crate) const IF_MATCH_LAST_MODIFIED: &str = "x-amz-if-match-last-modified-time";
+
+/// The header a DeleteObject names the object's size in.
+pub(crate) const IF_MATCH_SIZE: &str = "x-amz-if-match-size";
+
+/// The header an AbortMultipartUpload names its upload's initiation time in.
+pub(crate) const IF_MATCH_INITIATED: &str = "x-amz-if-match-initiated-time";
+
+/// A delete's conditions: DeleteObject's `If-Match`, `x-amz-if-match-last-modified-time` and
+/// `x-amz-if-match-size`, or the `ETag`, `LastModifiedTime` and `Size` of an `<Object>` of a
+/// `Delete` document. Each one given must hold of the object for it to be deleted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct DeleteConditions {
+    /// an ETag, quoted or not, or `*` (also quoted) for any object
+    pub(crate) etag: Option<String>,
+    /// seconds since the epoch
+    pub(crate) modified: Option<u64>,
+    pub(crate) size: Option<u64>,
+}
+
+impl DeleteConditions {
+    /// The conditions DeleteObject's headers carry; the reason for a 400 when one is not a
+    /// value its header takes.
+    pub(crate) fn of(headers: &HeaderMap) -> Result<Self, &'static str> {
+        let text = |name: &str| match headers.get(name) {
+            None => Ok(None),
+            Some(v) => v
+                .to_str()
+                .map(|v| Some(v.to_string()))
+                .map_err(|_| "a conditional header is not text"),
+        };
+        let modified = match text(IF_MATCH_LAST_MODIFIED)? {
+            None => None,
+            Some(v) => Some(
+                parse_time(&v)
+                    .map(whole_seconds)
+                    .ok_or("x-amz-if-match-last-modified-time is an HTTP date")?,
+            ),
+        };
+        let size = match text(IF_MATCH_SIZE)? {
+            None => None,
+            Some(v) => Some(parse_size(&v).ok_or("x-amz-if-match-size is a count of bytes")?),
+        };
+        Ok(DeleteConditions {
+            etag: text(IF_MATCH.as_str())?,
+            modified,
+            size,
+        })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.etag.is_none() && self.modified.is_none() && self.size.is_none()
+    }
+
+    /// Whether every condition holds of `obj`: its ETag named (`*` naming any), its
+    /// modification time to the second, its size.
+    pub(crate) fn hold(&self, obj: &Object) -> bool {
+        self.etag.as_deref().is_none_or(|list| {
+            let list = if list.trim() == "\"*\"" { "*" } else { list };
+            names(list, &etag_of(obj))
+        }) && self
+            .modified
+            .is_none_or(|t| t == whole_seconds(obj.modified))
+            && self.size.is_none_or(|s| s == obj.size)
+    }
+}
+
+/// A count of bytes as a condition gives it: decimal digits only.
+pub(crate) fn parse_size(text: &str) -> Option<u64> {
+    let text = text.trim();
+    (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| text.parse().ok())
+        .flatten()
+}
+
+/// A time as a delete's condition gives it: an HTTP date in any of RFC 9110's three forms,
+/// or, as S3 takes it, the IMF form with a numeric zone (`+0200`) in place of `GMT`;
+/// surrounding blanks are passed over.
+pub(crate) fn parse_time(text: &str) -> Option<SystemTime> {
+    let text = text.trim();
+    if let Ok(t) = httpdate::parse_http_date(text) {
+        return Some(t);
+    }
+    let (local, zone) = text.rsplit_once(' ')?;
+    let (sign, digits) = match zone.as_bytes().first()? {
+        b'+' => (1i64, &zone[1..]),
+        b'-' => (-1i64, &zone[1..]),
+        _ => return None,
+    };
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (hours, minutes): (i64, i64) = (digits[..2].parse().ok()?, digits[2..].parse().ok()?);
+    if minutes > 59 {
+        return None;
+    }
+    let as_gmt = httpdate::parse_http_date(&format!("{local} GMT")).ok()?;
+    let offset = sign * (hours * 3600 + minutes * 60);
+    let secs = i64::try_from(whole_seconds(as_gmt)).ok()? - offset;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,6 +495,65 @@ mod tests {
             decide(&[(named("x-amz-copy-source-if-modified-since"), &since)]),
             Outcome::NotModified
         );
+    }
+
+    #[test]
+    fn a_delete_s_time_is_an_http_date_or_one_with_a_numeric_zone() {
+        let t = Some(at(784_111_777));
+        assert_eq!(parse_time("Sun, 06 Nov 1994 08:49:37 GMT"), t);
+        assert_eq!(parse_time("Sunday, 06-Nov-94 08:49:37 GMT"), t);
+        assert_eq!(parse_time("Sun Nov  6 08:49:37 1994"), t);
+        assert_eq!(parse_time("Sun, 06 Nov 1994 10:49:37 +0200"), t);
+        assert_eq!(parse_time("Sun, 06 Nov 1994 07:19:37 -0130"), t);
+        assert_eq!(parse_time("  Sun, 06 Nov 1994 08:49:37 GMT  "), t);
+        for bad in [
+            "",
+            "1994-11-06T08:49:37Z",
+            "Sun, 06 Nov 1994 08:49:37 +02",
+            "Sun, 06 Nov 1994 08:49:37 +0260",
+            "Sun, 06 Nov 1994 08:49:37 UTC",
+            "not a date",
+        ] {
+            assert_eq!(parse_time(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_delete_s_conditions_all_hold_or_it_keeps_the_object() {
+        let obj = object(&[(MD5_ANNOTATION, MD5)]);
+        let e = format!("\"{MD5}\"");
+        let date = httpdate::fmt_http_date(at(1_000_000));
+        let named = |n: &'static str| hyper::header::HeaderName::from_static(n);
+        let check = |pairs: &[(hyper::header::HeaderName, &str)]| {
+            DeleteConditions::of(&headers(pairs)).map(|c| (c.is_empty(), c.hold(&obj)))
+        };
+        let size = named(IF_MATCH_SIZE);
+        let time = named(IF_MATCH_LAST_MODIFIED);
+        assert_eq!(check(&[]), Ok((true, true)));
+        for etag in [e.as_str(), MD5, "*", "\"*\""] {
+            assert_eq!(check(&[(IF_MATCH, etag)]), Ok((false, true)), "{etag}");
+        }
+        assert_eq!(check(&[(IF_MATCH, "\"x\"")]), Ok((false, false)));
+        assert_eq!(check(&[(IF_MATCH, "")]), Ok((false, false)));
+        assert_eq!(check(&[(size.clone(), "13")]), Ok((false, true)));
+        assert_eq!(check(&[(size.clone(), "14")]), Ok((false, false)));
+        assert_eq!(check(&[(time.clone(), &date)]), Ok((false, true)));
+        let before = httpdate::fmt_http_date(at(999_999));
+        assert_eq!(check(&[(time.clone(), &before)]), Ok((false, false)));
+        // every one must hold
+        assert_eq!(
+            check(&[
+                (IF_MATCH, &e),
+                (size.clone(), "13"),
+                (time.clone(), &before)
+            ]),
+            Ok((false, false))
+        );
+        // a value its header does not take is refused, not passed over
+        for bad in ["-1", "13 bytes", ""] {
+            assert!(check(&[(size.clone(), bad)]).is_err(), "{bad}");
+        }
+        assert!(check(&[(time, "yesterday")]).is_err());
     }
 
     #[test]
