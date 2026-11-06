@@ -123,9 +123,11 @@ pub(crate) async fn route(
         },
     };
     let id = &ctx.id;
-    // S3 parses the URI before it looks at the credential.
+    // S3 parses the URI, and routes the request, before it looks at the credential.
     let served = if unparsable {
         before_auth(req, ctx.error(Code::InvalidURI)).await
+    } else if let Some(resp) = misrouted(&req, &ctx) {
+        before_auth(req, resp).await
     } else {
         serve(state, req, &ctx).await
     };
@@ -462,6 +464,86 @@ async fn operate(
             object::unserved(state, authz, segs, req, ctx).await
         }
         _ => refuse(req, ctx.not_implemented(), ctx).await,
+    }
+}
+
+/// The answer to a request S3 cannot route to any operation, which it gives before it looks
+/// at the credential, as it does to a URI it cannot parse: query parameters that conflict or
+/// do not go with the method or the resource, or a copy source on a request that copies
+/// nothing. Those are 400 `InvalidArgument` or `InvalidRequest` in S3's words, or 405
+/// `MethodNotAllowed` naming the method and the kind of resource (with the methods it takes
+/// in `Allow`). `None` for a request that names an operation, served or not.
+fn misrouted(req: &Request<Incoming>, ctx: &Ctx) -> Option<Response<Body>> {
+    let params = parse_query(req.uri().query().unwrap_or(""))?;
+    let has = |name: &str| params.iter().any(|(n, _)| n == name);
+    let rest = ctx.path.strip_prefix("/s3").unwrap_or(&ctx.path);
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    let (service, object) = match rest.split_once('/') {
+        _ if rest.is_empty() => (true, false),
+        Some((_, key)) => (false, !key.is_empty()),
+        None => (false, false),
+    };
+    let method = req.method();
+    let not_allowed = |resource: &str, allowed: &'static str| {
+        let mut resp = ctx.error(
+            Refusal::new(Code::MethodNotAllowed)
+                .with("Method", method.as_str())
+                .with("ResourceType", resource),
+        );
+        if !allowed.is_empty() {
+            resp.headers_mut()
+                .insert(hyper::header::ALLOW, HeaderValue::from_static(allowed));
+        }
+        Some(resp)
+    };
+    let invalid = |message| Some(ctx.error(Refusal::said(Code::InvalidRequest, message)));
+    if service {
+        return match *method {
+            Method::POST => not_allowed("SERVICE", ""),
+            _ => None,
+        };
+    }
+    if has("uploads") && has("uploadId") {
+        return Some(ctx.error(Refusal::argument(
+            "Conflicting query string parameters: uploadId, uploads",
+            "ResourceType",
+            "uploadId",
+        )));
+    }
+    if let Some(source) = req.headers().get(copy::COPY_SOURCE)
+        && (matches!(*method, Method::GET | Method::HEAD | Method::DELETE)
+            || (method == Method::POST && has("uploadId")))
+    {
+        return Some(ctx.error(Refusal::argument(
+            "You can only specify a copy source header for copy requests.",
+            copy::COPY_SOURCE,
+            String::from_utf8_lossy(source.as_bytes()),
+        )));
+    }
+    if !object {
+        return None;
+    }
+    match *method {
+        _ if has("torrent") => match *method {
+            Method::GET => not_allowed("TORRENT", ""),
+            _ => not_allowed("TORRENT", "GET"),
+        },
+        Method::GET if has("uploads") => {
+            invalid("Key is not expected for the GET method ?uploads subresource")
+        }
+        Method::GET if has("versions") => {
+            invalid("There is no such thing as the ?versions sub-resource for a key")
+        }
+        Method::PUT if has("partNumber") && !has("uploadId") => Some(ctx.error(Refusal::argument(
+            "This operation does not accept partNumber without uploadId",
+            "partNumber",
+            "partNumber",
+        ))),
+        Method::PUT if has("uploadId") && !has("partNumber") => {
+            not_allowed("UPLOAD", "DELETE, POST, GET")
+        }
+        Method::POST if params.iter().all(implicit) => not_allowed("SERVICE", ""),
+        _ => None,
     }
 }
 

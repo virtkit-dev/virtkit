@@ -1146,8 +1146,14 @@ async fn a_read_only_registry_refuses_writes_with_retry_after() {
     let state = open_state(&dir, true);
     state.store.set_read_only(true);
     let host = spawn(state);
-    for method in ["PUT", "DELETE", "POST"] {
-        let resp = send(&host, Req::new(method, "/s3/b/k").body(b"x".to_vec())).await;
+    for (method, query) in [("PUT", ""), ("DELETE", ""), ("POST", "uploads")] {
+        let req = Req::new(method, "/s3/b/k").body(b"x".to_vec());
+        let req = if query.is_empty() {
+            req
+        } else {
+            req.query(query)
+        };
+        let resp = send(&host, req).await;
         resp.is(503, "ServiceUnavailable");
         assert_eq!(resp.header("retry-after"), Some("60"));
     }
@@ -2768,6 +2774,130 @@ async fn attributes_deletes_and_the_paths_a_key_cannot_take() {
 }
 
 /// A path S3 cannot parse — a malformed escape, or `..` climbing above the root — is 400
+/// A request S3 cannot route to an operation is refused before the credential is looked at,
+/// as an unparsable URI is: conflicting or misplaced query parameters and a copy source where
+/// nothing is copied are 400, a method the resource does not take 405 naming both.
+#[tokio::test]
+async fn a_request_no_operation_takes_is_refused_before_its_credential() {
+    let (_dir, host) = bearer_server("misrouted");
+    let unsigned = |method: &'static str, path: &str, query: &str| {
+        let req = Req::new(method, path);
+        if query.is_empty() {
+            req
+        } else {
+            req.query(query)
+        }
+    };
+    for (method, path, query, status, code, message) in [
+        (
+            "PUT",
+            "/s3/b/k",
+            "partNumber=1",
+            400,
+            "InvalidArgument",
+            "This operation does not accept partNumber without uploadId",
+        ),
+        (
+            "GET",
+            "/s3/b/k",
+            "uploads",
+            400,
+            "InvalidRequest",
+            "Key is not expected for the GET method ?uploads subresource",
+        ),
+        (
+            "GET",
+            "/s3/b/k",
+            "versions",
+            400,
+            "InvalidRequest",
+            "There is no such thing as the ?versions sub-resource for a key",
+        ),
+        (
+            "DELETE",
+            "/s3/b",
+            "uploads&uploadId=x",
+            400,
+            "InvalidArgument",
+            "Conflicting query string parameters: uploadId, uploads",
+        ),
+        (
+            "PUT",
+            "/s3/b/k",
+            "uploads&uploadId=x",
+            400,
+            "InvalidArgument",
+            "Conflicting query string parameters: uploadId, uploads",
+        ),
+        (
+            "POST",
+            "/s3/",
+            "",
+            405,
+            "MethodNotAllowed",
+            "The specified method is not allowed against this resource.",
+        ),
+        (
+            "POST",
+            "/s3/b/k",
+            "",
+            405,
+            "MethodNotAllowed",
+            "The specified method is not allowed against this resource.",
+        ),
+        (
+            "PUT",
+            "/s3/b/k",
+            "uploadId=x",
+            405,
+            "MethodNotAllowed",
+            "The specified method is not allowed against this resource.",
+        ),
+        (
+            "GET",
+            "/s3/b/k",
+            "torrent",
+            405,
+            "MethodNotAllowed",
+            "The specified method is not allowed against this resource.",
+        ),
+    ] {
+        let resp = send(&host, unsigned(method, path, query)).await;
+        resp.is(status, code).says(message);
+    }
+    let resp = send(&host, unsigned("PUT", "/s3/b/k", "uploadId=x")).await;
+    assert_eq!(element(&resp.body, "ResourceType"), "UPLOAD");
+    assert_eq!(element(&resp.body, "Method"), "PUT");
+    assert_eq!(resp.header("allow"), Some("DELETE, POST, GET"));
+    let resp = send(&host, unsigned("DELETE", "/s3/b/k", "torrent")).await;
+    assert_eq!(element(&resp.body, "ResourceType"), "TORRENT");
+    assert_eq!(resp.header("allow"), Some("GET"));
+    assert_eq!(
+        send(&host, unsigned("HEAD", "/s3/b/k", "torrent"))
+            .await
+            .status,
+        405
+    );
+    for (method, path, query) in [
+        ("GET", "/s3/b", ""),
+        ("DELETE", "/s3/b/k", ""),
+        ("POST", "/s3/b/k", "uploadId=x"),
+    ] {
+        let req = unsigned(method, path, query).header("x-amz-copy-source", "b/k");
+        let resp = send(&host, req).await;
+        resp.is(400, "InvalidArgument")
+            .says("You can only specify a copy source header for copy requests.");
+        assert_eq!(element(&resp.body, "ArgumentValue"), "b/k");
+    }
+    // Any other request is the gate's to refuse.
+    send(&host, unsigned("GET", "/s3/b/k", ""))
+        .await
+        .is(403, "AccessDenied");
+    send(&host, unsigned("POST", "/s3/b/k", "uploads"))
+        .await
+        .is(403, "AccessDenied");
+}
+
 /// `InvalidURI` before the credential is looked at, path-style or virtual-hosted; a `..`
 /// that stays below the root is a key's component, refused as one. Other routes keep their
 /// own answers.
@@ -3072,6 +3202,10 @@ async fn query_names_are_decoded_before_dispatch() {
     .await
     .is(400, "InvalidArgument")
     .says("Provided x not an integer or within integer range");
+    send(&host, Req::new("GET", "/s3/b").query("uploads&uploadId=x"))
+        .await
+        .is(400, "InvalidArgument")
+        .says("Conflicting query string parameters: uploadId, uploads");
     let resp = send(&host, Req::new("GET", "/s3/b").query("upload%73")).await;
     resp.ok(200);
     assert!(

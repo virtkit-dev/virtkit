@@ -44,6 +44,7 @@ pub(crate) enum Code {
     MalformedTrailerError,
     MalformedXML,
     MetadataTooLarge,
+    MethodNotAllowed,
     MissingContentLength,
     NoSuchBucket,
     NoSuchBucketPolicy,
@@ -201,6 +202,11 @@ impl Code {
                 "MetadataTooLarge",
                 BAD,
                 "Your metadata headers exceed the maximum allowed metadata size",
+            ),
+            MethodNotAllowed => (
+                "MethodNotAllowed",
+                StatusCode::METHOD_NOT_ALLOWED,
+                "The specified method is not allowed against this resource.",
             ),
             MissingContentLength => (
                 "MissingContentLength",
