@@ -120,20 +120,83 @@ persisted stays in force.
 
 ## Configuration
 
-A node's `vk` configuration (`config.toml`) is authoritative: paths, shares, resource
-ceilings, and the executor tuning a host with a lot of RAM and a slow network disk depends on
-(tmpfs `checkout_dir`, reused host-side checkouts, DAX shares, disk admission). The hub only
-narrows it — a lower concurrency ceiling, stopped acquisition, drain, quarantine, a choice
-among versions the node allows — and, apart from a forced update, never overrides a limit
-local policy sets or pushes `[executor]` settings. Proposed: the node's configuration also
-sets which operations the hub may run.
+A node needs no configuration beyond its enrollment (`vk node join <hub> --token`). Each
+setting resolves in three layers, a later one winning:
 
-The node reports a hash of its effective configuration, and its node page shows it, so drift
-between nodes that should match is visible.
+```
+built-in or autodetected default  <-  hub value  <-  the node's config.toml
+```
+
+Built today: the local file alone, over built-in defaults. The hub steers through desired state
+— a concurrency ceiling, stopped acquisition, its [egress layer](#job-egress-from-the-hub) —
+and through commands: drain, quarantine, and the release a node updates to, within what the
+node allows. The rest of this section is proposed.
+
+- **The local file wins.** A key `config.toml` sets, even to its default, is never overridden.
+  This preserves host exceptions and tuning for hosts with much RAM and slow network disks
+  (tmpfs `checkout_dir`, reused host-side checkouts, DAX shares). The node's configuration may
+  also set which operations the hub may run.
+- **The hub fills in from an allowlist**, an explicit list in the code: capacity and VM sizing
+  — `[executor.schedule]` `mem_budget`, `cpu_overcommit`, `from_history`, `disk_admission`,
+  `disk_default`, `wait_timeout_secs`; `[executor.vm]` `cpus`, `mem`, `max_cpus`, `max_mem`;
+  `image_cache_idle_secs` — and `[registry]` (below). The concurrency ceiling stays desired
+  state of its own. Any other key is refused. The hub never sets `state_dir`; `[node]`
+  `release_keys`, `require_signed`, `allow_downgrade` or `validate`; `[egress]`, which its
+  egress layer narrows instead; a path or a credential file; or anything that widens what a
+  job VM can reach. The trust model's [routine fields](trust-model.md#routine-and-sensitive)
+  bound what the list may grow to.
+- **Defaults are autodetected on an enrolled node**, one with an enrollment under
+  `<state_dir>/node/`. A `vk` on a host that is not enrolled keeps today's defaults.
+
+### Defaults on an enrolled node
+
+- **Memory.** An unset `mem_budget` is `MemTotal` less the smaller of 4 GiB and 10 % of
+  `MemTotal`, where today it means no admission gate. The hub places on the smaller of the
+  node's room under its budget and its live `MemAvailable` less 15 % of `MemTotal`, the reserve
+  `vk tune` keeps; today it reads the budget alone once one is set.
+- **vCPUs per job.** `max_cpus` defaults to the host's online CPUs, so `MICROVM_CPUS` may ask
+  for up to the whole host, and a job that asks for none is held to it as well. The default VM
+  keeps 4 vCPUs, fewer on a smaller host.
+- **vCPUs in all.** The admission ledger counts vCPUs too, against the online CPUs times
+  `cpu_overcommit` (default 2). A job waits for vCPUs as it waits for memory; the heartbeat
+  reports vCPUs committed and the budget, and the hub stops placing on a node past it.
+- **Registry.** With no `[registry]` in the local file, the node uses the one the hub names —
+  a registry the hub manages, by URL, CA and pipeline root — with no credential of its own:
+  guests get the job's token (`guest_credential = "job"`), so only jobs the hub places reach
+  it. A local `[registry]` is taken whole; the two never merge.
+
+### Hub settings
+
+- **On the hub.** A fleet-wide layer and one per node, in the database; the node's wins, key by
+  key. The hub expands them into each node's desired state as `settings`: a map from a dotted
+  key (`executor.vm.max_cpus`) to a value of that key's TOML type, `registry` a table. A change
+  is a new generation for every node it reaches, so settings are applied at most once, kept
+  across a hub outage, and handled as the rest of desired state is after a
+  [hub restore](#proposed-recovery-after-a-hub-restore). They go only to a node whose
+  inventory announces `hub_settings`, as the egress layer does: an older node would ignore
+  them.
+- **On the node.** `vk node run` checks each entry on receipt — on the list, of the key's type,
+  and leaving the merged configuration loadable — and writes those that pass to
+  `<state_dir>/node/settings.json`, with the hub, node ID and generation they came from,
+  published whole by rename before the generation is recorded as applied. `vk node join`
+  removes the file: settings, like generations, count for one hub and one enrollment.
+- **Loading.** Every `vk` reads the file after the local one, when the host is enrolled with
+  the hub and node ID it names, and fills in each listed key the local file leaves unset. A
+  file it cannot read is warned about and ignored, leaving local settings and defaults. Jobs
+  take a change from their next run; `vk node run` reloads on a generation that changes
+  settings.
+- **Reported back.** With each applied generation, the node reports every listed key's
+  effective value and its source — `local`, `hub` or `default`, autodetected included — and
+  each hub entry it refused, with the reason. A refusal does not fail the generation: the
+  other entries apply. The node's page shows both.
+
+The node reports a hash of its effective configuration, hub settings included, and its node
+page shows it, so drift between nodes that should match is visible.
 
 Proposed for the long term: the hub holds the configuration as signed bundles, with an
 offline fleet root signing what the hub may not grant itself. See
-[the trust model](trust-model.md).
+[the trust model](trust-model.md). Hub settings are their unsigned predecessor: the allowlist
+is the routine list, and sensitive settings stay local until the root can sign them.
 
 ## Inventory
 
@@ -145,7 +208,8 @@ Every node reports, keeping hard facts, measured load and operator policy apart:
 - **pressure** — memory available, CPU, memory and I/O PSI, disk latency;
 - **runner** — the gitlab-runner configuration, its `concurrent` and runner names, its
   version, and its jobs preparing, waiting on admission, running and cleaning up;
-- **admission** — memory reserved and budget, disk claimed;
+- **admission** — memory reserved and budget, disk claimed; proposed, vCPUs committed and
+  their budget;
 - **versions** — `vk`, the guest kernel, the effective configuration hash.
 
 A transient reading never changes a node's declared capabilities. The facts — hardware,
@@ -291,7 +355,15 @@ switch, restart deadlines, installed-path checks and the external-runner excepti
 Built release trust: a node with signing keys in its own configuration requires a signature
 by one of them, checked when the update arrives and again before the release first runs; the
 key signs offline, never on the hub ([Release signing](fleet-prototype.md#release-signing)).
-Proposed: remote updates require at least one locally pinned signing key and a valid
+Proposed: the keys are pinned at enrollment. A hub with `[nodes] release_keys` in `hub.toml`
+returns them in the enrollment answer, and `vk node join` keeps them in
+`<state_dir>/node/enrollment.json` beside the node ID; nothing a session carries changes them.
+A node whose configuration sets `[node] release_keys` uses those instead. They are taken on
+first use from the hub enrollment authenticates — its TLS certificate and a single-use token —
+so a hub compromised after a node joined can neither add nor replace one; rotating them takes
+a new enrollment, the local setting, or the fleet root
+([the trust model](trust-model.md#releases)).
+Proposed: remote updates require at least one pinned signing key and a valid
 signature by default, where a node with no keys takes unsigned releases today. A node may opt
 out explicitly for development; the hub cannot grant that exception, and the node's report
 and UI must show it. Official release signing is
@@ -316,6 +388,14 @@ with the rollout so a hub restart does not bypass them. Allow operator-defined c
 for material configuration differences, such as VMM version, kernel and executor settings,
 alongside the hardware profile. Show uncovered groups before starting a rollout. This gate is
 not built: a canary is promoted as soon as its own update has passed.
+
+Proposed automatic updates: the hub keeps a target `vk` release, which must be signed by one of
+`[nodes] release_keys` when any is set. Setting it starts a rollout of it over the nodes running
+an older version; afterwards a node reporting an older version — newly joined, or taken back by
+hand — is updated alone once it is ready and no rollout runs. Each is an ordinary update
+command, held to the node's signature, downgrade and trial checks. A node running a newer
+version is left alone, a node with an external runner is skipped rather than forced, and a node
+whose automatic update failed is not tried again for that target until an operator says so.
 
 Release downloads are authenticated and scoped to a pending update; their bytes do not ride on
 the control session. The hub stores and serves releases this way
@@ -452,8 +532,11 @@ model, commands and process handling.
   since an override the hub carried would be worth nothing against a compromised hub — which
   could otherwise take the fleet back to a release with a known flaw, signed or not.
 - A release's signature is checked by the node against keys in its own configuration
-  (`[node] release_keys`), made by a key kept off the hub: a compromised hub can hand a node
-  any bytes, but not a signature it has no key for.
+  (`[node] release_keys`) or, proposed, pinned when it enrolled, made by a key kept off the
+  hub: a compromised hub can hand a node any bytes, but not a signature it has no key for.
+- Proposed: hub settings are an allowlist of capacity and sizing keys the node's own file has
+  not set ([Configuration](#configuration)); a compromised hub can misuse those, not reach
+  anything else.
 - CI tools definitions are not signed: a compromised hub can put binaries of its choosing into
   job VMs, which see the job's token, sources and secrets. It cannot have them run on a node's
   host where the node requires signed releases: such a node never runs them outside a VM.
