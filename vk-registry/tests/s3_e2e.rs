@@ -4750,6 +4750,25 @@ fn multipart_etag(parts: &[&[u8]]) -> String {
     format!("\"{}-{}\"", md5_hex(&md5s), parts.len())
 }
 
+/// A part a completion names: its number, its ETag and its checksums' `(element, value)`.
+type Named<'a> = (u32, &'a str, &'a [(&'a str, &'a str)]);
+
+/// [`complete_doc`] with checksums.
+fn complete_doc_with(parts: &[Named<'_>]) -> Vec<u8> {
+    let mut doc = String::from("<CompleteMultipartUpload>");
+    for (n, etag, checksums) in parts {
+        doc.push_str(&format!(
+            "<Part><ETag>{etag}</ETag><PartNumber>{n}</PartNumber>"
+        ));
+        for (name, value) in *checksums {
+            doc.push_str(&format!("<{name}>{value}</{name}>"));
+        }
+        doc.push_str("</Part>");
+    }
+    doc.push_str("</CompleteMultipartUpload>");
+    doc.into_bytes()
+}
+
 /// Start an upload of the object at `path`: its id.
 async fn create_upload(host: &str, sign: Sign<'_>, path: &str) -> String {
     let resp = send(host, sign(Req::new("POST", path).query("uploads="))).await;
@@ -4798,6 +4817,267 @@ fn multipart_left(dir: &std::path::Path) -> Vec<String> {
     ids
 }
 
+/// An upload created with a checksum: its algorithm and kind checked, answered and recorded,
+/// each part held to the algorithm (a full object's computed for a part that carries none),
+/// and the completion held to what the parts were stored with and to the upload's kind; a
+/// full object's checksum is computed as the parts are assembled, checked and kept.
+#[tokio::test]
+async fn an_upload_holds_its_parts_to_the_checksum_it_was_created_with() {
+    let dir = tmp("mp-checksums");
+    let host = spawn(open_state(&dir, true));
+    let path = "/s3/b/k";
+    let create = |pairs: &[(&str, &str)]| {
+        let mut req = Req::new("POST", path).query("uploads=");
+        for (name, value) in pairs {
+            req = req.header(name, value);
+        }
+        req
+    };
+    let (algo, kind) = ("x-amz-checksum-algorithm", "x-amz-checksum-type");
+    for (pairs, message) in [
+        (
+            &[(algo, "crc31")][..],
+            "Checksum algorithm provided is unsupported. Please try again with any of the valid \
+             types: [CRC32, CRC32C, CRC64NVME, MD5, SHA1, SHA256, SHA512, XXHASH128, XXHASH3, \
+             XXHASH64]",
+        ),
+        (
+            &[(algo, "crc32"), (kind, "whole")],
+            "Value for x-amz-checksum-type header is invalid.",
+        ),
+        (
+            &[(kind, "COMPOSITE")],
+            "The x-amz-checksum-type header can only be used with the x-amz-checksum-algorithm \
+             header.",
+        ),
+        (
+            &[(algo, "SHA1"), (kind, "FULL_OBJECT")],
+            "The FULL_OBJECT checksum type cannot be used with the sha1 checksum algorithm.",
+        ),
+        (
+            &[(algo, "crc64nvme"), (kind, "composite")],
+            "The COMPOSITE checksum type cannot be used with the crc64nvme checksum algorithm.",
+        ),
+    ] {
+        send(&host, create(pairs))
+            .await
+            .is(400, "InvalidRequest")
+            .says(message);
+    }
+    for (pairs, algorithm, made) in [
+        (&[(algo, "crc64nvme")][..], "CRC64NVME", "FULL_OBJECT"),
+        (&[(algo, "Sha256")], "SHA256", "COMPOSITE"),
+        (
+            &[(algo, "crc32"), (kind, "full_object")],
+            "CRC32",
+            "FULL_OBJECT",
+        ),
+    ] {
+        let resp = send(&host, create(pairs)).await;
+        resp.ok(200);
+        assert_eq!(resp.header(algo), Some(algorithm));
+        assert_eq!(resp.header(kind), Some(made));
+    }
+
+    // A composite SHA256 upload: every part carries its SHA256.
+    let id = element(
+        &send(&host, create(&[(algo, "SHA256")])).await.body,
+        "UploadId",
+    );
+    let part = |n: u32, data: &[u8], pair: Option<(&str, &str)>| {
+        let mut req = Req::new("PUT", path).query(&part_query(&id, n));
+        if let Some((name, value)) = pair {
+            req = req.header(name, value);
+        }
+        req.body(data.to_vec())
+    };
+    let (one, two) = (bytes_of_len(1000), bytes_of_len(300));
+    let (sha1, sha2) = (
+        b64(&sha2::Sha256::digest(&one)),
+        b64(&sha2::Sha256::digest(&two)),
+    );
+    send(&host, part(1, &one, None))
+        .await
+        .is(400, "InvalidRequest")
+        .says(
+            "Checksum Type mismatch occurred, expected checksum Type: SHA256, actual checksum \
+             Type: null",
+        );
+    send(
+        &host,
+        part(1, &one, Some(("x-amz-checksum-crc32", &crc32_b64(&one)))),
+    )
+    .await
+    .is(400, "InvalidRequest")
+    .says(
+        "Checksum Type mismatch occurred, expected checksum Type: SHA256, actual checksum \
+             Type: CRC32",
+    );
+    let named = part(1, &one, None).header("x-amz-sdk-checksum-algorithm", "SHA1");
+    send(&host, named).await.is(400, "InvalidRequest");
+    let sent = send(&host, part(1, &one, Some(("x-amz-checksum-sha256", &sha1)))).await;
+    sent.ok(200);
+    assert_eq!(sent.header("x-amz-checksum-sha256"), Some(sha1.as_str()));
+    let e1 = format!("\"{}\"", md5_hex(&one));
+    send(&host, part(2, &two, Some(("x-amz-checksum-sha256", &sha2))))
+        .await
+        .ok(200);
+    let e2 = format!("\"{}\"", md5_hex(&two));
+    let completion = |parts: &[Named<'_>]| {
+        Req::new("POST", path)
+            .query(&format!("uploadId={id}"))
+            .body(complete_doc_with(parts))
+    };
+    let other = b64(&sha2::Sha256::digest(b"other"));
+    let crc = crc32_b64(&one);
+    let both = [
+        ("ChecksumCRC32", crc.as_str()),
+        ("ChecksumSHA256", sha1.as_str()),
+    ];
+    for (first, status, code, message) in [
+        (
+            &[][..],
+            400,
+            "InvalidRequest",
+            "The upload was created using a sha256 checksum. The complete request must include \
+             the checksum for each part. It was missing for part 1 in the request.",
+        ),
+        (
+            &both[..],
+            400,
+            "InvalidArgument",
+            "Invalid Base64 or multiple checksums present in request",
+        ),
+        (
+            &[("ChecksumSHA256", "invalid_checksum")],
+            400,
+            "InvalidArgument",
+            "Invalid Base64 or multiple checksums present in request",
+        ),
+        (
+            &[("ChecksumSHA256", other.as_str())],
+            400,
+            "InvalidPart",
+            "One or more of the specified parts could not be found.  The part may not have been \
+             uploaded, or the specified entity tag may not match the part's entity tag.",
+        ),
+        (
+            &[("ChecksumCRC32", crc.as_str())],
+            400,
+            "BadDigest",
+            "The crc32 you specified for part 1 did not match what we received.",
+        ),
+    ] {
+        let parts = [
+            (1, e1.as_str(), first),
+            (2, e2.as_str(), &[("ChecksumSHA256", sha2.as_str())][..]),
+        ];
+        send(&host, completion(&parts))
+            .await
+            .is(status, code)
+            .says(message);
+    }
+    let resp = send(
+        &host,
+        completion(&[
+            (1, e1.as_str(), &both[..]),
+            (2, e2.as_str(), &[("ChecksumSHA256", sha2.as_str())]),
+        ]),
+    )
+    .await;
+    assert!(
+        resp.body.contains(&format!(
+            "<ArgumentValue>CRC32:{crc};SHA256:{sha1};</ArgumentValue>"
+        )),
+        "{}",
+        resp.body
+    );
+    let typed = completion(&[(1, e1.as_str(), &[("ChecksumSHA256", sha1.as_str())])])
+        .header(kind, "FULL_OBJECT");
+    send(&host, typed).await.is(400, "InvalidRequest").says(
+        "The upload was created using the COMPOSITE checksum mode. The complete request must use \
+         the same checksum mode.",
+    );
+    let typed =
+        completion(&[(1, e1.as_str(), &[("ChecksumSHA256", sha1.as_str())])]).header(kind, "PARTS");
+    send(&host, typed)
+        .await
+        .is(400, "InvalidRequest")
+        .says("Value for x-amz-checksum-type header is invalid.");
+    let two_finals = completion(&[(1, e1.as_str(), &[("ChecksumSHA256", sha1.as_str())])])
+        .header("x-amz-checksum-crc32", "AAAAAA==")
+        .header("x-amz-checksum-crc32c", "AAAAAA==");
+    send(&host, two_finals)
+        .await
+        .is(400, "InvalidRequest")
+        .says(
+            "Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.",
+        );
+    let resp = send(
+        &host,
+        completion(&[
+            (1, e1.as_str(), &[("ChecksumSHA256", sha1.as_str())]),
+            (2, e2.as_str(), &[("ChecksumSHA256", sha2.as_str())]),
+        ])
+        .header(kind, "composite"),
+    )
+    .await;
+    resp.ok(200);
+
+    // A full object's CRC32C upload: a part with none has it computed, the object's is
+    // computed as it is assembled, checked against the one sent, and kept.
+    let path = "/s3/b/full";
+    let create = Req::new("POST", path)
+        .query("uploads=")
+        .header(algo, "CRC32C")
+        .header(kind, "FULL_OBJECT");
+    let id = element(&send(&host, create).await.body, "UploadId");
+    let resp = send(
+        &host,
+        Req::new("PUT", path)
+            .query(&part_query(&id, 1))
+            .body(one.clone()),
+    )
+    .await;
+    resp.ok(200);
+    assert_eq!(
+        resp.header("x-amz-checksum-crc32c"),
+        Some(&*crc32c_b64(&one))
+    );
+    let e2 = upload_part(&host, &|r| r, path, &id, 2, &two).await;
+    let whole = [one.as_slice(), &two].concat();
+    let (c1, c2) = (crc32c_b64(&one), crc32c_b64(&two));
+    let complete = |final_header: Option<(&str, &str)>| {
+        let mut req = Req::new("POST", path)
+            .query(&format!("uploadId={id}"))
+            .body(complete_doc_with(&[
+                (1, &e1, &[("ChecksumCRC32C", &c1)]),
+                (2, &e2, &[("ChecksumCRC32C", &c2)]),
+            ]));
+        if let Some((name, value)) = final_header {
+            req = req.header(name, value);
+        }
+        req
+    };
+    send(
+        &host,
+        complete(Some(("x-amz-checksum-crc32c", &crc32c_b64(&one)))),
+    )
+    .await
+    .is(400, "BadDigest")
+    .says("The CRC32C you specified did not match the calculated checksum.");
+    let resp = send(&host, complete(None)).await;
+    resp.ok(200);
+    assert_eq!(element(&resp.body, "ChecksumCRC32C"), crc32c_b64(&whole));
+    assert_eq!(element(&resp.body, "ChecksumType"), "FULL_OBJECT");
+    let asked = Req::new("HEAD", path).header("x-amz-checksum-mode", "ENABLED");
+    let resp = send(&host, asked).await;
+    assert_eq!(
+        resp.header("x-amz-checksum-crc32c"),
+        Some(&*crc32c_b64(&whole))
+    );
+}
+
 /// An upload in three parts, as the AWS CLI sends a large file (the first part SigV4-signed
 /// `aws-chunked`, the second with its `Content-MD5`, the last with its SHA-256 signed and an
 /// `x-amz-checksum-sha256`), one part replaced, listed, refused when completed wrong, then
@@ -4811,13 +5091,12 @@ async fn a_multipart_upload_is_assembled_from_its_parts() {
     let path = "/s3/b/big/obj";
     let create = Req::new("POST", path)
         .query("uploads=")
-        .header("x-amz-meta-mtime", "1700000000")
-        .header("x-amz-checksum-algorithm", "sha256");
+        .header("x-amz-meta-mtime", "1700000000");
     let resp = send(&host, sign(create)).await;
     resp.ok(200);
     assert_eq!(element(&resp.body, "Bucket"), "b");
     assert_eq!(element(&resp.body, "Key"), "big/obj");
-    assert_eq!(resp.header("x-amz-checksum-algorithm"), Some("SHA256"));
+    assert_eq!(resp.header("x-amz-checksum-algorithm"), None);
     let id = element(&resp.body, "UploadId");
     assert!(
         id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'),

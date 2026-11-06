@@ -444,7 +444,7 @@ struct Claim {
 }
 
 /// The refusal of a second `x-amz-checksum-*`, as S3 words it.
-const ONE_CHECKSUM: Refusal = Refusal::said(
+pub(super) const ONE_CHECKSUM: Refusal = Refusal::said(
     Code::InvalidRequest,
     "Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.",
 );
@@ -660,9 +660,10 @@ struct Digests {
 }
 
 impl Digests {
-    /// The digests `expected` asks for, or the one a trailer announced as `trailer`.
-    fn for_(expected: &Expected, trailer: Option<&str>) -> Self {
-        let header = expected.checksum.as_ref().map(|c| c.header).or(trailer);
+    /// The digests `expected` asks for, or else `other`: the checksum a trailer announced, or
+    /// the one a plan computes.
+    fn for_(expected: &Expected, other: Option<&str>) -> Self {
+        let header = expected.checksum.as_ref().map(|c| c.header).or(other);
         Digests {
             md5: md5::Context::new(),
             checksum: header.and_then(checksum::Hasher::for_),
@@ -776,6 +777,10 @@ pub(super) fn declared_too_large(headers: &HeaderMap) -> bool {
 pub(super) struct Plan {
     payload: Payload,
     expected: Expected,
+    /// the checksum header of the algorithm `x-amz-sdk-checksum-algorithm` names
+    sdk: Option<&'static str>,
+    /// the checksum header of the algorithm to compute when the body carries no checksum
+    compute: Option<&'static str>,
 }
 
 /// The [`Plan`] of a write's body, or why its headers are refused.
@@ -785,16 +790,41 @@ pub(super) fn plan(headers: &HeaderMap) -> std::result::Result<Plan, Refusal> {
     if payload.framing.is_some_and(|f| f.trailer.is_some()) && expected.checksum.is_some() {
         return Err(ONE_CHECKSUM);
     }
+    let sdk = headers
+        .get(checksum::SDK_ALGORITHM)
+        .and_then(|v| checksum::named(v.as_bytes()))
+        .and_then(checksum::header);
     // As beside a checksum header: the trailer's checksum is in the algorithm the SDK names.
-    if let (Some(named), Some(trailer)) = (
-        headers.get(checksum::SDK_ALGORITHM),
-        payload.framing.and_then(|f| f.trailer),
-    ) && !checksum::algorithm(trailer)
-        .is_some_and(|a| named.as_bytes().eq_ignore_ascii_case(a.as_bytes()))
+    if let (Some(sdk), Some(trailer)) = (sdk, payload.framing.and_then(|f| f.trailer))
+        && sdk != trailer
     {
         return Err(checksum::ALGORITHM_MISMATCH);
     }
-    Ok(Plan { payload, expected })
+    Ok(Plan {
+        payload,
+        expected,
+        sdk,
+        compute: None,
+    })
+}
+
+impl Plan {
+    /// The checksum header of the algorithm the body is said to carry a checksum in: by a
+    /// header, the trailer or `x-amz-sdk-checksum-algorithm`.
+    pub(super) fn claimed(&self) -> Option<&'static str> {
+        self.expected
+            .checksum
+            .as_ref()
+            .map(|c| c.header)
+            .or(self.payload.framing.and_then(|f| f.trailer))
+            .or(self.sdk)
+    }
+
+    /// Compute the checksum `header` names when the body carries none, to answer and keep
+    /// as if it had.
+    pub(super) fn compute(&mut self, header: &'static str) {
+        self.compute = Some(header);
+    }
 }
 
 /// A write's body, received whole and checked against what its request said of it.
@@ -802,7 +832,8 @@ pub(super) struct Received {
     /// the bytes, staged
     pub(super) staged: files::Staged,
     pub(super) md5: [u8; 16],
-    /// the `x-amz-checksum-*` that held, its header and text: to echo, and to keep
+    /// the `x-amz-checksum-*` that held, its header and text, or the one the plan had
+    /// computed in its place: to echo, and to keep
     pub(super) echo: Option<(&'static str, String)>,
 }
 
@@ -822,8 +853,12 @@ pub(super) async fn receive(
     let Plan {
         payload,
         mut expected,
+        compute,
+        ..
     } = plan;
-    let mut digests = Digests::for_(&expected, payload.framing.and_then(|f| f.trailer));
+    let trailer = payload.framing.and_then(|f| f.trailer);
+    let compute = compute.filter(|_| expected.checksum.is_none() && trailer.is_none());
+    let mut digests = Digests::for_(&expected, trailer.or(compute));
     let mut tap = |d: &[u8]| digests.update(d);
     let (staged, trailer) = match payload.framing {
         None => (files::stage_into(path, file, body, &mut tap).await, None),
@@ -858,13 +893,22 @@ pub(super) async fn receive(
     let md5 = digests.md5.finalize().0;
     let computed = digests.checksum.map(checksum::Hasher::finalize);
     let sha256 = hex_bytes(&staged.hex);
+    // What the plan computes in place of a checksum the body did not carry.
+    let made = compute.and_then(|header| {
+        let bytes = if header == CHECKSUM_SHA256 {
+            sha256.as_deref()
+        } else {
+            computed.as_deref()
+        };
+        Some((header, vk_hub_proto::to_base64(bytes?)))
+    });
     if let Err(why) = verify(&expected, &md5, sha256.as_deref(), computed) {
         return Ok(Err(ctx.error(why)));
     }
     Ok(Ok(Received {
         staged,
         md5,
-        echo: expected.checksum.map(|c| (c.header, c.text)),
+        echo: expected.checksum.map(|c| (c.header, c.text)).or(made),
     }))
 }
 

@@ -180,6 +180,24 @@ struct Meta {
     created: u64,
     /// the user metadata the object will carry, as [`meta::annotations`] made it
     annotations: BTreeMap<String, String>,
+    /// the checksum the upload was created with, which its parts are held to; absent from
+    /// the record of an upload created without one
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checksum: Option<Asked>,
+}
+
+/// The checksum a CreateMultipartUpload asks for: S3's name of its algorithm, and its kind.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Asked {
+    algorithm: String,
+    kind: checksum::Kind,
+}
+
+impl Asked {
+    /// The checksum header of its algorithm; `None` for a record this server did not write.
+    fn header(&self) -> Option<&'static str> {
+        checksum::header(&self.algorithm)
+    }
 }
 
 /// What a part's record says of it.
@@ -188,6 +206,10 @@ struct Part {
     size: u64,
     /// lowercase hex
     md5: String,
+    /// the checksum the part carried, or was given for its upload's, as an object's
+    /// annotation keeps one (`<ALGORITHM>:<base64>`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checksum: Option<String>,
 }
 
 /// An upload this request may act on: its directory and what it recorded.
@@ -353,12 +375,19 @@ fn temp_in(dir: &Path, what: &str) -> Result<(PathBuf, std::fs::File)> {
 /// part's, then its record. Each rename replaces its file whole, but the two are not one
 /// step: a reader between them sees new bytes beside the old record, which is why Complete
 /// checks every part's MD5 as it reads it.
-fn install_part(dir: &Path, n: u32, staged: Staged, md5: &str) -> Result<()> {
+fn install_part(
+    dir: &Path,
+    n: u32,
+    staged: Staged,
+    md5: &str,
+    checksum: Option<String>,
+) -> Result<()> {
     let size = staged.size;
     staged.rename_to(&part_path(dir, n))?;
     let record = serde_json::to_vec(&Part {
         size,
         md5: md5.to_string(),
+        checksum,
     })?;
     vk_fs::write_atomic_unsynced(&record_path(dir, n), &record, 0o600)
 }
@@ -393,8 +422,8 @@ pub(super) async fn create(
         Ok(a) => a,
         Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
-    let algorithm = match checksum_algorithm(headers) {
-        Ok(a) => a,
+    let asked = match asked(headers) {
+        Ok(asked) => asked,
         Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     if let Some(resp) = drain(req, ctx).await? {
@@ -410,6 +439,7 @@ pub(super) async fn create(
             key: key_of(&segs),
             created: vk_peer::now_secs(),
             annotations,
+            checksum: asked,
         };
         let (id, dir) = store.create_multipart()?;
         let recorded = serde_json::to_vec(&meta)
@@ -429,26 +459,55 @@ pub(super) async fn create(
                 xml::element("UploadId", &id)
             ),
         );
-        if let Some(algorithm) = algorithm
-            && let Ok(v) = hyper::header::HeaderValue::from_str(algorithm)
+        if let Some(asked) = &meta.checksum
+            && let Ok(v) = hyper::header::HeaderValue::from_str(&asked.algorithm)
         {
-            resp.headers_mut().insert("x-amz-checksum-algorithm", v);
+            let headers = resp.headers_mut();
+            headers.insert(CHECKSUM_ALGORITHM, v);
+            headers.insert(
+                checksum::TYPE_HEADER,
+                hyper::header::HeaderValue::from_static(asked.kind.name()),
+            );
         }
         Ok(resp)
     })
     .await
 }
 
-/// The `x-amz-checksum-algorithm` a creation names, as S3 spells it: the algorithm the
-/// parts' checksums will be in, which each part's request then carries and is checked by;
-/// one S3 does not have is refused as S3 refuses it.
-fn checksum_algorithm(headers: &HeaderMap) -> std::result::Result<Option<&'static str>, Refusal> {
-    match headers.get("x-amz-checksum-algorithm") {
-        None => Ok(None),
-        Some(v) => checksum::named(v.as_bytes())
-            .map(Some)
-            .ok_or(checksum::UNKNOWN_ALGORITHM),
+/// The header a CreateMultipartUpload names its parts' checksum algorithm in.
+const CHECKSUM_ALGORITHM: &str = "x-amz-checksum-algorithm";
+
+/// The checksum a creation asks for: the algorithm `x-amz-checksum-algorithm` names, as S3
+/// spells it, which each part is then held to, and the kind `x-amz-checksum-type` names, by
+/// default a full object's for CRC64NVME and a composite one otherwise. Refused as S3
+/// refuses them: an algorithm or a kind S3 does not have, a kind without an algorithm, and
+/// a kind the algorithm cannot make.
+fn asked(headers: &HeaderMap) -> std::result::Result<Option<Asked>, Refusal> {
+    let algorithm = match headers.get(CHECKSUM_ALGORITHM) {
+        None => None,
+        Some(v) => Some(checksum::named(v.as_bytes()).ok_or(checksum::UNKNOWN_ALGORITHM)?),
+    };
+    let kind = match headers.get(checksum::TYPE_HEADER) {
+        None => None,
+        Some(v) => Some(
+            checksum::Kind::of(v.as_bytes())
+                .ok_or_else(|| checksum::invalid(checksum::TYPE_HEADER))?,
+        ),
+    };
+    let Some(algorithm) = algorithm else {
+        return match kind {
+            None => Ok(None),
+            Some(_) => Err(checksum::TYPE_WITHOUT_ALGORITHM),
+        };
+    };
+    let kind = kind.unwrap_or(checksum::Kind::default_for(algorithm));
+    if !kind.fits(algorithm) {
+        return Err(checksum::unfit(kind, algorithm));
     }
+    Ok(Some(Asked {
+        algorithm: algorithm.to_string(),
+        kind,
+    }))
 }
 
 /// A request naming `uploadId` on an object, to the operation its method names.
@@ -544,13 +603,30 @@ async fn upload_part(
     if object::declared_too_large(headers) {
         return Ok(ctx.too_large());
     }
-    let plan = match object::plan(headers) {
+    let mut plan = match object::plan(headers) {
         Ok(plan) => plan,
         Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     let Some(up) = open_async(state, &id, &segs).await? else {
         return refuse(req, no_such_upload(ctx, &id), ctx).await;
     };
+    // A part of an upload created with a checksum carries one in its algorithm; a full
+    // object's is computed for a part that carries none, as S3 combines it from the parts'.
+    if let Some(asked) = &up.meta.checksum
+        && let Some(want) = asked.header()
+    {
+        match plan.claimed() {
+            Some(header) if header == want => {}
+            None if asked.kind == checksum::Kind::FullObject => plan.compute(want),
+            claimed => {
+                let why = checksum::part_mismatch(
+                    &asked.algorithm,
+                    claimed.and_then(checksum::algorithm),
+                );
+                return refuse(req, ctx.error(why), ctx).await;
+            }
+        }
+    }
     let staging = match temp_in(&up.dir, &format!("part-{n}")) {
         Ok(staging) => staging,
         // Completed or aborted since it was looked up.
@@ -562,9 +638,14 @@ async fn upload_part(
         Err(resp) => return Ok(resp),
     };
     let md5 = crate::hex_of(&received.md5);
+    let kept = received
+        .echo
+        .as_ref()
+        .and_then(|(header, text)| checksum::annotation(header, text))
+        .map(|(_, value)| value);
     let installed = {
         let (dir, md5) = (up.dir.clone(), md5.clone());
-        tokio::task::spawn_blocking(move || install_part(&dir, n, received.staged, &md5))
+        tokio::task::spawn_blocking(move || install_part(&dir, n, received.staged, &md5, kept))
             .await
             .context("installing a part panicked")?
     };
@@ -699,7 +780,7 @@ async fn copy_part(
         }
         drop(file);
         let md5 = crate::hex_of(&md5.finalize().0);
-        match install_part(&up.dir, n, staged, &md5) {
+        match install_part(&up.dir, n, staged, &md5, None) {
             Ok(()) => {}
             Err(_) if !up.dir.is_dir() => return Ok(no_such_upload(&ctx, &id)),
             Err(e) => return Err(e),
@@ -727,10 +808,17 @@ enum Unfit {
     Number(String),
 }
 
+/// The checksums a `Part` of a `CompleteMultipartUpload` names (`ChecksumCRC32`…), each its
+/// algorithm's header and its text, trimmed, as sent.
+type Sent = Vec<(&'static str, String)>;
+
+/// What [`document`] reads: each part's number and ETag, and the checksums each names.
+type Named = (Vec<(u32, String)>, Vec<Sent>);
+
 /// The parts a `CompleteMultipartUpload` document names, in order: each part's number and
-/// the ETag it is expected to have, unquoted and lowercase. Fields beside `PartNumber` and
-/// `ETag` (the parts' checksums) are passed over.
-fn document(body: &[u8]) -> std::result::Result<Vec<(u32, String)>, Unfit> {
+/// the ETag it is expected to have, unquoted and lowercase; and beside them the checksums
+/// each names. Other fields are passed over.
+fn document(body: &[u8]) -> std::result::Result<Named, Unfit> {
     let root = scan::parse(body, MAX_ELEMENTS).map_err(|Malformed(why)| Unfit::Malformed(why))?;
     if root.name != "CompleteMultipartUpload" {
         return Err(Unfit::Malformed(
@@ -738,6 +826,7 @@ fn document(body: &[u8]) -> std::result::Result<Vec<(u32, String)>, Unfit> {
         ));
     }
     let mut parts: Vec<(u32, String)> = Vec::new();
+    let mut checksums_of = Vec::new();
     for p in root.all("Part") {
         let field = |name| {
             p.one(name)
@@ -760,13 +849,90 @@ fn document(body: &[u8]) -> std::result::Result<Vec<(u32, String)>, Unfit> {
             return Err(Unfit::Order);
         }
         parts.push((n, etag));
+        let mut checksums = Sent::new();
+        for (header, name, _) in checksum::ALGORITHMS {
+            let element = p
+                .one(&format!("Checksum{name}"))
+                .map_err(|Malformed(why)| Unfit::Malformed(why))?;
+            if let Some(e) = element.filter(|e| !e.text.trim().is_empty()) {
+                checksums.push((header, e.text.trim().to_string()));
+            }
+        }
+        checksums_of.push(checksums);
     }
     if parts.is_empty() {
         return Err(Unfit::Malformed(
             "a CompleteMultipartUpload names at least one Part",
         ));
     }
-    Ok(parts)
+    Ok((parts, checksums_of))
+}
+
+/// Check the checksums a completion names for part `n` (`sent`) against the one the part
+/// was stored with (`kept`, `<ALGORITHM>:<base64>`), as S3 checks them: one at most, in
+/// base64 of its algorithm's length (400 `InvalidArgument`); none for a part stored with
+/// none, and that one for a part stored with one (`InvalidPart` when it differs, `BadDigest`
+/// when it is in another algorithm); and one for every part of an upload `asked` for a
+/// checksum (400 `InvalidRequest`).
+fn check_part(
+    n: u32,
+    sent: &[(&'static str, String)],
+    kept: Option<&str>,
+    asked: Option<&Asked>,
+    invalid_part: Refusal,
+) -> std::result::Result<(), Refusal> {
+    let argument = |value: String| {
+        Refusal::argument(
+            "Invalid Base64 or multiple checksums present in request",
+            "Checksum",
+            value,
+        )
+    };
+    if sent.len() > 1 {
+        let all: String = sent
+            .iter()
+            .map(|(header, text)| format!("{}:{text};", checksum::algorithm(header).unwrap_or("")))
+            .collect();
+        return Err(argument(all));
+    }
+    let kept = kept.and_then(|k| k.split_once(':'));
+    match (kept, sent.first()) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(invalid_part),
+        (Some((algorithm, _)), None) => match asked {
+            None => Ok(()),
+            Some(_) => Err(Refusal::saying(
+                Code::InvalidRequest,
+                format!(
+                    "The upload was created using a {} checksum. The complete request must \
+                     include the checksum for each part. It was missing for part {n} in the \
+                     request.",
+                    algorithm.to_ascii_lowercase()
+                ),
+            )),
+        },
+        (Some((algorithm, value)), Some((header, text))) => {
+            let fits = crate::auth::base64_decode(text)
+                .is_some_and(|b| Some(b.len()) == checksum::len(header));
+            if !fits {
+                return Err(argument(text.clone()));
+            }
+            if text == value {
+                return Ok(());
+            }
+            let named = checksum::algorithm(header).unwrap_or("");
+            if named == algorithm {
+                return Err(invalid_part);
+            }
+            Err(Refusal::saying(
+                Code::BadDigest,
+                format!(
+                    "The {} you specified for part {n} did not match what we received.",
+                    named.to_ascii_lowercase()
+                ),
+            ))
+        }
+    }
 }
 
 /// The ETag of an object made of parts whose MD5s are `md5s`, unquoted: the MD5 of their
@@ -779,15 +945,16 @@ fn multipart_etag(md5s: &[[u8; 16]]) -> String {
     format!("{}-{}", crate::hex_of(&all.finalize().0), md5s.len())
 }
 
-/// The whole-object checksum a completion's headers name: the first `x-amz-checksum-*` of
-/// S3's algorithms sent as a full object's (base64 of the algorithm's length),
-/// its header, text and bytes. A composite checksum (a checksum of the parts' checksums,
-/// `<base64>-<parts>`) is passed over, since the parts were checked as they came; anything
-/// else is refused, as is an algorithm S3 does not have.
+/// The checksum a completion's headers name for the object: one `x-amz-checksum-*` of S3's
+/// algorithms at most, its header and bytes, either a whole object's (base64 of the
+/// algorithm's length) or a composite one, a checksum of the parts' checksums
+/// (`<base64>-<parts>`, never for CRC64NVME, whose checksum is a full object's). Two, or one
+/// that is neither, or in an algorithm S3 does not have, are refused as S3 refuses them.
 struct Whole {
     header: &'static str,
-    text: String,
     bytes: Vec<u8>,
+    /// how many parts a composite checksum says it was made of
+    composite: Option<u32>,
 }
 
 impl Whole {
@@ -795,28 +962,48 @@ impl Whole {
         if let Some(why) = checksum::unknown(headers) {
             return Err(why);
         }
+        let sent = checksum::ALGORITHMS
+            .iter()
+            .filter(|(h, _, _)| headers.contains_key(*h));
+        if sent.count() > 1 {
+            return Err(object::ONE_CHECKSUM);
+        }
+        let mut found = None;
         for (header, _, len) in checksum::ALGORITHMS {
             let Some(value) = headers.get(header) else {
                 continue;
             };
-            if let Some((text, bytes)) = object::base64_header(headers, header, len).ok().flatten()
-            {
-                return Ok(Some(Whole {
-                    header,
-                    text,
-                    bytes,
-                }));
-            }
             let text = value.to_str().unwrap_or_default().trim();
-            let composite = text.rsplit_once('-').is_some_and(|(sum, parts)| {
-                crate::auth::base64_decode(sum).is_some_and(|b| b.len() == len)
-                    && part_number(parts).is_some()
+            let decoded = |sum: &str| crate::auth::base64_decode(sum).filter(|b| b.len() == len);
+            let (bytes, composite) = match decoded(text) {
+                Some(bytes) => (bytes, None),
+                None => text
+                    .rsplit_once('-')
+                    .filter(|_| header != CRC64NVME)
+                    .and_then(|(sum, parts)| Some((decoded(sum)?, Some(part_number(parts)?))))
+                    .ok_or_else(|| checksum::invalid(header))?,
+            };
+            found = Some(Whole {
+                header,
+                bytes,
+                composite,
             });
-            if !composite {
-                return Err(checksum::invalid(header));
-            }
         }
-        Ok(None)
+        Ok(found)
+    }
+}
+
+/// The header of S3's one checksum that is only ever a full object's.
+const CRC64NVME: &str = "x-amz-checksum-crc64nvme";
+
+/// The kind of checksum a completion's `x-amz-checksum-type` names, which must be its
+/// upload's: 400 `InvalidRequest` for anything else.
+fn completion_kind(headers: &HeaderMap) -> std::result::Result<Option<checksum::Kind>, Refusal> {
+    match headers.get(checksum::TYPE_HEADER) {
+        None => Ok(None),
+        Some(v) => checksum::Kind::of(v.as_bytes())
+            .map(Some)
+            .ok_or_else(|| checksum::invalid(checksum::TYPE_HEADER)),
     }
 }
 
@@ -832,12 +1019,16 @@ struct Assembled {
 /// Concatenate the `parts` of `up`, in order, into a staging file, in one pass, hashing on
 /// the way: each part's MD5, checked against both the ETag asked and the part's record, so a
 /// part replaced while this reads it is noticed rather than built in; the whole object's
-/// SHA-256, and the checksum `whole` asks to be checked against, in its algorithm.
+/// SHA-256; and its checksum: the full object's of an upload created with one, checked
+/// against what `whole` names in its algorithm, or for an upload created with none, the
+/// one `whole` names. First, the completion's `kind` must be the upload's, and the checksums
+/// `sent` for each part what [`check_part`] takes. A composite checksum is passed over.
 fn assemble(
     store: &Store,
     up: &Upload,
     parts: &[(u32, String)],
-    whole: Option<&Whole>,
+    sent: &[Sent],
+    (whole, kind): (Option<&Whole>, Option<checksum::Kind>),
 ) -> Result<std::result::Result<Assembled, Refusal>> {
     let invalid_part = |n: &u32, etag: &str| {
         Refusal::new(Code::InvalidPart)
@@ -845,18 +1036,58 @@ fn assemble(
             .with("PartNumber", n.to_string())
             .with("ETag", etag)
     };
+    let asked = up.meta.checksum.as_ref();
+    if let Some(kind) = kind
+        && asked.map(|a| a.kind) != Some(kind)
+    {
+        return Ok(Err(Refusal::saying(
+            Code::InvalidRequest,
+            format!(
+                "The upload was created using the {} checksum mode. The complete request must \
+                 use the same checksum mode.",
+                asked.map_or("null", |a| a.kind.name())
+            ),
+        )));
+    }
+    // The checksum the object will have, and the one sent to check it against.
+    let (target, check) = match asked {
+        None => {
+            let full = whole.filter(|w| w.composite.is_none());
+            (full.map(|w| w.header), full)
+        }
+        Some(a) if a.kind == checksum::Kind::FullObject => {
+            let named = whole.filter(|w| Some(w.header) == a.header());
+            if let Some(w) = named
+                && w.composite.is_some()
+            {
+                return Ok(Err(checksum::mismatch(w.header)));
+            }
+            (a.header(), named)
+        }
+        Some(_) => (None, None),
+    };
     // Written into, so the gc takes the upload as in use while it is read.
     if let Ok(meta) = std::fs::File::open(up.dir.join(META)) {
         // A failure only leaves the upload as fresh as its last write.
         let _ = meta.set_modified(SystemTime::now());
     }
     let mut total: u64 = 0;
-    for (n, etag) in parts {
+    for ((n, etag), sent) in parts.iter().zip(sent) {
         let Some(part) = read_record::<Part>(&record_path(&up.dir, *n)) else {
             return Ok(Err(invalid_part(n, etag)));
         };
         if part.md5 != *etag {
             return Ok(Err(invalid_part(n, etag)));
+        }
+        let checked = check_part(
+            *n,
+            sent,
+            part.checksum.as_deref(),
+            asked,
+            invalid_part(n, etag),
+        );
+        if let Err(why) = checked {
+            return Ok(Err(why));
         }
         total = total.saturating_add(part.size);
     }
@@ -872,7 +1103,7 @@ fn assemble(
     let (path, mut out) = store.stage_file()?;
     let mut staged = Staged::written(path, 0, String::new());
     let mut sha256 = sha2::Sha256::new();
-    let mut hasher = whole.and_then(|w| checksum::Hasher::for_(w.header));
+    let mut hasher = target.and_then(checksum::Hasher::for_);
     let mut md5s = Vec::with_capacity(parts.len());
     let mut sizes = Vec::with_capacity(parts.len());
     let mut buf = vec![0u8; STREAM_CHUNK];
@@ -914,20 +1145,22 @@ fn assemble(
     }
     drop(out);
     let sha256 = sha256.finalize().to_vec();
-    if let Some(whole) = whole {
+    let mut kept = None;
+    if let Some(header) = target {
         let got = match hasher {
             Some(h) => h.finalize(),
             None => sha256.clone(),
         };
-        if got != whole.bytes {
-            return Ok(Err(checksum::mismatch(whole.header)));
+        if check.is_some_and(|w| got != w.bytes) {
+            return Ok(Err(checksum::mismatch(header)));
         }
+        kept = Some((header, vk_hub_proto::to_base64(&got)));
     }
     staged.hex = crate::hex_of(&sha256);
     Ok(Ok(Assembled {
         staged,
         etag: multipart_etag(&md5s),
-        checksum: whole.map(|w| (w.header, w.text.clone())),
+        checksum: kept,
         sizes,
     }))
 }
@@ -965,10 +1198,11 @@ async fn complete(
     if !known {
         return refuse(req, no_such_upload(ctx, &id), ctx).await;
     }
-    let whole = match Whole::of(req.headers()) {
-        Ok(whole) => whole,
-        Err(why) => return refuse(req, ctx.error(why), ctx).await,
-    };
+    let whole =
+        match Whole::of(req.headers()).and_then(|w| Ok((w, completion_kind(req.headers())?))) {
+            Ok(whole) => whole,
+            Err(why) => return refuse(req, ctx.error(why), ctx).await,
+        };
     let (head, body) = req.into_parts();
     let too_long = ctx.error(Code::MalformedXML);
     let body = match read_small(body, MAX_DOCUMENT, too_long, ctx).await? {
@@ -978,7 +1212,7 @@ async fn complete(
     if let Err(why) = object::check_document(&head.headers, &body) {
         return Ok(ctx.error(why));
     }
-    let parts = match document(&body) {
+    let (parts, sent) = match document(&body) {
         Ok(parts) => parts,
         // What is wrong with it is S3's to say in its own words.
         Err(Unfit::Malformed(_)) => return Ok(ctx.error(Code::MalformedXML)),
@@ -1005,7 +1239,8 @@ async fn complete(
                     None => Found::Gone,
                 });
             };
-            let assembled = assemble(&store, &up, &parts, whole.as_ref())?;
+            let (whole, kind) = &whole;
+            let assembled = assemble(&store, &up, &parts, &sent, (whole.as_ref(), *kind))?;
             Ok(Found::Assembled(Held { _lock: lock, up }, parts, assembled))
         })
         .await
@@ -1550,7 +1785,7 @@ mod tests {
         )))
         .unwrap();
         assert_eq!(
-            parts,
+            parts.0,
             [
                 (1, MD5.to_string()),
                 (3, MD5.to_string()),
@@ -1596,7 +1831,7 @@ mod tests {
         let max = (1..=MAX_PARTS)
             .map(|n| part(&n.to_string(), MD5))
             .collect::<String>();
-        assert_eq!(document(&body(&max)).unwrap().len(), MAX_PARTS as usize);
+        assert_eq!(document(&body(&max)).unwrap().0.len(), MAX_PARTS as usize);
         let elements = (0..MAX_ELEMENTS).map(|_| "<x/>").collect::<String>();
         assert!(matches!(
             document(&body(&elements)),
@@ -1781,6 +2016,7 @@ mod tests {
             key: "a/k".into(),
             created: 1,
             annotations: BTreeMap::new(),
+            checksum: None,
         };
         std::fs::write(up.join(META), serde_json::to_vec(&meta).unwrap()).unwrap();
         let segs = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
