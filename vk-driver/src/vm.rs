@@ -1357,6 +1357,7 @@ fn build_windows_unit(
         let _ = std::fs::write(dir.join(crate::egress_report::UNRECORDED_BUILD), b"");
     }
     let registry = crate::windows_registry(None, false, &cfg.build)?;
+    let media_registry = registry.clone();
     let (cpus, mem) = crate::winbuild::default_size();
     let opts = crate::winbuild::Options {
         dockerfile: build.dockerfile.clone(),
@@ -1368,6 +1369,7 @@ fn build_windows_unit(
         net,
         reinstall: false,
         registry,
+        media_registry,
         pull_layers: true,
         // A job's Dockerfile sizes its build guests no larger than its services.
         ceiling: Some(service_ceiling(cfg)?),

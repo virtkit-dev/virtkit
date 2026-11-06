@@ -5569,6 +5569,7 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
         mem,
         net,
         reinstall: *reinstall,
+        media_registry: registry.clone(),
         registry,
         pull_layers: true,
         ceiling: None,

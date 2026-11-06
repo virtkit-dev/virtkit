@@ -161,6 +161,9 @@ pub(crate) struct Options {
     /// The build cache registry the hosts share layers through ([`crate::wincache`]); `None`
     /// keeps them on this host.
     pub registry: Option<crate::config::Registry>,
+    /// Registry for fetching install media missing from the build context by digest;
+    /// `None` disables fetching.
+    pub media_registry: Option<crate::config::Registry>,
     /// Whether to take layers from the build cache. When false, the build still locks and
     /// pushes its own layers and fetches install media.
     pub pull_layers: bool,
@@ -429,11 +432,17 @@ fn build_with(opts: &Options) -> Result<Vec<crate::cachelock::Guard>> {
     let target = target_index(&stages, opts.target.as_deref())
         .with_context(|| format!("{}", opts.dockerfile.display()))?;
     let cache = crate::run::default_data_base()?.join("windows");
+    let media_dir = cache.join("winiso");
+    let media = crate::winiso::MediaSource {
+        dir: &media_dir,
+        registry: opts.media_registry.as_ref(),
+    };
     let started = Instant::now();
     let refs = Refs::default();
     let mut build = Build {
         opts,
         cache: &cache,
+        media,
         built: HashMap::new(),
         reinstalled: Vec::new(),
         refs: &refs,
@@ -609,6 +618,8 @@ struct Build<'a> {
     opts: &'a Options,
     /// The layer cache.
     cache: &'a Path,
+    /// Where install media come from.
+    media: crate::winiso::MediaSource<'a>,
     /// The stages built so far, by index.
     built: HashMap<usize, Layer>,
     /// The installs (medium and disk size) `--reinstall` has made again in this build.
@@ -655,6 +666,7 @@ fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> R
             cpus,
             &mem,
             &cache.join("winiso"),
+            b.media,
             reinstall,
             opts.registry.as_ref(),
             opts.pull_layers,
@@ -1757,6 +1769,7 @@ mod tests {
             net: crate::build::BuildNet::All,
             reinstall: false,
             registry: None,
+            media_registry: None,
             pull_layers: true,
             ceiling,
         };
@@ -2317,13 +2330,19 @@ mod tests {
             net: crate::build::BuildNet::All,
             reinstall: false,
             registry: None,
+            media_registry: None,
             pull_layers: true,
             ceiling: None,
         };
         let refs = Refs::default();
+        let media_dir = cache.join("winiso");
         let mut build = Build {
             opts: &opts,
             cache: &cache,
+            media: crate::winiso::MediaSource {
+                dir: &media_dir,
+                registry: None,
+            },
             built: HashMap::new(),
             reinstalled: Vec::new(),
             refs: &refs,

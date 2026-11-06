@@ -558,6 +558,14 @@ fn count_reinstall(path: &Path) -> Result<()> {
     std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
 }
 
+/// Where a build's install media come from: their cache `dir`, its entries keyed by the
+/// pinned digests, and the `registry` missing ones are fetched from by digest.
+#[derive(Clone, Copy)]
+pub(crate) struct MediaSource<'a> {
+    pub dir: &'a Path,
+    pub registry: Option<&'a crate::config::Registry>,
+}
+
 /// Mark the media `source` pins as in use in `rg`, so the registry's retention keeps them for
 /// as long as builds use what was installed from them. Best effort: only the asking matters,
 /// not the answer, and an unreachable registry costs each build the client's timeout per
@@ -571,10 +579,10 @@ fn keep_media(rg: &crate::config::Registry, source: &Source) {
 /// Get or build `source`'s base layer on a `disk_size`-byte disk in `cache`; with `reinstall`,
 /// a new one under new keys. Cache the install by its medium and disk size, and the settle
 /// overlay by the install and settle step, so changing the settle does not reinstall. Media
-/// missing here are fetched from `registry`, which every build keeps them alive in; a base
-/// another host made is pulled from it, and one made here is pushed to it
-/// ([`crate::wincache`]). The entries the base stands on, down to its install, are referenced
-/// into `refs` once it is here; one still in the registry only once it is pulled.
+/// come from `media`; every build keeps them alive in its registry. Remote bases are pulled
+/// from `registry`, and locally built bases are pushed there ([`crate::wincache`]).
+/// Base dependencies, down to the install, are referenced into `refs` once local;
+/// remote dependencies only after pulling.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn base(
     source: &Source,
@@ -582,6 +590,7 @@ pub(crate) fn base(
     cpus: u32,
     mem: &str,
     cache: &Path,
+    media: MediaSource<'_>,
     reinstall: bool,
     registry: Option<&crate::config::Registry>,
     pull: bool,
@@ -608,10 +617,13 @@ pub(crate) fn base(
     };
     if let Some(base) = read_base(&dir, &key)? {
         eprintln!("virtkit: winiso: base {} (cached)", &key[..12]);
-        if let Some(rg) = registry {
+        if let Some(rg) = media.registry {
             keep_media(rg, source);
         }
         return here(base);
+    }
+    if let Some(rg) = media.registry {
+        keep_media(rg, source);
     }
     let Some(rg) = registry else {
         return here(make_base(
@@ -622,11 +634,10 @@ pub(crate) fn base(
             cache,
             &install_key,
             &key,
-            None,
+            media,
             refs,
         )?);
     };
-    keep_media(rg, source);
     // Reinstall counts are host-local: another host may have the same key, but pulling its
     // install would skip the requested reinstall.
     let first = if reinstall || !pull {
@@ -660,7 +671,7 @@ pub(crate) fn base(
         cache,
         &install_key,
         &key,
-        Some(rg),
+        media,
         refs,
     )?;
     // A disk built on this host, not pulled, is pushed. A concurrent build here that placed
@@ -750,7 +761,7 @@ pub(crate) fn pull_base(
 }
 
 /// Install `source` on a `disk_size`-byte disk, or take the install `install_key` from `cache`,
-/// and settle it into the base layer `key`. Media missing here are fetched from `registry`.
+/// and settle it into the base layer `key`, its media from `media`.
 /// What it uses is referenced into `refs`, the install among them.
 #[allow(clippy::too_many_arguments)]
 fn make_base(
@@ -761,7 +772,7 @@ fn make_base(
     cache: &Path,
     install_key: &str,
     key: &str,
-    registry: Option<&crate::config::Registry>,
+    media: MediaSource<'_>,
     refs: &crate::wincache::Refs,
 ) -> Result<Base> {
     let dir = cache.join("settled").join(key);
@@ -771,7 +782,7 @@ fn make_base(
     // Referenced before it is looked at, so a sweep cannot take it between the two.
     refs.reference(&install_dir)?;
     if !install_dir.join("installed").exists() {
-        let media = media(source, cache, registry, refs)?;
+        let media = self::media(source, media, refs)?;
         let tmp = scratch_beside(&install_dir)?;
         let disk = tmp.join("disk.qcow2");
         if let Err(e) = install(&tmp, &disk, &media, disk_size, cpus, mem) {
@@ -825,14 +836,10 @@ fn make_base(
     read_base(&dir, key)?.context("the base just placed has no record")
 }
 
-/// The install medium of `source`, cached or built in a helper VM. Only building the medium
-/// reads and verifies the ISOs, fetching missing ones from `registry`.
-fn media(
-    source: &Source,
-    cache: &Path,
-    registry: Option<&crate::config::Registry>,
-    refs: &crate::wincache::Refs,
-) -> Result<PathBuf> {
+/// The install medium of `source`, cached in `from.dir` or built in a helper VM. Only building
+/// the medium reads and verifies the ISOs, fetching missing ones from `from.registry`.
+fn media(source: &Source, from: MediaSource<'_>, refs: &crate::wincache::Refs) -> Result<PathBuf> {
+    let (cache, registry) = (from.dir, from.registry);
     let dir = cache.join("media").join(source.media_key());
     // Referenced into `refs` before each is looked at, so a sweep cannot take it between.
     refs.reference(&dir)?;
@@ -1733,12 +1740,17 @@ mod tests {
             .unwrap();
         }
 
+        let from = MediaSource {
+            dir: &cache,
+            registry: Some(&rg),
+        };
         let base = base(
             &source,
             size,
             1,
             "1G",
             &cache,
+            from,
             false,
             Some(&rg),
             true,
@@ -1758,6 +1770,7 @@ mod tests {
                 1,
                 "1G",
                 &cache,
+                from,
                 true,
                 Some(&rg),
                 true,
@@ -1804,7 +1817,14 @@ mod tests {
         .unwrap();
         std::fs::write(settled.join("base.json"), r#"{"password": "p"}"#).unwrap();
         let refs = crate::wincache::Refs::default();
-        let base = base(&source, size, 1, "1G", &cache, false, None, true, &refs).unwrap();
+        let from = MediaSource {
+            dir: &cache,
+            registry: None,
+        };
+        let base = base(
+            &source, size, 1, "1G", &cache, from, false, None, true, &refs,
+        )
+        .unwrap();
         assert_eq!(base.password, "p");
         assert!(refs.holds(&settled) && refs.holds(&install));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1840,7 +1860,11 @@ mod tests {
         };
         let refs = crate::wincache::Refs::default();
         // Stops at the ISO's digest, which these bytes do not have.
-        assert!(media(&source, &cache, None, &refs).is_err());
+        let from = MediaSource {
+            dir: &cache,
+            registry: None,
+        };
+        assert!(media(&source, from, &refs).is_err());
         assert!(linked.join("virtio.iso").exists(), "the drivers are linked");
         assert!(refs.holds(&cache.join("media").join(source.media_key())));
         assert!(refs.holds(&fetched) && refs.holds(&linked));
