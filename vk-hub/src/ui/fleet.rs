@@ -356,6 +356,9 @@ pub(super) async fn get(
     if path == super::users::PATH {
         return super::users::get(auth, ui).await.map(Some);
     }
+    if path == super::settings::PATH {
+        return super::settings::get(auth, ui).await.map(Some);
+    }
     if path == super::registries::PATH {
         return super::registries::list(auth, ui).await.map(Some);
     }
@@ -960,6 +963,7 @@ fn nav(users: bool, gitlabs: &[String]) -> Vec<pages::Section> {
                 },
                 tab(UPDATES_PATH, "Updates"),
                 tab(ROLLOUTS_PATH, "Rollouts"),
+                tab(super::settings::PATH, "Settings"),
             ],
         },
         Section {
@@ -2029,7 +2033,9 @@ fn settings_section(h: &mut Html, settings: &vk_hub_proto::SettingsReport) {
         }
         h.raw("</tbody></table>");
     }
-    h.raw("</section>");
+    h.raw("<p class=\"sub\"><a href=\"")
+        .raw(super::settings::PATH)
+        .raw("\">The hub's settings</a></p></section>");
 }
 
 /// A setting's value in a cell: a string as it is, a registry by its `repo`, anything else as

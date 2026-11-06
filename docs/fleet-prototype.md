@@ -1508,7 +1508,7 @@ provider (see [Signing in](#signing-in)).
 
 The UI's top bar has six sections, each opening on its first tab, the current section's tabs in a
 row below: *Fleet* (*Compute*, the nodes table; *Storage*, the registries; *Updates*, releases
-and the versions running; *Rollouts*, every rollout), *GitLab* (*Overview*, the servers and
+and the versions running; *Rollouts*, every rollout; *Settings*, the hub's settings for its nodes), *GitLab* (*Overview*, the servers and
 relays, then a tab per server), *Lanes*, *Jobs*, *Egress*, and *Administration* (*API keys*,
 *Users* for operators, *Audit*).
 A section's link counts what waits in its tabs, each tab its own. Connections' former
@@ -1576,6 +1576,12 @@ the session's principal; the token is never logged. Removing a node stays on the
 Operators grant who signs in through the OIDC provider, and as what, from `/users` (see [Signing
 in](#signing-in)). A page is refused to a request whose `Sec-Fetch-Site` is `same-site` or
 `cross-site`.
+
+`/settings` shows viewers and operators the fleet-wide and per-node settings, plus the keys
+the hub may set and their accepted values. Operators set and unset settings in either scope
+with the same validation as `vk-hub settings`, audited as the session's principal. Changes
+update the status line and displayed layers; plain forms are also supported. A node's page
+links to it.
 
 `/jobs` shows viewers and operators the job history (see [Placed jobs](#placed-jobs)), newest
 first, 100 jobs per page, with a link to older jobs. Each row shows the job's name, with a link

@@ -3652,7 +3652,8 @@ async fn releases_and_rollouts_are_shown_live() {
         "<nav class=\"subnav\" aria-label=\"Fleet\"><a href=\"/\">Compute</a>\
          <a href=\"/registries\">Storage</a>\
          <a href=\"/updates\" aria-current=\"page\">Updates</a>\
-         <a href=\"/updates/rollouts\">Rollouts</a></nav>",
+         <a href=\"/updates/rollouts\">Rollouts</a>\
+         <a href=\"/settings\">Settings</a></nav>",
         "sse-connect=\"/events/updates\"",
         &format!("<code title=\"{}\">abababababab</code>", "ab".repeat(32)),
         "<td>0.85.0</td><td>3.0 MiB</td><td>no</td>",
@@ -13514,4 +13515,111 @@ async fn an_unreadable_capacity_policy_is_reported_not_fatal() {
     let form = format!("_csrf={csrf}&op=replace&expected={digest}&policy=%7B%7D");
     let reply = post_action(addr, &origin, &operator, "/lanes", &form, false).await;
     assert_eq!(reply.status, 409, "{}", reply.body);
+}
+
+/// `/settings` shows every viewer the hub's settings; an operator sets and unsets them
+/// fleet-wide and per node through the admin socket's operation, audited as the session's
+/// principal, and is refused what `vk-hub settings` refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_sets_the_hubs_settings_from_the_settings_page() {
+    let (addr, hub, _) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let post = |cookie: String, form: String| async move {
+        post_action(
+            addr,
+            &format!("http://{addr}"),
+            &cookie,
+            settings::PATH,
+            &form,
+            true,
+        )
+        .await
+    };
+    let page = get(addr, "/settings", Some(&viewer)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(!page.body.contains("Set a setting"), "{}", page.body);
+    let form = format!("_csrf={viewer_csrf}&op=set&key=executor.vm.cpus&value=4&node=");
+    assert_eq!(post(viewer.clone(), form).await.status, 403);
+
+    let (cookie, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let reply = post(
+        cookie.clone(),
+        format!("_csrf={csrf}&op=set&key=executor.vm.cpus&value=4&node="),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Set executor.vm.cpus to 4 fleet-wide."),
+        "{}",
+        reply.body
+    );
+    let reply = post(
+        cookie.clone(),
+        format!("_csrf={csrf}&op=set&key=executor.vm.mem&value=8G&node={node}"),
+    )
+    .await;
+    assert!(reply.body.contains("for ci-1"), "{}", reply.body);
+    let layers = hub.db.settings_layers().unwrap();
+    assert_eq!(layers.fleet["executor.vm.cpus"], serde_json::json!(4));
+    assert_eq!(
+        layers.nodes[&node]["executor.vm.mem"],
+        serde_json::json!("8G")
+    );
+    for (form, status, said) in [
+        (
+            "op=set&key=executor.vm.cpus&value=0&node=",
+            400,
+            "from 1 to 255",
+        ),
+        ("op=set&key=state_dir&value=x&node=", 400, "not a setting"),
+        (
+            "op=set&key=registry&value=nope&node=",
+            400,
+            "no registry nope",
+        ),
+        (
+            "op=set&key=executor.vm.cpus&value=2&node=ffffffff",
+            404,
+            "no such node",
+        ),
+        ("op=drop&key=executor.vm.cpus", 400, "No such action"),
+    ] {
+        let reply = post(cookie.clone(), format!("_csrf={csrf}&{form}")).await;
+        assert_eq!(reply.status, status, "{form}: {}", reply.body);
+        assert!(reply.body.contains(said), "{form}: {}", reply.body);
+    }
+    let page = get(addr, "/settings", Some(&cookie)).await;
+    for want in [
+        "<a href=\"/settings\" aria-current=\"page\">Settings</a>",
+        "<code>executor.vm.cpus</code></td><td>4</td>",
+        "Node <a href=\"/node/",
+        "<button>Unset</button>",
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    let reply = post(
+        cookie.clone(),
+        format!("_csrf={csrf}&op=unset&key=executor.vm.mem&node={node}"),
+    )
+    .await;
+    assert!(
+        reply.body.contains("Unset executor.vm.mem for ci-1."),
+        "{}",
+        reply.body
+    );
+    assert!(hub.db.settings_layers().unwrap().nodes.is_empty());
+    let audit: Vec<String> = hub
+        .db
+        .audits(None, 10)
+        .unwrap()
+        .into_iter()
+        .map(|l| l.event)
+        .collect();
+    assert!(
+        audit
+            .iter()
+            .any(|e| e.ends_with("(operator) set executor.vm.cpus = 4 fleet-wide")),
+        "{audit:?}"
+    );
 }

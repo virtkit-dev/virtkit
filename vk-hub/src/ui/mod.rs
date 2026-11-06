@@ -85,6 +85,7 @@ mod pages;
 mod projects;
 mod registries;
 mod relays;
+mod settings;
 mod sse;
 mod updates;
 mod users;
@@ -421,6 +422,8 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                     operations::fetch_action(req, ui).await
                 } else if path == users::PATH {
                     users::action(req, ui, site).await
+                } else if path == settings::PATH {
+                    settings::action(req, ui).await
                 } else if path == clients::PATH {
                     clients::action(req, ui, site).await
                 } else if path == lanes::PATH {

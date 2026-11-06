@@ -6,9 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
-- **vk-hub sets its nodes' settings.** `vk-hub settings set` and `unset` give every node, or
-  one, capacity and VM sizing settings and a registry the hub manages to use, one node's own
-  winning over the fleet's; a value a node would refuse is refused at once.
+- **vk-hub manages node settings from the CLI and web UI.** Use `vk-hub settings set` and
+  `unset`, or the web UI's Settings page, to set capacity, VM sizing and a hub-managed registry
+  fleet-wide or per node, with per-node settings
+  winning over the fleet's; a value of the wrong type or out of bounds is refused at once.
 - **vk-hub shows what each node's settings come to.** A node's page lists each setting's value
   and whether it comes from the node's config file, the hub, the host's size or a default, the
   hub's settings it refused, the release keys it trusts (flagged when it has keys but does not
