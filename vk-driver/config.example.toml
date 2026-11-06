@@ -349,7 +349,9 @@
 #                      # which a small file never repays); "8G:always" maps every file,
 #                      # "8G:inode=64K" moves the floor. "off" disables it
 # max_cpus = 32        # ceilings for the per-job MICROVM_CPUS/MICROVM_MEM
-# max_mem = "128G"     # variables (unset = jobs cannot exceed cpus/mem above)
+# max_mem = "128G"     # variables (unset = jobs cannot exceed cpus/mem above; on a
+#                      # fleet node max_cpus is the host's CPUs, and an unset cpus or
+#                      # mem is held to it or to mem_budget)
 # nested = false       # let jobs boot microVMs of their own (vk inside vk); needs
 #                      # kvm_intel/kvm_amd nested=1, and widens what a job can reach
 # cmdline_extra = ""
@@ -381,7 +383,9 @@
 #                        # (see the end of a job trace) — size the budget from that.
 # mem_budget = "50%"     # total GUEST RAM admitted at once: an exact "48G", or a share of
 #                        # this host's MemTotal rounded up to whole GiB. Leave the rest of
-#                        # the host's memory for the VMMs, host tmpfs and everything else
+#                        # the host's memory for the VMMs, host tmpfs and everything else.
+#                        # Unset: no budget, but on a fleet node MemTotal less the smaller
+#                        # of 4G and 10%
 # from_history = false   # reserve what a job of this kind has been using (its largest run
 #                        # of the last 14 days at its current MICROVM_MEM + headroom, capped
 #                        # by what it declares) instead of declared size, so a host runs as

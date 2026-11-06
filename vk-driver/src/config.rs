@@ -1304,15 +1304,66 @@ fn load_resolved(explicit: Option<PathBuf>, fallbacks: &[PathBuf]) -> Result<Con
             ),
         }
     }
+    cfg.layers.local = local;
+    if crate::node::enrolled(&cfg) {
+        enrolled_defaults(
+            &mut cfg,
+            crate::schedule::host_total_mib(),
+            Some(crate::node::online_cpus()),
+        );
+    }
     for warning in ineffective_settings(&cfg) {
         match &shown {
             Some(path) => eprintln!("virtkit: warning: {path}: {warning}"),
             None => eprintln!("virtkit: warning: {warning}"),
         }
     }
-    cfg.layers.local = local;
     cfg.source = path;
     Ok(cfg)
+}
+
+/// Fill in what a host enrolled with a fleet hub takes from its own size where neither the
+/// local file nor the hub sets it (`docs/fleet-design.md`, *Defaults on an enrolled node*): a
+/// memory budget of [`enrolled_budget_gib`], a per-job vCPU ceiling of the host's `cpus`
+/// online, and the base VM held to both, so a job that asks for nothing fits. A figure this
+/// host cannot read leaves its default as it is.
+fn enrolled_defaults(cfg: &mut Config, total_mib: Option<u64>, cpus: Option<u32>) {
+    let schedule = &mut cfg.executor.schedule;
+    if schedule.mem_budget.is_none() {
+        schedule.mem_budget = total_mib
+            .map(enrolled_budget_gib)
+            .filter(|gib| *gib > 0)
+            .map(|gib| format!("{gib}G"));
+    }
+    let vm = &mut cfg.executor.vm;
+    if vm.max_cpus.is_none() {
+        vm.max_cpus = cpus.filter(|n| *n > 0);
+    }
+    let set = |key| {
+        crate::node::hub_settings::is_set(&cfg.layers.local, key)
+            || cfg.layers.hub.contains_key(key)
+    };
+    if !set("executor.vm.cpus")
+        && let Some(max) = vm.max_cpus
+    {
+        vm.cpus = vm.cpus.min(max);
+    }
+    // A budget that does not resolve fails every job anyway, which says why.
+    if !set("executor.vm.mem")
+        && let Some(Ok(budget_mib)) = crate::vm::budget_mib(cfg)
+        && let Ok(mem) = crate::vm::parse_gib(&cfg.executor.vm.mem)
+        && let gib @ 1.. = budget_mib / 1024
+        && gib < mem
+    {
+        cfg.executor.vm.mem = format!("{gib}G");
+    }
+}
+
+/// An enrolled host's `total_mib` less the smaller of 4 GiB and 10 %, reserved for the host,
+/// rounded down to whole GiB like job sizes.
+fn enrolled_budget_gib(total_mib: u64) -> u64 {
+    let reserve = total_mib.div_ceil(10).min(4 * 1024);
+    total_mib.saturating_sub(reserve) / 1024
 }
 
 /// The local config file at `path` as a table, refused when it uses a key that moved and
@@ -1644,12 +1695,72 @@ mod tests {
             cfg.layers.hub.keys().collect::<Vec<_>>(),
             ["executor.vm.max_cpus"]
         );
+        // Else the host's own size, as on any enrolled host.
+        let online = Some(crate::node::online_cpus());
         settings("https://other.example");
         let cfg = load_resolved(Some(file.clone()), &[]).unwrap();
-        assert_eq!(cfg.executor.vm.max_cpus, None);
+        assert_eq!(cfg.executor.vm.max_cpus, online);
         std::fs::write(node.join("settings.json"), "{").unwrap();
         let cfg = load_resolved(Some(file), &[]).unwrap();
-        assert_eq!((cfg.executor.vm.cpus, cfg.executor.vm.max_cpus), (4, None));
+        assert_eq!(
+            (cfg.executor.vm.cpus, cfg.executor.vm.max_cpus),
+            (4, online)
+        );
+    }
+
+    /// An enrolled host with nothing set budgets its memory less a reserve, lets a job ask for
+    /// every CPU and sizes the base VM within both; what a layer sets stays.
+    #[test]
+    fn an_enrolled_host_takes_defaults_from_its_size() {
+        let defaults = |text: &str, hub: &[&str], total_mib, cpus| {
+            let local: toml::Table = toml::from_str(text).unwrap();
+            let mut cfg = from_table(local.clone()).unwrap();
+            cfg.layers.local = local;
+            cfg.layers.hub = hub
+                .iter()
+                .map(|k| (k.to_string(), serde_json::Value::Null))
+                .collect();
+            enrolled_defaults(&mut cfg, total_mib, cpus);
+            let (schedule, vm) = (&cfg.executor.schedule, &cfg.executor.vm);
+            let budget = schedule.mem_budget.clone();
+            (budget, vm.max_cpus, vm.cpus, vm.mem.clone())
+        };
+        let some = |s: &str| Some(s.to_string());
+        // 4 GiB kept back past 40 GiB, a tenth below; whole GiB.
+        assert_eq!(
+            defaults("", &[], Some(257_000), Some(64)),
+            (some("246G"), Some(64), 4, "4G".into())
+        );
+        assert_eq!(
+            defaults("", &[], Some(7_900), Some(2)),
+            (some("6G"), Some(2), 2, "4G".into())
+        );
+        // The tenth rounded up: 4551 - 456 is under 4 GiB.
+        assert_eq!(
+            defaults("", &[], Some(4_551), Some(2)),
+            (some("3G"), Some(2), 2, "3G".into())
+        );
+        // Unreadable figures leave the defaults as they are; a budget under a GiB is none.
+        assert_eq!(
+            defaults("", &[], None, Some(0)),
+            (None, None, 4, "4G".into())
+        );
+        assert_eq!(
+            defaults("", &[], Some(1_000), None),
+            (None, None, 4, "4G".into())
+        );
+        // Set in the file or by the hub, a value stays; the base VM is held to a set ceiling.
+        let set = "[executor.schedule]\nmem_budget = \"2G\"\n[executor.vm]\nmax_cpus = 3\n";
+        assert_eq!(
+            defaults(set, &[], Some(257_000), Some(64)),
+            (some("2G"), Some(3), 3, "2G".into())
+        );
+        let vm = "[executor.vm]\ncpus = 8\nmem = \"8G\"\n";
+        let (_, _, cpus, mem) = defaults(vm, &[], Some(4_551), Some(2));
+        assert_eq!((cpus, mem.as_str()), (8, "8G"), "set in the file");
+        let hub = ["executor.vm.cpus", "executor.vm.mem"];
+        let (_, _, cpus, mem) = defaults("", &hub, Some(4_551), Some(2));
+        assert_eq!((cpus, mem.as_str()), (4, "4G"), "set by the hub");
     }
 
     #[test]

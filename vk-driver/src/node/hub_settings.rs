@@ -24,7 +24,7 @@ const FILE: &str = "settings.json";
 type Read = fn(&Config) -> Option<Value>;
 
 /// The keys the hub may set, by dotted key, and how to read each one's effective value: its
-/// default where it has one, `None` where unset means none.
+/// default where it has one, as resolved for this host, `None` where unset means none.
 const KEYS: &[(&str, Read)] = &[
     ("executor.schedule.mem_budget", |c| {
         json(&c.executor.schedule.mem_budget)
@@ -181,7 +181,7 @@ fn insert_unset(table: &mut toml::Table, key: &str, value: toml::Value) -> bool 
 }
 
 /// Whether dotted `key` is set in `table`.
-fn is_set(table: &toml::Table, key: &str) -> bool {
+pub(crate) fn is_set(table: &toml::Table, key: &str) -> bool {
     let mut at = table;
     let mut parts = key.split('.').peekable();
     while let Some(part) = parts.next() {

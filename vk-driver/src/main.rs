@@ -898,7 +898,7 @@ enum Cmd {
     /// at `[executor.schedule] max_concurrency`, where the root-side `vk-runnerctl` applies it.
     /// Run from a timer every half minute or so (see the GitLab CI guide), so it is hidden from
     /// the everyday help like `vk gitlab`. Needs `[executor.schedule] mem_budget` or
-    /// `max_concurrency`.
+    /// `max_concurrency`, except on a fleet node, which has a budget by default.
     #[command(hide = true)]
     Tune,
     /// plumbing: what a VM's guest did on the network, for a local UI

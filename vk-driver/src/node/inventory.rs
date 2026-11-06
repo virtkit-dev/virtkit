@@ -340,7 +340,7 @@ fn is_tmpfs(path: &Path) -> bool {
 /// CPUs online on the host. Not `available_parallelism`, which answers for this process's
 /// affinity and cgroup — a `vk node` started under a restricted unit would report a smaller
 /// host than the one its jobs run on.
-fn online_cpus() -> u32 {
+pub(crate) fn online_cpus() -> u32 {
     // SAFETY: sysconf reads a system value and touches no memory of ours.
     let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
     u32::try_from(n).unwrap_or(0)

@@ -24,6 +24,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **A fleet node needs no memory budget or vCPU ceiling in its config.** Unless its config or
+  hub sets them, its jobs' memory is budgeted at the host's RAM less the smaller of 4 GiB and
+  10 %, and a job may ask for up to all of the host's CPUs; the default job VM keeps 4 vCPUs
+  and 4 GiB, less on a smaller host. `vk tune` works on such a node with no config.
 - **A node keeps each placed job's builds to its project, protection and scope.** Built
   images, layers, build locks and Windows builds are cached under the job's `ci-build` prefix
   with its token, or not at all, no longer in `[build] cache_registry`, and what the node

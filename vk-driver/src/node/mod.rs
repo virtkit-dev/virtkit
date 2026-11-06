@@ -53,6 +53,7 @@ mod update;
 
 pub use ci_user::{runner_mode, runner_mode_in};
 pub use inventory::egress_caps;
+pub(crate) use inventory::online_cpus;
 
 use std::io::Read;
 use std::os::fd::AsRawFd;

@@ -128,7 +128,8 @@ built-in or autodetected default  <-  hub value  <-  the node's config.toml
 ```
 
 Built today: the local file, over built-in defaults, and on the node the hub settings below,
-which the hub has no way to set yet. The hub steers through desired state — a concurrency
+which the hub has no way to set yet, and an enrolled node's memory and per-job vCPU defaults.
+The hub steers through desired state — a concurrency
 ceiling, stopped acquisition, its [egress layer](#job-egress-from-the-hub) — and through
 commands: drain, quarantine, and the release a node updates to, within what the node allows.
 The rest of this section is proposed.
@@ -149,17 +150,27 @@ The rest of this section is proposed.
   job VM can reach. The trust model's [routine fields](trust-model.md#routine-and-sensitive)
   bound what the list may grow to.
 - **Defaults are autodetected on an enrolled node**, one with an enrollment under
-  `<state_dir>/node/`. A `vk` on a host that is not enrolled keeps today's defaults.
+  `<state_dir>/node/`. A `vk` on a host that is not enrolled keeps its defaults.
 
 ### Defaults on an enrolled node
 
+Each applies where neither the local file nor the hub sets the key, and the node reports it
+with the source `default`.
+
 - **Memory.** An unset `mem_budget` is `MemTotal` less the smaller of 4 GiB and 10 % of
-  `MemTotal`, where today it means no admission gate. The hub places on the smaller of the
-  node's room under its budget and its live `MemAvailable` less 15 % of `MemTotal`, the reserve
-  `vk tune` keeps; today it reads the budget alone once one is set.
+  `MemTotal`, rounded down to a whole GiB as job sizes are, where on a host that is not enrolled
+  it means no admission gate; so `vk tune` has a budget to work from. An unset `mem` is held to
+  the budget, so a job that asks for nothing fits a small host. A host whose `MemTotal` cannot
+  be read, or that has less than a GiB to give, keeps no budget. Proposed: the hub
+  places on the smaller of the node's room under its budget and its live `MemAvailable` less
+  15 % of `MemTotal`, the reserve `vk tune` keeps; today it reads the budget alone once one is
+  set.
 - **vCPUs per job.** `max_cpus` defaults to the host's online CPUs, so `MICROVM_CPUS` may ask
-  for up to the whole host, and a job that asks for none is held to it as well. The default VM
-  keeps 4 vCPUs, fewer on a smaller host.
+  for up to the whole host. A job that asks for none gets `cpus`, held to `max_cpus` on any
+  host. The default VM keeps 4 vCPUs, fewer on a smaller host.
+
+Proposed:
+
 - **vCPUs in all.** The admission ledger counts vCPUs too, against the online CPUs times
   `cpu_overcommit` (default 2). A job waits for vCPUs as it waits for memory; the heartbeat
   reports vCPUs committed and the budget, and the hub stops placing on a node past it.
