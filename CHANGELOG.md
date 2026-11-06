@@ -23,7 +23,8 @@ All notable changes to virtkit will be documented in this file.
   and deleted in batches, and the configuration probes tools send before using a bucket
   (versioning, ACLs, tagging and the like) are answered as for a bucket with none set, and a
   write asking for one of them — encryption under the client's own key, tags, an ACL, a
-  storage class, a redirect, a retention lock — is refused rather than stored without it. Large
+  storage class, a redirect, a retention lock — is refused rather than stored without it, and
+  a refused upload sees its refusal rather than a dropped connection. Large
   files can be uploaded in parts, as the AWS CLI uploads them, read back a part at a time,
   parts copied from other objects,
   and unfinished uploads listed, aborted, or cleaned up by `gc` once idle; `status` counts

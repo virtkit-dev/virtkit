@@ -788,10 +788,12 @@ rather than a bare status. Every `/s3/` response carries an `x-amz-request-id` o
 digits, the same id again as `x-amz-id-2` (S3's second id, which SDK test suites expect on
 every answer) and `nosniff`; an internal error logs its request id, so a client's report can
 be matched to the server's line. A refusal decided before the caller is authenticated reads at
-most 64 KiB of the body first, enough for `sccache`'s 13-byte probe to see its answer rather
-than a reset; every refusal after it reads the body through, up to the 4 GiB cap, as
-WebDAV's do. A refusal of a request with a body then closes the connection. A registry its
-hub made read-only answers writes 503 `ServiceUnavailable` with `Retry-After`.
+most 8 MiB of the body first, enough for a write of the AWS CLI's part size (and `sccache`'s
+13-byte probe) to see its answer rather than a reset; every refusal after it reads the body
+through, up to the 4 GiB cap, as WebDAV's do. A refusal of a request with a body then closes
+the connection. A request holding its body back on `Expect: 100-continue` is refused before
+the `100` goes out, so the client sends no body and sees the refusal, as it would from S3.
+A registry its hub made read-only answers writes 503 `ServiceUnavailable` with `Retry-After`.
 
 S3 writes into `files/` take the WebDAV view's namespace lock, run their store work on the
 blocking pool and stream their bodies on the runtime. Objects expire under the gc's tag
