@@ -1,7 +1,8 @@
 # Per-project build caches
 
 Status: **implemented**, steps 1–6; step 7 in part (`build_cache` in
-`tests/gitlab/scenarios.sh`).
+`tests/gitlab/scenarios.sh`). Not to be released before the
+[node-wide content store](#node-wide-content-store), steps 8–12.
 
 On a fleet, a job's builds cache their layers in a registry repository of the job's project
 and protection, reached with the job's registry token, as `task-cache` scopes task-rs's
@@ -253,6 +254,148 @@ isolation does not hold, as for builds. sccache takes an area the same way.
    isolated branch building its own, each token reading and locking its own scope's
    build-cache and refused the other's; the rest of this list is still to do.
 
+## Node-wide content store
+
+Status: **design**, reviewed once by codex. It ships with steps 1–7: without it, scoping the local tier multiplies a
+node's disk use by its number of scopes.
+
+### What a node stores twice today
+
+- A pulled bundle (`<state>/registry/<name>/<digest>`) keeps its chunks compressed in a
+  chunk directory two levels up (`<state>/registry/chunks` for a one-component name, another
+  for a longer one) and its whole filesystem again, decompressed, in `runner.ext4`. Two
+  bundles sharing chunks download them once but store their bytes once each.
+- A build-tier entry (`<state>/build/<fp>`) is a standalone qcow2, flattened. The same stage
+  key in two local scopes is two entries, two full copies.
+- A restore from a remote build cache caches its chunks beside its output: inside the tier
+  entry it builds (`<fp>/chunks`), kept with it, once per entry.
+- Windows keeps installs, settled bases and layers per scope root, each root with its own
+  chunk cache (`<root>/registry/chunks`). Two scopes building or pulling the same key store it
+  twice; an install is tens of GB.
+- Only the media cache (by sha256, an identical ISO under another name hardlinked) and a
+  local `vk-registry` store (lazy views read its blobs in place) store a hash once.
+
+### Content once, an index per scope
+
+Scoping decides what a job can *find*; it need not decide where bytes live. A node keeps
+content once, by digest, and each scope an index of keys to digests:
+
+- **Chunk store.** `<state>/cas/chunks/<hex>`, the stored blob as the registry served it
+  (zstd, or raw for a `transparent_zstd` chunk), its name its verified digest, written by
+  tmp sibling and rename. Every pull from a remote registry goes through it: `pull_into`,
+  `try_pull_ext4` and its lazy form, and `wincache::pull`. The per-entry and per-root chunk
+  directories go. A view names the store by path, so the roots need not share a filesystem
+  with it; temporary files are siblings of where they are published.
+- **Canonical digests only.** Every digest from a manifest is parsed once, as
+  `sha256:<64 lowercase hex>`, before any lookup, path, lease or view uses it; anything else
+  fails the pull, and vk-registry refuses a pushed manifest naming one (0.106.1, step 8).
+- **A canonical digest is not an entitlement.** A chunk found locally is used only for a
+  manifest whose blobs the registry checked against the reader's access. Two paths skip
+  that check today:
+  - a manifest the pull-through relay stored from an upstream (`put_relayed_manifest`)
+    records no membership for its blobs, and a digest GET serves it to anyone who can read
+    some repository holding it; an upstream a job controls could name another scope's
+    chunk by its real digest;
+  - a JSON body uploaded as a blob can be read back through `/manifests/<digest>` without
+    the manifest checks.
+
+  Before step 9, the registry serves as a manifest only what was admitted as one (relayed
+  manifests included, their children checked against the upstream repository's members),
+  and the relay's manifests never satisfy a digest lookup in another repository.
+- **The local store.** With `[build] cache_registry` unset the builder uses the node's local
+  vk-registry store, whose lazy views already read its blobs in place
+  (`VK_RO_IMG_LAYOUT_STORE_ROOT`): that store is the content store for those builds, nothing
+  is imported, and a persistent view over it holds a reference the store's own gc honours,
+  not only a process lease. `none` keeps caching off.
+- **Views, not copies.** An entry holds a `.vk_ro_img` view over store chunks, not a
+  reassembled image:
+  - A pulled bundle is `runner.vk_ro_img`. The job's disk is already a throwaway qcow2 overlay
+    over the base (`vm.rs` `create_overlay`), and libkrun opens a view as a backing file, as
+    for Windows layers.
+  - A build-tier entry the build pushed to its cache destination becomes a view of the
+    pushed manifest, pinned by digest, once **every** chunk it names is in the store and
+    referenced, including chunks a diff push inherited from its parent and chunks the
+    registry already had, which a push does not upload and so never reads today. The
+    export's own changes (the normalized superblock, the freshness UUID, the journal) stay
+    in a small immutable qcow2 overlay above the view. Until all of that holds, and when the
+    push or the conversion fails, the entry stays the qcow2 it is now. An entry that was not
+    pushed (the cache off) stays a qcow2; a private scope's goes when the job ends.
+  - Windows: pulled layers and bases are views already; built layers are overlays, deltas
+    only. Installs: below.
+  - Where a full file is unavoidable (the eager fallback when chunks cannot be leased, a
+    raw export), it is written as today.
+- **Resolve before use.** A scope's entry is written only after its digest was resolved
+  through that scope's registry access: a tag read, or a manifest asked for by digest, with
+  the job's token for a scoped job. The guest never names store paths; only the node writes
+  views. Knowing a digest therefore grants nothing: a pull by digest whose bundle is already
+  present asks the registry for the manifest first (one request), and a pulled bundle's
+  entry is keyed by the registry and the full repository path, not the bare name. This
+  closes the [pulled-images-by-digest](#open-points) gap.
+- **Collection.** A chunk is live while a registered reference names it. One protocol,
+  under the store's lock, covers every writer and collector, starting from Windows'
+  `hold_chunks`:
+  - a pull, push, conversion or restore registers the chunks it will use before fetching or
+    linking any, and keeps them registered until its view is published or abandoned;
+  - a published view's chunk list is a registered reference while the view exists; the
+    roots holding views (pulled tier, build tier, every Windows root) are registered with
+    the store, and a collection that cannot read one stops without removing anything;
+  - a chunk is published before any view names it: a failed rename fails the pull, unlike
+    `pull_chunk`'s best-effort publish today;
+  - the collector takes the lock, computes the live set, and removes the rest.
+
+  Entries go by idle time as now; chunks then go when nothing names them. `vk gc --dry-run`
+  counts each chunk once.
+
+### Windows installs
+
+An install is built from its medium alone (`install_key`: the media key and disk size; the
+media key covers the ISO and driver digests, the edition and product key, the answer file
+and setup scripts the node generates). It holds no project content when the medium came
+from the operator, so:
+
+- An install whose ISO and drivers were both taken from the media cache under
+  `[executor] windows_media`, not from a build context, goes in a node-wide tier,
+  `<data>/windows/installs/<install_key>`, shared by every scope and the unscoped cache.
+  Approving a medium is the operator's statement that whatever it installs may be shared by
+  every scope of the node; equal digests alone would not be.
+- Shared installs are immutable generations: a failed settle never deletes or replaces an
+  install some root's chain stands on (today `make_base` discards the install after a failed
+  settle, checking only live references); a retry builds a new generation. The build-once
+  lock and the reinstall count move to the shared install key, out of the scope's cache.
+- Anything else (media from a job's build context) stays in its scope, as now.
+- Settled bases and layers stay per scope, overlays on the install: a scope costs its deltas.
+- The product key is part of the key; a scope reaches a shared install only with the same
+  key, which it supplied itself.
+- The sweep keeps a shared install while any root's chain stands on it.
+
+Two separate installs of one key are not byte-identical (Setup is not reproducible), so
+sharing comes from building once into the shared tier under its build lock, not from
+deduplicating afterwards.
+
+### Migration
+
+The store starts empty. Old per-entry and per-root chunk directories and reassembled
+`runner.ext4` bundles stay usable until the idle GC takes them; nothing is moved.
+
+### Performance
+
+A view is decompressed as the guest reads it; each reader caches 128 decoded chunks and holds
+its cache lock while it decodes a miss. Before pulled bundles and build-tier entries become
+views, cold and warm Linux boots and concurrent jobs are measured against reassembled images.
+If views cost too much, the fallback keeps full images but shares them by their own digest,
+with the same per-scope index and resolve-before-use rule: less saving (no chunk sharing
+between images), no change to boot or export.
+
+### Steps
+
+8. **Digests.** Canonical digests in the driver and vk-registry: done, 0.106.1.
+9. **Store.** `<state>/cas/chunks` used by every remote pull; per-entry chunk directories
+   gone; the reference protocol and collection over every root; durable references into a
+   local vk-registry store; the boot benchmarks; manifests served only as admitted (above).
+10. **Pulled bundles as views**, keyed by registry and repository, resolved before use.
+11. **Build tier as views** once pushed.
+12. **Windows**: one chunk store, the shared install tier in generations.
+
 ## Open points
 
 - **Merge-request pipelines.** What `git_info.ref` holds there (the source branch, or
@@ -263,7 +406,15 @@ isolation does not hold, as for builds. sccache takes an area the same way.
   relay caches upstream images by their reference, with the registry's own upstream
   credentials where it has any, so a job can pull through it what those reach. That is not a
   project's builds and is left out of the scope here; it needs its own change.
-- **Pulled images by digest.** A node reuses a pulled bundle found by digest without asking
-  the registry (`registry.rs`), whatever repository the reference names: a job could boot an
-  image another project pulled on the same node. This predates build caches and is not
-  addressed here; it needs its own change.
+- **Pulled images by digest.** A pulled bundle is cached at `<state>/registry/<name>/<digest>`,
+  `<name>` relative to the registry prefix it came from, and one found there by digest is
+  used without asking the registry. A `pipeline/build/runner` pulled from one pipeline's
+  namespace therefore satisfies another project's `virtkit/runner@sha256:<that digest>` on
+  the same node. This predates build caches; [the content store](#content-once-an-index-per-scope)
+  fixes it.
+- **Chunk presence across scopes.** With one store, a scope's pull of a chunk another scope
+  stored is served locally. To name such a chunk a job must get a manifest naming it into its
+  own scope: a scoped manifest push referencing a blob not in its repository is accepted
+  only when the pusher can read that blob elsewhere, and refused (`MANIFEST_BLOB_UNKNOWN`)
+  otherwise; non-canonical descriptors are refused (0.106.1). What remains is the relay and
+  blob paths above, and timing: a local hit is faster than a fetch.
