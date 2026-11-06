@@ -13,6 +13,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use vk_hub_proto::settings::REGISTRY_KEYS;
 use vk_hub_proto::{DesiredState, Setting, SettingSource, SettingsReport};
 
 use super::state::Issuer;
@@ -32,8 +33,9 @@ const MAX_CA_PEM: usize = 256 * 1024;
 /// Reads a key's effective value off a loaded config.
 type Read = fn(&Config) -> Option<Value>;
 
-/// The keys the hub may set, by dotted key, and how to read each one's effective value: its
-/// default where it has one, as resolved for this host, `None` where unset means none.
+/// The keys the hub may set ([`vk_hub_proto::settings::KEYS`]), by dotted key, and how to read
+/// each one's effective value: its default where it has one, as resolved for this host, `None`
+/// where unset means none.
 const KEYS: &[(&str, Read)] = &[
     ("executor.schedule.mem_budget", |c| {
         json(&c.executor.schedule.mem_budget)
@@ -64,26 +66,13 @@ const KEYS: &[(&str, Read)] = &[
     ("registry", |c| json(&c.registry)),
 ];
 
-/// The `[registry]` keys the hub may name: the registry and how to reach it, never a path or a
-/// credential of the node's. `ca_pem` is the CA as PEM content, which the node pins and names
-/// as `ca_file`.
-const REGISTRY_KEYS: &[&str] = &[
-    "repo",
-    "ca_pem",
-    "insecure",
-    "transparent_zstd",
-    "proxy_guests",
-    "guest_credential",
-    "pipeline_root",
-];
-
 /// `value` as JSON; `None` for an unset `Option`.
 fn json<T: Serialize>(value: &T) -> Option<Value> {
     serde_json::to_value(value).ok().filter(|v| !v.is_null())
 }
 
 fn allowed(key: &str) -> bool {
-    KEYS.iter().any(|(k, _)| *k == key)
+    vk_hub_proto::settings::kind(key).is_some()
 }
 
 /// `settings.json`: the hub's entries the node took, and those it refused, from the desired
@@ -322,11 +311,13 @@ pub fn check(
     (taken, refused)
 }
 
-/// That the hub may set `key` to `value`, judged on its own.
+/// That the hub may set `key` to `value`, judged on its own: by the hub's own check of it
+/// first, so it holds to the bounds the hub does.
 fn check_entry(key: &str, value: &Value, dir: &Path) -> Result<(), String> {
-    if !allowed(key) {
+    let Some(kind) = vk_hub_proto::settings::kind(key) else {
         return Err("not a setting the hub may set".to_string());
-    }
+    };
+    kind.check(value)?;
     let toml = toml::Value::try_from(value).map_err(|e| format!("not a TOML value: {e}"))?;
     if key == "registry" {
         check_registry(&toml)?;
@@ -577,6 +568,38 @@ mod tests {
             .collect()
     }
 
+    /// The node reports every key the hub may set, as the hub lists them, and takes a value of
+    /// each kind the hub checks it to be.
+    #[test]
+    fn the_keys_are_those_the_hub_may_set() {
+        let ours: Vec<&str> = KEYS.iter().map(|(k, _)| *k).collect();
+        let hubs: Vec<&str> = vk_hub_proto::settings::KEYS
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(ours, hubs);
+        let dir = Path::new("/state/node");
+        for (key, text) in [
+            ("executor.schedule.mem_budget", "50%"),
+            ("executor.schedule.mem_budget", "40G"),
+            ("executor.schedule.from_history", "true"),
+            ("executor.schedule.disk_default", "20G"),
+            ("executor.schedule.cpu_overcommit", "1.5"),
+            ("executor.schedule.cpu_overcommit", "3"),
+            ("executor.schedule.wait_timeout_secs", "60"),
+            ("executor.vm.cpus", "2"),
+            ("executor.vm.max_mem", "64G"),
+            ("image_cache_idle_secs", "0"),
+        ] {
+            let value = vk_hub_proto::settings::kind(key)
+                .unwrap()
+                .parse(text)
+                .unwrap();
+            let (_, refused) = check(&toml::Table::new(), &wanted(&[(key, value)]), dir);
+            assert!(refused.is_empty(), "{key} = {text}: {refused:?}");
+        }
+    }
+
     /// A key the file sets, even to its default, stays the file's; `[registry]` is the file's
     /// whole when it has one.
     #[test]
@@ -617,6 +640,11 @@ mod tests {
                 ("executor.vm.max_mem", json!(8)),
                 ("executor.schedule.mem_budget", json!("40")),
                 ("executor.schedule.cpu_overcommit", json!(0)),
+                ("executor.schedule.wait_timeout_secs", json!(u64::MAX)),
+                (
+                    "executor.schedule.disk_default",
+                    json!("18014398509481984G"),
+                ),
                 ("state_dir", json!("/elsewhere")),
                 ("egress.allow_ip", json!([])),
                 ("node.release_keys", json!([])),
@@ -639,7 +667,9 @@ mod tests {
             [
                 "egress.allow_ip",
                 "executor.schedule.cpu_overcommit",
+                "executor.schedule.disk_default",
                 "executor.schedule.mem_budget",
+                "executor.schedule.wait_timeout_secs",
                 "executor.vm",
                 "executor.vm.max_mem",
                 "executor.vm.mem",
@@ -649,7 +679,7 @@ mod tests {
             ]
         );
         assert!(
-            refused["executor.vm.max_mem"].contains("invalid type"),
+            refused["executor.vm.max_mem"].contains("expected a size"),
             "{refused:?}"
         );
         assert!(refused["state_dir"].contains("may set"), "{refused:?}");
@@ -680,7 +710,7 @@ mod tests {
                 json!({"repo": "r/ci", "pipeline_root": "A"}),
                 "pipeline_root",
             ),
-            (json!("reg.example.com"), "not a table"),
+            (json!("reg.example.com"), "a table"),
             (
                 json!({"repo": "r/ci", "guest_credential": "node"}),
                 "may only be \"job\"",
@@ -689,7 +719,7 @@ mod tests {
                 json!({"repo": "r/ci", "ca_pem": "not PEM"}),
                 "no certificate",
             ),
-            (json!({"repo": "r/ci", "ca_pem": 1}), "not a string"),
+            (json!({"repo": "r/ci", "ca_pem": 1}), "a string"),
             (
                 json!({"repo": "r/ci", "ca_pem": "x".repeat(MAX_CA_PEM + 1)}),
                 "over",

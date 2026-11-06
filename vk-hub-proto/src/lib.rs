@@ -115,6 +115,7 @@ pub mod egress;
 pub mod gitlab;
 pub mod job;
 pub mod registry;
+pub mod settings;
 pub mod stamp;
 pub mod token;
 

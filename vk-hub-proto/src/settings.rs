@@ -1,0 +1,268 @@
+//! The node settings a fleet hub may set ([`crate::DesiredState::settings`]): every key, by
+//! dotted name, with the type a value of it takes. A node refuses any other key, and checks
+//! each value against these same checks, then against its own configuration; the hub checks
+//! them first, so an operator hears of a mistake when making it.
+
+use serde_json::Value;
+
+/// What a setting's value is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A size in whole GiB, `"<n>G"`, `n` from 1 to [`MAX_GIB`].
+    Gib,
+    /// A memory budget: a [`Kind::Gib`], or `"<n>%"` of the host's memory, 1 to 100.
+    Budget,
+    Bool,
+    /// A count, at least 1, that fits a `u32`.
+    Count,
+    /// A VM's vCPUs, 1 to [`MAX_VCPUS`].
+    Vcpus,
+    /// A number of seconds, at most [`MAX_SECS`].
+    Secs,
+    /// A positive ratio, at most [`MAX_RATIO`].
+    Ratio,
+    /// A `[registry]` table of [`REGISTRY_KEYS`].
+    Registry,
+}
+
+/// Every key the hub may set, and its kind.
+pub const KEYS: &[(&str, Kind)] = &[
+    ("executor.schedule.mem_budget", Kind::Budget),
+    ("executor.schedule.from_history", Kind::Bool),
+    ("executor.schedule.disk_admission", Kind::Bool),
+    ("executor.schedule.disk_default", Kind::Gib),
+    ("executor.schedule.cpu_overcommit", Kind::Ratio),
+    ("executor.schedule.wait_timeout_secs", Kind::Secs),
+    ("executor.vm.cpus", Kind::Vcpus),
+    ("executor.vm.mem", Kind::Gib),
+    ("executor.vm.max_cpus", Kind::Count),
+    ("executor.vm.max_mem", Kind::Gib),
+    ("image_cache_idle_secs", Kind::Secs),
+    ("registry", Kind::Registry),
+];
+
+/// The `[registry]` keys the hub may name: the registry and how to reach it, never a path or a
+/// credential of the node's. `ca_pem` is the CA as PEM content, which the node pins.
+pub const REGISTRY_KEYS: &[&str] = &[
+    "repo",
+    "ca_pem",
+    "insecure",
+    "transparent_zstd",
+    "proxy_guests",
+    "guest_credential",
+    "pipeline_root",
+];
+
+/// The largest size a setting may name, in GiB: 1 PiB.
+pub const MAX_GIB: u64 = 1 << 20;
+/// The most vCPUs a VM may have.
+pub const MAX_VCPUS: u64 = 255;
+/// The longest a setting may name, in seconds: ten years.
+pub const MAX_SECS: u64 = 10 * 365 * 24 * 3600;
+/// The largest ratio a setting may name.
+pub const MAX_RATIO: f64 = 64.0;
+
+/// The only `guest_credential` a registry the hub names may have: the job's token.
+pub const GUEST_CREDENTIAL: &str = "job";
+
+/// `key`'s kind; `None` for a key the hub may not set.
+pub fn kind(key: &str) -> Option<Kind> {
+    KEYS.iter().find(|(k, _)| *k == key).map(|(_, kind)| *kind)
+}
+
+impl Kind {
+    /// What a value of the kind looks like, in words.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Kind::Gib => "a size, <n>G, from 1G to 1048576G",
+            Kind::Budget => {
+                "a size, <n>G, from 1G to 1048576G, or a share of the host's memory, <n>%, \
+                 from 1 to 100"
+            }
+            Kind::Bool => "true or false",
+            Kind::Count => "a whole number, at least 1",
+            Kind::Vcpus => "a whole number, from 1 to 255",
+            Kind::Secs => "a number of seconds, at most 315360000 (ten years)",
+            Kind::Ratio => "a positive number, at most 64",
+            Kind::Registry => "a registry",
+        }
+    }
+
+    /// Parse operator input as this kind, returning the reason on failure.
+    /// Registries cannot be parsed from text.
+    pub fn parse(self, text: &str) -> Result<Value, String> {
+        let text = text.trim();
+        let value = match self {
+            Kind::Gib | Kind::Budget => Value::from(text),
+            Kind::Bool => match text {
+                "true" => Value::Bool(true),
+                "false" => Value::Bool(false),
+                _ => Value::Null,
+            },
+            Kind::Count | Kind::Vcpus | Kind::Secs => {
+                text.parse::<u64>().map_or(Value::Null, Value::from)
+            }
+            Kind::Ratio => text.parse::<f64>().map_or(Value::Null, Value::from),
+            Kind::Registry => return Err("a registry is named by the registry's ID".to_string()),
+        };
+        self.check(&value).map(|()| value)
+    }
+
+    /// That `value` is one of the kind.
+    pub fn check(self, value: &Value) -> Result<(), String> {
+        let ok = match self {
+            Kind::Gib => value.as_str().is_some_and(is_gib),
+            Kind::Budget => value.as_str().is_some_and(|s| {
+                is_gib(s)
+                    || s.strip_suffix('%')
+                        .filter(|n| digits(n))
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .is_some_and(|n| (1..=100).contains(&n))
+            }),
+            Kind::Bool => value.is_boolean(),
+            Kind::Count => value
+                .as_u64()
+                .is_some_and(|n| n >= 1 && u32::try_from(n).is_ok()),
+            Kind::Vcpus => value.as_u64().is_some_and(|n| (1..=MAX_VCPUS).contains(&n)),
+            Kind::Secs => value.as_u64().is_some_and(|n| n <= MAX_SECS),
+            Kind::Ratio => value
+                .as_f64()
+                .is_some_and(|r| r.is_finite() && r > 0.0 && r <= MAX_RATIO),
+            Kind::Registry => return check_registry(value),
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("expected {}", self.describe()))
+        }
+    }
+}
+
+/// Whether `n` is nonempty and contains only ASCII digits.
+fn digits(n: &str) -> bool {
+    !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `s` is `"<n>G"`, `n` a whole number from 1 to [`MAX_GIB`].
+fn is_gib(s: &str) -> bool {
+    s.strip_suffix('G')
+        .filter(|n| digits(n))
+        .and_then(|n| n.parse::<u64>().ok())
+        .is_some_and(|n| (1..=MAX_GIB).contains(&n))
+}
+
+/// That `value` is a `[registry]` the hub may send: a table of [`REGISTRY_KEYS`] naming a
+/// `repo`, whose guests get the job's token alone.
+fn check_registry(value: &Value) -> Result<(), String> {
+    let Value::Object(table) = value else {
+        return Err("expected a table".to_string());
+    };
+    if let Some(key) = table.keys().find(|k| !REGISTRY_KEYS.contains(&k.as_str())) {
+        return Err(format!(
+            "`{key}` is the node's own to set: the hub may name only {}",
+            REGISTRY_KEYS.join(", ")
+        ));
+    }
+    if !table.get("repo").is_some_and(Value::is_string) {
+        return Err("`repo` must name the registry".to_string());
+    }
+    if table
+        .get("guest_credential")
+        .is_some_and(|v| v.as_str() != Some(GUEST_CREDENTIAL))
+    {
+        return Err(format!(
+            "`guest_credential` may only be {GUEST_CREDENTIAL:?}: guests get the job's token"
+        ));
+    }
+    for key in ["ca_pem", "pipeline_root"] {
+        if table.get(key).is_some_and(|v| !v.is_string()) {
+            return Err(format!("`{key}` must be a string"));
+        }
+    }
+    for key in ["insecure", "transparent_zstd", "proxy_guests"] {
+        if table.get(key).is_some_and(|v| !v.is_boolean()) {
+            return Err(format!("`{key}` must be true or false"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn values_are_parsed_and_checked_by_kind() {
+        let parse = |key: &str, text: &str| kind(key).unwrap().parse(text);
+        assert_eq!(parse("executor.vm.mem", "8G"), Ok(json!("8G")));
+        assert!(parse("executor.vm.mem", "0G").is_err());
+        assert!(parse("executor.vm.mem", "+8G").is_err());
+        assert!(parse("executor.vm.mem", "8").is_err());
+        assert_eq!(parse("executor.vm.mem", "1048576G"), Ok(json!("1048576G")));
+        assert!(parse("executor.vm.mem", "1048577G").is_err());
+        assert!(parse("executor.vm.max_mem", "18014398509481984G").is_err());
+        assert!(parse("executor.schedule.disk_default", "99999999999999999999G").is_err());
+        assert!(parse("executor.schedule.mem_budget", "18014398509481984G").is_err());
+        assert_eq!(
+            parse("executor.schedule.mem_budget", "50%"),
+            Ok(json!("50%"))
+        );
+        assert!(parse("executor.schedule.mem_budget", "101%").is_err());
+        assert_eq!(parse("executor.vm.cpus", " 4 "), Ok(json!(4)));
+        assert!(parse("executor.vm.cpus", "0").is_err());
+        assert_eq!(parse("executor.vm.cpus", "255"), Ok(json!(255)));
+        assert!(parse("executor.vm.cpus", "256").is_err());
+        assert_eq!(parse("executor.vm.max_cpus", "512"), Ok(json!(512)));
+        assert!(parse("executor.vm.max_cpus", "4294967296").is_err());
+        assert_eq!(parse("image_cache_idle_secs", "0"), Ok(json!(0)));
+        assert_eq!(
+            parse("executor.schedule.wait_timeout_secs", "315360000"),
+            Ok(json!(315_360_000))
+        );
+        assert!(
+            parse(
+                "executor.schedule.wait_timeout_secs",
+                "18446744073709551615"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            parse("executor.schedule.cpu_overcommit", "1.5"),
+            Ok(json!(1.5))
+        );
+        assert!(parse("executor.schedule.cpu_overcommit", "0").is_err());
+        assert!(parse("executor.schedule.cpu_overcommit", "inf").is_err());
+        assert_eq!(
+            parse("executor.schedule.cpu_overcommit", "64"),
+            Ok(json!(64.0))
+        );
+        assert!(parse("executor.schedule.cpu_overcommit", "64.5").is_err());
+        assert_eq!(
+            parse("executor.schedule.from_history", "true"),
+            Ok(json!(true))
+        );
+        assert!(parse("executor.schedule.from_history", "yes").is_err());
+        assert!(parse("registry", "r").is_err());
+        assert_eq!(kind("state_dir"), None);
+        // A whole ratio, as JSON may carry it.
+        assert_eq!(Kind::Ratio.check(&json!(2)), Ok(()));
+    }
+
+    #[test]
+    fn a_registry_names_a_repo_and_nothing_of_the_nodes() {
+        let check = |v: Value| Kind::Registry.check(&v);
+        assert_eq!(
+            check(
+                json!({"repo": "reg:5000", "ca_pem": "x", "pipeline_root": "ci",
+                         "insecure": false, "guest_credential": "job"})
+            ),
+            Ok(())
+        );
+        assert!(check(json!({"ca_pem": "x"})).is_err());
+        assert!(check(json!({"repo": "r", "token_file": "/t"})).is_err());
+        assert!(check(json!({"repo": "r", "guest_credential": "node"})).is_err());
+        assert!(check(json!({"repo": "r", "insecure": "yes"})).is_err());
+        assert!(check(json!("r")).is_err());
+    }
+}
