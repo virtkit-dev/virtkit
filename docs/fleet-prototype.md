@@ -788,6 +788,13 @@ and `vk-hub nodes` notes each node that is not current. `--clear` ends the autom
 update under way finishes, and a rollout the target started goes on until aborted. The target
 lives in the hub's database, so a restarted hub carries on.
 
+The web UI's *Updates* tab shows the target above the nodes' versions: its release, who set it
+and when, a link to its rollout, and why automatic updates are held. It lists nodes not on the
+target with their status, flagging those whose release keys refuse it and those not updated
+automatically. Operators can set a `MAJOR.MINOR.PATCH` `vk` target after confirmation, clear
+it, resume held updates and retry failed nodes. These operations use the command line's checks and are audited as the session's
+principal.
+
 ## CI tools
 
 `vk-hub tools add <dir> --version <label>` packs a build context into a definition stored in

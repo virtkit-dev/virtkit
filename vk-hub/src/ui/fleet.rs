@@ -2569,6 +2569,13 @@ fn peers_part(hub: &Hub, held: &Held, steer: bool, now: u64) -> Result<Html> {
 fn nodes_part(hub: &Hub, held: &Held, steer: bool, now: u64) -> Result<Html> {
     let rollouts = ops::rollouts(hub)?;
     let mut h = Html::new();
+    super::target::part(
+        &mut h,
+        ops::target_view(hub)?.as_ref(),
+        &held.releases,
+        steer,
+    );
+    h.raw("<h3>Versions</h3>");
     node_versions(&mut h, &held.views, &rollouts);
     for r in rollouts.iter().filter(|r| r.row.state.active()) {
         rollout(&mut h, r, &held.views, steer, now);

@@ -25,7 +25,8 @@ All notable changes to virtkit will be documented in this file.
   release are left alone, a node running a pre-release or development build is shown as not
   updated automatically, and a node whose update failed waits for an operator's `--retry`. The
   target must be signed by one of `[nodes] release_keys` when the hub sets any, and cannot be
-  deleted while it is the target.
+  deleted while it is the target. The web UI's Updates page shows the target and each node's
+  status, and lets operators set or clear the target and resume its updates.
 - **A fleet node's jobs have a network with no config of its own.** Unless its config file
   sets `[net] mode`, a node enrolled with a hub gives its jobs the per-job switch, held to its
   own `[egress]` and the hub's egress rules, so they can reach the registry proxy and run

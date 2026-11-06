@@ -5820,8 +5820,13 @@ async fn the_rollout_form_follows_what_it_offers() {
         .add_release(&"12".repeat(32), &release, "uid 0")
         .unwrap();
     hub.touch();
-    let next = next_with(&mut live, ">vk 0.87.0 (").await;
-    assert!(next.starts_with("event: start-rollout\n"), "{next}");
+    // In the target's form too, an event of its own.
+    let next = loop {
+        let next = next_with(&mut live, ">vk 0.87.0 (").await;
+        if next.starts_with("event: start-rollout\n") {
+            break next;
+        }
+    };
     assert_ne!(rollout_form_id(&next), enrolled, "{next}");
 }
 
@@ -5851,7 +5856,11 @@ async fn the_rollout_section_says_live_what_a_rollout_lacks() {
         .add_release(&"ab".repeat(32), &release, "uid 0")
         .unwrap();
     hub.touch();
-    let next = next_with(&mut live, "No node has enrolled yet.").await;
+    let next = next_with(
+        &mut live,
+        "<h3>Start a rollout</h3><p class=\"empty\">No node",
+    )
+    .await;
     assert!(next.starts_with("event: start-rollout\n"), "{next}");
 
     let node = enrolled_as(&hub, "ci-1", "ab");
@@ -8307,8 +8316,9 @@ async fn an_operator_updates_the_hub_from_the_updates_page() {
         page.contains(&format!("<option value=\"{sha}\">0.200.0 (")),
         "{page}"
     );
+    // Offered as the nodes' target alone.
     assert!(
-        !page.contains(&format!("<option value=\"{vk}\">")),
+        !page.contains(&format!("<option value=\"{vk}\">0.")),
         "{page}"
     );
     for (release, want) in [
@@ -13622,4 +13632,94 @@ async fn an_operator_sets_the_hubs_settings_from_the_settings_page() {
             .any(|e| e.ends_with("(operator) set executor.vm.cpus = 4 fleet-wide")),
         "{audit:?}"
     );
+}
+
+/// `/updates` shows the target release and each node's standing against it; an operator sets
+/// it once confirmed, is refused what `vk-hub release target` refuses, and clears it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_sets_and_clears_the_target_from_the_updates_page() {
+    let (addr, hub, _) = start_fleet().await;
+    let release = |version: &str| crate::store::ReleaseRow {
+        version: version.into(),
+        size: 3 << 20,
+        signature: None,
+        program: None,
+        added_at: 1,
+        added_by: "uid 0".into(),
+    };
+    hub.db
+        .add_release(&"ab".repeat(32), &release("1.2.3"), "uid 0")
+        .unwrap();
+    hub.db
+        .add_release(&"cd".repeat(32), &release("1.2.3-dev"), "uid 0")
+        .unwrap();
+    let (cookie, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let post = |form: String| {
+        let cookie = cookie.clone();
+        async move {
+            post_action(
+                addr,
+                &format!("http://{addr}"),
+                &cookie,
+                target::PATH,
+                &form,
+                true,
+            )
+            .await
+        }
+    };
+    let page = get(addr, "/updates", Some(&cookie)).await;
+    for want in [
+        "<h3>Target release</h3><p class=\"empty\">None",
+        &format!("<option value=\"{}\">vk 1.2.3 (", "ab".repeat(32)),
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    // Only a MAJOR.MINOR.PATCH vk is offered.
+    assert!(!page.body.contains("vk 1.2.3-dev ("), "{}", page.body);
+
+    let asked = post(format!("_csrf={csrf}&op=set&release={}", "ab".repeat(32))).await;
+    assert!(
+        asked.body.contains("name=\"confirm\" value=\"yes\""),
+        "{}",
+        asked.body
+    );
+    let answer = format!(
+        "_csrf={csrf}&op=set&release={}&nonce={}&confirm=yes",
+        hidden(&asked.body, "release"),
+        hidden(&asked.body, "nonce")
+    );
+    let reply = post(answer).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("The target is vk 1.2.3."),
+        "{}",
+        reply.body
+    );
+    assert_eq!(hub.db.target().unwrap().unwrap().version, "1.2.3");
+    let page = get(addr, "/updates", Some(&cookie)).await;
+    for want in ["<tr><th>Release</th><td>vk 1.2.3 (", "Clear target"] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+
+    // Refused as on the command line: no such release, not MAJOR.MINOR.PATCH.
+    for release in ["ef".repeat(32), "cd".repeat(32)] {
+        let asked = post(format!("_csrf={csrf}&op=set&release={release}")).await;
+        let answer = format!(
+            "_csrf={csrf}&op=set&release={release}&nonce={}&confirm=yes",
+            hidden(&asked.body, "nonce")
+        );
+        let reply = post(answer).await;
+        assert_eq!(reply.status, 409, "{}", reply.body);
+        assert!(reply.body.contains("Refused: "), "{}", reply.body);
+    }
+    let reply = post(format!("_csrf={csrf}&op=retry")).await;
+    assert!(reply.body.contains("Nothing changed"), "{}", reply.body);
+    let reply = post(format!("_csrf={csrf}&op=clear")).await;
+    assert!(
+        reply.body.contains("Cleared the target, vk 1.2.3."),
+        "{}",
+        reply.body
+    );
+    assert!(hub.db.target().unwrap().is_none());
 }
