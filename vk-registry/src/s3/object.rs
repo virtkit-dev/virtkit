@@ -535,7 +535,7 @@ fn payload(headers: &HeaderMap) -> std::result::Result<Payload, Refusal> {
                         .to_ascii_lowercase()
                         .starts_with(checksum::HEADER_PREFIX) =>
                 {
-                    return Err(checksum::NOT_COMPUTED);
+                    return Err(checksum::UNKNOWN_TRAILER);
                 }
                 None => return Err(invalid("x-amz-trailer names one x-amz-checksum header")),
             }
@@ -597,11 +597,11 @@ fn content_md5(headers: &HeaderMap) -> std::result::Result<Option<Vec<u8>>, Refu
 }
 
 /// What a request's headers ask to be checked: its `Content-MD5` and the one
-/// `x-amz-checksum-*` it carries, in an algorithm computed here; a second one is refused as
-/// S3 refuses it, and one in another algorithm as not implemented.
+/// `x-amz-checksum-*` it carries; a second one, or one in an algorithm S3 does not have, is
+/// refused as S3 refuses it.
 fn expected(headers: &HeaderMap) -> std::result::Result<Expected, Refusal> {
-    if checksum::not_computed(headers) {
-        return Err(checksum::NOT_COMPUTED);
+    if let Some(why) = checksum::unknown(headers) {
+        return Err(why);
     }
     // More than one is refused whatever they hold, as S3 refuses it.
     let sent = checksum::ALGORITHMS
@@ -1214,9 +1214,11 @@ mod tests {
             );
         }
         assert_eq!(
-            code(&[trailer, length, ("x-amz-trailer", "x-amz-checksum-xxhash3")]),
-            Some("NotImplemented")
+            code(&[trailer, length, ("x-amz-trailer", "x-amz-checksum-xxhash")]),
+            Some("InvalidRequest")
         );
+        let (_, f) = framing(&[trailer, length, ("x-amz-trailer", "x-amz-checksum-xxhash3")]);
+        assert_eq!(f.trailer, Some("x-amz-checksum-xxhash3"));
         let signed = ("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
         let crc = ("x-amz-trailer", "x-amz-checksum-crc32");
         assert_eq!(code(&[signed, length, crc]), Some("InvalidRequest"));
@@ -1288,13 +1290,18 @@ mod tests {
             code(&[("x-amz-checksum-crc64nvme", "AAAAAA==")]),
             Some("InvalidRequest")
         );
+        assert_eq!(code(&[("x-amz-checksum-xxhash64", "AAAAAAAAAAA=")]), None);
         assert_eq!(
-            code(&[("x-amz-checksum-xxhash64", "AAAAAAAAAAA=")]),
-            Some("NotImplemented")
+            code(&[("x-amz-checksum-xxhash64", "AAAAAA==")]),
+            Some("InvalidRequest")
         );
         assert_eq!(
-            code(&[("x-amz-sdk-checksum-algorithm", "XXHASH128")]),
-            Some("NotImplemented")
+            code(&[("x-amz-checksum-whirlpool", "AAAAAA==")]),
+            Some("InvalidRequest")
+        );
+        assert_eq!(
+            code(&[("x-amz-sdk-checksum-algorithm", "WHIRLPOOL")]),
+            Some("InvalidRequest")
         );
         assert_eq!(
             code(&[

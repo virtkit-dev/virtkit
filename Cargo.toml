@@ -139,6 +139,9 @@ crc32fast = "1.5"
 # vk-registry: the check of an S3 upload's x-amz-checksum-crc32c and -crc64nvme, from its
 # catalog. Already in the tree via lzma-rs.
 crc = "3"
+# vk-registry: the check of an S3 upload's x-amz-checksum-xxhash64, -xxhash3 and -xxhash128.
+# Pure Rust, no dependencies of its own; XXH3 is too intricate to rewrite safely.
+xxhash-rust = { version = "0.8", features = ["xxh64", "xxh3"] }
 # vk-tpm: the TPM's entropy (TPM2_GetRandom, its seeds) from the OS. Already in the tree via rand.
 getrandom = "0.4"
 # vk-tpm: constant-time comparison of authorization values. Already in the tree via the

@@ -1460,6 +1460,9 @@ async fn a_put_checks_the_digests_it_is_sent() {
         sha1::Sha1::digest(b).to_vec()
     };
     let crc = |b: &[u8]| crc32fast::hash(b).to_be_bytes().to_vec();
+    let xxh64 = |b: &[u8]| xxhash_rust::xxh64::xxh64(b, 0).to_be_bytes().to_vec();
+    let xxh3 = |b: &[u8]| xxhash_rust::xxh3::xxh3_64(b).to_be_bytes().to_vec();
+    let xxh128 = |b: &[u8]| xxhash_rust::xxh3::xxh3_128(b).to_be_bytes().to_vec();
     let good: Vec<(&str, String)> = vec![
         ("Content-MD5", b64(&md5::compute(HELLO).0)),
         ("x-amz-checksum-sha256", b64(&sha2::Sha256::digest(HELLO))),
@@ -1469,6 +1472,9 @@ async fn a_put_checks_the_digests_it_is_sent() {
         ("x-amz-checksum-crc64nvme", crc64nvme_b64(HELLO)),
         ("x-amz-checksum-sha512", b64(&sha2::Sha512::digest(HELLO))),
         ("x-amz-checksum-md5", b64(&md5::compute(HELLO).0)),
+        ("x-amz-checksum-xxhash64", b64(&xxh64(HELLO))),
+        ("x-amz-checksum-xxhash3", b64(&xxh3(HELLO))),
+        ("x-amz-checksum-xxhash128", b64(&xxh128(HELLO))),
     ];
     let bad: Vec<(&str, String)> = vec![
         ("Content-MD5", b64(&md5::compute(other).0)),
@@ -1479,6 +1485,9 @@ async fn a_put_checks_the_digests_it_is_sent() {
         ("x-amz-checksum-crc64nvme", crc64nvme_b64(other)),
         ("x-amz-checksum-sha512", b64(&sha2::Sha512::digest(other))),
         ("x-amz-checksum-md5", b64(&md5::compute(other).0)),
+        ("x-amz-checksum-xxhash64", b64(&xxh64(other))),
+        ("x-amz-checksum-xxhash3", b64(&xxh3(other))),
+        ("x-amz-checksum-xxhash128", b64(&xxh128(other))),
     ];
     for (i, (name, value)) in good.iter().enumerate() {
         let path = format!("/s3/b/good{i}");
@@ -1488,6 +1497,9 @@ async fn a_put_checks_the_digests_it_is_sent() {
         if name.starts_with("x-amz-checksum") {
             assert_eq!(resp.header(name), Some(value.as_str()), "{name}");
             assert_eq!(resp.header("x-amz-checksum-type"), Some("FULL_OBJECT"));
+            let asked = Req::new("HEAD", &path).header("x-amz-checksum-mode", "ENABLED");
+            let resp = send(&host, asked).await;
+            assert_eq!(resp.header(name), Some(value.as_str()), "{name} kept");
         } else {
             assert_eq!(resp.header("x-amz-checksum-type"), None);
         }
@@ -1525,23 +1537,33 @@ async fn a_put_checks_the_digests_it_is_sent() {
     )
     .await
     .is(400, "InvalidRequest");
-    // One checksum, of one algorithm, and one computed here: never taken unchecked.
+    // One checksum, of one algorithm, and one S3 has: never taken unchecked.
     let two = put("/s3/b/x", ("x-amz-checksum-crc32c", &crc32c_b64(HELLO)))
         .header("x-amz-checksum-crc32", &crc32_b64(HELLO));
     send(&host, two).await.is(400, "InvalidRequest");
-    for (name, value) in [
-        ("x-amz-checksum-xxhash64", "AAAAAAAAAAA="),
-        ("x-amz-checksum-xxhash128", "AAAAAAAAAAAAAAAAAAAAAA=="),
-        ("x-amz-sdk-checksum-algorithm", "XXHASH3"),
+    for (name, value, message) in [
+        (
+            "x-amz-checksum-xxhash",
+            "AAAAAAAAAAA=",
+            "The algorithm type you specified in x-amz-checksum- header is invalid.",
+        ),
+        (
+            "x-amz-sdk-checksum-algorithm",
+            "XXHASH",
+            "Checksum algorithm provided is unsupported. Please try again with any of the valid \
+             types: [CRC32, CRC32C, CRC64NVME, MD5, SHA1, SHA256, SHA512, XXHASH128, XXHASH3, \
+             XXHASH64]",
+        ),
     ] {
         send(&host, put("/s3/b/x", (name, value)))
             .await
-            .is(501, "NotImplemented");
+            .is(400, "InvalidRequest")
+            .says(message);
     }
     let req = Req::new("POST", "/s3/b/x")
         .query("uploads=")
-        .header("x-amz-checksum-algorithm", "XXHASH64");
-    send(&host, req).await.is(501, "NotImplemented");
+        .header("x-amz-checksum-algorithm", "XXHASH");
+    send(&host, req).await.is(400, "InvalidRequest");
     send(&host, get("/s3/b/x")).await.is(404, "NoSuchKey");
     assert_eq!(staging_left(&dir), 0);
 
@@ -1831,10 +1853,10 @@ async fn the_checksum_a_write_carried_is_kept_with_the_object() {
         ("x-amz-checksum-crc32", "AAAAAA==-0", 400, "InvalidRequest"),
         ("x-amz-checksum-crc32", "AAAAAA==-x", 400, "InvalidRequest"),
         (
-            "x-amz-checksum-xxhash64",
+            "x-amz-checksum-xxhash",
             "AAAAAAAAAAA=",
-            501,
-            "NotImplemented",
+            400,
+            "InvalidRequest",
         ),
     ] {
         let req = complete(path, &id, &[(1, e1.as_str())]).header(name, value);
@@ -2139,11 +2161,18 @@ async fn a_trailer_checksum_must_be_the_body_s() {
         resp.ok(200);
         assert_eq!(resp.header("x-amz-checksum-sha1"), Some(sha1.as_str()));
 
-        // Not computed here; not base64 of its length; announced and not sent; sent as a
+        let xxh3 = b64(&xxhash_rust::xxh3::xxh3_64(&data).to_be_bytes());
+        let xx = ("x-amz-checksum-xxhash3", xxh3.as_str());
+        let req = Req::new("PUT", "/s3/b/xx").chunked(&host, BEARER, mode, &data, Some(xx));
+        let resp = send(&host, req).await;
+        resp.ok(200);
+        assert_eq!(resp.header("x-amz-checksum-xxhash3"), Some(xxh3.as_str()));
+
+        // No algorithm S3 has; not base64 of its length; announced and not sent; sent as a
         // header too.
-        let xx = ("x-amz-checksum-xxhash64", "AAAAAAAAAAA=");
+        let xx = ("x-amz-checksum-xxhash", "AAAAAAAAAAA=");
         let req = Req::new("PUT", "/s3/b/x").chunked(&host, BEARER, mode, &data, Some(xx));
-        send(&host, req).await.is(501, "NotImplemented");
+        send(&host, req).await.is(400, "InvalidRequest");
         let crc = ("x-amz-checksum-crc32", "!!");
         let req = Req::new("PUT", "/s3/b/x").chunked(&host, BEARER, mode, &data, Some(crc));
         send(&host, req).await.is(400, "InvalidRequest");
