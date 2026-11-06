@@ -34,6 +34,12 @@ pub struct NodeView {
     pub mem_total_mib: Option<u64>,
     pub committed_mib: Option<u64>,
     pub budget_mib: Option<u64>,
+    /// The vCPUs its admitted jobs have; `None` from a node that does not count them.
+    #[serde(default)]
+    pub committed_cpus: Option<u32>,
+    /// What its jobs' vCPUs together may reach; `None` without a vCPU budget.
+    #[serde(default)]
+    pub cpu_budget: Option<u32>,
     /// How many VMs the node last said it runs; `None` until it has said.
     #[serde(default)]
     pub workloads: Option<u32>,
@@ -114,6 +120,8 @@ pub fn node_view(hub: &Hub, id: String, row: &NodeRow, target: Option<&TargetRow
         mem_total_mib: inventory.and_then(|i| i.hardware.mem_total_mib),
         committed_mib: admission.map(|a| a.committed_mib),
         budget_mib: admission.and_then(|a| a.budget_mib),
+        committed_cpus: admission.and_then(|a| a.committed_cpus),
+        cpu_budget: admission.and_then(|a| a.cpu_budget),
         workloads: row.workloads,
         protocol: row.protocol,
         desired: row.desired.clone(),

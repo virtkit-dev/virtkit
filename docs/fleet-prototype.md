@@ -287,8 +287,9 @@ The hub stores heartbeats and reports at most once per half heartbeat, holding b
 and storing it at the next ping. Heartbeats are written without an fsync, one a minute made
 durable; an inventory is made durable at most once a heartbeat. Each of an inventory's lists
 (filesystems, memory nodes, checks, runner names) is cut to 64 entries. `vk-hub nodes` lists
-ID, NAME, REACH, STATE, ACQUIRE, CEILING, CONC, SYNC, LAST SEEN, VK, CPUS, RAM, ADMITTED and
-VMS.
+ID, NAME, REACH, STATE, ACQUIRE, CEILING, CONC, SYNC, LAST SEEN, VK, CPUS, RAM, ADMITTED, VCPUS
+(committed of the budget) and VMS; under the table, a node that takes hub settings says how many
+of its settings come from the hub and from its config file, and each of the hub's it refused.
 
 The node redials a lost session with a backoff doubling from 1 to 60 seconds, plus up to a
 quarter of jitter, reset by a session that lasted a minute. Superseded three times in a row, it
@@ -1544,7 +1545,12 @@ ASCII case). The actor in a line links to the same view narrowed to them. A page
 what the hub asks of
 it beside what it reports — its state, acquisition, runner (`none: placed jobs only` for a node
 with none), concurrency, drain progress and what it cannot carry out — and its 20 latest
-commands with their outcomes. It opens with a steering panel describing the current state in
+commands with their outcomes; its admitted vCPUs against their budget; each setting the hub may
+set with its value and where it comes from — its config file, the hub, autodetected from the
+host, or a fixed default — and
+the hub's it refused; and, under *Updates*, where it stands against the target release and the
+release keys it checks updates against, where they come from and whether it requires a
+signature, flagged when it has keys but does not. It opens with a steering panel describing the current state in
 plain language, grouped into *Job intake* — whether the node takes new jobs, the hub's
 concurrency ceiling and the node's current effective limit, and on a hub that places jobs, for a
 node at protocol version 3 or later, the jobs the hub has placed on it against that ceiling or

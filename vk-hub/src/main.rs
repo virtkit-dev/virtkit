@@ -3439,7 +3439,7 @@ pub(crate) fn human_duration(d: Duration) -> String {
 }
 
 /// The columns of `vk-hub nodes`, and of the web UI's nodes table.
-pub(crate) const NODE_COLUMNS: [&str; 14] = [
+pub(crate) const NODE_COLUMNS: [&str; 15] = [
     "ID",
     "NAME",
     "REACH",
@@ -3453,12 +3453,13 @@ pub(crate) const NODE_COLUMNS: [&str; 14] = [
     "CPUS",
     "RAM",
     "ADMITTED",
+    "VCPUS",
     "VMS",
 ];
 
 /// One node's cells under [`NODE_COLUMNS`]: what it is, and for what the hub steers, what it
 /// wants beside what the node last reported. A node only monitored has no steering to show.
-pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 14] {
+pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 15] {
     let gib = |mib: u64| format!("{}G", mib / 1024);
     let dash = || "-".to_string();
     let count = |n: Option<u32>| n.map_or_else(dash, |c| c.to_string());
@@ -3492,6 +3493,11 @@ pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 14] {
         match (n.committed_mib, n.budget_mib) {
             (Some(c), Some(b)) => format!("{}/{}", gib(c), gib(b)),
             (Some(c), None) => format!("{}/-", gib(c)),
+            (None, _) => dash(),
+        },
+        match (n.committed_cpus, n.cpu_budget) {
+            (Some(c), Some(b)) => format!("{c}/{b}"),
+            (Some(c), None) => format!("{c}/-"),
             (None, _) => dash(),
         },
         n.workloads.map_or_else(dash, |w| w.to_string()),
@@ -3639,7 +3645,41 @@ fn node_notes(n: &ops::NodeView) -> Vec<String> {
             n.hostname
         ));
     }
+    notes.extend(settings_notes(n));
     notes.extend(tools_notes(n));
+    notes
+}
+
+/// What a node says of the hub's settings: how many keys come from the hub and how many from
+/// its config file, and each entry of the hub's it refused.
+fn settings_notes(n: &ops::NodeView) -> Vec<String> {
+    let Some(settings) = n.report.as_ref().and_then(|r| r.settings.as_ref()) else {
+        return Vec::new();
+    };
+    let from = |source| {
+        settings
+            .effective
+            .values()
+            .filter(|s| s.source == source)
+            .count()
+    };
+    let (hub, local) = (
+        from(vk_hub_proto::SettingSource::Hub),
+        from(vk_hub_proto::SettingSource::Local),
+    );
+    let mut notes = Vec::new();
+    if hub + local > 0 {
+        notes.push(format!(
+            "{}: settings: {hub} from the hub, {local} from its config file",
+            n.hostname
+        ));
+    }
+    for (key, why) in &settings.refused {
+        notes.push(format!(
+            "{}: refused the hub's setting {key}: {why}",
+            n.hostname
+        ));
+    }
     notes
 }
 
@@ -3937,7 +3977,7 @@ fn render_registry(
 
 /// `vk-hub nodes`' table, with each node's notes under it.
 fn render_nodes(nodes: &[ops::NodeView], now: u64) -> String {
-    let rows: Vec<[String; 14]> = nodes.iter().map(|n| node_cells(n, now)).collect();
+    let rows: Vec<[String; 15]> = nodes.iter().map(|n| node_cells(n, now)).collect();
     let mut out = table(&NODE_COLUMNS, &rows);
     for n in nodes {
         for note in node_notes(n) {

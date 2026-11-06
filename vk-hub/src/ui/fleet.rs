@@ -1811,6 +1811,17 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
                             a.budget_mib.map_or_else(|| "no budget".to_string(), mib)
                         ),
                     );
+                    if let Some(c) = a.committed_cpus {
+                        kv(
+                            &mut h,
+                            "Admitted vCPUs",
+                            &format!(
+                                "{c} of {}",
+                                a.cpu_budget
+                                    .map_or_else(|| "no budget".to_string(), |b| b.to_string())
+                            ),
+                        );
+                    }
                     kv(
                         &mut h,
                         "Jobs",
@@ -1835,6 +1846,11 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
     end_section(&mut h);
 
     workloads(&mut h, d.workloads.as_ref());
+
+    if let Some(settings) = v.report.as_ref().and_then(|r| r.settings.as_ref()) {
+        settings_section(&mut h, settings);
+    }
+    updates_section(&mut h, v);
 
     let inventory = d.row.inventory.as_ref();
     section(&mut h, "Hardware");
@@ -1974,6 +1990,103 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
     }
 
     h
+}
+
+/// Each setting's effective value and source, plus refused hub entries.
+fn settings_section(h: &mut Html, settings: &vk_hub_proto::SettingsReport) {
+    use vk_hub_proto::SettingSource;
+    h.raw("<section><h2>Settings</h2>");
+    if settings.effective.is_empty() {
+        h.raw("<p class=\"empty\">none reported</p>");
+    } else {
+        h.raw("<table class=\"grid\"><thead><tr><th>setting</th><th>value</th>")
+            .raw("<th>from</th></tr></thead><tbody>");
+        for (key, setting) in &settings.effective {
+            h.raw("<tr><td><code>").node(key).raw("</code></td><td>");
+            match &setting.value {
+                None => h.raw("-"),
+                Some(value) => h.node(&setting_text(value)),
+            };
+            h.raw("</td><td>").raw(match setting.source {
+                SettingSource::Local => "its config file",
+                SettingSource::Hub => "the hub",
+                SettingSource::Detected => "autodetected",
+                SettingSource::Default => "default",
+                SettingSource::Other => "-",
+            });
+            h.raw("</td></tr>");
+        }
+        h.raw("</tbody></table>");
+    }
+    if !settings.refused.is_empty() {
+        h.raw("<h3>Refused</h3><table class=\"kv\"><tbody>");
+        for (key, why) in &settings.refused {
+            h.raw("<tr><th><code>")
+                .node(key)
+                .raw("</code></th><td>")
+                .node(why)
+                .raw("</td></tr>");
+        }
+        h.raw("</tbody></table>");
+    }
+    h.raw("</section>");
+}
+
+/// A setting's value in a cell: a string as it is, a registry by its `repo`, anything else as
+/// JSON.
+fn setting_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(table) => match table.get("repo").and_then(|r| r.as_str()) {
+            Some(repo) => repo.to_string(),
+            None => value.to_string(),
+        },
+        other => other.to_string(),
+    }
+}
+
+/// The release keys the node checks updates against, and where it stands against the hub's
+/// target release.
+fn updates_section(h: &mut Html, v: &NodeView) {
+    use vk_hub_proto::ReleaseKeySource;
+    let keys = v.report.as_ref().and_then(|r| r.release_keys.as_ref());
+    if keys.is_none() && v.auto_update.is_none() {
+        return;
+    }
+    section(h, "Updates");
+    if let Some(note) = &v.auto_update {
+        kv(h, "Automatic update", note);
+    }
+    if let Some(k) = keys {
+        if k.keys.is_empty() {
+            kv(h, "Release keys", "none");
+        } else {
+            h.raw("<tr><th>Release keys</th><td>");
+            for (i, key) in k.keys.iter().enumerate() {
+                if i > 0 {
+                    h.raw(", ");
+                }
+                h.raw("<code>").node(key).raw("</code>");
+            }
+            h.raw(match k.source {
+                Some(ReleaseKeySource::Enrollment) => ", pinned when it joined",
+                Some(ReleaseKeySource::Local) => ", from its config file",
+                Some(ReleaseKeySource::Other) | None => "",
+            })
+            .raw("</td></tr>");
+        }
+        h.raw("<tr><th>Signed releases</th><td>");
+        match (k.required, k.keys.is_empty()) {
+            (true, _) => h.raw("required"),
+            (false, false) => h.raw(
+                "<span class=\"badge bad\">not required</span> its config file lets it take \
+                 unsigned releases",
+            ),
+            (false, true) => h.raw("not required: it takes unsigned releases"),
+        };
+        h.raw("</td></tr>");
+    }
+    end_section(h);
 }
 
 /// Show desired and reported state and recent commands, or a monitoring-only notice.
@@ -2841,6 +2954,82 @@ mod tests {
             ops(&view(Ready, External, Some(paused.clone()))),
             ["ceiling", "resume", "lift-ceiling", "drain", "quarantine"]
         );
+    }
+
+    /// A node's page shows each setting's value and source, the hub's it refused, and the
+    /// release keys it checks, flagging a node with keys that does not require signatures.
+    #[test]
+    fn a_nodes_settings_and_release_keys_are_shown() {
+        use vk_hub_proto::{ReleaseKeySource, ReleaseKeys, Setting, SettingSource, SettingsReport};
+        let settings = SettingsReport {
+            effective: [
+                (
+                    "executor.vm.max_cpus",
+                    Some(serde_json::json!(16)),
+                    SettingSource::Detected,
+                ),
+                (
+                    "executor.schedule.disk_admission",
+                    Some(serde_json::json!(true)),
+                    SettingSource::Default,
+                ),
+                (
+                    "executor.vm.cpus",
+                    Some(serde_json::json!(4)),
+                    SettingSource::Hub,
+                ),
+                (
+                    "registry",
+                    Some(serde_json::json!({"repo": "reg.example"})),
+                    SettingSource::Local,
+                ),
+                ("executor.vm.max_mem", None, SettingSource::Default),
+            ]
+            .into_iter()
+            .map(|(k, value, source)| (k.to_string(), Setting { value, source }))
+            .collect(),
+            refused: [("state_dir".to_string(), "not <allowed>".to_string())].into(),
+        };
+        let mut h = Html::new();
+        settings_section(&mut h, &settings);
+        let text = h.into_string();
+        for want in [
+            "<code>executor.vm.max_cpus</code></td><td>16</td><td>autodetected",
+            "<code>executor.schedule.disk_admission</code></td><td>true</td><td>default<",
+            "<code>executor.vm.cpus</code></td><td>4</td><td>the hub",
+            "<code>registry</code></td><td>reg.example</td><td>its config file",
+            "<code>executor.vm.max_mem</code></td><td>-</td>",
+            "<code>state_dir</code></th><td>not &lt;allowed&gt;",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        let mut v = view(NodeState::Ready, RunnerMode::Managed, None);
+        let keys = |required, keys: &[&str]| ReleaseKeys {
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+            source: (!keys.is_empty()).then_some(ReleaseKeySource::Local),
+            required,
+        };
+        let shown = |v: &NodeView| {
+            let mut h = Html::new();
+            updates_section(&mut h, v);
+            h.into_string()
+        };
+        assert_eq!(shown(&v), "");
+        v.auto_update = Some("behind the target vk 1.2.3".into());
+        if let Some(r) = v.report.as_mut() {
+            r.release_keys = Some(keys(false, &["k1"]));
+        }
+        let text = shown(&v);
+        assert!(text.contains("behind the target vk 1.2.3"), "{text}");
+        assert!(
+            text.contains("<code>k1</code>, from its config file"),
+            "{text}"
+        );
+        assert!(text.contains("badge bad\">not required"), "{text}");
+        if let Some(r) = v.report.as_mut() {
+            r.release_keys = Some(keys(true, &["k1"]));
+        }
+        assert!(shown(&v).contains("<td>required</td>"));
     }
 
     /// Each control says where the node stands in words.

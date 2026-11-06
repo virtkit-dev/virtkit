@@ -90,6 +90,9 @@ pub struct Layers {
     pub local: toml::Table,
     /// The hub's settings taken, by dotted key: those the local file leaves unset.
     pub hub: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The dotted keys whose value an enrolled node derived from its host, where neither the
+    /// file nor the hub sets them.
+    pub detected: std::collections::BTreeSet<&'static str>,
 }
 
 /// VMM backend selector for the `vmm` config key. `cloud-hypervisor` and its old aliases
@@ -1385,12 +1388,16 @@ fn enrolled_defaults(cfg: &mut Config, total_mib: Option<u64>, cpus: Option<u32>
     if !crate::node::hub_settings::is_set(&cfg.layers.local, "net.mode") {
         cfg.net.mode = "switch".into();
     }
+    let detected = &mut cfg.layers.detected;
     let schedule = &mut cfg.executor.schedule;
     if schedule.mem_budget.is_none() {
         schedule.mem_budget = total_mib
             .map(enrolled_budget_gib)
             .filter(|gib| *gib > 0)
             .map(|gib| format!("{gib}G"));
+        if schedule.mem_budget.is_some() {
+            detected.insert("executor.schedule.mem_budget");
+        }
     }
     let overcommit = *schedule
         .cpu_overcommit
@@ -1398,6 +1405,9 @@ fn enrolled_defaults(cfg: &mut Config, total_mib: Option<u64>, cpus: Option<u32>
     let vm = &mut cfg.executor.vm;
     if vm.max_cpus.is_none() {
         vm.max_cpus = cpus.filter(|n| *n > 0);
+        if vm.max_cpus.is_some() {
+            detected.insert("executor.vm.max_cpus");
+        }
     }
     let set = |key| {
         crate::node::hub_settings::is_set(&cfg.layers.local, key)
@@ -1405,8 +1415,11 @@ fn enrolled_defaults(cfg: &mut Config, total_mib: Option<u64>, cpus: Option<u32>
     };
     if !set("executor.vm.cpus") {
         let budget = cpus.and_then(|n| crate::vm::cpu_budget_of(n, overcommit));
-        if let Some(max) = vm.max_cpus.into_iter().chain(budget).min() {
-            vm.cpus = vm.cpus.min(max);
+        if let Some(max) = vm.max_cpus.into_iter().chain(budget).min()
+            && max < vm.cpus
+        {
+            vm.cpus = max;
+            cfg.layers.detected.insert("executor.vm.cpus");
         }
     }
     // A budget that does not resolve fails every job anyway, which says why.
@@ -1417,6 +1430,7 @@ fn enrolled_defaults(cfg: &mut Config, total_mib: Option<u64>, cpus: Option<u32>
         && gib < mem
     {
         cfg.executor.vm.mem = format!("{gib}G");
+        cfg.layers.detected.insert("executor.vm.mem");
     }
 }
 
@@ -1827,6 +1841,26 @@ mod tests {
         let hub = ["executor.vm.cpus", "executor.vm.mem"];
         let (_, _, cpus, mem) = defaults("", &hub, Some(4_551), Some(2));
         assert_eq!((cpus, mem.as_str()), (4, "4G"), "set by the hub");
+        // What the host's size supplied or held down is detected; the rest is built in.
+        let detected = |total_mib, cpus| {
+            let mut cfg = from_table(toml::Table::new()).unwrap();
+            enrolled_defaults(&mut cfg, total_mib, cpus);
+            cfg.layers.detected.into_iter().collect::<Vec<_>>()
+        };
+        assert_eq!(
+            detected(Some(4_551), Some(2)),
+            [
+                "executor.schedule.mem_budget",
+                "executor.vm.cpus",
+                "executor.vm.max_cpus",
+                "executor.vm.mem"
+            ]
+        );
+        assert_eq!(
+            detected(Some(257_000), Some(64)),
+            ["executor.schedule.mem_budget", "executor.vm.max_cpus"]
+        );
+        assert!(detected(None, None).is_empty());
     }
 
     /// An enrolled host's jobs get the switch's network unless its file sets a mode, even

@@ -744,8 +744,8 @@ pub const fn column_is(columns: &[&str], i: usize, name: &str) -> bool {
 
 /// Right-aligned numeric columns in `vk-hub nodes` and node workloads.
 /// Compile-time checks reject names absent from both column lists.
-const NUMERIC: [&str; 9] = [
-    "CEILING", "CONC", "CPUS", "RAM", "ADMITTED", "VMS", "PID", "RESERVED", "IN USE",
+const NUMERIC: [&str; 10] = [
+    "CEILING", "CONC", "CPUS", "RAM", "ADMITTED", "VCPUS", "VMS", "PID", "RESERVED", "IN USE",
 ];
 const _: () = {
     let mut i = 0;

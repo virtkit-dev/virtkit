@@ -212,8 +212,9 @@ pub fn shown(value: &Value) -> String {
     }
 }
 
-/// Check that the node accepts `key` and `value`; for `registry`, require a registry the hub
-/// manages with a bound URL, whose table a node would take.
+/// Check that the hub may set `key` and that `value` is of its kind and within its bounds; for
+/// `registry`, require a registry the hub manages with a bound URL, whose table a node would
+/// take. A node may still refuse an entry its own config leaves unloadable.
 fn check(
     key: &str,
     value: &Value,

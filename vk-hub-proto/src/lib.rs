@@ -1034,8 +1034,11 @@ pub struct Setting {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SettingSource {
-    /// Built in, or autodetected on the host.
+    /// Built in. A node before [`SettingSource::Detected`] reports its host-derived values so
+    /// too.
     Default,
+    /// Derived from the node's host, such as its memory or CPU count.
+    Detected,
     /// The hub's settings.
     Hub,
     /// The node's own configuration file.
@@ -2259,6 +2262,13 @@ mod tests {
                             source: SettingSource::Local,
                         },
                     ),
+                    (
+                        "executor.vm.mem".to_string(),
+                        Setting {
+                            value: Some(json!("6G")),
+                            source: SettingSource::Detected,
+                        },
+                    ),
                 ]),
                 refused: BTreeMap::from([("state_dir".to_string(), "not settable".to_string())]),
             }),
@@ -2275,6 +2285,7 @@ mod tests {
                 "executor.schedule.mem_budget": {"source": "default"},
                 "executor.vm.cpus": {"value": 8, "source": "local"},
                 "executor.vm.max_cpus": {"value": 16, "source": "hub"},
+                "executor.vm.mem": {"value": "6G", "source": "detected"},
             },
             "refused": {"state_dir": "not settable"},
         });

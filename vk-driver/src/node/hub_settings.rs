@@ -395,6 +395,8 @@ fn report(cfg: &Config, refused: &BTreeMap<String, String>) -> SettingsReport {
                 SettingSource::Local
             } else if cfg.layers.hub.contains_key(*key) {
                 SettingSource::Hub
+            } else if cfg.layers.detected.contains(key) {
+                SettingSource::Detected
             } else {
                 SettingSource::Default
             };
@@ -769,6 +771,7 @@ mod tests {
             layers: crate::config::Layers {
                 local: table("[executor.vm]\ncpus = 2\n"),
                 hub: BTreeMap::new(),
+                detected: ["executor.vm.max_cpus"].into(),
             },
             ..cfg
         };
@@ -780,6 +783,12 @@ mod tests {
                 value: Some(json!(2)),
                 source: SettingSource::Local
             }
+        );
+        let source = |key: &str| held.report().effective[key].source;
+        assert_eq!(source("executor.vm.max_cpus"), SettingSource::Detected);
+        assert_eq!(
+            source("executor.schedule.disk_admission"),
+            SettingSource::Default
         );
         // Masked by the file: saved, but nothing to reload.
         held.take(

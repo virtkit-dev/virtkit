@@ -157,7 +157,7 @@ The rest of this section is proposed.
 ### Defaults on an enrolled node
 
 Each applies where neither the local file nor the hub sets the key, and the node reports it
-with the source `default`.
+with the source `detected` where the host's size supplied or held down the value.
 
 - **Memory.** An unset `mem_budget` is `MemTotal` less the smaller of 4 GiB and 10 % of
   `MemTotal`, rounded down to a whole GiB as job sizes are, where on a host that is not enrolled
@@ -210,7 +210,8 @@ with the source `default`.
   or job cleanup is under way — as across any restart: placed jobs run on, and a managed
   runner is adopted.
 - **Reported back.** With each applied generation, the node reports every listed key's
-  effective value and its source — `local`, `hub` or `default`, autodetected included — and
+  effective value and its source — `local`, `hub`, `detected` (from the host) or `default`
+  (built in; what a node from before `detected` reports for both) — and
   each hub entry it refused, with the reason. A refusal does not fail the generation: the
   other entries apply. The node's page shows both.
 - **A registry.** With no `[registry]` in the local file, the node uses the one the hub names —
@@ -411,7 +412,8 @@ enrollment: a hub with `[nodes] release_keys` in `hub.toml` returns them in the 
 answer, and `vk node join` keeps them in `<state_dir>/node/enrollment.json` beside the node ID;
 nothing a session carries changes them. A node whose configuration sets `[node] release_keys`
 uses those instead, and `[node] require_signed` applies to either. The node reports the keys in
-force, where they come from (`enrollment` or `local`) and whether a signature is required. They
+force, where they come from (`enrollment` or `local`) and whether a signature is required;
+its page shows them, flagging a node with keys that requires no signature. They
 are taken on first use from the hub enrollment authenticates — its TLS certificate and a
 single-use token — so a hub compromised after a node joined can neither add nor replace one;
 rotating them takes a new enrollment, the local setting, or the fleet root
