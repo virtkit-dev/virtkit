@@ -22,6 +22,9 @@ use vk_registry::{Authenticator, ServerConfig, ServerState, Store};
 const AUD: &str = "9c2f4e1a7b3d5e60f1a2b3c4d5e6f708";
 const UNSIGNED: &str = "UNSIGNED-PAYLOAD";
 
+/// The fewest bytes S3 takes in a part that is not an upload's last.
+const MIN_PART: usize = 5 << 20;
+
 fn tmp(tag: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(
         "vk-registry-s3-e2e-{tag}-{}-{:?}",
@@ -1609,7 +1612,9 @@ async fn an_object_made_of_parts_is_read_a_part_at_a_time() {
     let sign = |r: Req| r;
     let path = "/s3/b/parts";
     let id = create_upload(&host, &sign, path).await;
-    let parts: Vec<Vec<u8>> = vec![bytes_of_len(70_000), bytes_of_len(500), b"end".to_vec()];
+    // Every part but the last holds S3's minimum at least.
+    let (a, b) = (MIN_PART + 70_000, MIN_PART + 500);
+    let parts: Vec<Vec<u8>> = vec![bytes_of_len(a), bytes_of_len(b), b"end".to_vec()];
     let mut etags = Vec::new();
     for (i, data) in parts.iter().enumerate() {
         etags.push(upload_part(&host, &sign, path, &id, i as u32 + 1, data).await);
@@ -1679,7 +1684,7 @@ async fn an_object_made_of_parts_is_read_a_part_at_a_time() {
     is_object(&send(&host, Req::new("GET", path)).await, &whole);
     let resp = send(
         &host,
-        Req::new("GET", path).header("Range", "bytes=70000-70499"),
+        Req::new("GET", path).header("Range", &format!("bytes={a}-{}", a + b - 1)),
     )
     .await;
     resp.ok(206);
@@ -1696,12 +1701,14 @@ async fn an_object_made_of_parts_is_read_a_part_at_a_time() {
     resp.ok(200);
     assert_eq!(
         element(&resp.body, "ObjectParts"),
-        "<IsTruncated>false</IsTruncated><MaxParts>1000</MaxParts><PartNumberMarker>0\
-         </PartNumberMarker><Part><PartNumber>1</PartNumber><Size>70000</Size></Part><Part>\
-         <PartNumber>2</PartNumber><Size>500</Size></Part><Part><PartNumber>3</PartNumber>\
-         <Size>3</Size></Part><PartsCount>3</PartsCount>"
+        format!(
+            "<IsTruncated>false</IsTruncated><MaxParts>1000</MaxParts><PartNumberMarker>0\
+             </PartNumberMarker><Part><PartNumber>1</PartNumber><Size>{a}</Size></Part><Part>\
+             <PartNumber>2</PartNumber><Size>{b}</Size></Part><Part><PartNumber>3</PartNumber>\
+             <Size>3</Size></Part><PartsCount>3</PartsCount>"
+        )
     );
-    assert_eq!(element(&resp.body, "ObjectSize"), "70503");
+    assert_eq!(element(&resp.body, "ObjectSize"), (a + b + 3).to_string());
     let resp = send(
         &host,
         attrs("ObjectParts")
@@ -1840,7 +1847,7 @@ async fn the_checksum_a_write_carried_is_kept_with_the_object() {
     let sign = |r: Req| r;
     let path = "/s3/b/parts";
     let id = create_upload(&host, &sign, path).await;
-    let (one, two) = (bytes_of_len(70_000), bytes_of_len(500));
+    let (one, two) = (bytes_of_len(MIN_PART), bytes_of_len(500));
     let e1 = upload_part(&host, &sign, path, &id, 1, &one).await;
     let e2 = upload_part(&host, &sign, path, &id, 2, &two).await;
     let whole = [one.as_slice(), &two].concat();
@@ -4906,7 +4913,7 @@ async fn an_upload_holds_its_parts_to_the_checksum_it_was_created_with() {
         }
         req.body(data.to_vec())
     };
-    let (one, two) = (bytes_of_len(1000), bytes_of_len(300));
+    let (one, two) = (bytes_of_len(MIN_PART), bytes_of_len(300));
     let (sha1, sha2) = (
         b64(&sha2::Sha256::digest(&one)),
         b64(&sha2::Sha256::digest(&two)),
@@ -5106,7 +5113,7 @@ async fn an_upload_holds_its_parts_to_the_checksum_it_was_created_with() {
         elements(&resp.body, "Part"),
         [
             format!(
-                "<ChecksumSHA256>{sha1}</ChecksumSHA256><PartNumber>1</PartNumber><Size>1000</Size>"
+                "<ChecksumSHA256>{sha1}</ChecksumSHA256><PartNumber>1</PartNumber><Size>{MIN_PART}</Size>"
             ),
             format!(
                 "<ChecksumSHA256>{sha2}</ChecksumSHA256><PartNumber>2</PartNumber><Size>300</Size>"
@@ -5382,6 +5389,18 @@ async fn a_multipart_upload_is_assembled_from_its_parts() {
         let resp = send(&host, sign(complete(path, &id, &parts))).await;
         resp.is(status, code);
     }
+    // Every part but the last holds S3's minimum: part 3 cannot come before another.
+    let e4 = upload_part(&host, &sign, path, &id, 4, b"tail").await;
+    let resp = send(
+        &host,
+        sign(complete(path, &id, &[(1, e1), (3, e3), (4, &e4)])),
+    )
+    .await;
+    resp.is(400, "EntityTooSmall")
+        .says("Your proposed upload is smaller than the minimum allowed size");
+    assert_eq!(element(&resp.body, "PartNumber"), "3");
+    assert_eq!(element(&resp.body, "ProposedSize"), three.len().to_string());
+    assert_eq!(element(&resp.body, "MinSizeAllowed"), MIN_PART.to_string());
     let resp = send(
         &host,
         sign(complete(path, &id, &[(1, e1), (2, e2), (3, e3)])),
@@ -5591,7 +5610,7 @@ async fn multipart_uploads_are_aborted_copied_bounded_and_swept() {
     send(&host, sign(req)).await.is(409, "OperationAborted");
 
     // Parts copied from an object: whole, then a range of it.
-    let src = bytes_of_len(70_000);
+    let src = bytes_of_len(MIN_PART);
     send(&host, sign(Req::new("PUT", "/s3/b/src").body(src.clone())))
         .await
         .ok(200);
@@ -5615,11 +5634,14 @@ async fn multipart_uploads_are_aborted_copied_bounded_and_swept() {
     resp.ok(200);
     let e2 = element(&resp.body, "ETag").replace("&quot;", "\"");
     assert_eq!(e2, format!("\"{}\"", md5_hex(&src[100..1100])));
-    let past = copy(3).header("x-amz-copy-source-range", "bytes=69000-70000");
+    let past = format!("bytes={}-{MIN_PART}", MIN_PART - 1000);
+    let past = copy(3).header("x-amz-copy-source-range", &past);
     send(&host, sign(past))
         .await
         .is(400, "InvalidArgument")
-        .says("Range specified is not valid for source object of size: 70000");
+        .says(&format!(
+            "Range specified is not valid for source object of size: {MIN_PART}"
+        ));
     let backwards = copy(3).header("x-amz-copy-source-range", "bytes=5-2");
     send(&host, sign(backwards))
         .await

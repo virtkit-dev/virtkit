@@ -50,6 +50,10 @@ use crate::{Authz, Body, STREAM_CHUNK, ServerState, Store, accounts, body_of};
 /// Most parts an upload has, and the highest part number: S3's bound.
 const MAX_PARTS: u32 = 10_000;
 
+/// The fewest bytes a part holds when it is not the last one an upload completes with:
+/// S3's minimum.
+const MIN_PART: u64 = 5 << 20;
+
 /// Longest `CompleteMultipartUpload` document taken.
 const MAX_DOCUMENT: usize = 1 << 20;
 
@@ -1135,7 +1139,7 @@ fn assemble(
     let mut total: u64 = 0;
     // The parts' checksums in the upload's algorithm, which every part of it has.
     let mut part_checksums = asked.map(|_| Vec::with_capacity(parts.len()));
-    for ((n, etag), sent) in parts.iter().zip(sent) {
+    for (i, ((n, etag), sent)) in parts.iter().zip(sent).enumerate() {
         let Some(part) = read_record::<Part>(&record_path(&up.dir, *n)) else {
             return Ok(Err(invalid_part(n, etag)));
         };
@@ -1151,6 +1155,13 @@ fn assemble(
         );
         if let Err(why) = checked {
             return Ok(Err(why));
+        }
+        if part.size < MIN_PART && i.saturating_add(1) < parts.len() {
+            return Ok(Err(Refusal::new(Code::EntityTooSmall)
+                .with("ProposedSize", part.size.to_string())
+                .with("MinSizeAllowed", MIN_PART.to_string())
+                .with("PartNumber", n.to_string())
+                .with("ETag", etag)));
         }
         let own = asked.and_then(|a| {
             let (algorithm, value) = part.checksum.as_deref()?.split_once(':')?;

@@ -28,7 +28,8 @@ All notable changes to virtkit will be documented in this file.
   storage class, a redirect, a retention lock — is refused rather than stored without it, and
   a refused upload sees its refusal rather than a dropped connection; every refusal carries
   the error code, status and message S3 answers with. Large
-  files can be uploaded in parts, as the AWS CLI uploads them, each part and the completion
+  files can be uploaded in parts, as the AWS CLI uploads them, every part but the last at
+  least 5 MiB as S3 requires, each part and the completion
   held to the checksum the upload was created with, and the object given S3's composite or
   full-object checksum of them, completed once however many
   completions of the upload are sent, at once or as retries (each answered as the first while
