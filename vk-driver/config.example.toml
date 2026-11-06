@@ -405,6 +405,9 @@
 # disk_default = "8G"    # what a job with no history is expected to write into its job dir.
 #                        # Unset: 8G, capped at the filesystem's size; set larger than the
 #                        # filesystem, such jobs fail at once
+# cpu_overcommit = 2     # wait if admitting this job would exceed this many guest vCPUs per
+#                        # online CPU (total rounded down, at least 1). MICROVM_CPUS is
+#                        # clamped to that total. Unset: no vCPU gate, but 2 on a fleet node
 # max_concurrency = 12   # the most jobs `vk tune` ever asks the runner to accept, whatever the
 #                        # budget would allow; at least 1. Unset: no ceiling. A fleet hub's
 #                        # ceiling can lower it on a node, never raise it. On a fleet node

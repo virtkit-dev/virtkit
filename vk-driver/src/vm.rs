@@ -420,14 +420,17 @@ async fn prepare_job(ctx: &JobCtx) -> Result<()> {
             .is_some_and(|image| image.starts_with("compose:"));
     let (_checkout_use, _reservation) = if services_in_checkout {
         let checkout_use = host_checkout(ctx)?;
-        (checkout_use, admit(ctx, &mem, services_mem_mib(ctx)?)?)
+        (
+            checkout_use,
+            admit(ctx, cpus, &mem, services_mem_mib(ctx)?)?,
+        )
     } else {
         // Without a budget nothing reads the services' sizes; env `services:` need no checkout.
         let services_mib = match budget_mib(cfg) {
             Some(_) => services_mem_mib(ctx)?,
             None => 0,
         };
-        let reservation = admit(ctx, &mem, services_mib)?;
+        let reservation = admit(ctx, cpus, &mem, services_mib)?;
         (host_checkout(ctx)?, reservation)
     };
     // Record job metadata beside the VM for `vk workloads`. Like the VM registry, this is
@@ -3760,7 +3763,10 @@ fn vm_size(ctx: &JobCtx) -> Result<(u32, String)> {
                 .ok()
                 .filter(|n| *n > 0)
                 .with_context(|| format!("invalid MICROVM_CPUS {s:?}"))?;
+            // Held to the vCPU budget as MICROVM_MEM is to the memory budget: a request no
+            // admission could ever grant would fail every retry.
             n.min(max_cpus)
+                .min(cpu_budget(&ctx.cfg).unwrap_or(u32::MAX))
         }
     };
     let base_mem = parse_gib(&vm.mem).context("invalid vm.mem")?;
@@ -4011,12 +4017,17 @@ fn host_checkout(ctx: &JobCtx) -> Result<Option<crate::cachelock::Guard>> {
     Ok(Some(guard))
 }
 
-/// Reserve this job's guest RAM against the host's `[executor.schedule] mem_budget`, and room for
-/// its job dir on the filesystem holding it (`disk_admission`), blocking until there is room for
-/// both (see admit). `None` when both are off — the host then admits every job the runner hands
-/// it. A job that never gets room fails prepare, which exits `SYSTEM_FAILURE_EXIT_CODE`: a
-/// system failure, not the job's fault.
-fn admit(ctx: &JobCtx, mem: &str, services_mib: u64) -> Result<Option<crate::admit::Reservation>> {
+/// Reserve this job's guest RAM against the host's `[executor.schedule] mem_budget`, its guest's
+/// `cpus` against the vCPU budget (`cpu_overcommit`), and room for its job dir on the filesystem
+/// holding it (`disk_admission`), blocking until there is room for all (see admit). `None` when
+/// all are off — the host then admits every job the runner hands it. A job that never gets room
+/// fails prepare, which exits `SYSTEM_FAILURE_EXIT_CODE`: a system failure, not the job's fault.
+fn admit(
+    ctx: &JobCtx,
+    cpus: u32,
+    mem: &str,
+    services_mib: u64,
+) -> Result<Option<crate::admit::Reservation>> {
     let declared_mib = mem_mib(mem)?;
     let mem_ask = admit_memory(ctx, declared_mib, services_mib)?;
     if let Some(ask) = &mem_ask
@@ -4056,8 +4067,9 @@ fn admit(ctx: &JobCtx, mem: &str, services_mib: u64) -> Result<Option<crate::adm
     let ask = crate::admit::Ask {
         mem: mem_ask,
         disk: admit_disk(ctx, declared_mib, &reclaim)?,
+        cpus: cpu_budget(&ctx.cfg).map(|budget| crate::admit::CpuAsk { want: cpus, budget }),
     };
-    if ask.mem.is_none() && ask.disk.is_none() {
+    if ask.is_empty() {
         return Ok(None);
     }
     let reservation = crate::admit::acquire(&ctx.admit_dir(), &ctx.job_id, &ask, timeout)?;
@@ -4231,6 +4243,21 @@ pub(crate) fn budget_mib(cfg: &crate::config::Config) -> Option<Result<u64>> {
         parse_budget_mib(raw, host_total_mib)
             .with_context(|| format!("cannot resolve [executor.schedule] mem_budget {raw:?}")),
     )
+}
+
+/// The host's vCPU budget, `[executor.schedule] cpu_overcommit` times its online CPUs (see
+/// [`cpu_budget_of`]). `None` without a ratio, or on a host whose CPUs cannot be counted.
+pub(crate) fn cpu_budget(cfg: &crate::config::Config) -> Option<u32> {
+    cpu_budget_of(
+        crate::node::online_cpus(),
+        cfg.executor.schedule.cpu_overcommit?,
+    )
+}
+
+/// `online` CPUs times `ratio`, rounded down and at least one; `None` for no CPUs.
+pub(crate) fn cpu_budget_of(online: u32, ratio: f64) -> Option<u32> {
+    // A float-to-int `as` saturates, and the config refuses a ratio that is not positive.
+    (online > 0).then(|| ((f64::from(online) * ratio) as u32).max(1))
 }
 
 /// `"<n>G"` as an exact size, or `"<n>%"` as a share of `host_total_mib`.
@@ -7050,8 +7077,8 @@ mod tests {
         cfg.executor.schedule.mem_budget = Some("8G".into());
         cfg.executor.schedule.wait_timeout_secs = Some(0);
         let ctx = JobCtx::new_for_job(cfg, "43".into()).unwrap();
-        drop(admit(&ctx, "4G", 4096).unwrap().unwrap());
-        let err = format!("{:#}", admit(&ctx, "4G", 5120).unwrap_err());
+        drop(admit(&ctx, 2, "4G", 4096).unwrap().unwrap());
+        let err = format!("{:#}", admit(&ctx, 2, "4G", 5120).unwrap_err());
         assert!(err.contains("its services' 5120 MiB"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7070,7 +7097,7 @@ mod tests {
         cfg.executor.schedule.disk_admission = Some(false);
         let mut ctx = JobCtx::new_for_job(cfg, "42".into()).unwrap();
         assert!(ctx.cfg.executor.schedule.mem_budget.is_none());
-        assert!(admit(&ctx, "8G", 0).unwrap().is_none());
+        assert!(admit(&ctx, 2, "8G", 0).unwrap().is_none());
         assert!(!ctx.admit_dir().exists(), "no ledger without a budget");
 
         let schedule = &mut ctx.cfg.executor.schedule;
@@ -7078,7 +7105,7 @@ mod tests {
         schedule.disk_default = Some("1G".into());
         schedule.wait_timeout_secs = Some(0);
         std::fs::create_dir_all(&ctx.job_dir).unwrap();
-        let held = admit(&ctx, "8G", 0).unwrap();
+        let held = admit(&ctx, 2, "8G", 0).unwrap();
         assert!(held.is_some(), "disk admission is on by default");
         let entry = std::fs::read_to_string(ctx.admit_dir().join("42")).unwrap();
         assert!(
@@ -7089,7 +7116,7 @@ mod tests {
 
         // Not a size at all (only `G` is): refused before any history is consulted.
         ctx.cfg.executor.schedule.disk_default = Some("1T".into());
-        let err = admit(&ctx, "8G", 0).unwrap_err();
+        let err = admit(&ctx, 2, "8G", 0).unwrap_err();
         assert!(
             format!("{err:#}").contains("disk_default \"1T\""),
             "{err:#}"

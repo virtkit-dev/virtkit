@@ -38,6 +38,9 @@ const KEYS: &[(&str, Read)] = &[
     ("executor.schedule.disk_default", |c| {
         json(&c.executor.schedule.disk_default)
     }),
+    ("executor.schedule.cpu_overcommit", |c| {
+        json(&c.executor.schedule.cpu_overcommit)
+    }),
     ("executor.schedule.wait_timeout_secs", |c| {
         let secs = c.executor.schedule.wait_timeout_secs;
         json(&secs.unwrap_or(crate::config::WAIT_TIMEOUT_SECS))
@@ -463,7 +466,7 @@ mod tests {
                 ("executor.vm.mem", json!("lots")),
                 ("executor.vm.max_mem", json!(8)),
                 ("executor.schedule.mem_budget", json!("40")),
-                ("executor.schedule.cpu_overcommit", json!(2)),
+                ("executor.schedule.cpu_overcommit", json!(0)),
                 ("state_dir", json!("/elsewhere")),
                 ("egress.allow_ip", json!([])),
                 ("node.release_keys", json!([])),
@@ -499,6 +502,10 @@ mod tests {
             "{refused:?}"
         );
         assert!(refused["state_dir"].contains("may set"), "{refused:?}");
+        assert!(
+            refused["executor.schedule.cpu_overcommit"].contains("positive"),
+            "{refused:?}"
+        );
     }
 
     /// The hub names a remote registry and how to reach it, never a credential or a path, and

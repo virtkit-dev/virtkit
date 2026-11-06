@@ -1175,6 +1175,28 @@ filesystem and how much of it is used.
 While a host is upgraded, a job prepared by an older `vk` neither claims disk nor waits for it;
 disk admission covers the host once every job it has running was prepared by this version.
 
+### Keeping vCPUs within the host's CPUs
+
+A guest's vCPUs are threads on the host, and many busy ones on few CPUs run every job slower.
+Set `cpu_overcommit` and a job also claims its guest's vCPUs, and waits while the jobs
+admitted, itself included, would hold more than that many per online CPU:
+
+```toml
+[executor.schedule]
+cpu_overcommit = 2        # vCPUs per online CPU, rounded down; 1.5 works too
+```
+
+It shares the oldest-first queue and `wait_timeout_secs` with memory and disk admission, and
+needs neither. A `MICROVM_CPUS` above the whole budget is clamped to it, as a `MICROVM_MEM` is
+to the memory budget; an `[executor.vm] cpus` above it fails every job. Only the job's own
+guest counts, not its services, and a job prepared by an older `vk` counts none. Unset there is
+no vCPU gate — except on a [fleet node](fleet-design.md#defaults-on-an-enrolled-node), where it
+is 2.
+
+```
+virtkit: waiting for 4 of the host's budget of 32 vCPUs (30 committed, 0 job(s) asked first)
+```
+
 ### What admission does not do
 
 A waiting job has already been assigned by GitLab: it holds a `concurrent` slot and its own

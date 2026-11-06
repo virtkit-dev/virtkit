@@ -248,7 +248,15 @@ pub struct Schedule {
     /// `"<n>G"`. Set larger than the filesystem, every such job fails at once. Default `"8G"`,
     /// capped at the filesystem's size.
     pub disk_default: Option<String>,
+    /// Wait if admitting this job would exceed the host's online CPUs times this positive
+    /// ratio (rounded down, at least one): `2` allows twice as many vCPUs as host CPUs.
+    /// Counts each job's guest, not its services. Shares `mem_budget`'s queue and
+    /// `wait_timeout_secs`. Unset: no vCPU gate, except on an enrolled fleet node, where it is 2.
+    pub cpu_overcommit: Option<f64>,
 }
+
+/// `[executor.schedule] cpu_overcommit` on a host enrolled with a fleet hub when unset.
+pub const ENROLLED_CPU_OVERCOMMIT: f64 = 2.0;
 
 /// `[executor.schedule] wait_timeout_secs` when unset.
 pub const WAIT_TIMEOUT_SECS: u64 = 600;
@@ -1325,8 +1333,9 @@ fn load_resolved(explicit: Option<PathBuf>, fallbacks: &[PathBuf]) -> Result<Con
 /// Fill in what a host enrolled with a fleet hub takes from its own size where neither the
 /// local file nor the hub sets it (`docs/fleet-design.md`, *Defaults on an enrolled node*): a
 /// memory budget of [`enrolled_budget_gib`], a per-job vCPU ceiling of the host's `cpus`
-/// online, and the base VM held to both, so a job that asks for nothing fits. A figure this
-/// host cannot read leaves its default as it is.
+/// online, a vCPU overcommit of [`ENROLLED_CPU_OVERCOMMIT`], and the base VM held to them, so
+/// a job that asks for nothing fits. A figure this host cannot read leaves its default as it
+/// is.
 fn enrolled_defaults(cfg: &mut Config, total_mib: Option<u64>, cpus: Option<u32>) {
     let schedule = &mut cfg.executor.schedule;
     if schedule.mem_budget.is_none() {
@@ -1335,6 +1344,9 @@ fn enrolled_defaults(cfg: &mut Config, total_mib: Option<u64>, cpus: Option<u32>
             .filter(|gib| *gib > 0)
             .map(|gib| format!("{gib}G"));
     }
+    let overcommit = *schedule
+        .cpu_overcommit
+        .get_or_insert(ENROLLED_CPU_OVERCOMMIT);
     let vm = &mut cfg.executor.vm;
     if vm.max_cpus.is_none() {
         vm.max_cpus = cpus.filter(|n| *n > 0);
@@ -1343,10 +1355,11 @@ fn enrolled_defaults(cfg: &mut Config, total_mib: Option<u64>, cpus: Option<u32>
         crate::node::hub_settings::is_set(&cfg.layers.local, key)
             || cfg.layers.hub.contains_key(key)
     };
-    if !set("executor.vm.cpus")
-        && let Some(max) = vm.max_cpus
-    {
-        vm.cpus = vm.cpus.min(max);
+    if !set("executor.vm.cpus") {
+        let budget = cpus.and_then(|n| crate::vm::cpu_budget_of(n, overcommit));
+        if let Some(max) = vm.max_cpus.into_iter().chain(budget).min() {
+            vm.cpus = vm.cpus.min(max);
+        }
     }
     // A budget that does not resolve fails every job anyway, which says why.
     if !set("executor.vm.mem")
@@ -1435,6 +1448,11 @@ fn strip_removed_keys(table: &mut toml::Table) -> Vec<&'static str> {
 
 /// Refuse what `cfg` sets that it cannot keep.
 fn refuse_conflicts(cfg: &Config) -> Result<()> {
+    if let Some(ratio) = cfg.executor.schedule.cpu_overcommit
+        && !(ratio.is_finite() && ratio > 0.0)
+    {
+        anyhow::bail!("`[executor.schedule] cpu_overcommit = {ratio}` must be a positive number");
+    }
     if let Some(root) = cfg
         .registry
         .as_ref()
@@ -1761,6 +1779,34 @@ mod tests {
         let hub = ["executor.vm.cpus", "executor.vm.mem"];
         let (_, _, cpus, mem) = defaults("", &hub, Some(4_551), Some(2));
         assert_eq!((cpus, mem.as_str()), (4, "4G"), "set by the hub");
+    }
+
+    /// An enrolled host overcommits its CPUs twice unless told otherwise, and holds the base
+    /// VM to the vCPU budget a smaller ratio leaves; a ratio must be positive, and may be
+    /// written as a whole number.
+    #[test]
+    fn an_enrolled_host_overcommits_its_cpus_twice() {
+        let defaults = |text: &str, cpus| {
+            let local: toml::Table = toml::from_str(text).unwrap();
+            let mut cfg = from_table(local.clone()).unwrap();
+            cfg.layers.local = local;
+            enrolled_defaults(&mut cfg, Some(257_000), cpus);
+            (cfg.executor.schedule.cpu_overcommit, cfg.executor.vm.cpus)
+        };
+        assert_eq!(defaults("", Some(64)), (Some(2.0), 4));
+        assert_eq!(defaults("", None), (Some(2.0), 4));
+        let low = "[executor.schedule]\ncpu_overcommit = 0.5\n";
+        assert_eq!(defaults(low, Some(6)), (Some(0.5), 3));
+        let whole = "[executor.schedule]\ncpu_overcommit = 3\n";
+        assert_eq!(defaults(whole, Some(6)), (Some(3.0), 4));
+        for bad in ["0", "-1.5", "nan", "inf"] {
+            let text = format!("[executor.schedule]\ncpu_overcommit = {bad}\n");
+            let err = from_table(toml::from_str(&text).unwrap()).unwrap_err();
+            assert!(format!("{err:#}").contains("positive"), "{bad}: {err:#}");
+        }
+        assert_eq!(crate::vm::cpu_budget_of(6, 0.1), Some(1));
+        assert_eq!(crate::vm::cpu_budget_of(6, 1.5), Some(9));
+        assert_eq!(crate::vm::cpu_budget_of(0, 2.0), None);
     }
 
     #[test]

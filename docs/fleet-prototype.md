@@ -893,11 +893,12 @@ hub places work on it as before.
 
 **Reservations.** An offer is decided at once against the same admission ledger
 (`<state_dir>/admit/`) as executor jobs: memory against `[executor.schedule] mem_budget`, job-dir
-disk under `disk_admission`, vCPUs against `[executor.vm] max_cpus` (else `cpus`). An offer
-that would jump executor jobs still waiting is refused too, as `memory` (`disk` without a
-budget). A granted offer is a ledger entry `reservation-<id>` the node holds locked, with no
-job behind it; with neither memory nor disk admission on, nothing is held and every offer that
-passes the vCPU check is granted. Leases are cut to 600 seconds and run on the node's monotonic
+disk under `disk_admission`, vCPUs against `[executor.vm] max_cpus` (else `cpus`) per job and
+against the node's vCPU budget (`cpu_overcommit`) in all. An offer that would jump executor jobs
+still waiting is refused too, as `memory` (`cpus` without a memory budget, `disk` without
+either). A granted offer is a ledger entry `reservation-<id>` the node holds locked, with no
+job behind it; with no admission on, nothing is held and every offer that passes the per-job
+vCPU check is granted. Leases are cut to 600 seconds and run on the node's monotonic
 clock; an offer of a reservation already held renews it. A node not `ready`, or with acquisition
 stopped, refuses offers and starts without a reservation; so does, as `ceiling`, a node whose
 placed jobs not finished and reservations held reach the hub's ceiling, as the node last

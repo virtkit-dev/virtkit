@@ -128,7 +128,7 @@ built-in or autodetected default  <-  hub value  <-  the node's config.toml
 ```
 
 Built today: the local file, over built-in defaults, and on the node the hub settings below,
-which the hub has no way to set yet, and an enrolled node's memory and per-job vCPU defaults.
+which the hub has no way to set yet, and an enrolled node's memory and vCPU defaults.
 The hub steers through desired state — a concurrency
 ceiling, stopped acquisition, its [egress layer](#job-egress-from-the-hub) — and through
 commands: drain, quarantine, and the release a node updates to, within what the node allows.
@@ -143,8 +143,7 @@ The rest of this section is proposed.
   `disk_default`, `wait_timeout_secs`; `[executor.vm]` `cpus`, `mem`, `max_cpus`, `max_mem`;
   `image_cache_idle_secs` — and `[registry]` (below), whose `ca_file`, `username`,
   `password_file` and `token_file` the hub never names, nor a store on the host.
-  `cpu_overcommit` joins the list with the vCPU admission it sets. The concurrency ceiling stays
-  desired state of its own. Any other key is refused. The hub never sets `state_dir`; `[node]`
+  The concurrency ceiling stays desired state of its own. Any other key is refused. The hub never sets `state_dir`; `[node]`
   `release_keys`, `require_signed`, `allow_downgrade` or `validate`; `[egress]`, which its
   egress layer narrows instead; a path or a credential file; or anything that widens what a
   job VM can reach. The trust model's [routine fields](trust-model.md#routine-and-sensitive)
@@ -169,12 +168,16 @@ with the source `default`.
 - **vCPUs per job.** `max_cpus` defaults to the host's online CPUs, so `MICROVM_CPUS` may ask
   for up to the whole host. A job that asks for none gets `cpus`, held to `max_cpus` on any
   host. The default VM keeps 4 vCPUs, fewer on a smaller host.
+- **vCPUs in all.** An unset `cpu_overcommit` is 2, where on a host that is not enrolled it
+  means no vCPU gate: the admission ledger counts each job guest's vCPUs, against the online
+  CPUs times the ratio, rounded down. A job waits for vCPUs as it waits for memory, and a
+  node refuses an offer past them; a `MICROVM_CPUS` is held to the budget, and an unset
+  `cpus` too.
 
 Proposed:
 
-- **vCPUs in all.** The admission ledger counts vCPUs too, against the online CPUs times
-  `cpu_overcommit` (default 2). A job waits for vCPUs as it waits for memory; the heartbeat
-  reports vCPUs committed and the budget, and the hub stops placing on a node past it.
+- **vCPUs reported.** The heartbeat reports vCPUs committed and the budget, and the hub stops
+  placing on a node past it.
 - **Registry.** With no `[registry]` in the local file, the node uses the one the hub names —
   a registry the hub manages, by URL, CA and pipeline root — with no credential of its own:
   guests get the job's token (`guest_credential = "job"`), so only jobs the hub places reach

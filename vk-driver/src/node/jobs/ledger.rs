@@ -29,6 +29,9 @@ pub struct Limits {
     pub disk_admission: bool,
     /// The most vCPUs a job may have.
     pub max_cpus: u32,
+    /// The vCPUs every job together may have (`[executor.schedule] cpu_overcommit`); `None`
+    /// with vCPU admission off.
+    pub cpu_budget: Option<u32>,
 }
 
 /// Frees `need` more bytes of room on the job dirs' filesystem, keeping the bases it is given.
@@ -155,14 +158,23 @@ pub fn refusal(short: Short, ask: &Envelope, limits: &Limits) -> (Refusal, Strin
                 limits.budget_mib.unwrap_or(0)
             ),
         ),
+        Short::Cpus => (
+            Refusal::Cpus,
+            format!(
+                "{} vCPUs do not fit the node's vCPU budget of {}",
+                ask.cpus,
+                limits.cpu_budget.unwrap_or(0)
+            ),
+        ),
         Short::Disk { .. } => (
             Refusal::Disk,
             format!("{} bytes of job-dir disk do not fit", ask.disk_bytes),
         ),
         Short::Queue => (
-            match limits.budget_mib {
-                Some(_) => Refusal::Memory,
-                None => Refusal::Disk,
+            match (limits.budget_mib, limits.cpu_budget) {
+                (Some(_), _) => Refusal::Memory,
+                (None, Some(_)) => Refusal::Cpus,
+                (None, None) => Refusal::Disk,
             },
             "jobs on this node are waiting for room".into(),
         ),
@@ -208,8 +220,12 @@ impl Ledger {
                 jobs: &self.limits.jobs_dir,
                 reclaim: None,
             }),
+            cpus: self.limits.cpu_budget.map(|budget| admit::CpuAsk {
+                want: envelope.cpus,
+                budget,
+            }),
         };
-        if ask.mem.is_none() && ask.disk.is_none() {
+        if ask.is_empty() {
             return Ok(None);
         }
         match admit::try_acquire(&self.limits.admit_dir, name, &ask) {
@@ -388,6 +404,7 @@ mod tests {
             budget_mib: budget,
             disk_admission: false,
             max_cpus: 8,
+            cpu_budget: None,
         };
         (Ledger::new(limits), dir)
     }
@@ -424,6 +441,32 @@ mod tests {
         );
         assert!(matches!(
             l.offer(&id("b"), env(4096, 4), 90, Gate::Open, now).reply,
+            OfferReply::Accepted { .. }
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn offers_hold_their_vcpus_against_the_vcpu_budget() {
+        let (mut l, dir) = ledger("cpu-budget", None);
+        l.limits.cpu_budget = Some(10);
+        let now = Instant::now();
+        assert!(matches!(
+            l.offer(&id("a"), env(1024, 8), 90, Gate::Open, now).reply,
+            OfferReply::Accepted { .. }
+        ));
+        let OfferReply::Refused { reason, message } =
+            l.offer(&id("b"), env(1024, 4), 90, Gate::Open, now).reply
+        else {
+            panic!("an offer over the vCPU budget was granted");
+        };
+        assert_eq!(reason, Refusal::Cpus);
+        assert!(
+            message.is_some_and(|m| m.contains("vCPU budget of 10")),
+            "{reason:?}"
+        );
+        assert!(matches!(
+            l.offer(&id("c"), env(1024, 2), 90, Gate::Open, now).reply,
             OfferReply::Accepted { .. }
         ));
         let _ = std::fs::remove_dir_all(dir);
@@ -529,6 +572,7 @@ mod tests {
                 jobs: &l.limits.jobs_dir,
                 reclaim: None,
             }),
+            cpus: None,
         };
         let blocker = admit::try_acquire(&l.limits.admit_dir, "blocker", &whole)
             .unwrap()
@@ -612,6 +656,7 @@ mod tests {
                 budget_mib: 8192,
             }),
             disk: None,
+            cpus: None,
         };
         let own = admit::acquire(&l.limits.admit_dir, "4242", &ask, Duration::ZERO).unwrap();
         // What it gave back fits another.

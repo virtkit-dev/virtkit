@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **CI jobs can wait for vCPUs as they wait for memory.** With `[executor.schedule]
+  cpu_overcommit` set, a job waits while the guests' vCPUs would pass that many per CPU of the
+  host. A fleet node does this at 2 unless its config or hub says otherwise, and refuses the
+  hub's offers past it.
 - **A fleet node takes settings from its hub.** Capacity and VM sizing settings and the
   registry may come from the hub; anything the node's own config file sets still wins, and
   every `vk` on the node uses the result. The node refuses anything else the hub sends and

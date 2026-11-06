@@ -1,5 +1,6 @@
 //! Admission for CI jobs: a host-wide ledger that keeps a runner from committing more guest
-//! RAM than it can back, or more disk than the filesystem holding its job dirs has room for.
+//! RAM than it can back, more disk than the filesystem holding its job dirs has room for, or
+//! more vCPUs than its overcommit of the host's CPUs allows.
 //!
 //! Without it a runner takes every job its `concurrent` limit allows and the host's OOM
 //! killer arbitrates — it takes a VMM, and that job dies mid-stage. So a job reserves what
@@ -63,12 +64,20 @@ pub struct Reservation {
     job_id: String,
 }
 
-/// What a job asks the ledger for: its guest RAM against the host's budget, room for its job
-/// dir to grow into, or both — each `None` where that admission is off.
+/// A job's guest RAM and vCPUs against the host's budgets, and room for its job dir to grow.
+/// Each is `None` where that admission is off.
 #[derive(Clone, Copy)]
 pub struct Ask<'a> {
     pub mem: Option<MemAsk>,
     pub disk: Option<DiskAsk<'a>>,
+    pub cpus: Option<CpuAsk>,
+}
+
+impl Ask<'_> {
+    /// Whether every admission is off, leaving nothing to hold.
+    pub fn is_empty(&self) -> bool {
+        self.mem.is_none() && self.disk.is_none() && self.cpus.is_none()
+    }
 }
 
 /// `want_mib` of guest RAM out of a `budget_mib` the whole host shares.
@@ -76,6 +85,13 @@ pub struct Ask<'a> {
 pub struct MemAsk {
     pub want_mib: u64,
     pub budget_mib: u64,
+}
+
+/// `want` vCPUs out of a `budget` the whole host shares.
+#[derive(Clone, Copy)]
+pub struct CpuAsk {
+    pub want: u32,
+    pub budget: u32,
 }
 
 /// Room for `want` more bytes on the filesystem holding `jobs`, the directory every job's dir
@@ -155,6 +171,15 @@ pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result
              budget ([executor.schedule] mem_budget vs [executor.vm] mem) — it can never be admitted"
         );
     }
+    if let Some(CpuAsk { want, budget }) = ask.cpus
+        && want > budget
+    {
+        // As for memory: a MICROVM_CPUS is clamped to the budget before it reaches here.
+        bail!(
+            "this job's {want} vCPUs exceed the host's whole budget of {budget} \
+             ([executor.schedule] cpu_overcommit vs [executor.vm] cpus) — it can never be admitted"
+        );
+    }
     if let Some(DiskAsk { want, jobs, .. }) = ask.disk {
         let total = crate::usage::fs_space(jobs)
             .with_context(|| format!("reading the free space of {}", jobs.display()))?
@@ -192,6 +217,7 @@ pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result
         // topology matters until there is a VM to place.
         node: None,
         disk: ask.disk.map(|d| d.want),
+        cpus: ask.cpus.map(|c| c.want),
     };
     // Held from here on: while waiting it marks a live request other jobs must queue behind,
     // and once granted it is the reservation itself. Created under the directory lock, which
@@ -236,12 +262,14 @@ pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result
             let mut pass = Pass {
                 ask: *ask,
                 used_mib: held.granted_mib,
+                used_cpus: held.granted_cpus,
                 ahead: held.ahead,
                 room: None,
             };
             // Walking every admitted job's dir is the costly part of a pass, under the lock
-            // every other admission waits on: skipped while memory keeps the job out anyway.
-            if !pass.mem_short() {
+            // every other admission waits on: skipped while memory or vCPUs keep the job out
+            // anyway.
+            if !pass.mem_short() && !pass.cpu_short() {
                 pass.room = ask
                     .disk
                     .map(|d| DiskRoom::of(d.jobs, &held.disk))
@@ -325,6 +353,8 @@ fn reserved_entry(path: &Path) -> Result<Option<u128>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Short {
     Memory,
+    /// The host's vCPU budget.
+    Cpus,
     Disk {
         /// The free space that would admit it, beyond what there is: what evicting caches would
         /// have to free. `None` for an ask larger than the whole filesystem.
@@ -343,6 +373,9 @@ pub fn try_acquire(
 ) -> Result<std::result::Result<Reservation, Short>> {
     if ask.mem.is_some_and(|m| m.want_mib > m.budget_mib) {
         return Ok(Err(Short::Memory));
+    }
+    if ask.cpus.is_some_and(|c| c.want > c.budget) {
+        return Ok(Err(Short::Cpus));
     }
     if let Some(DiskAsk { want, jobs, .. }) = ask.disk {
         // A node asked before any job ran has no job dirs yet; made as prepare makes it.
@@ -371,10 +404,11 @@ pub fn try_acquire(
         let mut pass = Pass {
             ask: *ask,
             used_mib: held.granted_mib,
+            used_cpus: held.granted_cpus,
             ahead: held.ahead,
             room: None,
         };
-        if !pass.mem_short() {
+        if !pass.mem_short() && !pass.cpu_short() {
             pass.room = ask
                 .disk
                 .map(|d| DiskRoom::of(d.jobs, &held.disk))
@@ -393,6 +427,7 @@ pub fn try_acquire(
             granted: true,
             node: None,
             disk: ask.disk.map(|d| d.want),
+            cpus: ask.cpus.map(|c| c.want),
         }
         .write(&file, &path)?;
         Ok(Ok(Reservation {
@@ -409,6 +444,8 @@ struct Pass<'a> {
     ask: Ask<'a>,
     /// The memory the other jobs hold.
     used_mib: u64,
+    /// The vCPUs the other jobs hold.
+    used_cpus: u64,
     /// How many jobs asked first and are still waiting.
     ahead: usize,
     /// The job dirs' filesystem, where disk is asked for.
@@ -419,6 +456,7 @@ struct Pass<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Blocker {
     Memory,
+    Cpus,
     Disk,
     /// Nothing but the jobs that asked first.
     Queue,
@@ -428,6 +466,7 @@ impl Blocker {
     fn what(self) -> &'static str {
         match self {
             Blocker::Memory => "memory",
+            Blocker::Cpus => "vCPUs",
             Blocker::Disk => "disk space",
             Blocker::Queue => "the jobs that asked first",
         }
@@ -441,6 +480,12 @@ impl<'a> Pass<'a> {
         self.ask
             .mem
             .is_some_and(|m| self.used_mib.saturating_add(m.want_mib) > m.budget_mib)
+    }
+
+    fn cpu_short(&self) -> bool {
+        self.ask
+            .cpus
+            .is_some_and(|c| self.used_cpus.saturating_add(u64::from(c.want)) > u64::from(c.budget))
     }
 
     /// The disk this job's own admission test asks for: what it expects, cut to what the
@@ -480,6 +525,7 @@ impl<'a> Pass<'a> {
     fn short(&self) -> Short {
         match self.blocker() {
             Some(Blocker::Memory) => Short::Memory,
+            Some(Blocker::Cpus) => Short::Cpus,
             Some(Blocker::Disk) => Short::Disk {
                 need: self.disk_shortfall(),
             },
@@ -497,11 +543,13 @@ impl<'a> Pass<'a> {
         }
     }
 
-    /// What keeps the job out, or `None` when it is admitted. Memory before disk where both
-    /// are short: it is the figure a job's trace sizes it by.
+    /// What keeps the job out, or `None` when it is admitted. Memory, then vCPUs, before disk
+    /// where several are short: they are the figures a job's trace sizes it by.
     fn blocker(&self) -> Option<Blocker> {
         if self.mem_short() {
             Some(Blocker::Memory)
+        } else if self.cpu_short() {
+            Some(Blocker::Cpus)
         } else if self.disk_short() {
             Some(Blocker::Disk)
         } else if self.ahead > 0 {
@@ -512,16 +560,19 @@ impl<'a> Pass<'a> {
     }
 
     /// The line a job prints when it starts to wait: the resource it is short of, or for a job
-    /// held only by the queue, the one it asked for — memory where it asked for both.
+    /// held only by the queue, the one it asked for — memory, then vCPUs, before disk.
     fn note(&self) -> String {
         let ahead = self.ahead;
-        let on_disk = match self.blocker() {
-            Some(Blocker::Disk) => true,
-            Some(Blocker::Queue) => self.ask.mem.is_none(),
-            _ => false,
+        let on = match self.blocker() {
+            Some(Blocker::Queue) | None => match self.ask {
+                Ask { mem: Some(_), .. } => Blocker::Memory,
+                Ask { cpus: Some(_), .. } => Blocker::Cpus,
+                _ => Blocker::Disk,
+            },
+            Some(blocker) => blocker,
         };
-        match (on_disk, self.ask.mem, self.ask.disk, self.room) {
-            (true, _, Some(disk), Some(room)) => format!(
+        match (on, self.ask.mem, self.ask.cpus, self.ask.disk, self.room) {
+            (Blocker::Disk, _, _, Some(disk), Some(room)) => format!(
                 "virtkit: waiting for {} of room in {} ({} free, {} still to be written by the \
                  jobs admitted there, {ahead} job(s) asked first)",
                 crate::usage::fmt_bytes(self.disk_claim().unwrap_or(disk.want)),
@@ -530,17 +581,21 @@ impl<'a> Pass<'a> {
                 crate::usage::fmt_bytes(room.pending)
             ),
             (
-                false,
+                Blocker::Memory,
                 Some(MemAsk {
                     want_mib,
                     budget_mib,
                 }),
-                _,
-                _,
+                ..,
             ) => format!(
                 "virtkit: waiting for {want_mib} MiB of the host's {budget_mib} MiB memory \
                  budget ({} MiB reserved, {ahead} job(s) asked first)",
                 self.used_mib
+            ),
+            (Blocker::Cpus, _, Some(CpuAsk { want, budget }), ..) => format!(
+                "virtkit: waiting for {want} of the host's budget of {budget} vCPUs ({} \
+                 committed, {ahead} job(s) asked first)",
+                self.used_cpus
             ),
             _ => format!("virtkit: waiting behind {ahead} job(s) that asked first"),
         }
@@ -550,8 +605,8 @@ impl<'a> Pass<'a> {
     fn refusal(&self, timeout: Duration) -> String {
         let secs = timeout.as_secs();
         let knob = "([executor.schedule] wait_timeout_secs)";
-        match (self.blocker(), self.ask.mem, self.ask.disk) {
-            (Some(Blocker::Disk), _, Some(disk)) => format!(
+        match (self.blocker(), self.ask.mem, self.ask.cpus, self.ask.disk) {
+            (Some(Blocker::Disk), _, _, Some(disk)) => format!(
                 "no room in {} for the {} this job is expected to write within {secs}s {knob}",
                 disk.jobs.display(),
                 crate::usage::fmt_bytes(self.disk_claim().unwrap_or(disk.want))
@@ -562,10 +617,14 @@ impl<'a> Pass<'a> {
                     want_mib,
                     budget_mib,
                 }),
-                _,
+                ..,
             ) => format!(
                 "no room in the host's {budget_mib} MiB memory budget for this job's \
                  {want_mib} MiB within {secs}s {knob}"
+            ),
+            (Some(Blocker::Cpus), _, Some(CpuAsk { want, budget }), _) => format!(
+                "no room in the host's budget of {budget} vCPUs for this job's {want} within \
+                 {secs}s {knob}"
             ),
             _ => format!(
                 "not admitted within {secs}s: {} job(s) that asked first are still waiting {knob}",
@@ -1640,11 +1699,15 @@ fn report(anomalies: &[String]) {
     }
 }
 
-/// What the ledger is holding: the memory granted and how many jobs hold it, plus how many
-/// asked before `asked` and are still waiting. Ignores `job_id` (the caller's own entry).
+/// What the ledger is holding: the memory and vCPUs granted and how many jobs hold them, plus
+/// how many asked before `asked` and are still waiting. Ignores `job_id` (the caller's own
+/// entry).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Held {
     pub granted_mib: u64,
+    /// The vCPUs granted. An entry written before vCPUs were counted, or with vCPU admission
+    /// off, counts none.
+    pub granted_cpus: u64,
     pub granted: usize,
     pub ahead: usize,
     /// Granted memory by node, used to place the next job. Entries without a placement,
@@ -1752,6 +1815,9 @@ fn tally(dir: &Path, job_id: &str, asked: u128, anomalies: &mut Vec<String>) -> 
         if entry.granted {
             out.granted_mib = out.granted_mib.saturating_add(entry.want_mib);
             out.granted = out.granted.saturating_add(1);
+            out.granted_cpus = out
+                .granted_cpus
+                .saturating_add(u64::from(entry.cpus.unwrap_or(0)));
             out.mem.push((name.to_os_string(), entry.want_mib));
             let placed = match entry.node {
                 Some(Place::Node(id)) => Some(out.per_node.entry(id).or_default()),
@@ -1781,6 +1847,8 @@ struct Entry {
     node: Option<Place>,
     /// The bytes it expects to write into its job dir, where disk admission is on.
     disk: Option<u64>,
+    /// Its vCPUs, where vCPU admission is on.
+    cpus: Option<u32>,
 }
 
 /// Where a job's guest RAM went, as the ledger records it.
@@ -1802,11 +1870,12 @@ impl Place {
 }
 
 impl Entry {
-    /// `<mib> <asked> <granted|waiting> [node=<n>|spread] [disk=<bytes>]`, rewritten whole
-    /// each time so a reader either sees the previous line or the new one, never a splice of
-    /// both. The node is absent until one is chosen, and absent for good on a host that places
-    /// nothing — so a three-field line, all this ledger ever held before, still reads. The disk
-    /// claim goes last, where a reader that knows only the node passes over it.
+    /// `<mib> <asked> <granted|waiting> [node=<n>|spread] [disk=<bytes>] [cpus=<n>]`, rewritten
+    /// whole each time so a reader either sees the previous line or the new one, never a splice
+    /// of both. The node is absent until one is chosen, and absent for good on a host that
+    /// places nothing — so a three-field line, all this ledger ever held before, still reads.
+    /// The disk claim and the vCPUs go last, where a reader that knows only the node passes over
+    /// them, and one that knows the disk claim passes over the vCPUs.
     fn write(&self, mut file: &File, path: &Path) -> Result<()> {
         let state = if self.granted { "granted" } else { "waiting" };
         let node = match self.node {
@@ -1818,7 +1887,14 @@ impl Entry {
             Some(bytes) => format!(" disk={bytes}"),
             None => String::new(),
         };
-        let line = format!("{} {} {state}{node}{disk}\n", self.want_mib, self.asked);
+        let cpus = match self.cpus {
+            Some(n) => format!(" cpus={n}"),
+            None => String::new(),
+        };
+        let line = format!(
+            "{} {} {state}{node}{disk}{cpus}\n",
+            self.want_mib, self.asked
+        );
         file.set_len(0)
             .and_then(|()| file.seek(SeekFrom::Start(0)))
             .and_then(|_| file.write_all(line.as_bytes()))
@@ -1838,18 +1914,18 @@ impl Entry {
             granted: fields.next()? == "granted",
             node: None,
             disk: None,
+            cpus: None,
         };
         for field in fields {
-            match field.strip_prefix("disk=") {
-                // A claim that does not parse makes the entry unreadable, not claimless: it is
-                // reported as a ledger anomaly rather than silently read as claiming no room.
-                Some(bytes) => entry.disk = Some(bytes.parse().ok()?),
+            // A claim that does not parse makes the entry unreadable, not claimless: it is
+            // reported as a ledger anomaly rather than silently read as claiming nothing.
+            if let Some(bytes) = field.strip_prefix("disk=") {
+                entry.disk = Some(bytes.parse().ok()?);
+            } else if let Some(n) = field.strip_prefix("cpus=") {
+                entry.cpus = Some(n.parse().ok()?);
+            } else if let Some(place) = Place::parse(field) {
                 // A field this version does not know leaves the node as it was.
-                None => {
-                    if let Some(place) = Place::parse(field) {
-                        entry.node = Some(place);
-                    }
-                }
+                entry.node = Some(place);
             }
         }
         Some(entry)
@@ -2079,7 +2155,16 @@ mod tests {
             want_mib,
             budget_mib,
         });
-        acquire(dir, job, &Ask { mem, disk: None }, timeout)
+        acquire(
+            dir,
+            job,
+            &Ask {
+                mem,
+                disk: None,
+                cpus: None,
+            },
+            timeout,
+        )
     }
 
     /// A reservation held by this test, as another job's would be.
@@ -2103,6 +2188,7 @@ mod tests {
             granted,
             node,
             disk: None,
+            cpus: None,
         }
         .write(&file, &dir.join(job))
         .unwrap();
@@ -2143,6 +2229,7 @@ mod tests {
                 budget_mib: 8192,
             }),
             disk: None,
+            cpus: None,
         };
         // Room for both, but the waiter asked first.
         assert!(matches!(
@@ -2172,6 +2259,7 @@ mod tests {
                 budget_mib: 8192,
             }),
             disk: None,
+            cpus: None,
         };
         let resv = try_acquire(&dir, "resv", &ask).unwrap().unwrap();
         let err = resv.rename(&dir, "job").unwrap_err();
@@ -3170,6 +3258,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
             granted: true,
             node: None,
             disk: None,
+            cpus: None,
         }
         .write(&garbled, &dir.join("mid-write"))
         .unwrap();
@@ -3337,8 +3426,10 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
                     jobs: Path::new("/jobs"),
                     reclaim: None,
                 }),
+                cpus: None,
             },
             used_mib: 0,
+            used_cpus: 0,
             ahead: 0,
             room: Some(DiskRoom {
                 avail: avail * GIB,
@@ -3557,6 +3648,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
                 jobs: &jobs,
                 reclaim: None,
             }),
+            cpus: None,
         };
         // A job already admitted that has yet to write more than the filesystem has free.
         let blocker = open_shared(&dir.join("running")).unwrap();
@@ -3566,6 +3658,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
             granted: true,
             node: None,
             disk: Some(u64::MAX / 2),
+            cpus: None,
         }
         .write(&blocker, &dir.join("running"))
         .unwrap();
@@ -3631,6 +3724,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
                 granted: true,
                 node: None,
                 disk: Some(PENDING),
+                cpus: None,
             }
             .write(&file, &dir.join("running"))
             .unwrap();
@@ -3673,6 +3767,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
                 jobs: &jobs,
                 reclaim: Some(&reclaim),
             }),
+            cpus: None,
         };
 
         // The shortfall: what the running job has yet to write plus this ask, less what is
@@ -3797,6 +3892,69 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
         let garbled = open_shared(&dir.join("garbled")).unwrap();
         (&garbled).write_all(b"0 1 granted disk=12x\n").unwrap();
         assert!(Entry::read(&garbled).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// vCPUs go after the disk claim, so a reader that knows only the node and the disk
+    /// passes over them; an entry without them, as an older version writes, holds none.
+    #[test]
+    fn an_entry_remembers_its_vcpus() {
+        let dir = tmpdir("entry-cpus");
+        let placed = held_on(&dir, "placed", 2048, 1, true, Some(Place::Node(3)));
+        let mut entry = Entry::read(&placed).unwrap();
+        (entry.disk, entry.cpus) = (Some(12345), Some(6));
+        entry.write(&placed, &dir.join("placed")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("placed")).unwrap(),
+            "2048 1 granted node=3 disk=12345 cpus=6\n"
+        );
+        let back = Entry::read(&placed).unwrap();
+        assert_eq!(
+            (back.node, back.disk, back.cpus),
+            (Some(Place::Node(3)), Some(12345), Some(6))
+        );
+        let older = held(&dir, "older", 1024, 2, true);
+        assert_eq!(committed(&dir).unwrap().granted_cpus, 6);
+
+        let garbled = open_shared(&dir.join("garbled")).unwrap();
+        (&garbled).write_all(b"0 1 granted cpus=x\n").unwrap();
+        assert!(Entry::read(&garbled).is_none());
+        drop((placed, older, garbled));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Like memory, vCPUs wait when this job and admitted jobs would exceed the budget;
+    /// a job larger than the whole budget fails at once.
+    #[test]
+    fn vcpus_are_admitted_within_their_budget() {
+        let dir = tmpdir("cpus");
+        let ask = |want| Ask {
+            mem: None,
+            disk: None,
+            cpus: Some(CpuAsk { want, budget: 8 }),
+        };
+        let first = acquire(&dir, "first", &ask(6), Duration::ZERO).unwrap();
+        assert_eq!(committed(&dir).unwrap().granted_cpus, 6);
+        let err = acquire(&dir, "second", &ask(4), Duration::ZERO).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("budget of 8 vCPUs for this job's 4"),
+            "{err}"
+        );
+        assert!(matches!(
+            try_acquire(&dir, "offer", &ask(4)).unwrap(),
+            Err(Short::Cpus)
+        ));
+        let second = try_acquire(&dir, "offer", &ask(2)).unwrap().unwrap();
+        assert_eq!(committed(&dir).unwrap().granted_cpus, 8);
+
+        let err = acquire(&dir, "huge", &ask(9), Duration::from_secs(60)).unwrap_err();
+        assert!(err.to_string().contains("never be admitted"), "{err}");
+        assert!(matches!(
+            try_acquire(&dir, "huge", &ask(9)).unwrap(),
+            Err(Short::Cpus)
+        ));
+        drop((first, second));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -230,6 +230,7 @@ pub fn limits(cfg: &Config) -> Result<Limits> {
         budget_mib: crate::vm::budget_mib(cfg).transpose()?,
         disk_admission: cfg.executor.schedule.disk_admission.unwrap_or(true),
         max_cpus: vm.max_cpus.unwrap_or(vm.cpus),
+        cpu_budget: crate::vm::cpu_budget(cfg),
     })
 }
 
@@ -1048,6 +1049,7 @@ pub(crate) fn for_test(node_dir: &Path, cfg: Config, budget_mib: Option<u64>) ->
         budget_mib,
         disk_admission: false,
         max_cpus: 8,
+        cpu_budget: None,
     };
     Jobs::open_with(
         node_dir,
@@ -1309,6 +1311,7 @@ pub(crate) mod tests {
                 jobs: &jobs_dir,
                 reclaim: None,
             }),
+            cpus: None,
         };
         let blocker = crate::admit::try_acquire(&admit_dir, "blocker", &whole)
             .unwrap()
@@ -1340,6 +1343,7 @@ pub(crate) mod tests {
             budget_mib: None,
             disk_admission: true,
             max_cpus: 8,
+            cpu_budget: None,
         };
         let jobs = Jobs::open_with(&dir, Arc::new(cfg), limits, fake_driver, fake_cleanup);
         (jobs, dir, asked)
@@ -1473,6 +1477,7 @@ pub(crate) mod tests {
             budget_mib: None,
             disk_admission: false,
             max_cpus: 8,
+            cpu_budget: None,
         };
         let jobs = Jobs::open_with(&dir, Arc::new(cfg), limits, running_driver, fake_cleanup);
         let now = Instant::now();
@@ -1544,6 +1549,7 @@ pub(crate) mod tests {
             budget_mib: None,
             disk_admission: false,
             max_cpus: 8,
+            cpu_budget: None,
         };
         let jobs = Jobs::open_with(&dir, Arc::new(cfg), limits, running_driver, fake_cleanup);
         let now = Instant::now();
@@ -1880,6 +1886,7 @@ pub(crate) mod tests {
                 budget_mib: 8192,
             }),
             disk: None,
+            cpus: None,
         };
         let _other = crate::admit::try_acquire(&dir.join("admit"), "4242", &ask)
             .unwrap()
@@ -2125,6 +2132,7 @@ pub(crate) mod tests {
             budget_mib: None,
             disk_admission: false,
             max_cpus: 8,
+            cpu_budget: None,
         };
         let jobs = Jobs::open_with(&dir, Arc::new(cfg), limits, fake_driver, slow_cleanup);
         let now = Instant::now();
