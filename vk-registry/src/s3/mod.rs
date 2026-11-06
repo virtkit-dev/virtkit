@@ -417,7 +417,8 @@ async fn operate(
             object::put(state, authz, segs, seed, req, ctx).await
         }
         (path::Target::Object { segs, .. }, &Method::DELETE, None) => {
-            object::delete(state, authz, segs, req, ctx).await
+            let versioned = query.iter().any(|(name, _)| name == "versionId");
+            object::delete(state, authz, segs, versioned, req, ctx).await
         }
         _ => refuse(req, ctx.not_implemented(), ctx).await,
     }

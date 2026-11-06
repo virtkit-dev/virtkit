@@ -2352,6 +2352,175 @@ async fn conditional_headers_decide_reads_and_writes() {
     }
 }
 
+/// DeleteObject's and DeleteObjects' conditions: an object is deleted only when each one
+/// given holds of it.
+#[tokio::test]
+async fn conditional_deletes_keep_what_they_do_not_name() {
+    let dir = tmp("conditional-delete");
+    let host = spawn(open_state(&dir, true));
+    let put = |path: &str| Req::new("PUT", path).body(HELLO.to_vec());
+    let exists = |path: &str| send(&host, Req::new("HEAD", path));
+    let etag = format!("\"{}\"", md5_hex(HELLO));
+    send(&host, put("/s3/b/k")).await.ok(200);
+    let modified = |path: &'static str| {
+        let head = exists(path);
+        async move { head.await.header("last-modified").unwrap().to_string() }
+    };
+    let past = "Mon, 01 Jan 2001 00:00:00 GMT";
+    let del = |name: &str, value: &str| Req::new("DELETE", "/s3/b/k").header(name, value);
+
+    // Each condition that does not hold keeps the object.
+    for (name, value) in [
+        ("If-Match", "\"incorrect_etag\""),
+        ("If-Match", "incorrect_etag"),
+        ("x-amz-if-match-size", "23234"),
+        ("x-amz-if-match-last-modified-time", past),
+    ] {
+        send(&host, del(name, value))
+            .await
+            .is(412, "PreconditionFailed");
+        exists("/s3/b/k").await.ok(200);
+    }
+    let all = del("If-Match", &etag)
+        .header("x-amz-if-match-size", "13")
+        .header("x-amz-if-match-last-modified-time", past);
+    send(&host, all).await.is(412, "PreconditionFailed");
+    // A value its header does not take is refused.
+    send(&host, del("x-amz-if-match-size", "-1"))
+        .await
+        .is(400, "InvalidArgument");
+    send(&host, del("x-amz-if-match-last-modified-time", "yesterday"))
+        .await
+        .is(400, "InvalidArgument");
+    // A condition applies to the object, not to a version of it.
+    let versioned = del("If-Match", &etag).query("versionId=null");
+    send(&host, versioned).await.is(501, "NotImplemented");
+    exists("/s3/b/k").await.ok(200);
+
+    // Each one that holds deletes it: the ETag quoted or not, `*`, the size, the time.
+    for (name, value) in [
+        ("If-Match", etag.as_str()),
+        ("If-Match", etag.trim_matches('"')),
+        ("If-Match", "*"),
+        ("If-Match", "\"*\""),
+        ("x-amz-if-match-size", "13"),
+        ("x-amz-if-match-last-modified-time", ""),
+    ] {
+        send(&host, put("/s3/b/k")).await.ok(200);
+        // An empty time stands for this write's own, read back: the clock may have ticked since the last.
+        let time = modified("/s3/b/k").await;
+        let value = if value.is_empty() {
+            time.as_str()
+        } else {
+            value
+        };
+        let resp = send(&host, del(name, value)).await;
+        assert_eq!(resp.status, 204, "{name}: {value}: {}", resp.body);
+        exists("/s3/b/k").await.ok(404);
+    }
+    // With nothing there, a condition is NoSuchKey; without one, 204 as before.
+    send(&host, del("If-Match", "*")).await.is(404, "NoSuchKey");
+    send(&host, del("x-amz-if-match-size", "13"))
+        .await
+        .is(404, "NoSuchKey");
+    send(&host, Req::new("DELETE", "/s3/b/k")).await.ok(204);
+
+    // DeleteObjects: the same conditions as an Object's children, each key on its own.
+    let keys = [
+        "quoted",
+        "unquoted",
+        "wildcard",
+        "size",
+        "time",
+        "stale",
+        "big",
+        "old",
+        "empty",
+        "versioned",
+    ];
+    for k in keys {
+        send(&host, put(&format!("/s3/b/{k}"))).await.ok(200);
+    }
+    let modified = modified("/s3/b/time").await;
+    let lmt = |t: &str| format!("<LastModifiedTime>{t}</LastModifiedTime>");
+    let doc = delete_doc(
+        &[
+            &format!("{}<ETag>{etag}</ETag>", key_of("quoted")),
+            &format!(
+                "{}<ETag>{}</ETag>",
+                key_of("unquoted"),
+                etag.trim_matches('"')
+            ),
+            &format!("{}<ETag>\"*\"</ETag>", key_of("wildcard")),
+            &format!("{}<Size>13</Size>", key_of("size")),
+            &format!("{}{}", key_of("time"), lmt(&modified)),
+            &format!(
+                "{}<ETag>00000000000000000000000000000000</ETag>",
+                key_of("stale")
+            ),
+            &format!("{}<ETag>{etag}</ETag><Size>14</Size>", key_of("big")),
+            &format!("{}{}", key_of("old"), lmt(past)),
+            &format!("{}<ETag></ETag>", key_of("empty")),
+            &format!(
+                "{}<VersionId>null</VersionId><ETag>{etag}</ETag>",
+                key_of("versioned")
+            ),
+            &format!("{}<ETag>*</ETag>", key_of("missing")),
+            &format!("{}<Size>13</Size>", key_of("missing-size")),
+        ],
+        false,
+    );
+    let resp = send(&host, delete_objects("b", doc)).await;
+    let (deleted, errors) = delete_result(&resp);
+    assert_eq!(deleted, ["quoted", "unquoted", "wildcard", "size", "time"]);
+    let errors: Vec<(&str, &str)> = errors
+        .iter()
+        .map(|(k, c)| (k.as_str(), c.as_str()))
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            ("stale", "PreconditionFailed"),
+            ("big", "PreconditionFailed"),
+            ("old", "PreconditionFailed"),
+            ("empty", "InvalidArgument"),
+            ("versioned", "NotImplemented"),
+            ("missing", "NoSuchKey"),
+            ("missing-size", "NoSuchKey"),
+        ]
+    );
+    let versioned = &elements(&resp.body, "Error")[4];
+    assert_eq!(element(versioned, "VersionId"), "null");
+    for k in keys {
+        let kept = !deleted.iter().any(|d| d == k);
+        exists(&format!("/s3/b/{k}"))
+            .await
+            .ok(if kept { 200 } else { 404 });
+    }
+
+    // A LastModifiedTime that is not a date refuses the whole document, an empty one first.
+    let refused = |times: &[&str]| {
+        let objects: Vec<String> = times
+            .iter()
+            .map(|t| format!("{}{}", key_of("stale"), lmt(t)))
+            .collect();
+        let objects: Vec<&str> = objects.iter().map(String::as_str).collect();
+        delete_objects("b", delete_doc(&objects, false))
+    };
+    let resp = send(&host, refused(&["2001-01-01T00:00:00Z"])).await;
+    resp.is(400, "InvalidRequest");
+    assert!(
+        resp.body
+            .contains("Invalid value for date attribute: 2001-01-01T00:00:00Z"),
+        "{}",
+        resp.body
+    );
+    send(&host, refused(&["not a date", ""]))
+        .await
+        .is(400, "MalformedXML");
+    exists("/s3/b/stale").await.ok(200);
+}
+
 #[tokio::test]
 async fn attributes_deletes_and_the_paths_a_key_cannot_take() {
     let dir = tmp("objects");
@@ -4493,6 +4662,47 @@ async fn multipart_uploads_are_aborted_copied_bounded_and_swept() {
     let list = Req::new("GET", path).query(&format!("uploadId={id}"));
     send(&host, sign(list)).await.is(404, "NoSuchUpload");
     send(&host, abort()).await.is(404, "NoSuchUpload");
+
+    // Aborted only if initiated when it says; a time still to come is no condition.
+    let now = || std::time::SystemTime::now();
+    let before = now();
+    let id = create_upload(&host, &sign, path).await;
+    let after = now();
+    let abort_if = |date: &str| {
+        let req = Req::new("DELETE", path)
+            .query(&format!("uploadId={id}"))
+            .header("x-amz-if-match-initiated-time", date);
+        sign(req)
+    };
+    let past = "Mon, 01 Jan 2001 00:00:00 GMT";
+    send(&host, abort_if(past))
+        .await
+        .is(412, "PreconditionFailed");
+    send(&host, abort_if("yesterday"))
+        .await
+        .is(400, "InvalidArgument");
+    let list = || sign(Req::new("GET", path).query(&format!("uploadId={id}")));
+    send(&host, list()).await.ok(200);
+    // The upload was initiated in the second before or after it was asked for.
+    let mut status = 0;
+    for t in [before, after] {
+        status = send(&host, abort_if(&httpdate::fmt_http_date(t)))
+            .await
+            .status;
+        if status == 204 {
+            break;
+        }
+    }
+    assert_eq!(status, 204);
+    send(&host, list()).await.is(404, "NoSuchUpload");
+    let id = create_upload(&host, &sign, path).await;
+    let req = Req::new("DELETE", path)
+        .query(&format!("uploadId={id}"))
+        .header(
+            "x-amz-if-match-initiated-time",
+            "Fri, 01 Jan 2100 00:00:00 GMT",
+        );
+    send(&host, sign(req)).await.ok(204);
 
     // An id names its own key's upload only, and an id this server cannot mint nothing.
     let id = create_upload(&host, &sign, path).await;

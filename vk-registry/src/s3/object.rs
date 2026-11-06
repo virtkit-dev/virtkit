@@ -1015,15 +1015,37 @@ pub(super) async fn put(
 /// a key that is a directory has no object to delete, and is 204 too. A foreign tag is not
 /// this view's to delete (409), and a caller that may read the object but not write it is
 /// refused (403). Under the namespace lock, as every change of `files/` is.
+///
+/// `If-Match`, `x-amz-if-match-last-modified-time` and `x-amz-if-match-size` are checked
+/// under that lock, against the object the delete would remove: 412 when one does not hold,
+/// 404 `NoSuchKey` when no object is there, and 400 for a value its header does not take.
+/// They apply to the object's one version, so `versioned` (a `?versionId=null` in the query)
+/// with any of them is 501.
 pub(super) async fn delete(
     state: &ServerState,
     authz: &Authz<'_>,
     segs: Vec<String>,
+    versioned: bool,
     req: Request<Incoming>,
     ctx: &Ctx,
 ) -> Result<Response<Body>> {
     if !admitted(authz, accounts::Action::Write, &segs) {
         return refuse(req, ctx.access_denied(), ctx).await;
+    }
+    let conditions = match conditional::DeleteConditions::of(req.headers()) {
+        Ok(c) => c,
+        Err(why) => {
+            let resp = ctx.error(StatusCode::BAD_REQUEST, "InvalidArgument", why);
+            return refuse(req, resp, ctx).await;
+        }
+    };
+    if versioned && !conditions.is_empty() {
+        let resp = ctx.error(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            "A header you provided implies functionality that is not implemented",
+        );
+        return refuse(req, resp, ctx).await;
     }
     if let Some(resp) = drain(req, ctx).await? {
         return Ok(resp);
@@ -1031,11 +1053,19 @@ pub(super) async fn delete(
     let ctx = ctx.clone();
     crate::dav::blocking(state, authz, move |store, authz| {
         let namespace = files::namespace(store)?;
-        Ok(match delete_one(store, &namespace, authz, &segs)? {
-            Deleted::Gone => no_content(),
-            Deleted::Denied => ctx.access_denied(),
-            Deleted::Foreign => unwritable(Unwritable::Foreign, &ctx),
-        })
+        Ok(
+            match delete_one(store, &namespace, authz, &segs, &conditions)? {
+                Deleted::Gone => no_content(),
+                Deleted::Denied => ctx.access_denied(),
+                Deleted::Foreign => unwritable(Unwritable::Foreign, &ctx),
+                Deleted::Absent => no_such_key(&ctx),
+                Deleted::Failed => ctx.error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "PreconditionFailed",
+                    conditional::PRECONDITION_FAILED,
+                ),
+            },
+        )
     })
     .await
 }
@@ -1048,34 +1078,47 @@ pub(super) enum Deleted {
     Denied,
     /// a foreign tag is there, which is not this view's to delete
     Foreign,
+    /// conditions were asked of an object, and none is there as far as the caller can tell;
+    /// nothing was deleted
+    Absent,
+    /// a condition did not hold of the object, which is kept
+    Failed,
 }
 
-/// Delete the object at `segs` for this caller, the namespace held (`_namespace`): a key
-/// that is a directory holds no object to delete. Writing the repository it is in is what
-/// deletes it, reading it or not; one the caller may neither read nor write is absent.
+/// Delete the object at `segs` for this caller, the namespace held (`_namespace`), when
+/// `conditions` hold of it: a key that is a directory holds no object to delete. Writing the
+/// repository it is in is what deletes it, reading it or not; one the caller may neither read
+/// nor write is absent. Holding the namespace, the object the conditions are checked against
+/// is the one deleted.
 pub(super) fn delete_one(
     store: &Store,
     _namespace: &files::Namespace,
     authz: &Authz<'_>,
     segs: &[String],
+    conditions: &conditional::DeleteConditions,
 ) -> Result<Deleted> {
+    let absent = match conditions.is_empty() {
+        true => Deleted::Gone,
+        false => Deleted::Absent,
+    };
     let Some(node) = files::resolve(store, segs)? else {
-        return Ok(Deleted::Gone);
+        return Ok(absent);
     };
     if !allowed(authz, accounts::Action::Write, node.repo()) {
         return Ok(match allowed(authz, accounts::Action::Read, node.repo()) {
             true => Deleted::Denied,
-            false => Deleted::Gone,
+            false => absent,
         });
     }
     match node {
+        Node::Object(obj) if !conditions.hold(&obj) => Ok(Deleted::Failed),
         Node::Object(obj) => {
             store.delete_tag(&obj.repo, &obj.tag)?;
+            Ok(Deleted::Gone)
         }
-        Node::Foreign(_) => return Ok(Deleted::Foreign),
-        Node::Dir(_) => {}
+        Node::Foreign(_) => Ok(Deleted::Foreign),
+        Node::Dir(_) => Ok(absent),
     }
-    Ok(Deleted::Gone)
 }
 
 fn no_content() -> Response<Body> {
