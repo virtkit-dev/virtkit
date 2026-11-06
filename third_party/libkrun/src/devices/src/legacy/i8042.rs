@@ -57,12 +57,13 @@ const CMD_RESET_CPU: u8 = 0xFE; // Reset CPU
 // controller with a keyboard and no AUX (mouse) port.
 const CMD_DISABLE_AUX: u8 = 0xA7;
 const CMD_ENABLE_AUX: u8 = 0xA8;
+const CMD_AUX_TEST: u8 = 0xA9;
 const CMD_SELF_TEST: u8 = 0xAA;
 const CMD_KBD_TEST: u8 = 0xAB;
 const CMD_DISABLE_KBD: u8 = 0xAD;
 const CMD_ENABLE_KBD: u8 = 0xAE;
 const CMD_WRITE_KBD_OUT: u8 = 0xD2; // the next data byte comes back as if the keyboard sent it
-const CMD_WRITE_AUX_OUT: u8 = 0xD3; // ... as if the AUX port sent it: no AUX here, dropped
+const CMD_WRITE_AUX_OUT: u8 = 0xD3; // ... as if the AUX port sent it: no AUX here, see below
 const CMD_WRITE_AUX: u8 = 0xD4; // the next data byte goes to the AUX device: dropped
 
 /// i8042 status register bits
@@ -432,6 +433,13 @@ impl BusDevice for I8042Device {
                 // Cannot fail: the buffer was just flushed.
                 let _ = self.push_byte(0x55);
             }
+            // No AUX port, said at once: the test reports its clock line stuck (0x01), which
+            // is how Linux tells an AT controller with no mouse port, rather than timing out.
+            OFS_STATUS if data[0] == CMD_AUX_TEST => {
+                self.flush_buf();
+                // Cannot fail: the buffer was just flushed.
+                let _ = self.push_byte(0x01);
+            }
             OFS_STATUS if data[0] == CMD_KBD_TEST => {
                 self.flush_buf();
                 // Cannot fail: the buffer was just flushed.
@@ -452,6 +460,9 @@ impl BusDevice for I8042Device {
                     CMD_WRITE_CTR => self.control = data[0],
                     CMD_WRITE_OUTP => self.outp = data[0],
                     CMD_WRITE_KBD_OUT => self.reply(&[data[0]]),
+                    // The AUX loopback comes back as keyboard data, without the AUX status
+                    // bit: a controller with no AUX port, which Linux sees at once.
+                    CMD_WRITE_AUX_OUT => self.reply(&[data[0]]),
                     _ => (),
                 }
             }
@@ -702,6 +713,21 @@ mod tests {
         assert_eq!(drain(&mut i8042), [KBD_ACK, KBD_SCANCODE_SET]);
         i8042.write(0, OFS_DATA, &[KBD_CMD_ECHO]);
         assert_eq!(drain(&mut i8042), [KBD_CMD_ECHO]);
+    }
+
+    #[test]
+    fn says_at_once_there_is_no_aux_port() {
+        let mut i8042 = device();
+        // Linux's loopback test: the byte comes back, but not as AUX data.
+        i8042.write(0, OFS_STATUS, &[CMD_WRITE_AUX_OUT]);
+        i8042.write(0, OFS_DATA, &[0x5a]);
+        let mut status = [0u8];
+        i8042.read(0, OFS_STATUS, &mut status);
+        assert_eq!(status[0] & SB_OUT_DATA_AVAIL, SB_OUT_DATA_AVAIL);
+        assert_eq!(status[0] & 0x20, 0, "no AUX data bit");
+        assert_eq!(drain(&mut i8042), [0x5a]);
+        i8042.write(0, OFS_STATUS, &[CMD_AUX_TEST]);
+        assert_eq!(drain(&mut i8042), [0x01]);
     }
 
     #[test]

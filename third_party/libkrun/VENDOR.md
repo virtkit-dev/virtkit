@@ -868,7 +868,10 @@ probe: the controller self-test (`0xAA` → `0x55`) and keyboard interface test 
 `0x00`), the keyboard interface and AUX enable/disable bits, and the keyboard's answers to
 reset (`FA AA`), identify (`FA AB 83`), the scancode set query (set 2), echo, and the commands
 that take a parameter (LEDs, scancode set, typematic), whose parameter is no longer taken for
-a command of its own. Writes for the AUX port (`0xD3`, `0xD4`) are dropped: there is no mouse.
+a command of its own. There is no AUX (mouse) port, and the controller says so at once: the
+AUX loopback (`0xD3`) comes back without the AUX-data status bit and the AUX interface test
+(`0xA9`) reports a stuck clock line, which ends Linux's AUX probe instead of each command
+waiting out its timeout. Bytes for the AUX device (`0xD4`) are dropped.
 `I8042Device::type_scancodes` types set-2 scancodes from the host, as many as the buffer has
 room for, and drops them while the guest has the keyboard disabled. The upstream device acked
 every keyboard byte and answered nothing else, so atkbd waited out its identify timeouts and
