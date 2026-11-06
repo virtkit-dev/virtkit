@@ -24,6 +24,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **vk-hub places jobs only where a node's memory is free now as well as within its budget,**
+  keeping 15 % of the node's RAM spare, as `vk tune` does.
 - **A fleet node needs no memory budget or vCPU ceiling in its config.** Unless its config or
   hub sets them, its jobs' memory is budgeted at the host's RAM less the smaller of 4 GiB and
   10 %, and a job may ask for up to all of the host's CPUs; the default job VM keeps 4 vCPUs

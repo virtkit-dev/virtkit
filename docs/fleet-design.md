@@ -161,10 +161,11 @@ with the source `default`.
   `MemTotal`, rounded down to a whole GiB as job sizes are, where on a host that is not enrolled
   it means no admission gate; so `vk tune` has a budget to work from. An unset `mem` is held to
   the budget, so a job that asks for nothing fits a small host. A host whose `MemTotal` cannot
-  be read, or that has less than a GiB to give, keeps no budget. Proposed: the hub
-  places on the smaller of the node's room under its budget and its live `MemAvailable` less
-  15 % of `MemTotal`, the reserve `vk tune` keeps; today it reads the budget alone once one is
-  set.
+  be read, or that has less than a GiB to give, keeps no budget. The hub places on the
+  smaller of the node's room under its budget and its live `MemAvailable` less 15 % of
+  `MemTotal`, the reserve `vk tune` keeps — on any node, enrolled defaults or not; on either
+  alone when the node reports only one, and on `MemAvailable` whole when it reports no
+  `MemTotal`.
 - **vCPUs per job.** `max_cpus` defaults to the host's online CPUs, so `MICROVM_CPUS` may ask
   for up to the whole host. A job that asks for none gets `cpus`, held to `max_cpus` on any
   host. The default VM keeps 4 vCPUs, fewer on a smaller host.

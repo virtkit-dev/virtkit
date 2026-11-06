@@ -1199,8 +1199,9 @@ the CPUs the envelope asks, does not report a gitlab-runner of its own ([one kin
 host](#placed-jobs-on-the-node)), and while it holds less placed work than its cap: the smaller
 of the ceiling the operator set it and the node's own `max_concurrency`, if either is set —
 read, from a node older than reporting it, from its runner's concurrency report.
-Its room is its last heartbeat's admission budget less committed memory
-— or its memory available, with no budget — and the job filesystem's most free space, less what
+Its room is the smaller of its last heartbeat's admission budget less committed memory and its
+memory available less 15 % of its inventory's `MemTotal` — either alone when the node reports
+only one, memory available whole with no `MemTotal` — and the job filesystem's most free space, less what
 the hub asked of it since: offers not yet answered, reservations accepted after that heartbeat,
 and starts not yet answered that are not on a reservation. `fits` is the sum of each node's room
 in envelopes, at most 1024 a node, and at most what its cap leaves.

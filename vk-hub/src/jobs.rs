@@ -97,6 +97,10 @@ const RETRY_PAUSE: Duration = Duration::from_secs(2);
 /// The most envelopes counted on one node, however small the envelope.
 const MAX_FITS: u64 = 1024;
 
+/// The share of a node's `MemTotal`, in percent, its live `MemAvailable` must keep free of the
+/// jobs placed on it: what is outside the guests' ledger, as `vk tune` reserves it on the node.
+const RESERVE_PCT: u64 = 15;
+
 /// What a job's stored output may run past its trace limit, for the notice a node writes
 /// when it cuts the output there.
 const OUTPUT_SLACK: u64 = 64 * 1024;
@@ -1965,13 +1969,8 @@ fn room(
             add(j.row.placement.envelope);
         }
     }
-    let mem_free = match heartbeat.admission.as_ref() {
-        Some(a) if a.budget_mib.is_some() => {
-            a.budget_mib.unwrap_or(0).saturating_sub(a.committed_mib)
-        }
-        _ => heartbeat.mem_available_mib?,
-    }
-    .saturating_sub(pending.mem_mib);
+    let mem_free =
+        mem_room(heartbeat, inventory.hardware.mem_total_mib)?.saturating_sub(pending.mem_mib);
     let mut fits = below_cap.min(MAX_FITS);
     if let Some(n) = mem_free.checked_div(env.mem_mib) {
         fits = fits.min(n);
@@ -1989,6 +1988,24 @@ fn room(
         fits = fits.min(n);
     }
     (fits > 0).then_some(fits)
+}
+
+/// Guest memory available for placement in MiB at `heartbeat`: the smaller of uncommitted
+/// budget and live `MemAvailable` less [`RESERVE_PCT`] percent of `total_mib` (`MemTotal`).
+/// The budget counts grants before jobs fault memory in; the live reading accounts for other
+/// host use. Use either alone when the other is unknown, all `MemAvailable` without
+/// `MemTotal`, and `None` with neither.
+fn mem_room(heartbeat: &vk_hub_proto::Heartbeat, total_mib: Option<u64>) -> Option<u64> {
+    let budget = (heartbeat.admission.as_ref())
+        .and_then(|a| Some(a.budget_mib?.saturating_sub(a.committed_mib)));
+    let reserve = total_mib.map_or(0, |t| t.saturating_mul(RESERVE_PCT) / 100);
+    let live = heartbeat
+        .mem_available_mib
+        .map(|a| a.saturating_sub(reserve));
+    match (budget, live) {
+        (Some(b), Some(l)) => Some(b.min(l)),
+        (b, l) => b.or(l),
+    }
 }
 
 /// How much placed work `node` holds as the hub counts it against the node's ceiling, one
@@ -5668,6 +5685,38 @@ mod tests {
             (Some("prepare_executor"), None)
         );
         assert_eq!(preparing.ran_ms(crate::now_secs()), None);
+    }
+
+    /// A node's room is the smaller of its budget's and its live memory's less the reserve,
+    /// either alone when the other is unknown.
+    #[test]
+    fn a_nodes_memory_room_is_the_tighter_of_budget_and_live() {
+        let beat = |budget: Option<u64>, available| vk_hub_proto::Heartbeat {
+            admission: Some(vk_hub_proto::Admission {
+                committed_mib: 8_000,
+                budget_mib: budget,
+                running: 1,
+                waiting: 0,
+            }),
+            mem_available_mib: available,
+            ..Default::default()
+        };
+        let total = Some(100_000);
+        // Budget room 52_000; live 70_000 - 15_000.
+        assert_eq!(
+            mem_room(&beat(Some(60_000), Some(70_000)), total),
+            Some(52_000)
+        );
+        // Live 60_000 - 15_000, under the budget's room.
+        assert_eq!(
+            mem_room(&beat(Some(90_000), Some(60_000)), total),
+            Some(45_000)
+        );
+        assert_eq!(mem_room(&beat(Some(60_000), None), total), Some(52_000));
+        assert_eq!(mem_room(&beat(None, Some(60_000)), total), Some(45_000));
+        assert_eq!(mem_room(&beat(None, Some(60_000)), None), Some(60_000));
+        assert_eq!(mem_room(&beat(None, Some(10_000)), total), Some(0));
+        assert_eq!(mem_room(&beat(None, None), total), None);
     }
 
     /// A node of 8 CPUs reporting `load1_hundredths`, and how long it keeps idle images.
