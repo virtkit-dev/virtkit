@@ -128,7 +128,8 @@ built-in or autodetected default  <-  hub value  <-  the node's config.toml
 ```
 
 Built today: the local file, over built-in defaults, and on the node the hub settings below,
-which the hub has no way to set yet, and an enrolled node's memory and vCPU defaults.
+which the hub has no way to set yet, an enrolled node's memory and vCPU defaults, and the
+registry the hub names.
 The hub steers through desired state — a concurrency
 ceiling, stopped acquisition, its [egress layer](#job-egress-from-the-hub) — and through
 commands: drain, quarantine, and the release a node updates to, within what the node allows.
@@ -141,8 +142,9 @@ The rest of this section is proposed.
 - **The hub fills in from an allowlist**, an explicit list in the code: capacity and VM sizing
   — `[executor.schedule]` `mem_budget`, `cpu_overcommit`, `from_history`, `disk_admission`,
   `disk_default`, `wait_timeout_secs`; `[executor.vm]` `cpus`, `mem`, `max_cpus`, `max_mem`;
-  `image_cache_idle_secs` — and `[registry]` (below), whose `ca_file`, `username`,
-  `password_file` and `token_file` the hub never names, nor a store on the host.
+  `image_cache_idle_secs` — and `[registry]` (below), whose CA it sends as content, and whose
+  `ca_file`, `username`, `password_file` and `token_file` it never names, nor a store on the
+  host.
   The concurrency ceiling stays desired state of its own. Any other key is refused. The hub never sets `state_dir`; `[node]`
   `release_keys`, `require_signed`, `allow_downgrade` or `validate`; `[egress]`, which its
   egress layer narrows instead; a path or a credential file; or anything that widens what a
@@ -176,13 +178,6 @@ with the source `default`.
   jobs both budgets have room for, and the hub places on a node no more vCPUs than its budget
   has left, less those it has asked of the node since.
 
-Proposed:
-
-- **Registry.** With no `[registry]` in the local file, the node uses the one the hub names —
-  a registry the hub manages, by URL, CA and pipeline root — with no credential of its own:
-  guests get the job's token (`guest_credential = "job"`), so only jobs the hub places reach
-  it. A local `[registry]` is taken whole; the two never merge.
-
 ### Hub settings
 
 - **On the hub.** A fleet-wide layer and one per node, in the database; the node's wins, key by
@@ -209,6 +204,15 @@ Proposed:
   effective value and its source — `local`, `hub` or `default`, autodetected included — and
   each hub entry it refused, with the reason. A refusal does not fail the generation: the
   other entries apply. The node's page shows both.
+- **A registry.** With no `[registry]` in the local file, the node uses the one the hub names —
+  a registry the hub manages, by URL, CA and pipeline root — with no credential of its own:
+  guests get the job's token (`guest_credential = "job"`, the only value the hub may send),
+  so only jobs the hub places reach it, and only on `[net] mode = "switch"`, which the hub
+  cannot set. The hub sends the CA as PEM, `ca_pem`; the node checks it holds certificates
+  and pins it by content as `<state_dir>/node/registry-ca-<hash>.pem`, written whole by rename
+  before the settings that name it. A CA the hub no longer names is kept a week, the longest
+  a job's registry token lives, for the jobs that started with it. A local `[registry]` is
+  taken whole; the two never merge.
 
 The node reports a hash of its effective configuration, hub settings included, and its node
 page shows it, so drift between nodes that should match is visible.

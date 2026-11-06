@@ -18,11 +18,12 @@
 //! (the private key, `0600`), `enrollment.json` (the hub's URL and the node ID it assigned),
 //! `state.json` (what the hub asked, the node's own state and its command journal),
 //! `runner.pid` (a managed runner's pid and start time, for a restarted node to find), `ca.pem`
-//! (the CA the hub is verified against, copied at `join` when one was given), `releases/` (a
-//! release being installed, and the binary it replaces) and `lock`, which one `vk node`
-//! process at a time holds. A `join` whose answer was lost keeps the key it made
-//! and joins again with a new token: the hub answers a key it already pinned with the node it
-//! pinned it to.
+//! (the CA the hub is verified against, copied at `join` when one was given), `settings.json`
+//! and `registry-ca-*.pem` (the hub's settings and the CAs of the registries they name, see
+//! [`hub_settings`]), `releases/` (a release being installed, and the binary it replaces)
+//! and `lock`, which one `vk node` process at a time holds. A `join` whose answer was lost
+//! keeps the key it made and joins again with a new token: the hub answers a key it already
+//! pinned with the node it pinned it to.
 //!
 //! Both HTTP paths go straight to the hub, never through `HTTP(S)_PROXY`: the session is a
 //! raw socket a proxy variable cannot reach, and enrollment follows the same route rather

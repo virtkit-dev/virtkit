@@ -4,7 +4,8 @@
 //! laid under the local config file by every `vk` on the enrolled host ([`layer`], [`merge`]).
 //! A key the file sets, even to its default, is never overridden, and `[registry]` is taken
 //! whole or not at all. Only the keys of [`KEYS`] may come from the hub; never a path or a
-//! credential.
+//! credential. A registry the hub names lends guests the job's token alone, and its CA, which
+//! the hub sends as content, is pinned beside the settings as `registry-ca-<hash>.pem`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -19,6 +20,14 @@ use super::{read_enrollment, read_nofollow};
 use crate::config::Config;
 
 const FILE: &str = "settings.json";
+/// The CAs of the registries the hub names, pinned from their `ca_pem`, each named by its
+/// content ([`ca_name`]) so a job keeps the one it started with.
+const REGISTRY_CA: &str = "registry-ca-";
+/// Retain retired CAs for the maximum job-token lifetime (`max_job_token_secs` at most),
+/// so jobs that started with them keep registry access until their tokens expire.
+const RETIRED_CA_KEPT: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+/// The most a `ca_pem` may hold.
+const MAX_CA_PEM: usize = 256 * 1024;
 
 /// Reads a key's effective value off a loaded config.
 type Read = fn(&Config) -> Option<Value>;
@@ -56,9 +65,11 @@ const KEYS: &[(&str, Read)] = &[
 ];
 
 /// The `[registry]` keys the hub may name: the registry and how to reach it, never a path or a
-/// credential of the node's.
+/// credential of the node's. `ca_pem` is the CA as PEM content, which the node pins and names
+/// as `ca_file`.
 const REGISTRY_KEYS: &[&str] = &[
     "repo",
+    "ca_pem",
     "insecure",
     "transparent_zstd",
     "proxy_guests",
@@ -120,13 +131,103 @@ pub fn layer(state_dir: &Path) -> Option<BTreeMap<String, Value>> {
         );
         return None;
     }
-    Some(saved.settings)
+    Some(for_node(&saved.settings, &dir))
+}
+
+/// `settings` as the config of a node whose node dir is `dir` takes them: a registry's
+/// `ca_pem` becomes `ca_file`, naming where the node pinned it, and its guests get the job's
+/// token unless the hub said so already. A key the hub may not name is left out, even from
+/// the node's own file, and a registry whose CA cannot be named is left out whole, rather than
+/// reached through the system's roots.
+fn for_node(settings: &BTreeMap<String, Value>, dir: &Path) -> BTreeMap<String, Value> {
+    let mut out = settings.clone();
+    let Some(Value::Object(registry)) = out.get_mut("registry") else {
+        return out;
+    };
+    registry.retain(|key, _| REGISTRY_KEYS.contains(&key.as_str()));
+    if let Some(pem) = registry.remove("ca_pem") {
+        let path = pem
+            .as_str()
+            .map(|pem| dir.join(ca_name(pem)))
+            .and_then(|path| path.to_str().map(Value::from));
+        match path {
+            Some(path) => {
+                registry.insert("ca_file".to_string(), path);
+            }
+            None => {
+                out.remove("registry");
+                return out;
+            }
+        }
+    }
+    registry
+        .entry("guest_credential")
+        .or_insert_with(|| Value::from("job"));
+    out
+}
+
+/// The name `pem` is pinned under in the node dir.
+fn ca_name(pem: &str) -> String {
+    use sha2::Digest;
+    let hash = vk_hub_proto::to_hex(&sha2::Sha256::digest(pem.as_bytes()));
+    format!("{REGISTRY_CA}{}.pem", hash.get(..16).unwrap_or(&hash))
+}
+
+/// The registry CA `settings` carry, as the hub sent it.
+fn ca_pem(settings: &BTreeMap<String, Value>) -> Option<&str> {
+    settings.get("registry")?.get("ca_pem")?.as_str()
+}
+
+/// The names of the registry CAs pinned in the node dir `dir`.
+fn pinned_cas(dir: &Path) -> Result<Vec<std::ffi::OsString>> {
+    let mut names = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(names),
+        entries => entries.with_context(|| format!("listing {}", dir.display()))?,
+    };
+    for entry in entries {
+        let name = entry
+            .with_context(|| format!("listing {}", dir.display()))?
+            .file_name();
+        if name.as_encoded_bytes().starts_with(REGISTRY_CA.as_bytes()) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// Remove the registry CAs pinned in the node dir `dir` but `current`, retired longer ago than
+/// [`RETIRED_CA_KEPT`].
+fn prune_cas(dir: &Path, current: Option<&str>) -> Result<()> {
+    for name in pinned_cas(dir)? {
+        if current.is_some_and(|c| name == c) {
+            continue;
+        }
+        let path = dir.join(&name);
+        let age = std::fs::symlink_metadata(&path)
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().unwrap_or_default());
+        match age {
+            Ok(age) if age < RETIRED_CA_KEPT => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => remove_file(&path)?,
+        }
+    }
+    Ok(())
 }
 
 /// Remove the hub's settings from the node dir `dir`, as a new enrollment starts without them.
 pub fn remove(dir: &Path) -> Result<()> {
-    let path = dir.join(FILE);
-    match std::fs::remove_file(&path) {
+    remove_file(&dir.join(FILE))?;
+    for name in pinned_cas(dir)? {
+        remove_file(&dir.join(name))?;
+    }
+    Ok(())
+}
+
+/// Remove `path`, which may be gone already.
+fn remove_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
             Err(e).with_context(|| format!("removing {}", path.display()))
         }
@@ -198,20 +299,20 @@ pub(crate) fn is_set(table: &toml::Table, key: &str) -> bool {
     false
 }
 
-/// The hub's `wanted` settings checked against `local`, the node's config file: the entries
-/// the node takes, and why it refuses the others. An entry must be one the hub may set, of
-/// its key's type and a value the key takes, and leave the config loadable with the entries
-/// taken before it.
+/// Check the hub's `wanted` settings against the node's `local` config and node directory
+/// `dir`, returning accepted entries and refusal reasons. Each entry must be allowed, have
+/// a valid type and value, and leave the config loadable with previously accepted entries.
 pub fn check(
     local: &toml::Table,
     wanted: &BTreeMap<String, Value>,
+    dir: &Path,
 ) -> (BTreeMap<String, Value>, BTreeMap<String, String>) {
     let mut taken = BTreeMap::new();
     let mut refused = BTreeMap::new();
     for (key, value) in wanted {
         let mut with = taken.clone();
         with.insert(key.clone(), value.clone());
-        match check_entry(key, value).and_then(|()| loads(local, &with).map(drop)) {
+        match check_entry(key, value, dir).and_then(|()| loads(local, &with, dir).map(drop)) {
             Ok(()) => taken = with,
             Err(why) => {
                 refused.insert(key.clone(), why);
@@ -222,25 +323,37 @@ pub fn check(
 }
 
 /// That the hub may set `key` to `value`, judged on its own.
-fn check_entry(key: &str, value: &Value) -> Result<(), String> {
+fn check_entry(key: &str, value: &Value, dir: &Path) -> Result<(), String> {
     if !allowed(key) {
         return Err("not a setting the hub may set".to_string());
     }
     let toml = toml::Value::try_from(value).map_err(|e| format!("not a TOML value: {e}"))?;
     if key == "registry" {
         check_registry(&toml)?;
+        let alone = BTreeMap::from([(key.to_string(), value.clone())]);
+        if !for_node(&alone, dir).contains_key(key) {
+            return Err(format!(
+                "the node dir {} is not UTF-8, so no config can name the CA",
+                dir.display()
+            ));
+        }
     }
     let alone = loads(
         &toml::Table::new(),
         &BTreeMap::from([(key.to_string(), value.clone())]),
+        dir,
     )?;
     check_value(key, &alone).map_err(|e| format!("{e:#}"))
 }
 
-/// The config `settings` laid under `local` makes, or why it does not load.
-fn loads(local: &toml::Table, settings: &BTreeMap<String, Value>) -> Result<Config, String> {
+/// Load `settings` beneath `local` for node directory `dir`, or return the load error.
+fn loads(
+    local: &toml::Table,
+    settings: &BTreeMap<String, Value>,
+    dir: &Path,
+) -> Result<Config, String> {
     let mut table = local.clone();
-    merge(&mut table, settings);
+    merge(&mut table, &for_node(settings, dir));
     // One line, for a report.
     crate::config::from_table(table).map_err(|e| format!("{e:#}").replace('\n', " "))
 }
@@ -273,7 +386,8 @@ fn check_value(key: &str, cfg: &Config) -> Result<()> {
 }
 
 /// That a `[registry]` from the hub names a remote registry, and nothing of the node's: no
-/// path, no credential.
+/// path, no credential; its guests reach it with the job's token alone, and `ca_pem` holds
+/// certificates.
 fn check_registry(value: &toml::Value) -> Result<(), String> {
     let toml::Value::Table(table) = value else {
         return Err("not a table".to_string());
@@ -283,6 +397,24 @@ fn check_registry(value: &toml::Value) -> Result<(), String> {
             "`{key}` is the node's own to set: the hub may name only {}",
             REGISTRY_KEYS.join(", ")
         ));
+    }
+    if table
+        .get("guest_credential")
+        .is_some_and(|v| v.as_str() != Some("job"))
+    {
+        return Err(
+            "`guest_credential` may only be \"job\": a registry the hub names lends guests the \
+             job's token, never a credential of the node's"
+                .to_string(),
+        );
+    }
+    if let Some(pem) = table.get("ca_pem") {
+        let pem = pem.as_str().ok_or("`ca_pem` is not a string")?;
+        if pem.len() > MAX_CA_PEM {
+            return Err(format!("`ca_pem` is over {MAX_CA_PEM} bytes"));
+        }
+        super::roots_from_pem(pem.as_bytes(), Path::new("`ca_pem`"))
+            .map_err(|e| format!("{e:#}"))?;
     }
     match table.get("repo").and_then(toml::Value::as_str) {
         Some(repo) if crate::config::Registry::local_root_of(repo).is_some() => {
@@ -361,7 +493,7 @@ impl Held {
     /// generation is recorded as applied: checked, and written whole when they changed, or
     /// removed when there are none. A refused entry is left out, and reported.
     pub fn take(&mut self, dir: &Path, issuer: &Issuer, desired: &DesiredState) -> Result<()> {
-        let (settings, refused) = check(&self.local, &desired.settings);
+        let (settings, refused) = check(&self.local, &desired.settings, dir);
         let saved = Saved {
             hub: issuer.hub.clone(),
             node_id: issuer.node_id.clone(),
@@ -382,16 +514,34 @@ impl Held {
                 vk_hub_proto::display_safe(key)
             );
         }
+        let old = self.saved.as_ref().and_then(|s| ca_pem(&s.settings));
+        let new = ca_pem(&saved.settings);
+        // Pinned first, so the settings never name a CA the node does not hold.
+        let pin = |pem: &str| {
+            let path = dir.join(ca_name(pem));
+            vk_fs::write_atomic(&path, pem.as_bytes(), 0o600)
+                .with_context(|| format!("writing {}", path.display()))
+        };
+        if let Some(pem) = new {
+            pin(pem)?;
+        }
+        // Rewrite the retired CA to restart retention while existing jobs can still use it.
+        if let Some(pem) = old.filter(|o| Some(*o) != new) {
+            pin(pem)?;
+        }
+        let path = dir.join(FILE);
         if desired.settings.is_empty() {
-            remove(dir)?;
-            self.saved = None;
+            remove_file(&path)?;
         } else {
-            let path = dir.join(FILE);
             let json = serde_json::to_vec_pretty(&saved).context("encoding the hub's settings")?;
             vk_fs::write_atomic(&path, &json, 0o600)
                 .with_context(|| format!("writing {}", path.display()))?;
-            self.saved = Some(saved);
         }
+        let current = new.map(ca_name);
+        if let Err(e) = prune_cas(dir, current.as_deref()) {
+            say!("could not remove a retired registry CA: {e:#}");
+        }
+        self.saved = (!desired.settings.is_empty()).then_some(saved);
         self.report.refused = self
             .saved
             .as_ref()
@@ -474,6 +624,7 @@ mod tests {
                 ("image_cache_idle_secs", json!(null)),
                 ("executor.schedule.from_history", json!(true)),
             ]),
+            Path::new("/state/node"),
         );
         assert_eq!(
             taken,
@@ -508,13 +659,15 @@ mod tests {
         );
     }
 
-    /// The hub names a remote registry and how to reach it, never a credential or a path, and
-    /// an entry that would leave the config unloadable beside the file's is refused.
+    /// The hub names a remote registry and how to reach it, never a credential or a path, nor
+    /// a guest credential but the job's, and a CA only as certificates.
     #[test]
     fn a_registry_from_the_hub_carries_nothing_of_the_nodes() {
         let none = toml::Table::new();
-        let one = |registry: Value| check(&none, &wanted(&[("registry", registry)])).1;
+        let dir = Path::new("/state/node");
+        let one = |registry: Value| check(&none, &wanted(&[("registry", registry)]), dir).1;
         assert!(one(json!({"repo": "reg.example.com/ci", "guest_credential": "job"})).is_empty());
+        assert!(one(json!({"repo": "r/ci", "ca_pem": CA})).is_empty());
         for (registry, why) in [
             (
                 json!({"repo": "r/ci", "password_file": "/p"}),
@@ -528,16 +681,58 @@ mod tests {
                 "pipeline_root",
             ),
             (json!("reg.example.com"), "not a table"),
+            (
+                json!({"repo": "r/ci", "guest_credential": "node"}),
+                "may only be \"job\"",
+            ),
+            (
+                json!({"repo": "r/ci", "ca_pem": "not PEM"}),
+                "no certificate",
+            ),
+            (json!({"repo": "r/ci", "ca_pem": 1}), "not a string"),
+            (
+                json!({"repo": "r/ci", "ca_pem": "x".repeat(MAX_CA_PEM + 1)}),
+                "over",
+            ),
         ] {
             let refused = one(registry);
             assert!(refused["registry"].contains(why), "{refused:?}");
         }
+        // Guests get the job's token alone, so they may build beside a proxy.
         let lends = json!({"repo": "r/ci", "proxy_guests": true});
-        assert!(one(lends.clone()).is_empty());
         let building = table("[executor]\nguest_build = true\n");
-        let refused = check(&building, &wanted(&[("registry", lends)])).1;
-        assert!(refused["registry"].contains("guest_build"), "{refused:?}");
+        assert!(
+            check(&building, &wanted(&[("registry", lends)]), dir)
+                .1
+                .is_empty()
+        );
     }
+
+    /// A CA the hub sends as content is named where the node pins it, and a hub registry
+    /// lends guests the job's token; an entry the hub may not name, found in the node's file,
+    /// is dropped rather than taken.
+    #[test]
+    fn a_hub_registry_is_loaded_with_its_pinned_ca_and_job_tokens() {
+        let dir = Path::new("/state/node");
+        let settings = wanted(&[(
+            "registry",
+            json!({"repo": "reg.example.com/ci", "ca_pem": CA, "token_file": "/t"}),
+        )]);
+        let cfg = loads(&toml::Table::new(), &settings, dir).unwrap();
+        let rg = cfg.registry.unwrap();
+        assert_eq!(rg.ca_file.as_deref(), Some(dir.join(ca_name(CA)).as_path()));
+        assert_eq!(rg.token_file, None);
+        assert!(rg.lends_job_token());
+        let plain = wanted(&[("registry", json!({"repo": "reg.example.com/ci"}))]);
+        let rg = loads(&toml::Table::new(), &plain, dir)
+            .unwrap()
+            .registry
+            .unwrap();
+        assert_eq!(rg.ca_file, None);
+        assert!(rg.lends_job_token());
+    }
+
+    const CA: &str = include_str!("../../../vk-hub/src/testdata/tls-ca.pem");
 
     fn issuer() -> Issuer {
         Issuer {
@@ -633,6 +828,71 @@ mod tests {
         assert!(read(&dir).is_err_and(|e| super::super::is_not_found(&e)));
         assert!(!held.changed());
         assert!(held.report().refused.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The hub's registry CA is pinned beside the settings, by content; one the hub no longer
+    /// names is kept for the jobs that started with it until it has been retired a while.
+    #[test]
+    fn a_registry_ca_is_pinned_and_kept_for_jobs_that_use_it() {
+        let dir = scratch("ca");
+        let cfg = crate::config::from_table(toml::Table::new()).unwrap();
+        let mut held = Held::new(&cfg, &dir, &issuer());
+        let registry = |ca: Option<&str>| {
+            let mut r = json!({"repo": "reg.example.com/ci"});
+            if let Some(ca) = ca {
+                r["ca_pem"] = json!(ca);
+            }
+            r
+        };
+        let pinned = || {
+            let mut names: Vec<_> = pinned_cas(&dir)
+                .unwrap()
+                .into_iter()
+                .map(|n| n.into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        held.take(
+            &dir,
+            &issuer(),
+            &desired(1, &[("registry", registry(Some(CA)))]),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join(ca_name(CA))).unwrap(), CA);
+        assert!(held.changed());
+        // Another CA: the first stays for the jobs that use it.
+        let other = format!("{CA}{CA}");
+        held.take(
+            &dir,
+            &issuer(),
+            &desired(2, &[("registry", registry(Some(&other)))]),
+        )
+        .unwrap();
+        let mut both = vec![ca_name(CA), ca_name(&other)];
+        both.sort();
+        assert_eq!(pinned(), both);
+        // Retired long enough ago, it goes at the next change.
+        let old = std::time::SystemTime::now() - RETIRED_CA_KEPT;
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join(ca_name(CA)))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        held.take(
+            &dir,
+            &issuer(),
+            &desired(3, &[("registry", registry(None))]),
+        )
+        .unwrap();
+        assert_eq!(pinned(), [ca_name(&other)]);
+        held.take(&dir, &issuer(), &desired(4, &[])).unwrap();
+        assert!(read(&dir).is_err_and(|e| super::super::is_not_found(&e)));
+        assert_eq!(pinned(), [ca_name(&other)]);
+        remove(&dir).unwrap();
+        assert!(pinned().is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

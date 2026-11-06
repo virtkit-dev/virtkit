@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **A fleet node can use the registry its hub names.** With no `[registry]` in its config, the
+  node takes the hub's, CA included, and holds no registry credential of its own: its jobs'
+  guests reach the registry with the token the hub gives each job. The hub cannot name one
+  yet.
 - **CI jobs can wait for vCPUs as they wait for memory.** With `[executor.schedule]
   cpu_overcommit` set, a job waits while the guests' vCPUs would pass that many per CPU of the
   host, and `vk tune` asks the runner for no more jobs than that leaves room for. A fleet node
