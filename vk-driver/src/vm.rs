@@ -3746,35 +3746,40 @@ fn vm_reclaim(cfg: &crate::config::Config) -> Result<vk_core::reclaim::Policy> {
 }
 
 /// Effective vCPU count and memory size: the job's MICROVM_CPUS/MICROVM_MEM
-/// requests, silently clamped to the host ceilings (vm.max_cpus/max_mem,
-/// defaulting to the base values — config opt-in for any elevation).
+/// requests, else the base values, silently clamped to the host ceilings
+/// (vm.max_cpus/max_mem, defaulting to the base values — config opt-in for any
+/// elevation).
 fn vm_size(ctx: &JobCtx) -> Result<(u32, String)> {
     let vm = &ctx.cfg.executor.vm;
+    let max_cpus = vm.max_cpus.unwrap_or(vm.cpus);
     let cpus = match &ctx.cpus_req {
-        None => vm.cpus,
+        None => vm.cpus.min(max_cpus),
         Some(s) => {
             let n: u32 = s
                 .parse()
                 .ok()
                 .filter(|n| *n > 0)
                 .with_context(|| format!("invalid MICROVM_CPUS {s:?}"))?;
-            n.min(vm.max_cpus.unwrap_or(vm.cpus))
+            n.min(max_cpus)
         }
     };
+    let base_mem = parse_gib(&vm.mem).context("invalid vm.mem")?;
+    let max_mem = match &vm.max_mem {
+        Some(m) => parse_gib(m).context("invalid vm.max_mem")?,
+        None => base_mem,
+    };
     let mem = match &ctx.mem_req {
-        None => vm.mem.clone(),
+        // Not clamped to the memory budget: admission reports a base size above it as a
+        // configuration error.
+        None => format!("{}G", base_mem.min(max_mem)),
         Some(s) => {
             let req = parse_gib(s).with_context(|| format!("invalid MICROVM_MEM {s:?}"))?;
-            let max = match &vm.max_mem {
-                Some(m) => parse_gib(m).context("invalid vm.max_mem")?,
-                None => parse_gib(&vm.mem).context("invalid vm.mem")?,
-            };
             // `[executor.schedule] mem_budget` is a host ceiling like the others: a request above the
             // whole budget could never be admitted, and failing prepare over it would be a
             // *system* failure — the retryable class, which no retry could ever satisfy.
             let max = match budget_mib(&ctx.cfg) {
-                Some(b) => max.min(b? / 1024),
-                None => max,
+                Some(b) => max_mem.min(b? / 1024),
+                None => max_mem,
             };
             format!("{}G", req.min(max))
         }
@@ -6780,6 +6785,15 @@ mod tests {
         let mut plain = self::ctx(None, None);
         plain.cfg.executor.schedule.mem_budget = Some("2G".into());
         assert_eq!(vm_size(&plain).unwrap().1, "8G");
+    }
+
+    /// Base sizes above the ceilings are clamped like explicit requests.
+    #[test]
+    fn sizing_clamps_the_base_values_to_the_ceilings() {
+        let mut ctx = ctx(None, None);
+        ctx.cfg.executor.vm.max_cpus = Some(2);
+        ctx.cfg.executor.vm.max_mem = Some("6G".into());
+        assert_eq!(vm_size(&ctx).unwrap(), (2, "6G".into()));
     }
 
     /// A compose service's declared sizing obeys the same `[executor.vm] max_*` ceilings a job's

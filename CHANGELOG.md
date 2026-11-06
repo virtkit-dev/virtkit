@@ -44,6 +44,12 @@ All notable changes to virtkit will be documented in this file.
 - **While a fleet is upgraded, hosts of this release and earlier ones may each build the same
   cached layer once** instead of waiting for each other's build.
 
+### Fixed
+
+- **GitLab jobs without `MICROVM_CPUS` or `MICROVM_MEM` respect
+  `[executor.vm] max_cpus` and `max_mem`.** Previously, they used `cpus` and `mem` even
+  when those exceeded the ceilings.
+
 ## [0.106.1] - 2026-11-06
 
 ### Fixed
