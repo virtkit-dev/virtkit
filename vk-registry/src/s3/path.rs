@@ -93,6 +93,8 @@ pub(crate) fn parse(path: &str) -> Result<Target, Refusal> {
         .ok_or_else(|| Refusal::new(Code::InvalidBucketName).with("BucketName", raw_bucket))?;
     let raw_key = match raw_key {
         None | Some("") => return Ok(Target::Bucket(bucket)),
+        // Slashes only, which S3 cannot make a request of.
+        Some(k) if k.bytes().all(|b| b == b'/') => return Err(Refusal::new(Code::BadRequest)),
         Some(k) => k,
     };
     let mut segs = vec![bucket];
@@ -107,6 +109,15 @@ pub(crate) fn parse(path: &str) -> Result<Target, Refusal> {
         return Err(too_long(key.len(), MAX_KEY));
     }
     Ok(Target::Object { key, segs })
+}
+
+/// The bucket a path under `/s3` names, decoded, and its key as sent, whether or not the key
+/// is one the store can name: what a read of a key [`parse`] refuses is a miss of.
+pub(crate) fn bucket_and_raw_key(path: &str) -> Option<(String, &str)> {
+    let rest = path.strip_prefix("/s3/")?;
+    let (raw_bucket, raw_key) = rest.split_once('/')?;
+    let bucket = decode_segment(raw_bucket).filter(|b| is_bucket(b))?;
+    Some((bucket, raw_key))
 }
 
 /// Whether `name`, decoded, can name a bucket: one top-level component of `files/`.

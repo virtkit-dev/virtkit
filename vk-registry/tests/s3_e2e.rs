@@ -636,13 +636,16 @@ async fn sigv4_refusals(host: &str, good: (&str, &str)) {
         "invalid_header",
         "AWS2-HMAC-SHA1 Credential=x/20260101/us-east-1/s3/aws4_request, \
          SignedHeaders=host, Signature=00",
-        "AWS AKIDNOTAKEY:c2ln",
         "Digest username=x",
     ] {
         send(host, get().header("Authorization", value))
             .await
             .is(400, "InvalidArgument");
     }
+    // SigV2's, which S3 no longer takes.
+    send(host, get().header("Authorization", "AWS AKIDNOTAKEY:c2ln"))
+        .await
+        .is(400, "InvalidRequest");
     // An id it does not know, whose signature is consistent with it.
     send(host, get().signed(host, ("AKIDNOTAKEY", "AKIDNOTAKEY"), 0))
         .await
@@ -803,6 +806,9 @@ async fn a_shared_bearer_is_the_access_key_and_its_secret() {
         .is(403, "AccessDenied");
     // A scheme this registry does not take is malformed, not refused.
     send(&host, get().header("Authorization", "AWS AKID:sig"))
+        .await
+        .is(400, "InvalidRequest");
+    send(&host, get().header("Authorization", "Digest x"))
         .await
         .is(400, "InvalidArgument");
     // The bearer itself still works, as on `/dav/`.
@@ -1411,7 +1417,8 @@ async fn a_put_body_is_unsigned_or_its_signed_sha256() {
         .header("Content-Encoding", "aws-chunked, gzip")
         .header("x-amz-decoded-content-length", "13")
         .signed(&host, key, 0);
-    send(&host, gzip).await.is(501, "NotImplemented");
+    // Unsigned, as here, S3 takes no aws-chunked body at all.
+    send(&host, gzip).await.is(400, "InvalidArgument");
     for path in ["/s3/b/ecdsa", "/s3/b/gzip"] {
         send(&host, get(path)).await.is(404, "NoSuchKey");
     }
@@ -2025,7 +2032,7 @@ async fn a_chunked_body_that_does_not_hold_leaves_nothing() {
         Req::new("PUT", path).chunked_declaring(&host, BEARER, mode, &data, trailer, decoded)
     };
     let req = declaring("/s3/b/short", Chunked::Signed, Some(data.len() - 1));
-    cases.push(("/s3/b/short", req, 400, "InvalidChunkSizeError"));
+    cases.push(("/s3/b/short", req, 400, "IncompleteBody"));
     let req = declaring("/s3/b/long", Chunked::UnsignedTrailer, Some(data.len() + 1));
     cases.push(("/s3/b/long", req, 400, "IncompleteBody"));
     let mut req = put("/s3/b/garbage", Chunked::Signed);
@@ -2033,13 +2040,13 @@ async fn a_chunked_body_that_does_not_hold_leaves_nothing() {
     cases.push(("/s3/b/garbage", req, 400, "MalformedTrailerError"));
     let mut req = put("/s3/b/header", Chunked::UnsignedTrailer);
     req.body.splice(0..0, std::iter::repeat_n(b'0', 300));
-    cases.push(("/s3/b/header", req, 400, "InvalidChunkSizeError"));
+    cases.push(("/s3/b/header", req, 400, "IncompleteBody"));
     let mut req = put("/s3/b/truncated", Chunked::Signed);
     req.body.truncate(req.body.len() - 50);
     cases.push(("/s3/b/truncated", req, 400, "IncompleteBody"));
     // No decoded length at all.
     let req = declaring("/s3/b/no-length", Chunked::Signed, None);
-    cases.push(("/s3/b/no-length", req, 400, "InvalidRequest"));
+    cases.push(("/s3/b/no-length", req, 411, "MissingContentLength"));
 
     for (path, req, status, code) in cases {
         send_refused(&host, req).await.is(status, code);
@@ -2339,9 +2346,20 @@ async fn conditional_headers_decide_reads_and_writes() {
     )
     .await
     .is(412, "PreconditionFailed");
+    // No object to compare with is a miss, as S3 answers it.
     send(&host, put("/s3/b/absent", HELLO).header("If-Match", &etag))
         .await
-        .is(412, "PreconditionFailed");
+        .is(404, "NoSuchKey");
+    // One condition, and an ETag to match, else not served.
+    for (name, value) in [("If-Match", "*"), ("If-Match", "\"*\"")] {
+        send(&host, put("/s3/b/k", b"x").header(name, value))
+            .await
+            .is(501, "NotImplemented");
+    }
+    let both = put("/s3/b/k", b"x")
+        .header("If-Match", &etag)
+        .header("If-None-Match", "*");
+    send(&host, both).await.is(501, "NotImplemented");
     let resp = send(&host, put("/s3/b/k", b"swapped").header("If-Match", &etag)).await;
     resp.ok(200);
     let etag = format!("\"{}\"", md5_hex(b"swapped"));
@@ -2594,7 +2612,7 @@ async fn attributes_deletes_and_the_paths_a_key_cannot_take() {
         .is(400, "InvalidArgument");
     send(&host, Req::new("GET", "/s3/b/k").query("attributes"))
         .await
-        .is(400, "InvalidArgument");
+        .is(400, "InvalidRequest");
     send(&host, attrs("ETag").path_of("/s3/b/absent"))
         .await
         .is(404, "NoSuchKey");
@@ -2632,6 +2650,21 @@ async fn attributes_deletes_and_the_paths_a_key_cannot_take() {
     }
     let long = format!("/s3/b/{}", "x".repeat(256));
     send(&host, put(&long)).await.is(400, "KeyTooLongError");
+    // No object is there, so a read of one is a miss, as S3's is; slashes alone are no key.
+    for path in ["/s3/b/a%20b", "/s3/b/k/", "/s3/b/tags/x"] {
+        send(&host, Req::new("GET", path))
+            .await
+            .is(404, "NoSuchKey");
+        send(&host, Req::new("HEAD", path)).await.ok(404);
+    }
+    send(&host, put("/s3/b//")).await.is(400, "BadRequest");
+    // A version named by no id.
+    for method in ["GET", "DELETE"] {
+        send(&host, Req::new(method, "/s3/b/k").query("versionId="))
+            .await
+            .is(400, "InvalidArgument")
+            .says("Version id cannot be the empty string");
+    }
 
     // Where an object cannot go: a directory, below an object, over a foreign tag.
     store
@@ -2736,9 +2769,11 @@ async fn a_path_that_cannot_be_parsed_is_an_invalid_uri() {
     conn.send(&Req::new("GET", "/a%zz"))
         .await
         .is(400, "InvalidURI");
+    // A `..` that stays below it is a key's, which the store cannot name: a read of it is a
+    // miss, here of the bucket first.
     conn.send(&Req::new("GET", "/a/../x"))
         .await
-        .is(400, "InvalidArgument");
+        .is(404, "NoSuchBucket");
 }
 
 /// A key the store fails to delete is reported on its own, and the batch goes on past it.
@@ -2969,6 +3004,24 @@ async fn query_names_are_decoded_before_dispatch() {
             "The specified multipart upload does not exist. The upload ID may be invalid, or \
              the upload may have been aborted or completed.",
         );
+    // An upload no id names is said before what else is asked of it: a part number, or a
+    // count, that is no number S3 takes.
+    for (method, q) in [
+        ("PUT", "partNumber=0&uploadId=..%2Fnope"),
+        ("GET", "max-parts=-3&uploadId=nope"),
+        ("GET", "part-number-marker=-14&uploadId=nope"),
+    ] {
+        send(&host, Req::new(method, "/s3/b/d/k").query(q))
+            .await
+            .is(404, "NoSuchUpload");
+    }
+    send(
+        &host,
+        Req::new("GET", "/s3/b/d/k").query("part-number-marker=x&uploadId=nope"),
+    )
+    .await
+    .is(400, "InvalidArgument")
+    .says("Provided x not an integer or within integer range");
     let resp = send(&host, Req::new("GET", "/s3/b").query("upload%73")).await;
     resp.ok(200);
     assert!(
@@ -4103,6 +4156,8 @@ async fn objects_are_copied(host: &str, sign: Sign<'_>) -> Vec<u8> {
     send(host, sign(req)).await.is(412, "PreconditionFailed");
     let req = copy("/s3/dst/copy", "/src/d/k").header("If-Match", "\"other\"");
     send(host, sign(req)).await.is(412, "PreconditionFailed");
+    let req = copy("/s3/dst/none", "/src/d/k").header("If-Match", "\"other\"");
+    send(host, sign(req)).await.is(404, "NoSuchKey");
     let req = copy("/s3/dst/copy", "/src/d/k").header("If-Match", &etag);
     assert_eq!(copied(&send(host, sign(req)).await), etag);
     let req = copy("/s3/dst/fresh", "/src/d/k").header("If-None-Match", "*");
@@ -4118,13 +4173,18 @@ async fn objects_are_copied(host: &str, sign: Sign<'_>) -> Vec<u8> {
         ("/s3/dst/x", "/nobucket/k", 404, "NoSuchBucket"),
         ("/s3/dst/x", "/src/d/k?versionId=1", 501, "NotImplemented"),
         ("/s3/dst/x", "/src", 400, "InvalidArgument"),
-        ("/s3/dst/x", "/src/a%20b", 400, "InvalidArgument"),
+        ("/s3/dst/x", "/src/a%20b", 404, "NoSuchKey"),
         ("/s3/src/d", "/src/d/k", 409, "OperationAborted"),
         ("/s3/src/d/k/below", "/src/e/copy", 409, "OperationAborted"),
     ] {
         let resp = send(host, sign(copy(to, from))).await;
         resp.is(status, code);
     }
+    let req = copy("/s3/dst/x", "/src/d/k").header("x-amz-tagging-directive", "invalid");
+    send(host, sign(req))
+        .await
+        .is(400, "InvalidArgument")
+        .says("Unknown tagging directive.");
     send(host, sign(Req::new("GET", "/s3/dst/x")))
         .await
         .is(404, "NoSuchKey");
@@ -5055,7 +5115,10 @@ async fn multipart_uploads_are_aborted_copied_bounded_and_swept() {
     let e2 = element(&resp.body, "ETag").replace("&quot;", "\"");
     assert_eq!(e2, format!("\"{}\"", md5_hex(&src[100..1100])));
     let past = copy(3).header("x-amz-copy-source-range", "bytes=69000-70000");
-    send(&host, sign(past)).await.is(416, "InvalidRange");
+    send(&host, sign(past))
+        .await
+        .is(400, "InvalidArgument")
+        .says("Range specified is not valid for source object of size: 70000");
     let backwards = copy(3).header("x-amz-copy-source-range", "bytes=5-2");
     send(&host, sign(backwards))
         .await

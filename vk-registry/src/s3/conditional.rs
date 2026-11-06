@@ -167,8 +167,8 @@ pub(crate) fn whole_seconds(t: SystemTime) -> u64 {
         .as_secs()
 }
 
-/// A write's conditional headers.
-#[derive(Debug, Default, PartialEq, Eq)]
+/// A write's conditional headers: S3 takes one, `If-None-Match: *` or `If-Match: <etag>`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WriteConditions {
     /// `If-None-Match: *`: only where no object is
     pub(crate) absent: bool,
@@ -202,15 +202,39 @@ impl WriteConditions {
                 .collect::<Result<_, _>>()?;
             Ok::<_, Refusal>((!values.is_empty()).then(|| values.join(",")))
         };
-        let absent = match text(IF_NONE_MATCH)? {
+        let (none_match, if_match) = (text(IF_NONE_MATCH)?, text(IF_MATCH)?);
+        if none_match.is_some() && if_match.is_some() {
+            return Err(Refusal::new(Code::NotImplemented)
+                .with("Header", "If-Match,If-None-Match")
+                .with(
+                    "additionalMessage",
+                    "Multiple conditional request headers present in the request",
+                ));
+        }
+        let absent = match none_match {
             None => false,
             Some(v) if v.trim() == "*" => true,
             Some(_) => return Err(unsupported(&IF_NONE_MATCH)),
         };
-        Ok(WriteConditions {
-            absent,
-            if_match: text(IF_MATCH)?,
-        })
+        // An ETag only: S3 replaces any object with no condition at all.
+        if if_match
+            .as_deref()
+            .is_some_and(|v| v.trim().trim_matches('"') == "*")
+        {
+            return Err(unsupported(&IF_MATCH));
+        }
+        Ok(WriteConditions { absent, if_match })
+    }
+
+    /// Why the write was refused when [`precondition`](Self::precondition) failed, an object
+    /// being `found` or not: `If-Match` of no object is `NoSuchKey`, as S3 answers it, and
+    /// any other failure 412 `PreconditionFailed` naming the condition.
+    pub(crate) fn refusal(&self, found: bool) -> Refusal {
+        match (&self.if_match, found) {
+            (Some(_), false) => Refusal::new(Code::NoSuchKey),
+            (Some(_), true) => Refusal::new(Code::PreconditionFailed).with("Condition", "If-Match"),
+            (None, _) => Refusal::new(Code::PreconditionFailed).with("Condition", "If-None-Match"),
+        }
     }
 
     /// What [`crate::files::commit`] checks, or `None` when nothing is asked.
@@ -614,9 +638,26 @@ mod tests {
         assert!(!check(&[(IF_MATCH, &e)], Some(&sha)));
         assert!(check(&[(IF_MATCH, &format!("\"{SHA}\""))], Some(&sha)));
         assert!(!check(&[(IF_MATCH, &e)], None));
-        assert!(check(&[(IF_MATCH, "*")], Some(&sha)));
-        assert!(!check(&[(IF_MATCH, "*")], None));
-        // only `*` is served for If-None-Match
-        assert!(WriteConditions::of(&headers(&[(IF_NONE_MATCH, &e)])).is_err());
+        // only `*` is served for If-None-Match, only an ETag for If-Match, one at most
+        let refused = |pairs: &[(hyper::header::HeaderName, &str)]| {
+            WriteConditions::of(&headers(pairs)).err().map(|r| r.code)
+        };
+        assert_eq!(refused(&[(IF_NONE_MATCH, &e)]), Some(Code::NotImplemented));
+        assert_eq!(refused(&[(IF_MATCH, "*")]), Some(Code::NotImplemented));
+        assert_eq!(refused(&[(IF_MATCH, "\"*\"")]), Some(Code::NotImplemented));
+        assert_eq!(
+            refused(&[(IF_MATCH, &e), (IF_NONE_MATCH, "*")]),
+            Some(Code::NotImplemented)
+        );
+        // a failed If-Match is a miss where there is no object
+        let c = WriteConditions::of(&headers(&[(IF_MATCH, &e)]))
+            .ok()
+            .unwrap();
+        assert_eq!(c.refusal(false).code, Code::NoSuchKey);
+        assert_eq!(c.refusal(true).element("Condition"), Some("If-Match"));
+        let c = WriteConditions::of(&headers(&[(IF_NONE_MATCH, "*")]))
+            .ok()
+            .unwrap();
+        assert_eq!(c.refusal(true).element("Condition"), Some("If-None-Match"));
     }
 }

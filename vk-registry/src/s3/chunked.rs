@@ -142,27 +142,32 @@ fn trailer_string_to_sign(stamp: &str, scope: &str, previous: &str, lines_sha256
     )
 }
 
-/// Why a chunked body was refused: the S3 code it is answered with, and what was wrong with
-/// it, which the answer leaves to the code's own message.
+/// Why a chunked body was refused: the S3 code and message it is answered with, and what was
+/// wrong with it, which the answer leaves to S3's words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Refusal {
     pub(crate) code: Code,
+    pub(crate) said: &'static str,
     pub(crate) message: &'static str,
 }
 
 impl Refusal {
-    /// A chunk header that is malformed, too long, or sizes a chunk past the declared length.
-    fn size(message: &'static str) -> Self {
+    /// A body whose framing breaks off or is not `aws-chunked`'s: a chunk header that is
+    /// malformed or too long, data not followed by CRLF, an end before the last chunk. S3
+    /// answers all of it as a body that ended early.
+    fn malformed(message: &'static str) -> Self {
         Refusal {
-            code: Code::InvalidChunkSizeError,
+            code: Code::IncompleteBody,
+            said: "The request body terminated unexpectedly",
             message,
         }
     }
 
-    /// A body that ends early, or holds other than the declared length.
-    fn incomplete(message: &'static str) -> Self {
+    /// Chunks that hold other than `x-amz-decoded-content-length`.
+    fn mismatch(message: &'static str) -> Self {
         Refusal {
             code: Code::IncompleteBody,
+            said: Code::IncompleteBody.message(),
             message,
         }
     }
@@ -171,6 +176,7 @@ impl Refusal {
     fn trailer(message: &'static str) -> Self {
         Refusal {
             code: Code::MalformedTrailerError,
+            said: Code::MalformedTrailerError.message(),
             message,
         }
     }
@@ -179,6 +185,7 @@ impl Refusal {
     fn signature(message: &'static str) -> Self {
         Refusal {
             code: Code::SignatureDoesNotMatch,
+            said: Code::SignatureDoesNotMatch.message(),
             message,
         }
     }
@@ -186,7 +193,7 @@ impl Refusal {
 
 impl From<Refusal> for super::error::Refusal {
     fn from(r: Refusal) -> Self {
-        super::error::Refusal::new(r.code)
+        super::error::Refusal::said(r.code, r.said)
     }
 }
 
@@ -319,7 +326,9 @@ impl<B> Decoder<B> {
             .extend_from_slice(self.pending.get(..end).unwrap_or_default());
         self.pending.advance(end.saturating_add(1));
         if self.line.pop() != Some(b'\r') {
-            return Err(Refusal::size("a line of the body does not end in CRLF"));
+            return Err(Refusal::malformed(
+                "a line of the body does not end in CRLF",
+            ));
         }
         Ok(true)
     }
@@ -327,41 +336,41 @@ impl<B> Decoder<B> {
     /// The chunk header in `line`: the next chunk's size, and its signature.
     fn header(&mut self) -> Result<(), Refusal> {
         let line = std::mem::take(&mut self.line);
-        let text =
-            std::str::from_utf8(&line).map_err(|_| Refusal::size("a chunk header is not text"))?;
+        let text = std::str::from_utf8(&line)
+            .map_err(|_| Refusal::malformed("a chunk header is not text"))?;
         let (size, extension) = match text.split_once(';') {
             Some((size, extension)) => (size, Some(extension)),
             None => (text, None),
         };
         if size.is_empty() || size.len() > 16 || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(Refusal::size("a chunk size is not a hex number"));
+            return Err(Refusal::malformed("a chunk size is not a hex number"));
         }
         let size = u64::from_str_radix(size, 16)
-            .map_err(|_| Refusal::size("a chunk size is not a hex number"))?;
+            .map_err(|_| Refusal::malformed("a chunk size is not a hex number"))?;
         let signature = match (self.framing.mode.signed(), extension) {
             (true, Some(extension)) => Some(
                 extension
                     .strip_prefix("chunk-signature=")
                     .filter(|s| is_signature(s))
-                    .ok_or(Refusal::size(
+                    .ok_or(Refusal::malformed(
                         "a signed chunk's header is its size and chunk-signature=<64 hex>",
                     ))?,
             ),
             (false, None) => None,
             (true, None) => {
-                return Err(Refusal::size(
+                return Err(Refusal::malformed(
                     "a signed chunk's header has no chunk-signature",
                 ));
             }
             (false, Some(_)) => {
-                return Err(Refusal::size(
+                return Err(Refusal::malformed(
                     "an unsigned chunk's header is its size alone",
                 ));
             }
         };
         let left = self.framing.declared.saturating_sub(self.decoded);
         if size > left {
-            return Err(Refusal::size(
+            return Err(Refusal::mismatch(
                 "a chunk runs past x-amz-decoded-content-length",
             ));
         }
@@ -370,7 +379,7 @@ impl<B> Decoder<B> {
             .map(|s| (s.to_string(), Sha256::new()));
         if size == 0 {
             if left != 0 {
-                return Err(Refusal::incomplete(
+                return Err(Refusal::mismatch(
                     "the chunks hold fewer bytes than x-amz-decoded-content-length",
                 ));
             }
@@ -478,14 +487,14 @@ impl<B> Decoder<B> {
     /// Decode what `pending` holds, which is empty only at the inner body's end.
     fn step(&mut self) -> Result<Step, Refusal> {
         let end = self.pending.is_empty();
-        let truncated = Refusal::incomplete("the body ends before its last chunk and trailer");
+        let truncated = Refusal::malformed("the body ends before its last chunk and trailer");
         match self.state {
             State::Failed => Ok(Step::End),
             State::Done if end => Ok(Step::End),
             State::Done => Err(Refusal::trailer("bytes follow the end of the body")),
             _ if end && !matches!(self.state, State::Trailer) => Err(truncated),
             State::Header => {
-                let too_long = Refusal::size("a chunk header is longer than 256 bytes");
+                let too_long = Refusal::malformed("a chunk header is longer than 256 bytes");
                 if self.read_line(MAX_HEADER, too_long)? {
                     self.header()?;
                 }
@@ -509,9 +518,7 @@ impl<B> Decoder<B> {
             State::DataEnd(seen) => {
                 let want = if seen == 0 { b'\r' } else { b'\n' };
                 if self.pending.first() != Some(&want) {
-                    return Err(Refusal::incomplete(
-                        "a chunk's data is not followed by CRLF",
-                    ));
+                    return Err(Refusal::malformed("a chunk's data is not followed by CRLF"));
                 }
                 self.pending.advance(1);
                 if seen == 0 {
@@ -834,7 +841,7 @@ mod tests {
         );
         assert_eq!(
             code(&format!("1;chunk-signature={FINAL}\r\na\r\n0\r\n\r\n"), t),
-            Code::InvalidChunkSizeError
+            Code::IncompleteBody
         );
         // A plain aws-chunked body has no trailer.
         let plain = Framing {
@@ -903,21 +910,32 @@ mod tests {
             };
             decode(body, 3, framing, None).unwrap_err().code
         };
-        // Past the declared length, short of it, or not the length a size says.
+        // Past the declared length, short of it, or not the length a size says, in S3's
+        // words for each.
+        let said = |body: &[u8], declared| {
+            let framing = Framing {
+                mode: Mode::Unsigned,
+                declared,
+                trailer: None,
+            };
+            decode(body, 3, framing, None).unwrap_err().said
+        };
+        let mismatch = "You did not provide the number of bytes specified by the Content-Length \
+                        HTTP header";
+        assert_eq!(said(b"5\r\nhello\r\n0\r\n\r\n", 4), mismatch);
+        assert_eq!(said(b"5\r\nhello\r\n0\r\n\r\n", 6), mismatch);
         assert_eq!(
-            code(b"5\r\nhello\r\n0\r\n\r\n", 4),
-            Code::InvalidChunkSizeError
+            said(b"4\r\nhello\r\n0\r\n\r\n", 5),
+            "The request body terminated unexpectedly"
         );
+        assert_eq!(code(b"5\r\nhello\r\n0\r\n\r\n", 4), Code::IncompleteBody);
         assert_eq!(code(b"5\r\nhello\r\n0\r\n\r\n", 6), Code::IncompleteBody);
         assert_eq!(code(b"4\r\nhello\r\n0\r\n\r\n", 5), Code::IncompleteBody);
         assert_eq!(
             code(b"ffffffffffffffff\r\nhello\r\n0\r\n\r\n", 5),
-            Code::InvalidChunkSizeError
+            Code::IncompleteBody
         );
-        assert_eq!(
-            code(b"10000000000000000\r\n", 5),
-            Code::InvalidChunkSizeError
-        );
+        assert_eq!(code(b"10000000000000000\r\n", 5), Code::IncompleteBody);
         // Sizes in hex only.
         for bad in [
             &b"x\r\n"[..],
@@ -926,7 +944,7 @@ mod tests {
             b" 5\r\nhello\r\n",
             b"+5\r\nhello\r\n",
         ] {
-            assert_eq!(code(bad, 5), Code::InvalidChunkSizeError, "{bad:?}");
+            assert_eq!(code(bad, 5), Code::IncompleteBody, "{bad:?}");
         }
         let plain = Framing {
             mode: Mode::Unsigned,
@@ -950,16 +968,13 @@ mod tests {
             message(&pad(256))
         );
         assert!(message(&pad(257)).contains("256"));
-        assert_eq!(code(&pad(300), 1), Code::InvalidChunkSizeError);
+        assert_eq!(code(&pad(300), 1), Code::IncompleteBody);
         // A header whose LF never comes is refused at the bound, not read further.
         let mut endless = vec![b'0'; 10_000];
         endless.insert(0, b'1');
-        assert_eq!(code(&endless, 1), Code::InvalidChunkSizeError);
+        assert_eq!(code(&endless, 1), Code::IncompleteBody);
         // LF without CR, or data not followed by CRLF.
-        assert_eq!(
-            code(b"5\nhello\r\n0\r\n\r\n", 5),
-            Code::InvalidChunkSizeError
-        );
+        assert_eq!(code(b"5\nhello\r\n0\r\n\r\n", 5), Code::IncompleteBody);
         assert_eq!(code(b"5\r\nhello\n0\r\n\r\n", 5), Code::IncompleteBody);
         assert_eq!(code(b"5\r\nhelloXY0\r\n\r\n", 5), Code::IncompleteBody);
         // Anything after the end.

@@ -497,6 +497,13 @@ pub(super) async fn upload(
     }
     match method {
         Method::PUT => {
+            // The upload is looked up before anything asked of it is, as S3 looks it up.
+            if !on_parent(authz, accounts::Action::Write, &segs) {
+                return refuse(req, ctx.access_denied(), ctx).await;
+            }
+            if open_async(state, &id, &segs).await?.is_none() {
+                return refuse(req, no_such_upload(ctx, &id), ctx).await;
+            }
             let Some(n) = param(&params, "partNumber").and_then(part_number) else {
                 let resp = ctx.error(Refusal::argument(
                     PART_NUMBER,
@@ -623,6 +630,10 @@ async fn copy_part(
             let resp = ctx.error(Refusal::new(Code::NotImplemented).with("Header", COPY_SOURCE));
             return refuse(req, resp, ctx).await;
         }
+        Source::Absent { bucket, key } => {
+            let resp = copy::absent_source(state, authz, &bucket, &key, ctx).await?;
+            return refuse(req, resp, ctx).await;
+        }
         Source::Invalid(why) => return refuse(req, ctx.error(why), ctx).await,
     };
     if !admitted(authz, accounts::Action::Read, &src) {
@@ -664,9 +675,14 @@ async fn copy_part(
             None => (0, obj.size),
             Some((first, last)) if last < obj.size => (first, last - first + 1),
             Some(_) => {
-                return Ok(ctx.error(
-                    Refusal::new(Code::InvalidRange).with("ActualObjectSize", obj.size.to_string()),
-                ));
+                return Ok(ctx.error(Refusal::argument(
+                    format!(
+                        "Range specified is not valid for source object of size: {}",
+                        obj.size
+                    ),
+                    COPY_SOURCE_RANGE,
+                    obj.size.to_string(),
+                )));
             }
         };
         let Some((_, mut reader)) = store.read_blob_range(&obj.layer, start, len)? else {
@@ -718,6 +734,8 @@ enum Unfit {
     Malformed(&'static str),
     /// 400 `InvalidPartOrder`: the part numbers do not ascend
     Order,
+    /// 400 `InvalidArgument`: a `PartNumber` below 1, as sent
+    Number(String),
 }
 
 /// The parts a `CompleteMultipartUpload` document names, in order: each part's number and
@@ -738,8 +756,11 @@ fn document(body: &[u8]) -> std::result::Result<Vec<(u32, String)>, Unfit> {
                 .map(|e| e.text.trim().to_string())
                 .ok_or(Unfit::Malformed("each Part names its PartNumber and ETag"))
         };
-        let n = part_number(&field("PartNumber")?)
-            .ok_or(Unfit::Malformed("a PartNumber is 1 to 10000"))?;
+        let sent = field("PartNumber")?;
+        if sent.parse::<i64>().is_ok_and(|n| n < 1) {
+            return Err(Unfit::Number(sent));
+        }
+        let n = part_number(&sent).ok_or(Unfit::Malformed("a PartNumber is 1 to 10000"))?;
         let etag = field("ETag")?;
         let etag = etag
             .strip_prefix('"')
@@ -945,6 +966,16 @@ async fn complete(
         Ok(conditions) => conditions,
         Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
+    // An upload no id names, in progress or completed, before its document is read.
+    let known = {
+        let (store, id) = (Arc::clone(&state.store), id.clone());
+        tokio::task::spawn_blocking(move || store.multipart_dir(&id).is_some_and(|d| d.is_dir()))
+            .await
+            .context("looking up an upload panicked")?
+    };
+    if !known {
+        return refuse(req, no_such_upload(ctx, &id), ctx).await;
+    }
     let whole = match Whole::of(req.headers()) {
         Ok(whole) => whole,
         Err(why) => return refuse(req, ctx.error(why), ctx).await,
@@ -964,6 +995,13 @@ async fn complete(
         Err(Unfit::Malformed(_)) => return Ok(ctx.error(Code::MalformedXML)),
         Err(Unfit::Order) => {
             return Ok(ctx.error(Refusal::new(Code::InvalidPartOrder).with("UploadId", id)));
+        }
+        Err(Unfit::Number(sent)) => {
+            return Ok(ctx.error(Refusal::argument(
+                "PartNumber must be >= 1",
+                "PartNumber",
+                sent,
+            )));
         }
     };
     let found = {
@@ -1017,13 +1055,13 @@ async fn complete(
     };
     let how = Commit {
         annotations,
-        precondition: conditions.precondition(),
+        precondition: conditions.clone().precondition(),
         uncompressed: staged.size >= UNCOMPRESSED_FROM,
     };
     match files::commit(Arc::clone(&state.store), segs, staged, how).await? {
         Written::Created | Written::Replaced => {}
         Written::Refused(why) => return Ok(unwritable(why, ctx)),
-        Written::PreconditionFailed => return Ok(copy::failed(ctx)),
+        Written::PreconditionFailed { found } => return Ok(ctx.error(conditions.refusal(found))),
     }
     let resp = done.result(ctx);
     let dir = up.dir;
@@ -1249,21 +1287,31 @@ async fn list_parts(
     if !on_parent(authz, accounts::Action::Read, &segs) {
         return refuse(req, ctx.access_denied(), ctx).await;
     }
-    let max = match page_size("max-parts", param(params, "max-parts")) {
-        Ok(max) => max,
-        Err(why) => return refuse(req, ctx.error(why), ctx).await,
-    };
-    let marker = match param(params, "part-number-marker") {
-        None => 0,
-        Some(m) => match list::count("part-number-marker", m) {
-            Ok(m) => m,
-            Err(why) => return refuse(req, ctx.error(why), ctx).await,
-        },
-    };
+    // S3 refuses a count that is no number first, then looks the upload up, then refuses
+    // one that is negative.
+    let negative =
+        |name| param(params, name).is_some_and(|v| v.parse::<i64>().is_ok_and(|n| n < 0));
+    let max = page_size("max-parts", param(params, "max-parts"));
+    let marker =
+        param(params, "part-number-marker").map_or(Ok(0), |m| list::count("part-number-marker", m));
+    for (sent, name) in [
+        (max.as_ref().err(), "max-parts"),
+        (marker.as_ref().err(), "part-number-marker"),
+    ] {
+        if let Some(why) = sent
+            && !negative(name)
+        {
+            return refuse(req, ctx.error(why.clone()), ctx).await;
+        }
+    }
     let ctx = ctx.clone();
     crate::dav::blocking(state, authz, move |store, _| {
         let Some(up) = open(store, &id, &segs) else {
             return Ok(no_such_upload(&ctx, &id));
+        };
+        let (max, marker) = match (max, marker) {
+            (Ok(max), Ok(marker)) => (max, marker),
+            (Err(why), _) | (_, Err(why)) => return Ok(ctx.error(why)),
         };
         let mut numbers = if max == 0 {
             Vec::new()
@@ -1534,9 +1582,7 @@ mod tests {
             body(""),
             body("<Part><PartNumber>1</PartNumber></Part>"),
             body("<Part><ETag>x</ETag></Part>"),
-            body(&part("0", MD5)),
             body(&part("10001", MD5)),
-            body(&part("-1", MD5)),
             body(&part("one", MD5)),
             body(&part("", MD5)),
             body("<Part><PartNumber>1</PartNumber><PartNumber>2</PartNumber><ETag>x</ETag></Part>"),
@@ -1548,6 +1594,13 @@ mod tests {
                 matches!(document(&bad), Err(Unfit::Malformed(_))),
                 "{}",
                 String::from_utf8_lossy(&bad)
+            );
+        }
+        // A number below 1 is S3's InvalidArgument, naming it as sent.
+        for low in ["0", "-1"] {
+            assert_eq!(
+                document(&body(&part(low, MD5))),
+                Err(Unfit::Number(low.to_string()))
             );
         }
         // The most parts there can be fit in the bound; past it, the scan stops.
