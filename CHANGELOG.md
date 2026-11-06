@@ -27,7 +27,8 @@ All notable changes to virtkit will be documented in this file.
   storage class, a redirect, a retention lock — is refused rather than stored without it, and
   a refused upload sees its refusal rather than a dropped connection. Large
   files can be uploaded in parts, as the AWS CLI uploads them, completed once however many
-  completions of the upload are sent at once, read back a part at a time,
+  completions of the upload are sent, at once or as retries (each answered as the first while
+  the object is still the one it made), read back a part at a time,
   parts copied from other objects,
   and unfinished uploads listed, aborted, or cleaned up by `gc` once idle; `status` counts
   them. Set `s3 = false` in the server config to turn it off. A newly created API key is also

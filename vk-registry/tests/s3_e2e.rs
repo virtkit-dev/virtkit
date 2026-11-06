@@ -4456,11 +4456,13 @@ fn complete(path: &str, id: &str, parts: &[(u32, &str)]) -> Req {
         .body(complete_doc(parts))
 }
 
-/// The S3 multipart uploads left in the store, by id.
+/// The S3 multipart uploads in progress in the store, by id: not the completed ones kept to
+/// answer their completion again.
 fn multipart_left(dir: &std::path::Path) -> Vec<String> {
     let mut ids: Vec<String> = std::fs::read_dir(dir.join("store/uploads/s3"))
         .map(|d| {
             d.filter_map(|e| e.ok())
+                .filter(|e| e.path().join("meta.json").is_file())
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .collect()
         })
@@ -4587,6 +4589,7 @@ async fn a_multipart_upload_is_assembled_from_its_parts() {
     )
     .await;
     resp.ok(200);
+    let first = resp.body.clone();
     let etag = multipart_etag(&[&one, &two, &three]);
     assert!(etag.ends_with("-3\""), "{etag}");
     assert_eq!(element(&resp.body, "ETag"), etag.replace('"', "&quot;"));
@@ -4618,7 +4621,27 @@ async fn a_multipart_upload_is_assembled_from_its_parts() {
 
     // The upload is gone with its parts, and nothing is left staged.
     assert!(multipart_left(&dir).is_empty());
+    let up = dir.join(format!("store/uploads/s3/{id}"));
+    let kept: Vec<_> = std::fs::read_dir(&up)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(kept, ["completed.json"]);
     assert_eq!(staging_left(&dir), 0);
+    // The same completion sent again is answered as it was, as long as the object is the
+    // one it made; another list of parts finds no upload.
+    let again = || sign(complete(path, &id, &[(1, e1), (2, e2), (3, e3)]));
+    let resp2 = send(&host, again()).await;
+    resp2.ok(200);
+    assert_eq!(resp2.body, first);
+    send(&host, sign(complete(path, &id, &[(1, e1), (2, e2)])))
+        .await
+        .is(404, "NoSuchUpload");
+    let abort = Req::new("DELETE", path).query(&format!("uploadId={id}"));
+    send(&host, sign(abort)).await.is(404, "NoSuchUpload");
+    let resp2 = send(&host, again()).await;
+    resp2.ok(200);
+    assert_eq!(resp2.body, first);
     let listed = send(&host, sign(Req::new("GET", "/s3/b").query("uploads="))).await;
     listed.ok(200);
     assert!(
@@ -4633,6 +4656,36 @@ async fn a_multipart_upload_is_assembled_from_its_parts() {
     send(&host, sign(complete(path, &id, &[(1, e1)])))
         .await
         .is(404, "NoSuchUpload");
+    // Once the object is written over, the completion is no longer its answer; nor once
+    // it is deleted.
+    send(&host, sign(Req::new("PUT", path).body(whole.clone())))
+        .await
+        .ok(200);
+    send(&host, again()).await.is(404, "NoSuchUpload");
+    let id = create_upload(&host, &sign, path).await;
+    let etag = upload_part(&host, &sign, path, &id, 1, &three).await;
+    let once = || sign(complete(path, &id, &[(1, &etag)]));
+    send(&host, once()).await.ok(200);
+    send(&host, once()).await.ok(200);
+    send(&host, sign(Req::new("DELETE", path))).await.ok(204);
+    send(&host, once()).await.is(404, "NoSuchUpload");
+    // Nor once the gc has swept it, with the uploads left idle.
+    let id = create_upload(&host, &sign, path).await;
+    let etag = upload_part(&host, &sign, path, &id, 1, &three).await;
+    let once = || sign(complete(path, &id, &[(1, &etag)]));
+    send(&host, once()).await.ok(200);
+    let up = dir.join(format!("store/uploads/s3/{id}"));
+    let old = SystemTime::now() - Duration::from_secs(3 * 86_400);
+    std::fs::File::open(up.join("completed.json"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    std::fs::File::open(&up).unwrap().set_modified(old).unwrap();
+    let store = Store::new(dir.join("store")).unwrap();
+    let day = Duration::from_secs(86_400);
+    store.gc(day * 30, day, false).unwrap();
+    assert!(!up.exists());
+    send(&host, once()).await.is(404, "NoSuchUpload");
 }
 
 /// A one-part upload, an aborted one, part copies, an upload's id used for another key, a
@@ -4819,8 +4872,8 @@ async fn multipart_uploads_are_aborted_copied_bounded_and_swept() {
 }
 
 /// The same upload completed by several requests at once, as an SDK retrying a completion
-/// that timed out does: one makes the object and the others find the upload completed,
-/// never a part of it missing; the object is the parts', whole.
+/// that timed out does: one makes the object and the others, finding it made, are answered
+/// as it was, never with a part of it missing; the object is the parts', whole.
 #[tokio::test]
 async fn concurrent_completions_of_one_upload_make_one_object() {
     let (dir, host) = bearer_server("multipart-racey");
@@ -4845,21 +4898,20 @@ async fn concurrent_completions_of_one_upload_make_one_object() {
             let (host, req) = (host.clone(), sign(complete(path, &id, &named)));
             racing.spawn(async move { send(&host, req).await });
         }
-        let mut made = 0;
+        let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        let etag = multipart_etag(&refs);
         while let Some(resp) = racing.join_next().await {
             let resp = resp.unwrap();
-            if resp.status == 200 {
-                made += 1;
-            } else {
-                resp.is(404, "NoSuchUpload");
-            }
+            resp.ok(200);
+            assert_eq!(
+                element(&resp.body, "ETag"),
+                etag.replace('"', "&quot;"),
+                "round {round}"
+            );
         }
-        assert_eq!(made, 1, "round {round}");
-        let whole = parts.concat();
         let resp = send(&host, sign(Req::new("GET", path))).await;
-        is_object(&resp, &whole);
-        let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-        assert_eq!(resp.header("etag"), Some(&*multipart_etag(&refs)));
+        is_object(&resp, &parts.concat());
+        assert_eq!(resp.header("etag"), Some(&*etag));
     }
     assert!(multipart_left(&dir).is_empty());
     assert_eq!(staging_left(&dir), 0);
