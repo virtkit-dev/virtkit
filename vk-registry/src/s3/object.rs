@@ -971,10 +971,12 @@ pub(super) async fn put(
     if declared_too_large(headers) {
         return Ok(ctx.too_large());
     }
-    let plan = match plan(headers) {
+    let mut plan = match plan(headers) {
         Ok(plan) => plan,
         Err(why) => return refuse(req, ctx.error(why), ctx).await,
     };
+    // An object written with no checksum gets S3's default, computed as the body streams.
+    plan.compute(checksum::DEFAULT);
     let mut annotations = match meta::annotations(headers) {
         Ok(a) => a,
         Err(why) => return refuse(req, ctx.error(why), ctx).await,

@@ -1501,7 +1501,12 @@ async fn a_put_checks_the_digests_it_is_sent() {
             let resp = send(&host, asked).await;
             assert_eq!(resp.header(name), Some(value.as_str()), "{name} kept");
         } else {
-            assert_eq!(resp.header("x-amz-checksum-type"), None);
+            // None sent: S3's default, computed.
+            assert_eq!(
+                resp.header("x-amz-checksum-crc64nvme"),
+                Some(&*crc64nvme_b64(HELLO))
+            );
+            assert_eq!(resp.header("x-amz-checksum-type"), Some("FULL_OBJECT"));
         }
         is_object(&send(&host, get(&path)).await, HELLO);
     }
@@ -1567,18 +1572,24 @@ async fn a_put_checks_the_digests_it_is_sent() {
     send(&host, get("/s3/b/x")).await.is(404, "NoSuchKey");
     assert_eq!(staging_left(&dir), 0);
 
-    // On a read, the SHA-256 the store has, when asked, for an object whose write kept no
-    // checksum.
-    let resp = send(&host, get("/s3/b/good0")).await;
+    // On a read, the SHA-256 the store has, when asked, for an object written otherwise than
+    // through S3, which kept no checksum.
+    let dav = send(
+        &host,
+        Req::new("PUT", "/dav/files/b/dav").body(HELLO.to_vec()),
+    )
+    .await;
+    assert_eq!(dav.status, 201);
+    let resp = send(&host, get("/s3/b/dav")).await;
     assert_eq!(resp.header("x-amz-checksum-sha256"), None);
-    let asked = get("/s3/b/good0").header("x-amz-checksum-mode", "ENABLED");
+    let asked = get("/s3/b/dav").header("x-amz-checksum-mode", "ENABLED");
     let resp = send(&host, asked).await;
     is_object(&resp, HELLO);
     assert_eq!(
         resp.header("x-amz-checksum-sha256"),
         Some(&*b64(&sha2::Sha256::digest(HELLO)))
     );
-    let asked = Req::new("HEAD", "/s3/b/good0").header("x-amz-checksum-mode", "enabled");
+    let asked = Req::new("HEAD", "/s3/b/dav").header("x-amz-checksum-mode", "enabled");
     let resp = send(&host, asked).await;
     resp.ok(200);
     assert_eq!(
@@ -1796,11 +1807,11 @@ async fn the_checksum_a_write_carried_is_kept_with_the_object() {
         assert_eq!(keys(&resp.body), ["copy", "k", "plain"]);
         assert_eq!(
             elements(&resp.body, "ChecksumAlgorithm"),
-            ["CRC32C", "CRC32C"]
+            ["CRC32C", "CRC32C", "CRC64NVME"]
         );
         assert_eq!(
             elements(&resp.body, "ChecksumType"),
-            ["FULL_OBJECT", "FULL_OBJECT"]
+            ["FULL_OBJECT", "FULL_OBJECT", "FULL_OBJECT"]
         );
         assert!(
             resp.body.contains(
@@ -1811,17 +1822,21 @@ async fn the_checksum_a_write_carried_is_kept_with_the_object() {
             resp.body
         );
     }
-    // Replaced by a write carrying none, the object has none.
+    // Replaced by a write carrying none, the object has S3's default.
     send(&host, Req::new("PUT", "/s3/b/k").body(HELLO.to_vec()))
         .await
         .ok(200);
     let asked = Req::new("GET", "/s3/b/k").header("x-amz-checksum-mode", "ENABLED");
     let resp = send(&host, asked).await;
     assert_eq!(resp.header("x-amz-checksum-crc32c"), None);
-    assert_eq!(resp.header("x-amz-checksum-type"), None);
+    assert_eq!(
+        resp.header("x-amz-checksum-crc64nvme"),
+        Some(&*crc64nvme_b64(HELLO))
+    );
+    assert_eq!(resp.header("x-amz-checksum-type"), Some("FULL_OBJECT"));
 
-    // An upload completed with the whole object's checksum keeps it; a composite one is
-    // passed over, and a wrong one refused.
+    // An upload created with no checksum has S3's default, of the whole object, whatever
+    // final checksum its completion is sent (one that is not one is still refused).
     let sign = |r: Req| r;
     let path = "/s3/b/parts";
     let id = create_upload(&host, &sign, path).await;
@@ -1833,12 +1848,7 @@ async fn the_checksum_a_write_carried_is_kept_with_the_object() {
     let parts = [(1, e1.as_str()), (2, e2.as_str())];
     let wrong =
         complete(path, &id, &parts).header("x-amz-checksum-crc64nvme", &crc64nvme_b64(&one));
-    send(&host, wrong).await.is(400, "BadDigest");
-    let resp = send(
-        &host,
-        complete(path, &id, &parts).header("x-amz-checksum-crc64nvme", &nvme),
-    )
-    .await;
+    let resp = send(&host, wrong).await;
     resp.ok(200);
     assert_eq!(element(&resp.body, "ChecksumCRC64NVME"), nvme);
     assert_eq!(element(&resp.body, "ChecksumType"), "FULL_OBJECT");
@@ -1866,7 +1876,11 @@ async fn the_checksum_a_write_carried_is_kept_with_the_object() {
         complete(path, &id, &[(1, e1.as_str())]).header("x-amz-checksum-crc32", "AAAAAA==-1");
     let resp = send(&host, composite).await;
     resp.ok(200);
-    assert_eq!(elements(&resp.body, "ChecksumType"), Vec::<String>::new());
+    assert_eq!(
+        element(&resp.body, "ChecksumCRC64NVME"),
+        crc64nvme_b64(&one)
+    );
+    assert_eq!(elements(&resp.body, "ChecksumCRC32"), Vec::<String>::new());
 }
 
 /// The shared bearer of [`bearer_server`], which is also its access key and secret.
@@ -2630,10 +2644,10 @@ async fn attributes_deletes_and_the_paths_a_key_cannot_take() {
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><GetObjectAttributesResponse \
              xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ETag>{}</ETag><Checksum>\
-             <ChecksumSHA256>{}</ChecksumSHA256></Checksum><ObjectSize>13</ObjectSize>\
-             </GetObjectAttributesResponse>",
+             <ChecksumCRC64NVME>{}</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType>\
+             </Checksum><ObjectSize>13</ObjectSize></GetObjectAttributesResponse>",
             md5_hex(HELLO),
-            b64(&sha2::Sha256::digest(HELLO))
+            crc64nvme_b64(HELLO)
         )
     );
     send(&host, attrs("Nonsense"))
@@ -3815,17 +3829,17 @@ async fn ranges_of_plain_and_zstd_stored_objects() {
         let asked = |value: &str| ranged(value).header("x-amz-checksum-mode", "ENABLED");
         let resp = send(&host, asked("bytes=0-9")).await;
         is_part(&resp, data, 0, 10, &etag);
-        assert_eq!(resp.header("x-amz-checksum-sha256"), None);
+        assert_eq!(resp.header("x-amz-checksum-crc64nvme"), None);
         let resp = send(&host, asked(&format!("bytes=0-{}", n - 1))).await;
         is_part(&resp, data, 0, n, &etag);
-        assert_eq!(resp.header("x-amz-checksum-sha256"), None);
+        assert_eq!(resp.header("x-amz-checksum-crc64nvme"), None);
         let resp = send(
             &host,
             Req::new("GET", &path).header("x-amz-checksum-mode", "ENABLED"),
         )
         .await;
-        let sha = b64(&sha2::Sha256::digest(data));
-        assert_eq!(resp.header("x-amz-checksum-sha256"), Some(&*sha));
+        let crc = crc64nvme_b64(data);
+        assert_eq!(resp.header("x-amz-checksum-crc64nvme"), Some(&*crc));
 
         // A HEAD answers what the GET would.
         let resp = send(
