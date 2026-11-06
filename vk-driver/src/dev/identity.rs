@@ -1690,16 +1690,17 @@ mod tests {
     fn a_host_value_some_path_merely_contains_is_session_drift_when_it_changes() {
         let t = scratch("identity-coincidence");
         let mut plan = plan_in(&t.0);
-        // The state dir's hashed name holds `abc` by chance, as CI's `ws-794884fabc194aa` did.
-        plan.state_dir = t.0.join("state/ws-794884fabc194aa");
+        // The state dir's name holds the value by chance, as CI's `ws-794884fabc194aa` held
+        // `abc`. The value has a `q` so that no hex fingerprint in the manifest can hold it.
+        plan.state_dir = t.0.join("state/ws-794884fabq194aa");
         plan.managed_dirs = vec![plan.state_dir.join("data")];
         plan.mounts = vec![mount("data", plan.state_dir.join("data"), "/data")];
-        let (abc, xyz) = (with_token(&plan, "abc"), with_token(&plan, "xyz"));
-        // `abc` is what `${localEnv:…}` fed, so the boot records no string holding it.
+        let (abc, xyz) = (with_token(&plan, "abq"), with_token(&plan, "xyz"));
+        // `abq` is what `${localEnv:…}` fed, so the boot records no string holding it.
         assert!(
             !serde_json::to_string(&abc.manifest)
                 .unwrap()
-                .contains("abc")
+                .contains("abq")
         );
         for (before, after) in [(&abc, &xyz), (&xyz, &abc)] {
             let groups = drift(&before.manifest, &after.manifest);
