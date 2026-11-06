@@ -47,55 +47,81 @@ impl Credential<'_> {
     }
 }
 
+/// What AWS says of an `Authorization` value with fewer or more fields than three.
+const THREE_COMPONENTS: &str =
+    "the authorization header requires three components: Credential, SignedHeaders, and Signature.";
+
 /// Parse an `Authorization` value: `AWS4-HMAC-SHA256 Credential=<id>/<date>/<region>/<service>/
-/// <terminator>, SignedHeaders=<a;b;…>, Signature=<hex>`, the fields in any order, separated
-/// by commas with or without spaces. The scope is split from the right, so an id may hold a
-/// `/` and a scope field may not. The reason a value is malformed otherwise.
-pub(crate) fn parse_authorization(value: &str) -> Result<Credential<'_>, &'static str> {
+/// <terminator>, SignedHeaders=<a;b;…>, Signature=<hex>`, the three fields in any order,
+/// separated by commas with or without spaces, the credential's scope for `service`. The
+/// scope is split from the right, so an id may hold a `/` and a scope field may not. What is
+/// malformed otherwise is said as AWS says it after "The authorization header is malformed; ",
+/// checked in AWS's order: the fields, the credential's shape, its service, its terminator,
+/// its date.
+pub(crate) fn parse_authorization<'v>(
+    value: &'v str,
+    service: &str,
+) -> Result<Credential<'v>, String> {
     let fields = value
         .strip_prefix(ALGORITHM)
         .and_then(|r| r.strip_prefix(' '))
         .ok_or("the algorithm must be AWS4-HMAC-SHA256")?;
+    let fields: Vec<&str> = fields.split(',').map(str::trim).collect();
+    if fields.len() != 3 {
+        return Err(THREE_COMPONENTS.to_string());
+    }
     let (mut credential, mut signed, mut signature) = (None, None, None);
-    for field in fields.split(',') {
-        let (name, v) = field
-            .trim()
-            .split_once('=')
-            .ok_or("each field must be Name=value")?;
-        let slot = match name {
-            "Credential" => &mut credential,
-            "SignedHeaders" => &mut signed,
-            "Signature" => &mut signature,
-            _ => return Err("unknown field: only Credential, SignedHeaders and Signature"),
+    for field in fields {
+        let Some((name, v)) = field.split_once('=') else {
+            return Err(format!(
+                "the authorization component {field:?} is malformed."
+            ));
         };
-        if slot.replace(v).is_some() {
-            return Err("a field is given twice");
+        // Three fields, one named twice or not one of these: another is missing.
+        match name {
+            "Credential" => credential = Some(v),
+            "SignedHeaders" => signed = Some(v),
+            "Signature" => signature = Some(v),
+            _ => {}
         }
     }
-    let credential = credential.ok_or("Credential is missing")?;
-    let signed = signed.ok_or("SignedHeaders is missing")?;
-    let signature = signature.ok_or("Signature is missing")?;
+    let credential = credential.ok_or("missing Credential.")?;
+    let signed = signed.ok_or("missing SignedHeaders.")?;
+    let signature = signature.ok_or("missing Signature.")?;
 
     let mut scope = credential.rsplitn(5, '/');
-    let (Some(terminator), Some(service), Some(region), Some(date), Some(id)) = (
+    let (Some(terminator), Some(asked), Some(region), Some(date), Some(id)) = (
         scope.next(),
         scope.next(),
         scope.next(),
         scope.next(),
         scope.next(),
     ) else {
-        return Err("Credential must be <id>/<date>/<region>/<service>/aws4_request");
+        return Err(MALFORMED_CREDENTIAL.to_string());
     };
-    if id.is_empty() || region.is_empty() || service.is_empty() || terminator.is_empty() {
-        return Err("Credential has an empty field");
+    if id.is_empty() || region.is_empty() || asked.is_empty() || terminator.is_empty() {
+        return Err(MALFORMED_CREDENTIAL.to_string());
+    }
+    if asked != service {
+        return Err(format!(
+            "incorrect service {asked:?}. This endpoint belongs to {service:?}."
+        ));
+    }
+    if terminator != TERMINATOR {
+        return Err(format!(
+            "incorrect terminal {terminator:?}. This endpoint uses {TERMINATOR:?}."
+        ));
     }
     if date.len() != 8 || !date.bytes().all(|b| b.is_ascii_digit()) {
-        return Err("the credential's date must be YYYYMMDD");
+        return Err(format!(
+            "incorrect date format {date:?}. This date in the credential must be in the format \
+             \"yyyyMMdd\"."
+        ));
     }
     let mut signed_headers = Vec::new();
     for name in signed.split(';') {
         if name.is_empty() || !name.bytes().all(is_lowercase_token) {
-            return Err("SignedHeaders must be lowercase header names separated by ';'");
+            return Err("SignedHeaders must be lowercase header names separated by ';'".into());
         }
         signed_headers.push(name);
     }
@@ -106,34 +132,32 @@ pub(crate) fn parse_authorization(value: &str) -> Result<Credential<'_>, &'stati
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
-        return Err("Signature must be 64 lowercase hex digits");
+        return Err("Signature must be 64 lowercase hex digits".into());
     }
     Ok(Credential {
         id,
         date,
         region,
-        service,
+        service: asked,
         terminator,
         signed_headers,
         signature,
     })
 }
 
+/// What AWS says of a credential that is not five fields.
+const MALFORMED_CREDENTIAL: &str =
+    "the Credential is mal-formed; expecting \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\".";
+
 /// A header-name byte (RFC 9110 `tchar`), lowercase.
 fn is_lowercase_token(b: u8) -> bool {
     b.is_ascii_lowercase() || b.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
-/// What S3 requires of a SigV4 request beyond the signature: its scope names the service
-/// `s3` and ends in `aws4_request`, and it signs `host` (what it was sent to) and
+/// What S3 requires of a SigV4 request beyond the signature and the scope
+/// [`parse_authorization`] checks: it signs `host` (what it was sent to) and
 /// `x-amz-content-sha256` (what it carries). The reason, when it does not.
 pub(crate) fn s3_refusal(credential: &Credential<'_>) -> Option<&'static str> {
-    if credential.service != "s3" {
-        return Some("the credential's service must be s3");
-    }
-    if credential.terminator != TERMINATOR {
-        return Some("the credential must end in aws4_request");
-    }
     for required in ["host", "x-amz-content-sha256"] {
         if !credential.signed_headers.contains(&required) {
             return Some(if required == "host" {
@@ -146,16 +170,20 @@ pub(crate) fn s3_refusal(credential: &Credential<'_>) -> Option<&'static str> {
     None
 }
 
-/// The first `x-amz-*` header of `headers` the signature does not cover: S3 refuses a request
-/// carrying one, as anything on its way could have added it.
-pub(crate) fn unsigned_amz_header<'h>(
+/// The `x-amz-*` headers of `headers` the signature does not cover, as S3 lists them (`, `
+/// between two), sorted: S3 refuses a request carrying one, as anything on its way could have
+/// added it. `None` when it covers them all.
+pub(crate) fn unsigned_amz_headers(
     credential: &Credential<'_>,
-    headers: &'h HeaderMap,
-) -> Option<&'h str> {
-    headers
+    headers: &HeaderMap,
+) -> Option<String> {
+    let mut unsigned: Vec<&str> = headers
         .keys()
         .map(|name| name.as_str())
-        .find(|name| name.starts_with("x-amz-") && !credential.signed_headers.contains(name))
+        .filter(|name| name.starts_with("x-amz-") && !credential.signed_headers.contains(name))
+        .collect();
+    unsigned.sort_unstable();
+    (!unsigned.is_empty()).then(|| unsigned.join(", "))
 }
 
 /// Why a request's time is refused.
@@ -490,9 +518,10 @@ mod tests {
         verifies: bool,
     }
 
-    fn sign(req: &Request, secret: &str, payload_hash: &str) -> Signed {
+    /// What signing `req` for `service` with `secret` makes.
+    fn sign(req: &Request, service: &str, secret: &str, payload_hash: &str) -> Signed {
         let auth = req.headers["authorization"].to_str().unwrap();
-        let cred = parse_authorization(auth).unwrap();
+        let cred = parse_authorization(auth, service).unwrap();
         let stamp = req.headers["x-amz-date"].to_str().unwrap();
         let canonical = canonical_request(
             &req.method,
@@ -556,7 +585,7 @@ mod tests {
                 }
                 None => EMPTY_SHA256.to_string(),
             };
-            let signed = sign(&req, secret, &payload_hash);
+            let signed = sign(&req, "service", secret, &payload_hash);
             if let Some(stem) = name.strip_suffix("-normalized") {
                 assert_eq!(context["normalize"], true, "{name}");
                 let twin = root.join(format!("{stem}-unnormalized"));
@@ -660,18 +689,20 @@ mod tests {
                 text.push('\n');
             }
             let req = parse_request(&text);
-            let cred = parse_authorization(req.headers["authorization"].to_str().unwrap()).unwrap();
+            let cred =
+                parse_authorization(req.headers["authorization"].to_str().unwrap(), "s3").unwrap();
             assert_eq!(cred.id, "AKIAIOSFODNN7EXAMPLE");
             assert_eq!(s3_refusal(&cred), None, "{line}");
             let payload = req.headers["x-amz-content-sha256"].to_str().unwrap();
-            let signed = sign(&req, S3_SECRET, payload);
+            let signed = sign(&req, "s3", S3_SECRET, payload);
             assert_eq!(signed.canonical, canonical, "{line}");
             assert_eq!(signed.signature, sig, "{line}");
             assert!(signed.verifies, "{line}");
             // Another secret, or one byte of the request changed, and it no longer does.
-            assert!(!sign(&req, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEz", payload).verifies);
+            let other = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEz";
+            assert!(!sign(&req, "s3", other, payload).verifies);
             let moved = parse_request(&text.replacen(" /", " /x", 1));
-            assert!(!sign(&moved, S3_SECRET, payload).verifies, "{line}");
+            assert!(!sign(&moved, "s3", S3_SECRET, payload).verifies, "{line}");
         }
     }
 
@@ -775,7 +806,7 @@ mod tests {
             "team/ci/key/20130524/auto/s3/aws4_request",
             "x-amz-date;host;x-amz-content-sha256",
         );
-        let cred = parse_authorization(&value).unwrap();
+        let cred = parse_authorization(&value, "s3").unwrap();
         assert_eq!(cred.id, "team/ci/key");
         assert_eq!(cred.date, "20130524");
         assert_eq!(cred.region, "auto");
@@ -817,7 +848,7 @@ mod tests {
             "AWS4-HMAC-SHA256".to_string(),
             "AWS4-HMAC-SHA256 ".to_string(),
         ] {
-            assert!(parse_authorization(&bad).is_err(), "{bad}");
+            assert!(parse_authorization(&bad, "s3").is_err(), "{bad}");
         }
     }
 
@@ -827,7 +858,7 @@ mod tests {
             "id/20130524/us-east-1/s3/aws4_request",
             "host;x-amz-content-sha256;x-amz-date;x-amz-meta-x",
         );
-        let cred = parse_authorization(&header).unwrap();
+        let cred = parse_authorization(&header, "s3").unwrap();
         let mut headers = HeaderMap::new();
         for name in [
             "x-amz-content-sha256",
@@ -840,36 +871,91 @@ mod tests {
                 hyper::header::HeaderValue::from_static("v"),
             );
         }
-        assert_eq!(unsigned_amz_header(&cred, &headers), None);
+        assert_eq!(unsigned_amz_headers(&cred, &headers), None);
         headers.insert(
             hyper::header::HeaderName::from_static("x-amz-meta-y"),
             hyper::header::HeaderValue::from_static("v"),
         );
-        assert_eq!(unsigned_amz_header(&cred, &headers), Some("x-amz-meta-y"));
+        assert_eq!(
+            unsigned_amz_headers(&cred, &headers).as_deref(),
+            Some("x-amz-meta-y")
+        );
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-amz-copy-source"),
+            hyper::header::HeaderValue::from_static("v"),
+        );
+        assert_eq!(
+            unsigned_amz_headers(&cred, &headers).as_deref(),
+            Some("x-amz-copy-source, x-amz-meta-y")
+        );
     }
 
     #[test]
     fn s3_requires_its_service_and_both_headers_signed() {
         let refusal = |credential: &str, signed: &str| {
-            s3_refusal(&parse_authorization(&authorization(credential, signed)).unwrap())
+            s3_refusal(&parse_authorization(&authorization(credential, signed), "s3").unwrap())
         };
         let ok = "id/20130524/us-east-1/s3/aws4_request";
         assert_eq!(refusal(ok, "host;x-amz-content-sha256;x-amz-date"), None);
         assert!(refusal(ok, "x-amz-content-sha256;x-amz-date").is_some());
         assert!(refusal(ok, "host;x-amz-date").is_some());
-        assert!(
-            refusal(
-                "id/20130524/us-east-1/service/aws4_request",
-                "host;x-amz-content-sha256"
-            )
-            .is_some()
+    }
+
+    /// The reasons AWS gives, after "The authorization header is malformed; ", in its order:
+    /// the service before the terminator before the date.
+    #[test]
+    fn a_malformed_authorization_is_said_as_aws_says_it() {
+        let why = |value: &str| parse_authorization(value, "s3").unwrap_err();
+        let signed = "host;x-amz-content-sha256";
+        let with = |credential: &str| why(&authorization(credential, signed));
+        assert_eq!(
+            with("id/3223423234/us-east-1/s3/aws4_request"),
+            "incorrect date format \"3223423234\". This date in the credential must be in the \
+             format \"yyyyMMdd\"."
         );
-        assert!(
-            refusal(
-                "id/20130524/us-east-1/s3/aws4_requesT",
-                "host;x-amz-content-sha256"
-            )
-            .is_some()
+        assert_eq!(
+            with("id/32234/us-east-1/ec2/aws4_request"),
+            "incorrect service \"ec2\". This endpoint belongs to \"s3\"."
+        );
+        assert_eq!(
+            with("id/32234/us-east-1/s3/aws_request"),
+            "incorrect terminal \"aws_request\". This endpoint uses \"aws4_request\"."
+        );
+        assert_eq!(
+            with("us-east-1/s3/aws4_request"),
+            "the Credential is mal-formed; expecting \
+             \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\"."
+        );
+        let ok = "id/20130524/us-east-1/s3/aws4_request";
+        assert_eq!(
+            why(&format!(
+                "AWS4-HMAC-SHA256 Credential={ok}, SignedHeaders={signed}"
+            )),
+            THREE_COMPONENTS
+        );
+        assert_eq!(
+            why(&format!(
+                "AWS4-HMAC-SHA256 Credential={ok}, SignedHeaders-x, Signature={SIG}"
+            )),
+            "the authorization component \"SignedHeaders-x\" is malformed."
+        );
+        assert_eq!(
+            why(&format!(
+                "AWS4-HMAC-SHA256 Creds={ok}, SignedHeaders={signed}, Signature={SIG}"
+            )),
+            "missing Credential."
+        );
+        assert_eq!(
+            why(&format!(
+                "AWS4-HMAC-SHA256 Credential={ok}, Signature={SIG}, Signature={SIG}"
+            )),
+            "missing SignedHeaders."
+        );
+        assert_eq!(
+            why(&format!(
+                "AWS4-HMAC-SHA256 Credential={ok}, SignedHeaders={signed}, Sig={SIG}"
+            )),
+            "missing Signature."
         );
     }
 

@@ -7,8 +7,11 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
-use hyper::header::{HeaderMap, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
+use hyper::header::{
+    HeaderMap, HeaderName, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE,
+};
 
+use super::error::{Code, Refusal};
 use crate::files::{Object, Precondition};
 
 /// The manifest annotation holding an S3-written object's MD5, as lowercase hex; for an
@@ -173,23 +176,36 @@ pub(crate) struct WriteConditions {
     pub(crate) if_match: Option<String>,
 }
 
-/// Why a write's conditional headers are not served: an `If-None-Match` other than `*`.
-pub(crate) struct Unsupported;
+/// Why a write's `header` is not served, as S3 says it: an `If-None-Match` other than `*`,
+/// or a value that is not text.
+pub(crate) fn unsupported(header: &HeaderName) -> Refusal {
+    let name = if *header == IF_NONE_MATCH {
+        "If-None-Match"
+    } else {
+        "If-Match"
+    };
+    Refusal::new(Code::NotImplemented)
+        .with("Header", name)
+        .with(
+            "additionalMessage",
+            format!("We don't accept the provided value of {name} header for this API"),
+        )
+}
 
 impl WriteConditions {
-    pub(crate) fn of(headers: &HeaderMap) -> Result<Self, Unsupported> {
-        let text = |name| {
+    pub(crate) fn of(headers: &HeaderMap) -> Result<Self, Refusal> {
+        let text = |name: HeaderName| {
             let values: Vec<&str> = headers
-                .get_all(name)
+                .get_all(&name)
                 .iter()
-                .map(|v| v.to_str().map_err(|_| Unsupported))
+                .map(|v| v.to_str().map_err(|_| unsupported(&name)))
                 .collect::<Result<_, _>>()?;
-            Ok((!values.is_empty()).then(|| values.join(",")))
+            Ok::<_, Refusal>((!values.is_empty()).then(|| values.join(",")))
         };
         let absent = match text(IF_NONE_MATCH)? {
             None => false,
             Some(v) if v.trim() == "*" => true,
-            Some(_) => return Err(Unsupported),
+            Some(_) => return Err(unsupported(&IF_NONE_MATCH)),
         };
         Ok(WriteConditions {
             absent,
@@ -211,10 +227,6 @@ impl WriteConditions {
         }))
     }
 }
-
-/// What S3 says when a precondition does not hold.
-pub(crate) const PRECONDITION_FAILED: &str =
-    "At least one of the pre-conditions you specified did not hold";
 
 /// The header a DeleteObject names the object's modification time in.
 pub(crate) const IF_MATCH_LAST_MODIFIED: &str = "x-amz-if-match-last-modified-time";
@@ -238,30 +250,38 @@ pub(crate) struct DeleteConditions {
 }
 
 impl DeleteConditions {
-    /// The conditions DeleteObject's headers carry; the reason for a 400 when one is not a
+    /// The conditions DeleteObject's headers carry; 400 `InvalidArgument` when one is not a
     /// value its header takes.
-    pub(crate) fn of(headers: &HeaderMap) -> Result<Self, &'static str> {
-        let text = |name: &str| match headers.get(name) {
+    pub(crate) fn of(headers: &HeaderMap) -> Result<Self, Refusal> {
+        let text = |name: &'static str| match headers.get(name) {
             None => Ok(None),
-            Some(v) => v
-                .to_str()
-                .map(|v| Some(v.to_string()))
-                .map_err(|_| "a conditional header is not text"),
+            Some(v) => v.to_str().map(|v| Some(v.to_string())).map_err(|_| {
+                Refusal::said(Code::InvalidArgument, "a conditional header is not text")
+                    .with("ArgumentName", name)
+            }),
         };
         let modified = match text(IF_MATCH_LAST_MODIFIED)? {
             None => None,
-            Some(v) => Some(
-                parse_time(&v)
-                    .map(whole_seconds)
-                    .ok_or("x-amz-if-match-last-modified-time is an HTTP date")?,
-            ),
+            Some(v) => Some(parse_time(&v).map(whole_seconds).ok_or_else(|| {
+                Refusal::argument(
+                    "x-amz-if-match-last-modified-time is an HTTP date",
+                    IF_MATCH_LAST_MODIFIED,
+                    v.as_str(),
+                )
+            })?),
         };
         let size = match text(IF_MATCH_SIZE)? {
             None => None,
-            Some(v) => Some(parse_size(&v).ok_or("x-amz-if-match-size is a count of bytes")?),
+            Some(v) => Some(parse_size(&v).ok_or_else(|| {
+                Refusal::argument(
+                    "x-amz-if-match-size is a count of bytes",
+                    IF_MATCH_SIZE,
+                    v.as_str(),
+                )
+            })?),
         };
         Ok(DeleteConditions {
-            etag: text(IF_MATCH.as_str())?,
+            etag: text("if-match")?,
             modified,
             size,
         })
@@ -269,6 +289,16 @@ impl DeleteConditions {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.etag.is_none() && self.modified.is_none() && self.size.is_none()
+    }
+
+    /// The refusal of these conditions on a version, which S3 applies to the current object
+    /// only.
+    pub(crate) fn versioned(&self) -> Refusal {
+        Refusal::new(Code::NotImplemented).with(
+            "additionalMessage",
+            "Conditional delete operations are not allowed when a version ID is included in \
+             the request parameters.",
+        )
     }
 
     /// Whether every condition holds of `obj`: its ETag named (`*` naming any), its

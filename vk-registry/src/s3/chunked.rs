@@ -22,10 +22,10 @@ use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
 use bytes::{Buf as _, Bytes};
-use hyper::StatusCode;
 use hyper::body::{Body, Frame};
 use sha2::{Digest as _, Sha256};
 
+use super::error::Code;
 use super::sigv4::{self, SigningKey};
 
 /// The longest chunk header taken, its CRLF included: a size and a signature need 91.
@@ -142,11 +142,11 @@ fn trailer_string_to_sign(stamp: &str, scope: &str, previous: &str, lines_sha256
     )
 }
 
-/// Why a chunked body was refused: the S3 answer to it.
+/// Why a chunked body was refused: the S3 code it is answered with, and what was wrong with
+/// it, which the answer leaves to the code's own message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Refusal {
-    pub(crate) status: StatusCode,
-    pub(crate) code: &'static str,
+    pub(crate) code: Code,
     pub(crate) message: &'static str,
 }
 
@@ -154,8 +154,7 @@ impl Refusal {
     /// A chunk header that is malformed, too long, or sizes a chunk past the declared length.
     fn size(message: &'static str) -> Self {
         Refusal {
-            status: StatusCode::BAD_REQUEST,
-            code: "InvalidChunkSizeError",
+            code: Code::InvalidChunkSizeError,
             message,
         }
     }
@@ -163,8 +162,7 @@ impl Refusal {
     /// A body that ends early, or holds other than the declared length.
     fn incomplete(message: &'static str) -> Self {
         Refusal {
-            status: StatusCode::BAD_REQUEST,
-            code: "IncompleteBody",
+            code: Code::IncompleteBody,
             message,
         }
     }
@@ -172,8 +170,7 @@ impl Refusal {
     /// A trailer section that is malformed, too long, or followed by anything.
     fn trailer(message: &'static str) -> Self {
         Refusal {
-            status: StatusCode::BAD_REQUEST,
-            code: "MalformedTrailerError",
+            code: Code::MalformedTrailerError,
             message,
         }
     }
@@ -181,10 +178,15 @@ impl Refusal {
     /// A chunk or trailer signature that is not the seed's key's.
     fn signature(message: &'static str) -> Self {
         Refusal {
-            status: StatusCode::FORBIDDEN,
-            code: "SignatureDoesNotMatch",
+            code: Code::SignatureDoesNotMatch,
             message,
         }
+    }
+}
+
+impl From<Refusal> for super::error::Refusal {
+    fn from(r: Refusal) -> Self {
+        super::error::Refusal::new(r.code)
     }
 }
 
@@ -769,13 +771,13 @@ mod tests {
             decode(other.as_bytes(), 64, framing, Some(seed(chunk2)))
                 .unwrap_err()
                 .code,
-            "SignatureDoesNotMatch"
+            Code::SignatureDoesNotMatch
         );
         assert_eq!(
             decode(tail.as_bytes(), 64, framing, Some(seed(SEED)))
                 .unwrap_err()
                 .code,
-            "SignatureDoesNotMatch"
+            Code::SignatureDoesNotMatch
         );
         // Without a seed the trailer is read, its signature not checked.
         let (_, trailer) = decode(other.as_bytes(), 64, framing, None).unwrap();
@@ -812,15 +814,15 @@ mod tests {
         let t = unsigned_trailer(1);
         assert_eq!(
             code("1\r\na\r\n0\r\nx-amz-checksum-sha1:x\r\n\r\n", t),
-            "MalformedTrailerError"
+            Code::MalformedTrailerError
         );
-        assert_eq!(code("1\r\na\r\n0\r\n\r\n", t), "MalformedTrailerError");
+        assert_eq!(code("1\r\na\r\n0\r\n\r\n", t), Code::MalformedTrailerError);
         assert_eq!(
             code(
                 "1\r\na\r\n0\r\nx-amz-checksum-crc32:a\r\nx-amz-checksum-crc32:a\r\n\r\n",
                 t
             ),
-            "MalformedTrailerError"
+            Code::MalformedTrailerError
         );
         let sig = format!("x-amz-trailer-signature:{FINAL}");
         assert_eq!(
@@ -828,11 +830,11 @@ mod tests {
                 &format!("1\r\na\r\n0\r\nx-amz-checksum-crc32:a\r\n{sig}\r\n\r\n"),
                 t
             ),
-            "MalformedTrailerError"
+            Code::MalformedTrailerError
         );
         assert_eq!(
             code(&format!("1;chunk-signature={FINAL}\r\na\r\n0\r\n\r\n"), t),
-            "InvalidChunkSizeError"
+            Code::InvalidChunkSizeError
         );
         // A plain aws-chunked body has no trailer.
         let plain = Framing {
@@ -846,7 +848,7 @@ mod tests {
         );
         assert_eq!(
             code("1\r\na\r\n0\r\nx-amz-checksum-crc32:a\r\n\r\n", plain),
-            "MalformedTrailerError"
+            Code::MalformedTrailerError
         );
     }
 
@@ -859,19 +861,19 @@ mod tests {
         };
         let code = |body: String| decode(body.as_bytes(), 8, framing, None).unwrap_err().code;
         let zero = format!("0;chunk-signature={FINAL}\r\n");
-        assert_eq!(code(format!("{zero}\r\n")), "MalformedTrailerError");
+        assert_eq!(code(format!("{zero}\r\n")), Code::MalformedTrailerError);
         let sig = format!("x-amz-trailer-signature:{FINAL}\r\n");
         assert!(decode(format!("{zero}{sig}\r\n").as_bytes(), 8, framing, None).is_ok());
         assert_eq!(
             code(format!("{zero}{sig}{sig}\r\n")),
-            "MalformedTrailerError"
+            Code::MalformedTrailerError
         );
         assert_eq!(
             code(format!(
                 "{zero}x-amz-trailer-signature:{}\r\n\r\n",
                 FINAL.to_uppercase()
             )),
-            "MalformedTrailerError"
+            Code::MalformedTrailerError
         );
     }
 
@@ -883,12 +885,12 @@ mod tests {
             flipped.replace_range(..1, if wrong.starts_with('0') { "1" } else { "0" });
             let mutated = body.replace(wrong, &flipped);
             let r = decode(mutated.as_bytes(), 4096, signed(66_560), Some(seed(SEED))).unwrap_err();
-            assert_eq!(r.code, "SignatureDoesNotMatch", "{wrong}");
-            assert_eq!(r.status, StatusCode::FORBIDDEN);
+            assert_eq!(r.code, Code::SignatureDoesNotMatch, "{wrong}");
+            assert_eq!(r.code.status(), hyper::StatusCode::FORBIDDEN);
         }
         // Another seed: another chain.
         let r = decode(body.as_bytes(), 4096, signed(66_560), Some(seed(CHUNK1))).unwrap_err();
-        assert_eq!(r.code, "SignatureDoesNotMatch");
+        assert_eq!(r.code, Code::SignatureDoesNotMatch);
     }
 
     #[test]
@@ -902,14 +904,20 @@ mod tests {
             decode(body, 3, framing, None).unwrap_err().code
         };
         // Past the declared length, short of it, or not the length a size says.
-        assert_eq!(code(b"5\r\nhello\r\n0\r\n\r\n", 4), "InvalidChunkSizeError");
-        assert_eq!(code(b"5\r\nhello\r\n0\r\n\r\n", 6), "IncompleteBody");
-        assert_eq!(code(b"4\r\nhello\r\n0\r\n\r\n", 5), "IncompleteBody");
+        assert_eq!(
+            code(b"5\r\nhello\r\n0\r\n\r\n", 4),
+            Code::InvalidChunkSizeError
+        );
+        assert_eq!(code(b"5\r\nhello\r\n0\r\n\r\n", 6), Code::IncompleteBody);
+        assert_eq!(code(b"4\r\nhello\r\n0\r\n\r\n", 5), Code::IncompleteBody);
         assert_eq!(
             code(b"ffffffffffffffff\r\nhello\r\n0\r\n\r\n", 5),
-            "InvalidChunkSizeError"
+            Code::InvalidChunkSizeError
         );
-        assert_eq!(code(b"10000000000000000\r\n", 5), "InvalidChunkSizeError");
+        assert_eq!(
+            code(b"10000000000000000\r\n", 5),
+            Code::InvalidChunkSizeError
+        );
         // Sizes in hex only.
         for bad in [
             &b"x\r\n"[..],
@@ -918,7 +926,7 @@ mod tests {
             b" 5\r\nhello\r\n",
             b"+5\r\nhello\r\n",
         ] {
-            assert_eq!(code(bad, 5), "InvalidChunkSizeError", "{bad:?}");
+            assert_eq!(code(bad, 5), Code::InvalidChunkSizeError, "{bad:?}");
         }
         let plain = Framing {
             mode: Mode::Unsigned,
@@ -942,28 +950,31 @@ mod tests {
             message(&pad(256))
         );
         assert!(message(&pad(257)).contains("256"));
-        assert_eq!(code(&pad(300), 1), "InvalidChunkSizeError");
+        assert_eq!(code(&pad(300), 1), Code::InvalidChunkSizeError);
         // A header whose LF never comes is refused at the bound, not read further.
         let mut endless = vec![b'0'; 10_000];
         endless.insert(0, b'1');
-        assert_eq!(code(&endless, 1), "InvalidChunkSizeError");
+        assert_eq!(code(&endless, 1), Code::InvalidChunkSizeError);
         // LF without CR, or data not followed by CRLF.
-        assert_eq!(code(b"5\nhello\r\n0\r\n\r\n", 5), "InvalidChunkSizeError");
-        assert_eq!(code(b"5\r\nhello\n0\r\n\r\n", 5), "IncompleteBody");
-        assert_eq!(code(b"5\r\nhelloXY0\r\n\r\n", 5), "IncompleteBody");
+        assert_eq!(
+            code(b"5\nhello\r\n0\r\n\r\n", 5),
+            Code::InvalidChunkSizeError
+        );
+        assert_eq!(code(b"5\r\nhello\n0\r\n\r\n", 5), Code::IncompleteBody);
+        assert_eq!(code(b"5\r\nhelloXY0\r\n\r\n", 5), Code::IncompleteBody);
         // Anything after the end.
         assert_eq!(
             code(b"5\r\nhello\r\n0\r\n\r\n\r\n", 5),
-            "MalformedTrailerError"
+            Code::MalformedTrailerError
         );
         assert_eq!(
             code(b"5\r\nhello\r\n0\r\n\r\nx", 5),
-            "MalformedTrailerError"
+            Code::MalformedTrailerError
         );
         let mut garbage = example();
         garbage.push(b'x');
         let r = decode(&garbage, 4096, signed(66_560), Some(seed(SEED))).unwrap_err();
-        assert_eq!(r.code, "MalformedTrailerError");
+        assert_eq!(r.code, Code::MalformedTrailerError);
     }
 
     #[test]
@@ -975,7 +986,7 @@ mod tests {
         ]);
         for cut in cuts {
             let r = decode(&body[..cut], 4096, signed(66_560), Some(seed(SEED))).unwrap_err();
-            assert_eq!(r.code, "IncompleteBody", "{cut}");
+            assert_eq!(r.code, Code::IncompleteBody, "{cut}");
         }
     }
 
@@ -994,7 +1005,7 @@ mod tests {
         assert_eq!(ok.1.map(|v| v.len()), Some(MAX_TRAILER - 2 - 23));
         for len in [MAX_TRAILER - 1, MAX_TRAILER, 100_000] {
             let r = decode(body(len).as_bytes(), 512, unsigned_trailer(1), None).unwrap_err();
-            assert_eq!(r.code, "MalformedTrailerError", "{len}");
+            assert_eq!(r.code, Code::MalformedTrailerError, "{len}");
         }
     }
 

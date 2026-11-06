@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use hyper::header::{HeaderName, HeaderValue};
 use sha2::Digest as _;
 
+use super::error::{Code, Refusal};
 use super::xml;
 
 /// The manifest annotation holding an object's checksum: S3's name of the algorithm, a
@@ -44,15 +45,10 @@ pub(super) const SDK_ALGORITHM: &str = "x-amz-sdk-checksum-algorithm";
 /// The refusal of a checksum in an algorithm not computed here (S3's XXHASH64, XXHASH3 and
 /// XXHASH128, or anything else), rather than the checksum taken unchecked and the object
 /// then listed without it.
-pub(super) const NOT_COMPUTED: super::object::Refused = (
-    hyper::StatusCode::NOT_IMPLEMENTED,
-    "NotImplemented",
-    "the checksum algorithms this registry computes are CRC32, CRC32C, SHA1, SHA256, \
-     CRC64NVME, SHA512 and MD5",
-);
+pub(super) const NOT_COMPUTED: Refusal = Refusal::new(Code::NotImplemented);
 
 /// The refusal of a checksum that did not hold, as S3 words it, naming the algorithm.
-pub(super) fn mismatch(header: &str) -> super::object::Refused {
+pub(super) fn mismatch(header: &str) -> Refusal {
     let message = match header {
         "x-amz-checksum-crc32" => "The CRC32 you specified did not match the calculated checksum.",
         "x-amz-checksum-crc32c" => {
@@ -70,15 +66,30 @@ pub(super) fn mismatch(header: &str) -> super::object::Refused {
         }
         _ => "The MD5 you specified did not match the calculated checksum.",
     };
-    (hyper::StatusCode::BAD_REQUEST, "BadDigest", message)
+    Refusal::said(Code::BadDigest, message)
 }
 
 /// The refusal of a [`SDK_ALGORITHM`] naming an algorithm other than the checksum header's.
-pub(super) const ALGORITHM_MISMATCH: super::object::Refused = (
-    hyper::StatusCode::BAD_REQUEST,
-    "InvalidRequest",
+pub(super) const ALGORITHM_MISMATCH: Refusal = Refusal::said(
+    Code::InvalidRequest,
     "Value for x-amz-sdk-checksum-algorithm header is invalid.",
 );
+
+/// The refusal of checksum header `name` when it is not a checksum in base64, as S3 words it.
+pub(super) fn invalid(name: &str) -> Refusal {
+    Refusal::saying(
+        Code::InvalidRequest,
+        format!("Value for {name} header is invalid."),
+    )
+}
+
+/// [`invalid`] for the checksum `name` a trailer carries.
+pub(super) fn invalid_trailing(name: &str) -> Refusal {
+    Refusal::saying(
+        Code::InvalidRequest,
+        format!("Value for {name} trailing header is invalid."),
+    )
+}
 
 /// Whether `headers` name a checksum, by header or by [`SDK_ALGORITHM`], in an algorithm
 /// not computed here.
@@ -311,7 +322,11 @@ mod tests {
         assert!(of(&[(SDK_ALGORITHM, "XXHASH3")]));
         assert!(of(&[(SDK_ALGORITHM, "")]));
         for (header, name, _) in ALGORITHMS {
-            assert!(mismatch(header).2.starts_with(&format!("The {name} you")));
+            assert!(
+                mismatch(header)
+                    .message()
+                    .starts_with(&format!("The {name} you"))
+            );
         }
     }
 

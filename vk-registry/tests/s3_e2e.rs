@@ -513,6 +513,27 @@ impl Resp {
         );
         self
     }
+
+    /// For an error, that its `Message` is `message`, S3's words for it.
+    #[track_caller]
+    fn says(&self, message: &str) -> &Self {
+        assert!(
+            self.body
+                .contains(&format!("<Message>{}</Message>", xml_escaped(message))),
+            "{}",
+            self.body
+        );
+        self
+    }
+}
+
+/// `text` as an XML document carries it.
+fn xml_escaped(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\'', "&#39;")
+        .replace('"', "&quot;")
 }
 
 /// A kept-alive connection to the server.
@@ -707,12 +728,18 @@ async fn an_open_server_checks_no_signature_but_refuses_presigned_and_tokens() {
     let dir = tmp("open");
     let host = spawn(open_state(&dir, true));
     let get = |path: &str| Req::new("GET", path);
-    send(&host, get("/s3/b/k")).await.is(404, "NoSuchKey");
+    send(&host, get("/s3/b/k"))
+        .await
+        .is(404, "NoSuchKey")
+        .says("The specified key does not exist.");
     send(&host, get("/s3/b/k/deeper"))
         .await
         .is(404, "NoSuchKey");
     // A bucket that is not there; listing the buckets is not on an open server.
-    send(&host, get("/s3/b")).await.is(404, "NoSuchBucket");
+    send(&host, get("/s3/b"))
+        .await
+        .is(404, "NoSuchBucket")
+        .says("The specified bucket does not exist.");
     send(&host, get("/s3/b/")).await.is(404, "NoSuchBucket");
     send(&host, get("/s3/")).await.is(403, "AccessDenied");
     send(&host, get("/s3")).await.is(403, "AccessDenied");
@@ -1396,7 +1423,7 @@ async fn a_put_body_is_unsigned_or_its_signed_sha256() {
     let resp = tokio::time::timeout(Duration::from_secs(10), conn.response())
         .await
         .expect("answered unread");
-    resp.is(413, "EntityTooLarge");
+    resp.is(400, "EntityTooLarge");
     assert_eq!(staging_left(&dir), 0);
 }
 
@@ -2147,7 +2174,7 @@ async fn a_decoded_length_past_the_cap_is_refused_unread() {
     let resp = tokio::time::timeout(Duration::from_secs(10), conn.response())
         .await
         .expect("answered unread");
-    resp.is(413, "EntityTooLarge");
+    resp.is(400, "EntityTooLarge");
     assert_eq!(staging_left(&dir), 0);
 }
 
@@ -2292,7 +2319,8 @@ async fn conditional_headers_decide_reads_and_writes() {
     send(&host, create("/s3/b/k", HELLO)).await.ok(200);
     send(&host, create("/s3/b/k", b"again"))
         .await
-        .is(412, "PreconditionFailed");
+        .is(412, "PreconditionFailed")
+        .says("At least one of the pre-conditions you specified did not hold");
     let etag = format!("\"{}\"", md5_hex(HELLO));
     // Compare and swap.
     send(
@@ -2926,7 +2954,11 @@ async fn query_names_are_decoded_before_dispatch() {
         .ok(200);
     send(&host, Req::new("GET", "/s3/b/d/k").query("upload%49d=nope"))
         .await
-        .is(404, "NoSuchUpload");
+        .is(404, "NoSuchUpload")
+        .says(
+            "The specified multipart upload does not exist. The upload ID may be invalid, or \
+             the upload may have been aborted or completed.",
+        );
     let resp = send(&host, Req::new("GET", "/s3/b").query("upload%73")).await;
     resp.ok(200);
     assert!(
@@ -3884,7 +3916,8 @@ async fn buckets_are_made_and_removed(host: &str, sign: Sign<'_>) {
     }
     send(host, req("DELETE", "/s3/made"))
         .await
-        .is(409, "BucketNotEmpty");
+        .is(409, "BucketNotEmpty")
+        .says("The bucket you tried to delete is not empty.");
     send(host, req("DELETE", "/s3/made/top")).await.ok(204);
     send(host, req("DELETE", "/s3/made"))
         .await
@@ -5013,7 +5046,7 @@ async fn multipart_uploads_are_aborted_copied_bounded_and_swept() {
         sign(complete("/s3/b/huge", &id, &[(1, &e1), (2, &e2)])),
     )
     .await;
-    resp.is(413, "EntityTooLarge");
+    resp.is(400, "EntityTooLarge");
     send(&host, sign(Req::new("GET", "/s3/b/huge")))
         .await
         .is(404, "NoSuchKey");

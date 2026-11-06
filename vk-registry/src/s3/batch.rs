@@ -10,9 +10,10 @@
 
 use anyhow::Result;
 use hyper::body::Incoming;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Request, Response};
 
 use super::conditional::{self, DeleteConditions};
+use super::error::{Code, Refusal};
 use super::object::{Deleted, admitted, check_body, delete_one, unwritable_message};
 use super::xml::scan::{self, Malformed};
 use super::{Ctx, NULL_VERSION, path, read_small, xml};
@@ -123,9 +124,6 @@ fn document(body: &[u8]) -> Result<Asked, Refused> {
     Ok(Asked { quiet, entries })
 }
 
-/// Why one key was not deleted: an S3 error code and a message.
-type KeyError = (&'static str, &'static str);
-
 /// Delete `key` of `bucket` for this caller when `conditions` hold of its object, the
 /// namespace held: as DeleteObject would, a key with no object counting as deleted when no
 /// condition is asked.
@@ -136,30 +134,38 @@ fn delete_key(
     bucket: &str,
     key: &str,
     conditions: &DeleteConditions,
-) -> Result<std::result::Result<(), KeyError>> {
+) -> Result<std::result::Result<(), Refusal>> {
     // A key here is text, not a URL: no escape is decoded, and no key holds a `%`.
     if key.contains('%') {
-        return Ok(Err((
-            "InvalidArgument",
+        return Ok(Err(Refusal::said(
+            Code::InvalidArgument,
             "a key's components are runs of A-Z a-z 0-9 . _ - only",
         )));
     }
     let segs = match path::parse(&format!("/s3/{bucket}/{key}")) {
         Ok(path::Target::Object { segs, .. }) => segs,
-        Ok(_) => return Ok(Err(("InvalidArgument", "the key is empty"))),
-        Err(why) => return Ok(Err((why.code, why.message))),
+        Ok(_) => {
+            return Ok(Err(Refusal::said(
+                Code::InvalidArgument,
+                "the key is empty",
+            )));
+        }
+        Err(why) => return Ok(Err(why)),
     };
-    let denied = ("AccessDenied", "the credential may not delete this key");
+    let denied = || Refusal::new(Code::AccessDenied);
     if !admitted(authz, accounts::Action::Write, &segs) {
-        return Ok(Err(denied));
+        return Ok(Err(denied()));
     }
     Ok(
         match delete_one(store, namespace, authz, &segs, conditions)? {
             Deleted::Gone => Ok(()),
-            Deleted::Denied => Err(denied),
-            Deleted::Foreign => Err(("OperationAborted", unwritable_message(Unwritable::Foreign))),
-            Deleted::Absent => Err(("NoSuchKey", "The specified key does not exist.")),
-            Deleted::Failed => Err(("PreconditionFailed", conditional::PRECONDITION_FAILED)),
+            Deleted::Denied => Err(denied()),
+            Deleted::Foreign => Err(Refusal::said(
+                Code::OperationAborted,
+                unwritable_message(Unwritable::Foreign),
+            )),
+            Deleted::Absent => Err(Refusal::new(Code::NoSuchKey)),
+            Deleted::Failed => Err(Refusal::new(Code::PreconditionFailed)),
         },
     )
 }
@@ -167,27 +173,24 @@ fn delete_key(
 /// Why `entry` is refused before its key is looked at: a version this registry does not
 /// keep, an empty `ETag`, or a condition on a version, which S3 applies to the current
 /// object only.
-fn refused(entry: &Entry) -> Option<KeyError> {
+fn refused(entry: &Entry) -> Option<Refusal> {
     let conditions = &entry.conditions;
     if conditions
         .etag
         .as_deref()
         .is_some_and(|e| e.trim().is_empty())
     {
-        return Some((
-            "InvalidArgument",
+        return Some(Refusal::said(
+            Code::InvalidArgument,
             "The value provided for the ETag field cannot be empty for this API.",
         ));
     }
     match entry.version.as_deref() {
-        Some(_) if !conditions.is_empty() => Some((
-            "NotImplemented",
+        Some(_) if !conditions.is_empty() => Some(Refusal::said(
+            Code::NotImplemented,
             "A form field you provided implies functionality that is not implemented",
         )),
-        Some(v) if v != NULL_VERSION => Some((
-            "NotImplemented",
-            "this registry keeps no versions: a key's one VersionId is null",
-        )),
+        Some(v) if v != NULL_VERSION => Some(Refusal::new(Code::NotImplemented)),
         _ => None,
     }
 }
@@ -203,26 +206,21 @@ pub(super) async fn delete(
     ctx: &Ctx,
 ) -> Result<Response<Body>> {
     let (parts, body) = req.into_parts();
-    let too_long = ctx.error(
-        StatusCode::BAD_REQUEST,
-        "MalformedXML",
-        "a Delete document is at most 1 MiB",
-    );
+    let too_long = ctx.error(Code::MalformedXML);
     let body = match read_small(body, MAX_DOCUMENT, too_long, ctx).await? {
         Ok(body) => body,
         Err(resp) => return Ok(resp),
     };
-    if let Err((status, code, message)) = check_body(&parts.headers, &body) {
-        return Ok(ctx.error(status, code, message));
+    if let Err(why) = check_body(&parts.headers, &body) {
+        return Ok(ctx.error(why));
     }
     let asked = match document(&body) {
         Ok(asked) => asked,
-        Err(Refused::Malformed(why)) => {
-            return Ok(ctx.error(StatusCode::BAD_REQUEST, "MalformedXML", why));
-        }
+        // What is wrong with it is S3's to say in its own words.
+        Err(Refused::Malformed(_)) => return Ok(ctx.error(Code::MalformedXML)),
         Err(Refused::Date(date)) => {
             let message = format!("Invalid value for date attribute: {date}");
-            return Ok(ctx.error(StatusCode::BAD_REQUEST, "InvalidRequest", &message));
+            return Ok(ctx.error(Refusal::saying(Code::InvalidRequest, message)));
         }
     };
     let id = ctx.id.clone();
@@ -241,10 +239,7 @@ pub(super) async fn delete(
                             "vk-registry: S3 request {id} could not delete {:?}: {e:#}",
                             entry.key
                         );
-                        Err((
-                            "InternalError",
-                            "the server could not delete this key; its log names this request id",
-                        ))
+                        Err(Refusal::new(Code::InternalError))
                     })
             };
             let version = entry
@@ -258,11 +253,11 @@ pub(super) async fn delete(
                     "<Deleted>{}{version}</Deleted>",
                     xml::element("Key", &entry.key)
                 )),
-                Err((code, message)) => out.push_str(&format!(
+                Err(why) => out.push_str(&format!(
                     "<Error>{}{version}{}{}</Error>",
                     xml::element("Key", &entry.key),
-                    xml::element("Code", code),
-                    xml::element("Message", message)
+                    xml::element("Code", why.code.name()),
+                    xml::element("Message", why.message())
                 )),
             }
         }
@@ -334,15 +329,21 @@ mod tests {
         assert_eq!(asked.entries[0].conditions, conditions("\"x\"", Some(13)));
         assert_eq!(asked.entries[1].conditions, conditions("", None));
         // An empty ETag is that key's error; a condition on a version is not served.
-        assert_eq!(refused(&asked.entries[1]).unwrap().0, "InvalidArgument");
+        assert_eq!(
+            refused(&asked.entries[1]).unwrap().code,
+            Code::InvalidArgument
+        );
         assert!(refused(&asked.entries[0]).is_none());
         let versioned = Entry {
             version: Some("null".into()),
             ..asked.entries.into_iter().next().unwrap()
         };
-        assert_eq!(refused(&versioned).unwrap().0, "NotImplemented");
+        assert_eq!(refused(&versioned).unwrap().code, Code::NotImplemented);
         assert!(refused(&entry("k", Some("null"))).is_none());
-        assert_eq!(refused(&entry("k", Some("v"))).unwrap().0, "NotImplemented");
+        assert_eq!(
+            refused(&entry("k", Some("v"))).unwrap().code,
+            Code::NotImplemented
+        );
     }
 
     #[test]
