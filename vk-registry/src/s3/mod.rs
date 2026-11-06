@@ -105,6 +105,10 @@ pub(crate) async fn route(
     req: Request<Incoming>,
 ) -> Result<Response<Body>> {
     let path = req.uri().path();
+    let unparsable = path::unparsable(match bucket {
+        Some(_) => path,
+        None => path.strip_prefix("/s3").unwrap_or(path),
+    });
     let ctx = Ctx {
         id: accounts::random_token(8),
         path: match bucket {
@@ -117,7 +121,15 @@ pub(crate) async fn route(
         },
     };
     let id = &ctx.id;
-    let mut resp = match serve(state, req, &ctx).await {
+    // S3 parses the URI before it looks at the credential.
+    let served = match unparsable {
+        Some(why) => {
+            let resp = ctx.error(StatusCode::BAD_REQUEST, "InvalidURI", why);
+            before_auth(req, resp).await
+        }
+        None => serve(state, req, &ctx).await,
+    };
+    let mut resp = match served {
         Ok(resp) => resp,
         Err(e) => {
             eprintln!("vk-registry: S3 request {id} failed: {e:#}");

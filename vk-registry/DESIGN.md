@@ -635,9 +635,13 @@ one component; a key is 1 to 14 components (16 counting `files` and the bucket),
 `[A-Za-z0-9._-]` of at most 255 bytes, not `.`, `..`, `tags`, `manifests` or `blobs`, the whole
 key at most 1024 bytes, no empty component and no trailing slash, so there are no "directory
 marker" objects. Paths are split before they are percent-decoded, as WebDAV's are, so `%2F`
-cannot smuggle a separator. Anything else is 400 `InvalidArgument`, `KeyTooLongError` or
-`InvalidBucketName`, with a message naming the rule. `sccache`'s keys (`a/b/c/<hex>`,
-`.sccache_check`) pass. A query's parameters, names and values alike, are percent-decoded
+cannot smuggle a separator. A path S3 could not parse at all is 400 `InvalidURI`, answered
+before the credential is looked at, as S3 parses the URI first: a malformed percent escape, a
+component that is not UTF-8 once decoded or holds a control character (`\u{8a}`), or `..` components climbing above the root (the
+one below `/s3` path-style, the host's virtual-hosted), `\` separating them as `/` does. A
+`..` that stays below the root is a key component. Anything else is 400 `InvalidArgument`,
+`KeyTooLongError` or `InvalidBucketName`, with a message naming the rule. `sccache`'s keys
+(`a/b/c/<hex>`, `.sccache_check`) pass. A query's parameters, names and values alike, are percent-decoded
 once, as the signature decodes them, before the request is dispatched on them; a malformed
 escape is 400 `InvalidArgument`.
 

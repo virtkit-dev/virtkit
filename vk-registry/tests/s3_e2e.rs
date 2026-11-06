@@ -2646,6 +2646,63 @@ async fn attributes_deletes_and_the_paths_a_key_cannot_take() {
     assert_eq!(staging_left(&dir), 0);
 }
 
+/// A path S3 cannot parse — a malformed escape, or `..` climbing above the root — is 400
+/// `InvalidURI` before the credential is looked at, path-style or virtual-hosted; a `..`
+/// that stays below the root is a key's component, refused as one. Other routes keep their
+/// own answers.
+#[tokio::test]
+async fn a_path_that_cannot_be_parsed_is_an_invalid_uri() {
+    let (_dir, host) = bearer_server("invalid-uri");
+    let sign = |r: Req| r.signed(&host, BEARER, 0);
+    for path in [
+        "/s3/bucket/(*&^%&())",
+        "/s3/b/a%zz",
+        "/s3/b/a%",
+        "/s3/b%2/k",
+        "/s3/b/%FF",
+        "/s3/b/%C2%AE%C2%8A-",
+        "/s3/b/../../x",
+        "/s3/b/x//../../../y",
+        "/s3/b/x%5C..%5C..%5C..%5Cy",
+        "/s3/..",
+    ] {
+        send(&host, Req::new("GET", path))
+            .await
+            .is(400, "InvalidURI");
+        send(&host, sign(Req::new("PUT", path).body(HELLO.to_vec())))
+            .await
+            .is(400, "InvalidURI");
+    }
+    send(
+        &host,
+        sign(Req::new("PUT", "/s3/b/a/../x").body(HELLO.to_vec())),
+    )
+    .await
+    .is(400, "InvalidArgument");
+    send(&host, Req::new("GET", "/s3/b/a/../x"))
+        .await
+        .is(403, "AccessDenied");
+    let dav = send(&host, Req::new("GET", "/dav/a%zz")).await;
+    assert_eq!(dav.status, 401);
+    assert_eq!(dav.header("x-amz-request-id"), None);
+
+    let dir = tmp("invalid-uri-vhost");
+    let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("store"));
+    cfg.s3_host = Some("s3.example.com".to_string());
+    let addr = spawn(Arc::new(cfg.into_state().unwrap()));
+    let mut conn = Conn::open_as(&addr, "b.s3.example.com").await;
+    // The root is the host's: one `..` climbs above it.
+    conn.send(&Req::new("GET", "/../x"))
+        .await
+        .is(400, "InvalidURI");
+    conn.send(&Req::new("GET", "/a%zz"))
+        .await
+        .is(400, "InvalidURI");
+    conn.send(&Req::new("GET", "/a/../x"))
+        .await
+        .is(400, "InvalidArgument");
+}
+
 /// A key the store fails to delete is reported on its own, and the batch goes on past it.
 #[tokio::test]
 async fn a_key_that_fails_to_delete_is_reported_and_the_batch_goes_on() {
