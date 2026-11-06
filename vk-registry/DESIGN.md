@@ -556,7 +556,317 @@ an object under a name a collection already holds. Idleness is the tag's mtime, 
 `PUT` sets and a `GET` refreshes once it is an hour old, so a read-only pipeline's hits keep
 an entry alive as a writer's do. There is no per-directory policy and no size cap; a
 replaced or deleted object frees no disk until the next `gc`. A staging file a crashed `PUT`
-left in `uploads/` goes with the idle uploads.
+left in `uploads/` goes with the idle uploads, and so does an S3 multipart upload nothing has
+been written into for the grace window: its directory under `uploads/s3/` is idle by the
+newest mtime among its files (the directory's own does not move when a part is replaced),
+and goes whole, parts and all. Completing an upload marks it used, so the sweep does not
+take it while its parts are read, and leaves its directory holding only the record of what
+it made, swept in turn once idle, so a completion sent again until then is answered again.
+
+## S3 view (`/s3/`)
+
+The `files/` area is also served as S3, path-style, under `/s3/`, through the same listener,
+TLS and credentials: a bucket is a top-level `files/` directory and an object key the path
+below it, so `PUT /s3/sccache/a/b/abcdef` writes the same tag `/dav/files/sccache/a/b/abcdef`
+names. Nothing new is stored, and the WebDAV view, `/v2/`, `/browse`, `vk registry get` and
+the gc see the same entries. S3 is enabled by default. Set `s3 = false` to disable it: `/s3/`
+requests then return the 404 any unknown path returns, after the usual authentication, and
+the server logs this setting at startup.
+
+```text
+/s3/                          the buckets: top-level directories of files/
+/s3/<bucket>                  files/<bucket>
+/s3/<bucket>/<key…>           the object files/<bucket>/<key…> names, as in /dav/files/
+```
+
+Clients take `endpoint = https://<registry>/s3` and any region: `sccache` with
+`SCCACHE_BUCKET=<bucket> SCCACHE_ENDPOINT=https://<registry>/s3 SCCACHE_REGION=auto`
+(`SCCACHE_S3_KEY_PREFIX` names a directory inside the bucket).
+
+**Virtual-hosted style** is opt-in, for clients that cannot be made to use paths: with
+`s3_host = "s3.example.com"`, a request sent to `<bucket>.s3.example.com` names its bucket by
+its host and its key by its whole path, and is served as `/s3/<bucket>/<path>`, so `/` there
+is the bucket and `/a/b` its object `a/b`, even where the path is one another route would
+take. The `Host` port is ignored. The signature is checked over the request as sent, host and
+path included, so nothing about credentials changes. It needs a wildcard DNS record
+`*.s3.example.com` pointing at the registry and, with TLS, a certificate covering that
+wildcard (one label deep: a bucket name with a dot is not covered). A host whose label cannot
+be a bucket, `s3_host` itself, and every other host are served as before, and path-style
+`/s3/` keeps working on any of them. The setting is a lowercase host name with no port; the
+server refuses anything else at startup. The registry's own host name must not be below
+`s3_host`, since every `<label>.<s3_host>` is taken for a bucket, `/v2/`, `/login` and
+`/browse` included: `s3_host = "example.com"` would serve `reg.example.com` as bucket `reg`.
+The server refuses at startup an `[oidc] public_url` whose host is below `s3_host`, and
+`s3_host` with `s3 = false`; `s3_host` may be the registry's own name, which is not a
+bucket's.
+
+**Credentials.** SigV4 needs the server to hold the signing secret, and this registry stores
+API keys only as hashes and never mints hub tokens, so no new secret is introduced: the
+access key id is a credential the registry already takes, and the secret access key is the
+same string. In accounts mode `AWS_ACCESS_KEY_ID=vkr_…` and `AWS_SECRET_ACCESS_KEY=vkr_…`,
+the same value; a hub token likewise, in either mode, when the registry takes them; the
+shared bearer likewise. With a shared Basic user, the access key id is the user name and the
+secret its password, which then never crosses the wire; a user name holding `/` cannot be an
+access key id, since the credential scope is split from the right. The access key id is
+authenticated first, exactly as the bearer it would be, so revocation, expiry and scopes
+apply unchanged, and only then is its secret used to check the signature; an unknown id is
+403 `InvalidAccessKeyId`, a wrong signature 403 `SignatureDoesNotMatch` (with the string to
+sign and canonical request, as AWS answers). The signature must cover `host`, `x-amz-content-sha256`
+and, as S3 requires, every `x-amz-*` header the request carries: one left out is 403
+`AccessDenied` naming each in `HeadersNotSigned`, since anything on the way could have added
+it. The request's time must be on the scope's day
+and within 15 minutes of the server's (403 `RequestTimeTooSkewed`, naming the server's
+time). The usual `Authorization: Bearer|Basic` and the session cookie keep working on `/s3/`;
+an `Authorization` of any other scheme, or with no scheme at all, is 400
+`InvalidArgument`, as S3 answers a signature version it does not take, and SigV2's `AWS` 400
+`InvalidRequest`; an `x-amz-content-sha256` that is no value it takes is 400
+`InvalidArgument` before the signature is checked; a request with no
+credential on a server that requires one is S3's 403 `AccessDenied`, not the 401 challenge. On a server with no credential configured, signatures are not checked, as
+nothing else is. Presigned (query-string) URLs are refused with 400
+`AuthorizationQueryParametersError`, since they put a credential in a URL and so in logs, and
+temporary credentials (`x-amz-security-token`) with 400 `InvalidToken`.
+
+The exposure is today's: a bearer travels in clear under TLS and so does an access key id,
+while the signature also binds the method, path, query, signed headers and a timestamp. With
+`UNSIGNED-PAYLOAD`, which OpenDAL and most SDKs send, a captured `Authorization` header can be
+replayed with another body to the same key for those 15 minutes, as a captured bearer can be
+for as long as it is good.
+
+**Keys** follow the store's name rules as they are; there is no escaping scheme. A bucket is
+one component; a key is 1 to 14 components (16 counting `files` and the bucket), each a run of
+`[A-Za-z0-9._-]` of at most 255 bytes, not `.`, `..`, `tags`, `manifests` or `blobs`, the whole
+key at most 1024 bytes, no empty component and no trailing slash, so there are no "directory
+marker" objects. Paths are split before they are percent-decoded, as WebDAV's are, so `%2F`
+cannot smuggle a separator. A path S3 could not parse at all is 400 `InvalidURI`, answered
+before the credential is looked at, as S3 parses the URI first: a malformed percent escape, a
+component that is not UTF-8 once decoded or holds a control character (`\u{8a}`), or `..` components climbing above the root (the
+one below `/s3` path-style, the host's virtual-hosted), `\` separating them as `/` does. A
+`..` that stays below the root is a key component. A request S3 cannot route to any operation is
+refused before the credential too, as S3 routes it first: `uploads` beside `uploadId` (400
+`InvalidArgument`), `x-amz-copy-source` on a GET, HEAD, DELETE or a POST naming an upload (400
+`InvalidArgument`), `partNumber` without `uploadId` on an object's PUT (400 `InvalidArgument`),
+`?uploads` or `?versions` on an object's GET (400 `InvalidRequest`), and 405
+`MethodNotAllowed`, naming the `Method` and the `ResourceType` and with the methods taken in
+`Allow`, for a POST of the service or of an object with no operation named, an object's PUT
+naming an upload but no part, and `?torrent` on an object. Anything else is 400 `InvalidArgument`,
+`KeyTooLongError` (with the `Size` and the `MaxSizeAllowed`, 1024 for the key, 255 for a
+component) or `InvalidBucketName`, an `InvalidArgument` with a message naming the rule; a key
+of slashes only is 400 `BadRequest`. Such a key holds no object, so a read of it (GET, HEAD,
+or a copy's source) is 404 `NoSuchKey`, as S3's of a key it does not hold. `sccache`'s keys
+(`a/b/c/<hex>`, `.sccache_check`) pass. A query's parameters, names and values alike, are percent-decoded
+once, as the signature decodes them, before the request is dispatched on them; a malformed
+escape is 400 `InvalidArgument`.
+
+**Authorization** is the WebDAV view's: a `PUT` needs `Write` on the key's parent repository,
+a read `Read` on the repository the key resolves to, and a `DELETE` `Write` there; a caller
+holding the action on neither the key's own name nor its parent's is 403 `AccessDenied` before
+anything is looked up, and what it may not read is otherwise absent (`NoSuchKey`). A write
+refused over a clash answers 409 and so reveals that the name exists, as WebDAV's does. A
+bucket authorizes as `files/<bucket>`, except that HeadBucket and GetBucketLocation also
+admit a caller that may read only a directory inside it, which clients probe before listing
+the prefix they were given. Listing the buckets needs a configured credential, as `/dav/`'s
+root listing does, and shows only those HeadBucket admits the caller to: a bucket it may read,
+or read a directory inside. Listing a bucket's objects is
+admitted when the caller may read the bucket or the directory the prefix's whole components
+name (`prefix=proj/` for a `read:files/team/proj/*` key over bucket `team`; `prefix=proj`
+names no directory and is refused), and shows only what a read would serve: a directory the
+caller may not read is passed over with everything below it, as `PROPFIND` passes it over,
+and neither a foreign tag nor an object whose bytes the caller may not read through it is
+listed.
+
+**Refusals are S3's.** Every refusal is S3's XML `Error`, with the code, status and message
+AWS answers that case with (`The specified bucket does not exist.`, `The specified multipart
+upload does not exist. The upload ID may be invalid, or the upload may have been aborted or
+completed.`, `At least one of the pre-conditions you specified did not hold`…), from one
+table (`src/s3/error.rs`): a handler names a code, and the message is the code's unless AWS has
+one of its own for the case, as `InvalidArgument` and `InvalidRequest` always do. The detail
+goes in the elements AWS adds for it: `BucketName`, `Key`, `UploadId`, `ArgumentName` and
+`ArgumentValue`, `Condition`, `Header` (the header a `NotImplemented` is about), `Size` and
+`MaxSizeAllowed`, `PartNumber` and `ETag`. A refusal of this registry's own, one AWS never
+makes (a key outside the store's names, a write over a directory, a presigned URL, a
+cross-site write, a read-only store), keeps a message that says why. versitygw 1.10.0's
+`s3err` table, which mirrors AWS's messages, and AWS's error-code list are the references.
+
+**A bucket that is not there is said first.** A request about a bucket that does not exist is
+404 `NoSuchBucket` before anything else is said of it — an operation not served, a malformed
+argument, a missing key or upload — except a write, which makes its bucket (below), a
+request naming an upload, which is `NoSuchBucket` only when the upload is not there either,
+since an upload's bucket is made at its completion, and a read of an object (GetObject,
+HeadObject, a part of one), which is 404 `NoSuchKey` as in an empty bucket, where S3 says
+`NoSuchBucket`. Since a write makes the bucket, a bucket not made yet is one with no key; and
+OpenDAL takes `NoSuchBucket` for a broken configuration (`ConfigInvalid`), not for a miss, so
+`sccache`, whose first request is a read of `.sccache_check`, would not start on a bucket its
+first write is to make. As HeadBucket, it is said only to a caller
+that may read in the bucket: one that may not is answered as it would be otherwise (403, or
+501 for what is not served), so it never learns whether the bucket exists.
+
+**A write makes its bucket.** PutObject, CopyObject and CompleteMultipartUpload into a bucket
+that does not exist create it, with every directory above the key, as WebDAV's `PUT` creates
+missing directories, rather than answering S3's `NoSuchBucket`; the write is authorized as
+any other, on the key's parent. This is deliberate: a job behind the guest proxy may not
+create the bucket its area lies in (see below), and can write there all the same.
+
+**Objects are bytes.** Every object is served `application/octet-stream`,
+`Content-Disposition: attachment` and `nosniff`, whatever its writer sent: a `Content-Type`
+is not stored, for the reason manifest media types are restricted (this origin also serves
+`/browse` and holds the session cookie). An object's ETag is the MD5 of its bytes, quoted,
+which a `PutObject` computes in the same pass as the SHA-256 and records on the manifest as
+`org.virtkit.md5`; an object written otherwise (WebDAV, `vk registry put`, `/upload`) has no
+MD5 and its ETag is its SHA-256, quoted — 64 hex digits, which a client checking an ETag as
+an MD5 sees is not one. An object a multipart upload made has S3's multipart ETag,
+`"<MD5 of its parts' MD5s>-<parts>"`, recorded in the same annotation, so GetObject, HeadObject,
+the listings and a copy's source all answer it. The `x-amz-checksum-*` a write carried, once it held, or S3's default CRC64NVME computed as it was written, is kept as `org.virtkit.s3-checksum` and is the object's checksum from then on, in listings and on reads. User metadata (`x-amz-meta-<name>`, names `[a-z0-9-]`, at most 2 KiB
+of names and values) is kept on the manifest as `org.virtkit.s3-meta.<name>` and sent back on
+reads; a replaced object keeps only what its own write sent.
+
+| Request | Answer |
+|---|---|
+| `PUT /s3/<b>/<k>` PutObject | 200 with `ETag` and `x-amz-object-size`; streamed to `uploads/` while hashed (SHA-256, MD5, and the SHA-1 or CRC32 when asked), then tagged under the namespace lock as a WebDAV `PUT` is. `x-amz-content-sha256` is `UNSIGNED-PAYLOAD`, the body's SHA-256 (else 400 `XAmzContentSHA256Mismatch` and nothing is tagged), or a streaming mode whose `aws-chunked` body is decoded on the way in (below). `Content-MD5` and one `x-amz-checksum-{crc32,crc32c,sha1,sha256,crc64nvme,sha512,md5,xxhash64,xxhash3,xxhash128}` (every algorithm S3 has; the XXHASHes unseeded, base64 of the big-endian digest as the CRCs', XXH128's high half first), as a header or in a chunked body's trailer, are checked (400 `BadDigest`; 400 `InvalidDigest`/`InvalidRequest` when malformed, or when two are sent, whatever they hold, or when `x-amz-sdk-checksum-algorithm` names another algorithm than the header or the trailer; 400 `InvalidRequest` in S3's words for an `x-amz-checksum-*` header, `x-amz-sdk-checksum-algorithm` or `x-amz-trailer` naming an algorithm S3 does not have) and the checksum echoed with `x-amz-checksum-type: FULL_OBJECT` and kept on the manifest as `org.virtkit.s3-checksum` (`<ALGORITHM>:<base64>`), the object's from then on. A write that carries none gets S3's default, a CRC64NVME computed in the same pass over the body, echoed and kept the same way, as S3 has given every object since 2025. `If-None-Match: *` (create only) and `If-Match: <etag>` (replace only that object) are checked under the lock the tag is written under: 412 `PreconditionFailed` naming the `Condition`, or 404 `NoSuchKey` for an `If-Match` with no object there, as S3's conditional writes answer; S3 takes one of them, with those values only, so both at once, `If-Match: *` or an `If-None-Match` other than `*` is 501 `NotImplemented` naming the `Header`. CopyObject and CompleteMultipartUpload check them as PutObject does. 409 `OperationAborted` onto a directory, below an object, or over a foreign tag; 400 `EntityTooLarge` past 4 GiB, declared or streamed; 400 `MetadataTooLarge` |
+| `GET`, `HEAD /s3/<b>/<k>` GetObject, HeadObject | 200 with the bytes, `ETag`, `Last-Modified` from the tag, `Content-Length` and the metadata; with `x-amz-checksum-mode: ENABLED`, the checksum the write kept (`x-amz-checksum-<algorithm>` and `x-amz-checksum-type: FULL_OBJECT`), or `x-amz-checksum-sha256` (the store's digest, base64) for an object that kept none: one written otherwise than through S3 (WebDAV, `vk registry put`), or before the default was given, rather than its bytes being read again to compute one. `If-Match`, `If-Unmodified-Since`, `If-None-Match` and `If-Modified-Since` in RFC 9110's order: 412 `PreconditionFailed`, or 304 with the `ETag`. Then one byte range of `Range` (`bytes=a-b`, `bytes=a-`, `bytes=-n`): 206 with `Content-Range: bytes a-b/<size>`, the part's `Content-Length` and the same headers but no checksum, which S3 sends with the whole object only (the AWS CLI checks one it is sent against each part it reads); a last byte past the end, or a suffix longer than the object, is cut to it, and a suffix of an empty object is all of it (200); a first byte past the end, an empty object's first byte included, or `bytes=-0` is 416 `InvalidRange` with `Content-Range: bytes */<size>`; several ranges, another unit or a header that does not parse (whitespace in the range, `bytes= -1`, or a last byte before the first, `bytes=5-2`, as S3 takes them) are ignored (200), as RFC 9110 allows, as is a `Range` whose `If-Range` (an ETag compared strongly, or a date equal to `Last-Modified`) no longer holds. `?partNumber=<n>` instead of a `Range` (both is 400 `InvalidRequest`) serves part `n` of the object as it was uploaded: 206 with its `Content-Range` and `x-amz-mp-parts-count` for an object a multipart upload made (its parts' sizes are kept on the manifest as `org.virtkit.s3-parts`), an object written whole being its one part (206, no count), a part of no bytes the whole object (200); with `x-amz-checksum-mode: ENABLED`, a part of an upload created with a checksum is sent its own, with the object's `ChecksumType`, as S3 sends it; a part there is not is 416 `InvalidPartNumber`, a number outside 1 to 10000 400 `InvalidArgument`. A HEAD answers what the GET would. Every answer with the object says `Accept-Ranges: bytes`. A directory, a foreign tag or a missing key is 404 `NoSuchKey`, in a bucket not made yet too (above). `?versionId=null`, the one version ListObjectVersions gives every object, names the object itself, here and on a delete or a copy source; any other version id is 501 `NotImplemented`, an empty one (`?versionId=`) 400 `InvalidArgument`. A `GET` refreshes an idle tag as WebDAV's does, a ranged one included; a `HEAD` touches nothing |
+| `GET /s3/<b>/<k>?attributes` GetObjectAttributes | 200 `GetObjectAttributesResponse` with what `x-amz-object-attributes` names of `ETag`, `Checksum` (the kept checksum, named by its algorithm, with its `ChecksumType`; else the SHA-256), `ObjectParts` (for an object a multipart upload made: each part's number and size, and its checksum when the upload was created with one, `x-amz-max-parts` of them from after `x-amz-part-number-marker`, with `PartsCount`; absent for an object written whole), `StorageClass` (`STANDARD`) and `ObjectSize`, and `Last-Modified`; 400 `InvalidRequest` without the header; touches nothing |
+| `DELETE /s3/<b>/<k>` DeleteObject | 204 whether or not the key held an object, as S3 answers (404 `NoSuchBucket` when the bucket is not there), and for a key that is a directory, which holds no object to delete, with or without `?versionId=null`; 409 `OperationAborted` for a foreign tag; 403 when the caller may read the object but not write it. Writing the key's repository is what deletes: a grant to write and not read deletes too. `If-Match` (an ETag, quoted or not, or `*`, quoted or not, for any object), `x-amz-if-match-last-modified-time` (an HTTP date, or one with a numeric zone such as `+0200`, compared to the second) and `x-amz-if-match-size` are checked under the namespace lock against the object the delete would remove, each one given having to hold: 412 `PreconditionFailed` and the object kept when one does not, 404 `NoSuchKey` when no object is there (a directory, or one the caller may not see, included), as S3's conditional deletes answer; 400 `InvalidArgument` for a time or size that does not parse; 501 `NotImplemented` with `?versionId=null`, a condition applying to the current object only. S3 serves the time and size on directory buckets only; they are served here on every bucket, rather than taken and dropped |
+| `PUT /s3/<b>/<k>` with `x-amz-copy-source` CopyObject | 200 `CopyObjectResult` (`LastModified`, `ETag`): the source tagged again at the key on the same layer, so no byte moves and the pool holds it once; the destination's repository records the layer as a member, so a caller that may read only the copy reads its bytes. The source is `<bucket>/<key>`, with or without a leading `/`, escaped as a whole or not, `?versionId=null` naming the same; another `?versionId=` is 501 `NotImplemented`. It is read as GetObject reads it (403 when the caller may read neither its path nor its parent, 404 `NoSuchKey` when absent, a directory, foreign or unreadable, `NoSuchBucket` when its bucket is not there), and the destination written as PutObject writes (`Write` on its parent, 409 `OperationAborted`, `If-None-Match: *`/`If-Match` checked where the tag is written), under the namespace and shared store lock across both. `x-amz-copy-source-if-match`, `-if-none-match`, `-if-modified-since` and `-if-unmodified-since` decide on the source in GetObject's order, what a read would answer 304 failing too: 412 `PreconditionFailed`. The source's MD5 (so its ETag), the checksum it kept and its parts come along, the checksum named in the result with its `ChecksumType`; with `x-amz-checksum-algorithm` (400 `InvalidRequest` for one S3 does not have, before a copy onto itself is refused), the object's checksum is in that algorithm, the source's computed from its bytes, read once under the same locks, unless it kept one in it (a SHA-256 is the blob's name); its user metadata too with `x-amz-metadata-directive: COPY` (the default), the request's `x-amz-meta-*` instead with `REPLACE`; a retention annotation is not copied. A copy onto itself is 400 `InvalidRequest` unless it is a `REPLACE`; an `x-amz-metadata-directive` or `x-amz-tagging-directive` other than `COPY` or `REPLACE` is 400 `InvalidArgument` |
+| `POST /s3/<b>?delete` DeleteObjects | 200 `DeleteResult`: each key of the `Delete` document deleted as DeleteObject deletes it (a key with no object counts as deleted; a bucket that is not there is 404 `NoSuchBucket`), in the order asked, as `<Deleted>` (left out with `<Quiet>true</Quiet>`) or as an `<Error>` with its `Key`, `Code` and `Message`: `AccessDenied` for a key the caller may not delete, `InvalidArgument`/`KeyTooLongError` for one the store cannot name, `OperationAborted` for a foreign tag, `NotImplemented` for one naming a `VersionId` other than `null`, `InternalError` for one the store failed to delete (logged with the request id), the batch going on past it. An `<Object>`'s `ETag`, `LastModifiedTime` and `Size` are DeleteObject's conditions on that key, checked as its headers are: `PreconditionFailed` or `NoSuchKey` for that key, `InvalidArgument` for an empty `ETag`, `NotImplemented` for a condition beside a `VersionId`; a `VersionId` given is echoed in the key's `<Deleted>` or `<Error>`. A `LastModifiedTime` that is not a date refuses the whole document (400 `InvalidRequest`, naming the first as sent; an empty one 400 `MalformedXML`), as does a `Size` that is not a count (400 `MalformedXML`), before a key is touched. The namespace lock is taken once for the batch. The document is at most 1 MiB and 1000 keys, and holds no character XML 1.0 does not allow, literal or as a reference, else 400 `MalformedXML`, and is checked as a PutObject's body is against `x-amz-content-sha256`, `Content-MD5` and `x-amz-checksum-{sha256,sha1,crc32}` before a key is touched (400 `XAmzContentSHA256Mismatch`, `BadDigest`); an `aws-chunked` document is 501 |
+| `PUT /s3/<b>` CreateBucket | 200 with `Location: /s3/<b>`: the directory `files/<b>`, made as WebDAV's `MKCOL` makes it, under the namespace lock; needs `Write` on `files/<b>`. 409 `BucketAlreadyOwnedByYou` when it is a directory already, 409 `OperationAborted` when something else has its name in the store. A `CreateBucketConfiguration` body of at most 1 KiB is taken and ignored (a larger or malformed body is 400 `MalformedXML`); `x-amz-bucket-object-lock-enabled: true` is 501 `NotImplemented`, and so is an `x-amz-acl` other than the owner's (below) |
+| `DELETE /s3/<b>` DeleteBucket | 204 when the bucket holds no key: its directory tree is removed deepest first, each directory as WebDAV's `DELETE` removes an empty one, since the directories of deleted keys are left behind and S3 calls such a bucket empty; needs `Write` on `files/<b>`. 409 `BucketNotEmpty` while a key, a foreign tag or a record too fresh to be a deleted object's (an image's manifest pushed over `/v2/` lately, its message says) is there; 404 `NoSuchBucket`; the removal needs the store lock exclusive, retried for up to 30 s, then 503 `ServiceUnavailable` with `Retry-After` |
+| `GET /s3/<b>?versioning` and the other configurations | what S3 answers for a bucket with none configured, after HeadBucket's checks: an empty `VersioningConfiguration`, `BucketLoggingStatus`, `NotificationConfiguration` and `AccelerateConfiguration`; `RequestPaymentConfiguration` naming `BucketOwner`; `?tagging` (bucket or object) an empty `TagSet`; `?acl` (bucket or object) an `AccessControlPolicy` granting `FULL_CONTROL` to the owner `vk-registry`; 404 `NoSuchLifecycleConfiguration` (`?lifecycle`), `NoSuchBucketPolicy` (`?policy`, `?policyStatus`), `NoSuchCORSConfiguration` (`?cors`), `ServerSideEncryptionConfigurationNotFoundError` (`?encryption`), `ObjectLockConfigurationNotFoundError` (`?object-lock`), `ReplicationConfigurationNotFoundError` (`?replication`), `NoSuchWebsiteConfiguration` (`?website`), `NoSuchPublicAccessBlockConfiguration` (`?publicAccessBlock`), `OwnershipControlsNotFoundError` (`?ownershipControls`). An object's after GetObject's checks. Tools probe these before they use a bucket. A `PUT` or `DELETE` of any of them is 501 `NotImplemented`, its body read through. So is any request whose headers ask for one of them on the object or bucket it names, rather than the header being taken and dropped: `x-amz-server-side-encryption*` (SSE-S3, SSE-KMS and SSE-C, on a read and a copy's source too: a client that asked for its own key is never told its bytes are stored under it), `x-amz-tagging` naming a tag, `x-amz-acl` other than `private` or `bucket-owner-full-control` (the one ACL there is), `x-amz-grant-*`, `x-amz-storage-class` other than `STANDARD` (400 `InvalidStorageClass` for a class S3 does not have), `x-amz-website-redirect-location` and `x-amz-object-lock-*` |
+| `GET /s3/<b>?list-type=2` ListObjectsV2 | `ListBucketResult` with `KeyCount`, the keys starting with `prefix` (any text, which may end inside a component), each with `Key`, `LastModified`, `ETag` (as HeadObject's), `ChecksumAlgorithm` and `ChecksumType` when its write kept a checksum, `Size` and `StorageClass` `STANDARD`, and `Owner` `vk-registry` with `fetch-owner=true`. Keys come in byte order of the whole key, the order S3 lists in: a directory's keys all start with `<name>/`, so tag `a-b` and `a.b` come before the keys below directory `a`, and those before tag `a_b`. `delimiter` (any text) folds every key past the prefix holding it into a `CommonPrefixes` entry ending at its first occurrence; a directory folded so is not walked, and an empty one is listed as a prefix, as WebDAV shows it. `max-keys` defaults to 1000 and is clamped to it; `0` is an empty, complete page. `NextContinuationToken` names the page's last entry; a `continuation-token` or `start-after` resumes after it, a common prefix included (a start key inside a folded prefix passes over it); sent both, the page starts after the later of the two, so a paginator that keeps its `start-after` beside the token sees no key twice, and both are echoed. An empty `continuation-token` is none, echoed empty. `Prefix` is in the answer only when `prefix` was sent, as S3 echoes it, here and in the two listings below. `encoding-type=url` percent-encodes keys, prefixes, the delimiter and `StartAfter`. 400 `InvalidArgument` for a token this registry did not give or a malformed parameter; 404 `NoSuchBucket`; 403 `AccessDenied` past the admission rule above. Touches nothing |
+| `GET /s3/<b>` ListObjects | the first version of the same listing: `marker` for `start-after`, `Marker` (empty when none was sent) and, on a truncated page with a `delimiter`, `NextMarker` in the answer, as S3 sends it only then (without one, the page's last key is the next marker, as SDK paginators take it), no `KeyCount`, and every object's `Owner`. `start-after` or `continuation-token`, ListObjectsV2's, is 400 `InvalidArgument` |
+| `GET /s3/<b>?versions` ListObjectVersions | the same listing as a store that keeps no versions answers it, a `ListVersionsResult` in which each object is a `<Version>` with ListObjects' fields and its `Owner`, `VersionId` `null` and `IsLatest` `true`, with no `<DeleteMarker>`. `key-marker` resumes after a key; `version-id-marker` is taken and echoed as `VersionIdMarker`, a key having one version; `KeyMarker` and, on a truncated page, `NextKeyMarker` with `NextVersionIdMarker` `null` are in the answer, so a paginator sends back what it is given. `list-type` with it, or a `version-id-marker` without a `key-marker`, is 400 `InvalidArgument`. Ceph's s3-tests empty every bucket through it, deleting each key with the `null` version it lists |
+| `HEAD /s3/<b>` HeadBucket | 200 when `files/<b>` is a directory, 404 `NoSuchBucket` when not; 403 when the caller may read neither `files/<b>` nor anything below it |
+| `GET /s3/<b>?location` GetBucketLocation | the region the request was signed for, which is any the client chose, or an empty `LocationConstraint` for an unsigned request; after HeadBucket's checks |
+| `GET /s3/` ListBuckets | `ListAllMyBucketsResult`: the readable top-level directories, each dated by its directory's mtime, and the owner `vk-registry`; 403 `AccessDenied` on a server with no credential |
+| `POST /s3/<b>/<k>?uploads` CreateMultipartUpload | 200 `InitiateMultipartUploadResult` (`Bucket`, `Key`, `UploadId`): a new upload of the key, its user metadata recorded for the object; needs `Write` on the key's parent, and the key is checked as PutObject's is (409 `OperationAborted`), and again at completion. `x-amz-checksum-algorithm` and `x-amz-checksum-type` (`COMPOSITE`, a checksum of the parts' checksums, or `FULL_OBJECT`, by default `FULL_OBJECT` for CRC64NVME and `COMPOSITE` otherwise) are recorded with the upload and echoed; 400 `InvalidRequest` in S3's words for an algorithm or a type S3 does not have, a type without an algorithm, and a type the algorithm cannot make (`FULL_OBJECT` is CRC32, CRC32C and CRC64NVME only; `COMPOSITE` anything but CRC64NVME); `x-amz-copy-source` is 400 `InvalidArgument` |
+| `PUT /s3/<b>/<k>?partNumber=<n>&uploadId=<id>` UploadPart | 200 with the part's `ETag` (its MD5): its body received as a PutObject's is — the same payload modes, `aws-chunked` decoding, `Content-MD5` and `x-amz-checksum-*` checks and echoes, 400 `EntityTooLarge` past 4 GiB — into the upload's directory, replacing any earlier part `n` whole; the checksum it carried is recorded with it. A part of an upload created with a checksum carries one in that algorithm (header, trailer or `x-amz-sdk-checksum-algorithm`), else 400 `InvalidRequest` naming both; one that carries none is refused for a `COMPOSITE` upload and has the algorithm computed, echoed and recorded for a `FULL_OBJECT` one. Part numbers are 1 to 10000 (else 400 `InvalidArgument`), once the upload is found: an upload that is not there is 404 `NoSuchUpload` before what is asked of it is looked at, as S3 answers; a part of any size is taken, and held to S3's minimum at completion (below). An upload id that is not one of the key's own uploads, completed or aborted is 404 `NoSuchUpload`, whatever key it was made for |
+| UploadPart with `x-amz-copy-source` UploadPartCopy | 200 `CopyPartResult` (`LastModified`, `ETag`): the source object, or the bytes `x-amz-copy-source-range: bytes=<first>-<last>` names, copied into the part off the runtime (a part is the upload's own until it completes), the source read and its `x-amz-copy-source-if-*` conditions checked as CopyObject's are. The part has the checksum of its upload's algorithm computed as it is copied, recorded with it and named in the result (`ChecksumCRC32`…). A range past the source's end is 400 `InvalidArgument` naming the source's size, a malformed one 400 `InvalidArgument` |
+| `POST /s3/<b>/<k>?uploadId=<id>` CompleteMultipartUpload | 200 `CompleteMultipartUploadResult` (`Location`, the object's absolute URL as S3 gives it, from the listener's scheme, the `Host` and the path as sent; `Bucket`, `Key`, `ETag`): the parts the `CompleteMultipartUpload` document names, concatenated in that order into one staging file in a single pass off the runtime, then tagged as a PutObject's body is (the key checked again, `If-None-Match: *`/`If-Match` where the tag is written, stored plain from 8 MiB), with the metadata recorded at creation; the upload then goes, leaving the record of what it made (below). An upload that is not there is 404 `NoSuchUpload` before the document is read. The numbers must ascend (400 `InvalidPartOrder`) from 1 (400 `InvalidArgument` below), each part must be there with the ETag given (400 `InvalidPart`; each part's MD5 is checked again as it is read), at least one part (400 `MalformedXML`), each but the last at least 5 MiB, S3's minimum (400 `EntityTooSmall`, naming the part, its ETag, its `ProposedSize` and the `MinSizeAllowed`), and the total at most 4 GiB (400 `EntityTooLarge`). Each `Part` names at most one checksum (`ChecksumCRC32`…), in base64 of its algorithm's length (400 `InvalidArgument`, naming them), none for a part recorded without one and that one for a part recorded with one (400 `InvalidPart`; 400 `BadDigest` for one in another algorithm), and one for every part of an upload created with a checksum (400 `InvalidRequest`). The completion's `x-amz-checksum-type` is the upload's (400 `InvalidRequest`, also for a type S3 does not have). One final `x-amz-checksum-*` at most (400 `InvalidRequest`), a whole object's (base64 of the algorithm's length) or a composite one (`…-<parts>`, not for CRC64NVME), else 400 `InvalidRequest`, as is an algorithm S3 does not have. An upload created with a `FULL_OBJECT` checksum has it computed as the parts are assembled, checked against a final header in its algorithm (400 `BadDigest`; one in another algorithm is passed over, as S3 does) and kept as a PutObject's is; an upload created with none gets S3's default, a CRC64NVME of the whole object computed the same way, and any final checksum it is sent is passed over (S3, by versitygw's tests, ignores it); either is named in the result with its `ChecksumType`. An upload created with a `COMPOSITE` checksum gets S3's composite one, its algorithm's checksum of the parts' checksums concatenated in the order named, in base64 then `-<parts>`, checked against a final header in its algorithm with or without its count (400 `BadDigest`), kept (`<ALGORITHM>:<base64>-<parts>`) and answered with `ChecksumType` `COMPOSITE` in the result, on reads, listings and GetObjectAttributes; a composite final header is passed over for an upload created without a checksum. The parts' sizes are kept with the object, for a read of one part and `ObjectParts`, and for an upload created with a checksum the parts' checksums too (`org.virtkit.s3-part-checksums`, base64 joined by commas). Every refusal is a real status, never S3's late `200` carrying an `Error`, and leaves the upload to be completed again. A completion or an abort of an upload waits for one already under way, then finds the upload as that one left it, never a part going from under it. A completed upload is remembered until a `gc` finds it idle past the grace window (a day by default) from its completion: the same completion sent again — the same parts with the same ETags, as an SDK retries one whose answer it lost, or as several are sent at once — is 200 with the same `CompleteMultipartUploadResult` while the key still holds the object it made (the same bytes under the same ETag), its conditions and checksum headers not checked again, since that object is what they asked for. Another list of parts, or an object written over or deleted since, is 404 `NoSuchUpload`, as is an abort, a part or a ListParts of a completed upload. AWS's reference says only that `NoSuchUpload` may mean the upload was completed and that a failed completion should be retried; the 200 on a repeat and the 404 for other parts or another object are what S3 answers by versitygw's and ceph's tests |
+| `DELETE /s3/<b>/<k>?uploadId=<id>` AbortMultipartUpload | 204: the upload and its parts removed; 404 `NoSuchUpload`. With `x-amz-if-match-initiated-time` (an HTTP date), only an upload initiated in that second is removed: 412 `PreconditionFailed` for another, 400 `InvalidArgument` for a value that is not a date; a time still to come is no condition, as S3 (by versitygw's tests) takes it. A missing upload stays 404 with the header too, where S3's reference says 204 for directory buckets |
+| `GET /s3/<b>/<k>?uploadId=<id>` ListParts | 200 `ListPartsResult`: the parts in ascending order after `part-number-marker`, `max-parts` of them (at most and by default 1000), each with `PartNumber`, `LastModified`, `ETag`, `Size` and the checksum it was recorded with (`ChecksumCRC32`…), and the upload's `ChecksumAlgorithm` and `ChecksumType` when it was created with one, `IsTruncated` and `NextPartNumberMarker`; needs `Read` on the key's parent; 404 `NoSuchUpload`. A count that is no number is 400 `InvalidArgument` first, a negative one after the upload is found, as S3 orders them |
+| `GET /s3/<b>?uploads` ListMultipartUploads | (`uploadId` beside it is 400 `InvalidArgument`) 200 `ListMultipartUploadsResult`: the bucket's uploads in progress whose key starts with `prefix`, by key then, as S3 lists a key's uploads, in the order they were initiated, after `key-marker`, `max-uploads` of them (at most and by default 1000), each with `Key`, `UploadId`, `Initiator`, `Owner`, `StorageClass`, `Initiated`, and its `ChecksumAlgorithm` and `ChecksumType` when it was created with one. With `upload-id-marker` too, the page starts after that upload, which has to be one of the first key from `key-marker` on (that key's own when it has uploads), else 400 `InvalidArgument`, as S3 takes it; without `key-marker` it is ignored and echoed empty. `NextKeyMarker` and `NextUploadIdMarker` name the page's last upload, truncated or not, and `Prefix` is echoed only when sent; admitted as a listing of the bucket with that prefix is, showing only the uploads whose key the caller may read; `encoding-type=url` honoured, `delimiter` 501 `NotImplemented`; a `prefix` or marker holding a control character, or past 1024 bytes, is 400 `InvalidArgument`, as a bucket listing's; 404 `NoSuchBucket` |
+| anything else | 501 `NotImplemented`: writes of tagging, ACLs, versioning and the other configurations, `partNumber` on a read, every other subresource, and a parameter an operation does not take, once the bucket and, for an object's, the object are found there (404 `NoSuchBucket`, `NoSuchKey`), as S3 looks them up first; an SDK's `x-id` operation hint is ignored |
+
+**XML in** (`Delete`, `CreateBucketConfiguration`, `CompleteMultipartUpload`) is read by an
+element scanner of this registry's own, not a parser: UTF-8 only; the XML declaration,
+processing instructions and comments are passed over and CDATA is text;
+`&lt; &gt; &amp; &quot; &apos;` and character references are decoded, and any other entity, or
+a document type declaration (which could define one), is 400 `MalformedXML`, so nothing is
+fetched or expanded. Elements are known by their local name, so namespaces and attributes say
+nothing, and an element a request does not define is passed over. Nesting is at most 16 deep and a document holds a bounded number of
+elements (6 per key or part and a few more for a `Delete` or a `CompleteMultipartUpload`, of
+at most 1 MiB), so it costs at most its length in memory; a field given twice, a missing `Key`,
+`PartNumber` or `ETag`, or anything that is not well formed is `MalformedXML`.
+
+**`aws-chunked` bodies**, which AWS's SDKs and CLI send by default, are decoded as they
+stream, in one pass: a run of `<hex size>[;chunk-signature=<sig>]\r\n<data>\r\n` chunks ended
+by an empty one, then, in the `-TRAILER` modes, the checksum `x-amz-trailer` announced and,
+when signed, `x-amz-trailer-signature`. `x-amz-content-sha256` names the mode:
+`STREAMING-AWS4-HMAC-SHA256-PAYLOAD` signs every chunk, its `-TRAILER` form the trailer too,
+`STREAMING-UNSIGNED-PAYLOAD-TRAILER` signs nothing and carries the checksum, and
+`Content-Encoding: aws-chunked` beside a SHA-256, or no `x-amz-content-sha256`, is framing
+alone (the SHA-256 then being the decoded bytes'); beside `UNSIGNED-PAYLOAD` it is 400
+`InvalidArgument`, as S3 takes no unsigned payload aws-chunked. Chunk signatures chain from the request's own as AWS
+defines them, the trailer's signing its `name:value\n` lines after the last chunk's; they are
+checked with the signing key the request's signature was, which is kept while the body
+streams and wiped after. **A request authenticated by a bearer, Basic or session credential
+rather than SigV4** — the way a proxy that authenticates a guest's requests itself forwards
+them — and any request to a server with no credential has no secret to check them with: its
+framing is decoded and its signatures are read, not checked. `x-amz-decoded-content-length`
+is required (411 `MissingContentLength`), past 4 GiB is 400 `EntityTooLarge` before the body is read, and the chunks
+must hold exactly that many bytes; every chunk holding data but the last holds at least 8192
+bytes, as S3 requires (400 `InvalidChunkSizeError`, naming the `Chunk` and its
+`BadChunkSize`). The trailer's `x-amz-checksum-*`, in any of S3's algorithms, is
+checked against the decoded bytes, echoed and kept, as a header's is; a checksum sent both as
+a header and in the trailer is 400. Reading is
+bounded as it goes: a chunk header of at most 256 bytes, a chunk no longer than what is left
+of the declared length, a trailer of at most 8 KiB, nothing after its end, and memory of one
+frame and a line. A body that breaks any of this is refused where it goes wrong — 400
+`IncompleteBody` for chunks that break off or are malformed (`The request body terminated
+unexpectedly`) or hold other than the declared length (`You did not provide the number of
+bytes specified by the Content-Length HTTP header`), as S3 answers both, 400
+`MalformedTrailerError`, 403 `SignatureDoesNotMatch` — and its staging file is dropped, so
+nothing it held is tagged. No
+other content encoding is decoded: one named beside `aws-chunked` is 501 `NotImplemented`, as
+is another streaming mode (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD`); another encoding
+alone is stored as sent, its name not kept.
+
+**Ranges** are read from the stored blob without buffering the part. A blob stored plain is
+read after a seek. One stored as a zstd frame is decoded from its start and what precedes the
+range discarded, so a range costs a decode of everything before it: nothing to notice on a
+small object, but a client reading a large one in consecutive ranges would decode about
+N²/(2·range) bytes in all. The AWS CLI and the SDKs' transfer managers download an object past
+8 MiB as parallel 8 MiB ranges, so a `PutObject` of 8 MiB or more is stored plain, with no
+compression pass, and each of its ranges is a seek; smaller ones are compressed when that
+pays, and their ranges cost at most an 8 MiB decode. An object written otherwise (WebDAV,
+`vk registry put`, `/upload`) is stored as those writes store it, compressed when that pays
+whatever its size, and content already held keeps the form it was stored in first, so a large
+object of either kind can still be a zstd frame and pay that cost.
+
+**A listing's cost** is bounded by its page. The walk runs on the blocking pool, starts at the
+directory the prefix's whole components name, lists each directory it enters once (its
+subdirectories and tags), and stops one entry past `max-keys`, to know whether the page is
+truncated; memory is the page and a directory listing per level. A resumed page passes over
+every subtree that sorts before its resume point unread, so it costs the directories on the
+way down to that point plus the page, however deep into the bucket it is. Each key listed
+costs a manifest read and a membership `stat`, as a `PROPFIND` entry does: about a thousand
+small reads for a full page. A listing with `delimiter=/` never walks below the level it
+lists; one without a delimiter over a sharded `sccache` directory walks its thousands of
+repositories across its pages (see "Operational constraints and deferred work").
+
+**Multipart uploads** are staged in the store, each in a private directory
+`uploads/s3/<id>/` the gc sweeps once idle ("Lifecycle" above), not in the pool: `meta.json`
+(the bucket, the key, when it was created and the user metadata the object will carry), and
+for each part `part-<n>` (its bytes) and `part-<n>.json` (their size and MD5). Each file is
+written under a private temporary name and renamed over its own, so a part sent again replaces
+the earlier one whole; since a part's bytes and its record are two renames, completing an
+upload checks each part's MD5 again as it reads it. A completion or an abort holds the upload's
+directory locked (`flock`, so across processes on the store too) from looking the upload up
+until it is gone, so of two at once the second runs after the first and sees what it left;
+parts are written without the lock. A completion that made its object removes `meta.json`,
+then writes `completed.json` (the bucket, the key, the parts it named, the object's ETag, the
+SHA-256 of its bytes and the checksum it answered with), then removes the parts: the
+directory is no upload in progress from the first step on, and is swept as an idle upload is.
+A repeated completion compares the object at the key against that record; a crash between
+the first two steps forgets the completion, and a repeat then finds no upload. An upload id is minted as an OCI upload id
+is, `<pid>-<n>-<random hex>`, and held to hex digits and dashes, so it never names a path, and
+every call checks that the id's recorded bucket and key are the request's. A part's bytes
+stay out of the pool until the upload completes, so parts of the same content are stored once
+per upload until then; completing an upload costs a sequential read and write of the whole
+object, and listing uploads reads the record of every upload in progress in the store.
+`vk-registry status` counts the multipart uploads in progress beside the OCI ones.
+
+**`LastModified` moves on reads**, as `getlastmodified` does over WebDAV: a `GET` refreshes
+the tag's mtime once it is an hour old, which is what keeps a hot cache entry from the gc's
+retention. Sync tools that compare modification times (`aws s3 sync`, rclone `--update`) see
+it; they keep the source file's own time in user metadata.
+
+**Errors** are S3's XML `Error` documents (`Code`, `Message`, `Resource`, `RequestId`, and
+the extra elements AWS sends, such as `ServerTime` or `Condition`), so a client shows a code
+rather than a bare status. Every `/s3/` response carries an `x-amz-request-id` of 16 hex
+digits, the same id again as `x-amz-id-2` (S3's second id, which SDK test suites expect on
+every answer) and `nosniff`; an internal error logs its request id, so a client's report can
+be matched to the server's line. A refusal decided before the caller is authenticated reads at
+most 8 MiB of the body first, enough for a write of the AWS CLI's part size (and `sccache`'s
+13-byte probe) to see its answer rather than a reset; every refusal after it reads the body
+through, up to the 4 GiB cap, as WebDAV's do. A refusal of a request with a body then closes
+the connection. A request holding its body back on `Expect: 100-continue` is refused before
+the `100` goes out, so the client sends no body and sees the refusal, as it would from S3.
+A registry its hub made read-only answers writes 503 `ServiceUnavailable` with `Retry-After`.
+
+S3 writes into `files/` take the WebDAV view's namespace lock, run their store work on the
+blocking pool and stream their bodies on the runtime. Objects expire under the gc's tag
+retention like every `files/` entry ("Lifecycle" above): a PutObject writes no retention
+annotation.
+
+**Tests.** Besides the in-process suite (`tests/s3_e2e.rs`), `tests/s3-e2e.sh` at the
+repository root drives real clients in a microVM (`tests/s3/Dockerfile`) against a
+`vk-registry serve` in accounts mode, with TLS on the host's LAN address: `sccache` (a miss
+then a hit, read-only with a `read:files/*` key, a wrong secret failing its startup check),
+the AWS CLI (`cp` up to 100 MiB each way through multipart uploads and ranged downloads, its
+default CRC64NVME and CRC32/SHA-1/SHA-256 checksums, paged `list-objects-v2`, `sync`,
+`head-object`, ranged `get-object`, `copy-object`, `delete-objects`, a multipart upload by
+hand, a presigned URL refused, `rb --force`) and rclone (`copy` with a multipart upload,
+`ls`, `check`, `sync` twice with modification times from metadata, `delete`, `cleanup`); then
+`vk registry get` reads an object the CLI wrote and `vk-registry gc` keeps it.
 
 ## Accounts administration
 
@@ -589,6 +899,13 @@ print the issuer and subject of the user they act on. If more than one issuer ha
 the same email, the command requires `--issuer`. API keys are selected by the full hash
 identifier printed by `list-keys`.
 
+`create-key` prints the new token alone on stdout, so a redirect captures it and nothing else;
+what to do with it goes to stderr, including the token as S3 clients take it
+(`AWS_ACCESS_KEY_ID=vkr_… AWS_SECRET_ACCESS_KEY=vkr_…`, the same value twice). That pair
+spells the token out only when stdout is a terminal, so a redirected run leaves it out of a
+log stderr may be going to. `/settings/keys` shows a key it mints both ways, on the one page
+that ever shows its token.
+
 The administration channel is not HTTP and is never part of the public route table. By
 default, the socket is `admin.sock` beside the accounts database. It is published with mode
 `0600` by binding it inside a private staging directory and atomically renaming it into
@@ -607,10 +924,10 @@ service; an operator can still stop the server and use direct database access.
 ## Garbage collection and reporting
 
 `status` reports stored blob bytes split by whether tags reference them, with in-progress
-uploads counted separately. A blob counts as referenced when the `gc` mark would reach it
-from a tag, image indexes included. The repository table lists tag counts. Bytes without
-tag references are not a prediction of what `gc` will reclaim: its retention and grace
-windows still apply.
+uploads, and the S3 multipart uploads in progress, counted separately. A blob counts as
+referenced when the `gc` mark would reach it from a tag, image indexes included. The
+repository table lists tag counts. Bytes without tag references are not a prediction of what
+`gc` will reclaim: its retention and grace windows still apply.
 
 `Stage data` is the uncompressed data in recorded completed build stages, including builder
 stages but excluding intermediate instruction checkpoints. It sums the chunk placement
@@ -644,7 +961,8 @@ and markers included, waits for the next complete pass.
 `gc` applies two windows:
 
 - retention controls when idle tags stop being roots; and
-- grace protects recent unreferenced blobs, digest-pinned manifests, and uploads.
+- grace protects recent unreferenced blobs, digest-pinned manifests, and uploads, S3
+  multipart uploads among them (idle by the newest file in the upload's directory).
 
 A manifest can set its own tags' retention through annotations, which the pusher chooses:
 `org.virtkit.retention=keep` keeps a tag however long it sits idle, and
@@ -752,9 +1070,25 @@ layers. The feature is opt-in and requires guest networking.
 The runner's credential is not scoped, so the proxy lends it for `/v2/` only. Under
 `[registry] guest_credential = "job"` it lends a hub-placed job's own token instead, whose
 grants this registry enforces ([Hub tokens](#hub-tokens)), and forwards `/lock/` and
-`/dav/files/` too; under `/dav/files/` only GET, HEAD, PROPFIND, PUT, MKCOL, DELETE and
-OPTIONS pass, MOVE and COPY naming the proxy in their `Destination`. A job without a token,
-a gitlab-runner job included, gets a proxy that refuses everything.
+`/dav/files/` and the S3 view (`/s3`) too; under `/dav/files/` only GET, HEAD, PROPFIND, PUT,
+MKCOL, DELETE and OPTIONS pass, MOVE and COPY naming the proxy in their `Destination`, and
+under `/s3` GET, HEAD, PUT, POST, DELETE and OPTIONS. A job without a token, a gitlab-runner
+job included, gets a proxy that refuses everything.
+
+On `/s3/`, the proxy replaces the guest's `Authorization` — SigV4 with dummy keys, or none —
+with the job's token, so the guest holds no key, and drops `x-amz-security-token`. An
+`aws-chunked` body passes as sent: authenticated by a bearer, its framing is decoded and its
+chunk signatures are not checked (see `aws-chunked` bodies above). The job's areas map as on
+`/dav/files/`: `/s3/job/<alias>/<key…>` is the key below the area's prefix, so for the prefix
+`a/b/c`, bucket `a` and key `b/c/<key…>`, and a copy's `x-amz-copy-source: /job/<alias>/<key>`
+likewise. `/s3/job/<alias>` alone is the area as a bucket: the real bucket `a`, whose listings
+(`ListObjects`, `ListObjectsV2`, `ListMultipartUploads`) are given the key prefix `b/c/`
+before their `prefix`, `start-after`, `marker` and `key-marker` and inside their
+`continuation-token`, a `prefix` when they name none; an area below its bucket takes only
+reads there, since creating, deleting or batch-deleting its bucket would act on all of `a`.
+The documents answering a request through an area name it back: the bucket as `<alias>`, keys,
+prefixes, markers and continuation tokens without `b/c/` (a key outside the area as it is),
+and the paths in `Location` and `Resource` as `/s3/job/<alias>/…`.
 
 ## Connection limits
 
@@ -810,10 +1144,12 @@ when that is still below `max_connections` plus 256. The unit `install-service` 
   marker and the pool's manifest and layer blobs, the last two shared with identical
   entries. Everything that walks every repository name pays for those directories: a
   membership miss on `/v2/` (`readable_through`), a `/dav/repos/` prefix lookup or listing,
-  `/browse`, `status` and `gc`.
+  an S3 listing of such a directory without a delimiter, `/browse`, `status` and `gc`.
 - The `files/` area trusts its writers: a stored compiler-cache entry is linked into every
   project computing the same key, so write access belongs to trusted pipelines only (see
-  "WebDAV view").
+  "WebDAV view"). A key reaches exactly the same content over `/v2/`, `/dav/` and `/s3/`.
+- SigV4 needs the server's clock within 15 minutes of its clients'. A reverse proxy in front
+  of `/s3/` must pass `Host` and the path unchanged, since the signature covers both.
 - The store directory must be writable only by trusted local users. Requests can follow
   symlinks in parent directories under `repos/files/`; checks reject only a symlink at the
   final path component. Preventing this requires descriptor-relative path resolution.
@@ -825,6 +1161,6 @@ when that is still below `max_connections` plus 256. The unit `install-service` 
 - The server has no durable request audit log. Administrative changes are logged to stderr:
   `accounts admin: <peer>:` identifies the admin socket peer; `accounts web: <identity>:`
   identifies the session for browse and settings changes (tag deletion, API key minting and
-  revocation, captions, uploads). Writes through `/v2/` and WebDAV, including tag removal
+  revocation, captions, uploads). Writes through `/v2/`, WebDAV and S3, including tag removal
   and replacement, are not audited.
 - OIDC trusts platform roots only and caches discovery until restart.

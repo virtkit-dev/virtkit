@@ -1,0 +1,335 @@
+//! The path of an `/s3/` request as what it names in `files/`: the service, a bucket (a
+//! top-level directory) or an object (a key below one). Split before percent-decoding, so an
+//! escaped `/` cannot make one component two, and decoded as the WebDAV view decodes its
+//! paths. A key maps onto the store's names as they are, so it has to be one: each component
+//! a repository name's component, the leaf a tag, no empty component and no trailing slash.
+//! Arbitrary keys would need an escaping scheme, which this view deliberately does not have.
+
+use super::error::{Code, Refusal};
+use crate::dav::decode_segment;
+
+/// Most components a key may have: a repository name's bound less `files` and the bucket.
+pub(crate) const MAX_KEY_COMPONENTS: usize = crate::MAX_NAME_SEGMENTS - 2;
+
+/// Longest key, in bytes once decoded: S3's own bound.
+pub(crate) const MAX_KEY: usize = 1024;
+
+/// Longest key component, in bytes: a filename's.
+const MAX_COMPONENT: usize = 255;
+
+/// What a path names.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// `/s3` or `/s3/`
+    Service,
+    /// `/s3/<bucket>`, with or without a trailing slash
+    Bucket(String),
+    /// `/s3/<bucket>/<key>`: `segs` are the bucket then the key's components, the path below
+    /// `files/` the object layer takes
+    Object { key: String, segs: Vec<String> },
+}
+
+const BAD_ESCAPE: &str = "the key has a malformed percent escape or is not UTF-8";
+const EMPTY_COMPONENT: &str = "a key has no empty component and does not end in a slash";
+const BAD_CHARACTER: &str = "a key's components are runs of A-Z a-z 0-9 . _ - only";
+const DOT_COMPONENT: &str = "a key component cannot be . or ..";
+const RESERVED_COMPONENT: &str = "a key component cannot be tags, manifests or blobs";
+const TOO_DEEP: &str = "a key has at most 14 components";
+
+/// A key the store's names cannot hold: `InvalidArgument`, naming the rule it broke, which no
+/// S3 has.
+const fn invalid_key(rule: &'static str) -> Refusal {
+    Refusal::said(Code::InvalidArgument, rule)
+}
+
+/// A key, or one of its components, longer than `most` bytes: `KeyTooLongError`, with the
+/// length and the bound.
+fn too_long(len: usize, most: usize) -> Refusal {
+    Refusal::new(Code::KeyTooLongError)
+        .with("Size", len.to_string())
+        .with("MaxSizeAllowed", most.to_string())
+}
+
+/// Whether S3 could not parse a request's path at all, which it answers 400 `InvalidURI`
+/// before looking at the credential: a component with a malformed percent escape, not UTF-8
+/// once decoded or holding a control character (as ceph's suite has S3 refuse `\u{8a}`),
+/// or `..` components that climb above the root, `\` separating them as `/` does.
+/// `rel` is the path below the S3 root: what follows `/s3` path-style, the whole path of a
+/// request whose host names the bucket. A `.` or `..` that stays below the root is a key's
+/// component, which [`parse`] refuses as such.
+pub(crate) fn unparsable(rel: &str) -> bool {
+    let mut depth = 0usize;
+    for raw in rel.split('/') {
+        let Some(seg) = decode_segment(raw).filter(|s| !s.chars().any(char::is_control)) else {
+            return true;
+        };
+        for part in seg.split('\\') {
+            match part {
+                "" | "." => {}
+                ".." => match depth.checked_sub(1) {
+                    Some(up) => depth = up,
+                    None => return true,
+                },
+                _ => depth += 1,
+            }
+        }
+    }
+    false
+}
+
+/// What the path of a request under `/s3` names; the caller dispatches only `/s3` paths here.
+pub(crate) fn parse(path: &str) -> Result<Target, Refusal> {
+    let rest = path.strip_prefix("/s3").unwrap_or(path);
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    if rest.is_empty() {
+        return Ok(Target::Service);
+    }
+    let (raw_bucket, raw_key) = match rest.split_once('/') {
+        Some((b, k)) => (b, Some(k)),
+        None => (rest, None),
+    };
+    let bucket = decode_segment(raw_bucket)
+        .filter(|b| is_bucket(b))
+        .ok_or_else(|| Refusal::new(Code::InvalidBucketName).with("BucketName", raw_bucket))?;
+    let raw_key = match raw_key {
+        None | Some("") => return Ok(Target::Bucket(bucket)),
+        // Slashes only, which S3 cannot make a request of.
+        Some(k) if k.bytes().all(|b| b == b'/') => return Err(Refusal::new(Code::BadRequest)),
+        Some(k) => k,
+    };
+    let mut segs = vec![bucket];
+    for raw in raw_key.split('/') {
+        if segs.len() > MAX_KEY_COMPONENTS {
+            return Err(invalid_key(TOO_DEEP));
+        }
+        segs.push(component(raw)?);
+    }
+    let key = segs.get(1..).unwrap_or_default().join("/");
+    if key.len() > MAX_KEY {
+        return Err(too_long(key.len(), MAX_KEY));
+    }
+    Ok(Target::Object { key, segs })
+}
+
+/// The bucket a path under `/s3` names, decoded, and its key as sent, whether or not the key
+/// is one the store can name: what a read of a key [`parse`] refuses is a miss of.
+pub(crate) fn bucket_and_raw_key(path: &str) -> Option<(String, &str)> {
+    let rest = path.strip_prefix("/s3/")?;
+    let (raw_bucket, raw_key) = rest.split_once('/')?;
+    let bucket = decode_segment(raw_bucket).filter(|b| is_bucket(b))?;
+    Some((bucket, raw_key))
+}
+
+/// Whether `name`, decoded, can name a bucket: one top-level component of `files/`.
+pub(crate) fn is_bucket(name: &str) -> bool {
+    crate::valid_name(name) && !name.contains('/') && name.len() <= MAX_COMPONENT
+}
+
+/// One key component, decoded and held to a repository name's component rule (which the
+/// leaf, as a tag, also passes).
+fn component(raw: &str) -> Result<String, Refusal> {
+    if raw.is_empty() {
+        return Err(invalid_key(EMPTY_COMPONENT));
+    }
+    let seg = decode_segment(raw).ok_or(invalid_key(BAD_ESCAPE))?;
+    if seg.len() > MAX_COMPONENT {
+        return Err(too_long(seg.len(), MAX_COMPONENT));
+    }
+    if seg.is_empty() {
+        return Err(invalid_key(EMPTY_COMPONENT));
+    }
+    if !seg
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(invalid_key(BAD_CHARACTER));
+    }
+    if seg == "." || seg == ".." {
+        return Err(invalid_key(DOT_COMPONENT));
+    }
+    if !crate::valid_name(&seg) {
+        return Err(invalid_key(RESERVED_COMPONENT));
+    }
+    Ok(seg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object(key: &str) -> Result<Target, Refusal> {
+        parse(&format!("/s3/b/{key}"))
+    }
+
+    #[track_caller]
+    fn refused(key: &str, code: Code) -> Refusal {
+        match object(key) {
+            Err(r) => {
+                assert_eq!(r.code, code, "{key:?}: {}", r.message());
+                r
+            }
+            Ok(t) => panic!("accepted {key:?} as {t:?}"),
+        }
+    }
+
+    #[test]
+    fn a_path_is_unparsable_with_a_bad_escape_or_climbing_above_its_root() {
+        for bad in [
+            "/b/(*&^%&())",
+            "/b/a%zz",
+            "/b/a%",
+            "/b/%FF",
+            "/b/%C2%AE%C2%8A-",
+            "/b/a%0Ab",
+            "/b%2",
+            "/b/../../x",
+            "/b/a/a/../../../../x",
+            "/b//a/../../b/../../c",
+            "/b/x//../../../y",
+            "/b/x%5C..%5C..%5C..%5Cy",
+            "/../x",
+            "/..",
+        ] {
+            assert!(unparsable(bad), "{bad}");
+        }
+        for good in [
+            "",
+            "/",
+            "/b",
+            "/b/k",
+            "/b/..",
+            "/b/a/../b",
+            "/b/x/y/../..",
+            "/b/./k",
+            "/b/a%2F..%2F..%2F..",
+        ] {
+            assert!(!unparsable(good), "{good}");
+        }
+    }
+
+    #[test]
+    fn the_service_and_buckets_are_named_by_one_component() {
+        assert_eq!(parse("/s3"), Ok(Target::Service));
+        assert_eq!(parse("/s3/"), Ok(Target::Service));
+        assert_eq!(parse("/s3/sccache"), Ok(Target::Bucket("sccache".into())));
+        assert_eq!(parse("/s3/sccache/"), Ok(Target::Bucket("sccache".into())));
+        assert_eq!(parse("/s3/a%2Db"), Ok(Target::Bucket("a-b".into())));
+        for bad in [
+            "/s3//",
+            "/s3//k",
+            "/s3/a%2Fb",
+            "/s3/..",
+            "/s3/.",
+            "/s3/tags",
+            "/s3/blobs/k",
+            "/s3/a b",
+            "/s3/a%20b",
+            "/s3/%C3%A9",
+            "/s3/a%2",
+        ] {
+            let r = parse(bad).unwrap_err();
+            assert_eq!(r.code, Code::InvalidBucketName, "{bad}");
+            assert_eq!(r.message(), "The specified bucket is not valid.");
+        }
+    }
+
+    #[test]
+    fn sccache_keys_map_onto_the_files_tree() {
+        assert_eq!(
+            object(".sccache_check"),
+            Ok(Target::Object {
+                key: ".sccache_check".into(),
+                segs: vec!["b".into(), ".sccache_check".into()],
+            })
+        );
+        let hex = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+        let Ok(Target::Object { key, segs }) = object(&format!("a/b/c/{hex}")) else {
+            panic!("a sharded key");
+        };
+        assert_eq!(key, format!("a/b/c/{hex}"));
+        assert_eq!(segs, ["b", "a", "b", "c", hex]);
+        let (repo, tag) = crate::files::object_of(&segs).unwrap();
+        assert_eq!((repo.as_str(), tag), ("files/b/a/b/c", hex));
+        assert!(crate::valid_name(&crate::files::repo_name(&segs)));
+        // An escape of an allowed character is that character.
+        assert!(matches!(object("a%2Db"), Ok(Target::Object { key, .. }) if key == "a-b"));
+    }
+
+    #[test]
+    fn the_deepest_and_longest_keys_pass() {
+        let deepest = vec!["x"; MAX_KEY_COMPONENTS].join("/");
+        let Ok(Target::Object { segs, .. }) = object(&deepest) else {
+            panic!("14 components");
+        };
+        assert_eq!(segs.len(), crate::MAX_NAME_SEGMENTS - 1);
+        assert!(crate::valid_name(&crate::files::repo_name(&segs)));
+        assert!(object(&"x".repeat(255)).is_ok());
+        assert_eq!(longest().len(), MAX_KEY);
+        assert!(object(&longest()).is_ok());
+    }
+
+    /// A key of exactly [`MAX_KEY`] bytes, no component over 255.
+    fn longest() -> String {
+        format!("{0}/{0}/{0}/{1}/y", "x".repeat(255), "x".repeat(254))
+    }
+
+    #[test]
+    fn keys_outside_the_store_s_names_are_refused_naming_the_rule() {
+        let too_deep = vec!["x"; MAX_KEY_COMPONENTS + 1].join("/");
+        let says = |r: Refusal, rule: &str| r.message().contains(rule);
+        assert!(says(refused(&too_deep, Code::InvalidArgument), "14"));
+        let r = refused(&"x".repeat(256), Code::KeyTooLongError);
+        assert_eq!(r.message(), "Your key is too long.");
+        assert_eq!(r.element("Size"), Some("256"));
+        assert_eq!(r.element("MaxSizeAllowed"), Some("255"));
+        let over = format!("{}y", longest());
+        assert_eq!(over.len(), MAX_KEY + 1);
+        let r = refused(&over, Code::KeyTooLongError);
+        assert_eq!(r.element("Size"), Some("1025"));
+        assert_eq!(r.element("MaxSizeAllowed"), Some("1024"));
+        for empty in ["a//b", "a/", "a/b/", "/a"] {
+            assert!(
+                says(refused(empty, Code::InvalidArgument), "empty"),
+                "{empty}"
+            );
+        }
+        for dot in [".", "..", "a/./b", "a/../b", "%2E%2E/x"] {
+            assert!(
+                says(refused(dot, Code::InvalidArgument), ". or .."),
+                "{dot}"
+            );
+        }
+        for reserved in ["tags", "a/manifests/b", "blobs/x", "a/blobs"] {
+            assert!(
+                says(
+                    refused(reserved, Code::InvalidArgument),
+                    "tags, manifests or blobs"
+                ),
+                "{reserved}"
+            );
+        }
+        for bad in [
+            "a%2Fb",
+            "a%5Cb",
+            "%C3%A9",
+            "caf\u{e9}",
+            "a b",
+            "a%20b",
+            "a%00b",
+            "a%0Ab",
+            "a%7F",
+            "a+b",
+            "a~b",
+            "a:b",
+            "a*b",
+        ] {
+            assert!(
+                says(refused(bad, Code::InvalidArgument), "A-Z a-z 0-9 . _ -"),
+                "{bad}"
+            );
+        }
+        for bad in ["a%2", "a%G0", "%FF", "%C3"] {
+            assert!(says(refused(bad, Code::InvalidArgument), "escape"), "{bad}");
+        }
+    }
+}

@@ -960,8 +960,13 @@ pub fn resolve_principal(
 }
 
 /// [`resolve_principal`]'s body, over the headers alone — a `Request<Incoming>` can only
-/// be built by a live connection, so this is the testable half.
-fn resolve_headers(db: &Db, headers: &HeaderMap, secure: bool) -> Result<Option<Principal>> {
+/// be built by a live connection, so this is the testable half. The S3 gate also hands it
+/// a SigV4 access key id, as the one header `Authorization: Bearer <id>`.
+pub(crate) fn resolve_headers(
+    db: &Db,
+    headers: &HeaderMap,
+    secure: bool,
+) -> Result<Option<Principal>> {
     // An `Authorization` header is a claim to be authenticated by it, so one that does not
     // carry a `vkr_…` key is a failed authentication rather than a reason to fall back to
     // the cookie — otherwise a stale shared-secret client would silently authenticate as

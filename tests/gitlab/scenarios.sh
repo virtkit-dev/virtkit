@@ -391,6 +391,59 @@ EOF
   SC_DETAIL="built in $p1 ($ref), refused in $p2"
 }
 
+# A job reaches the S3 view through the guest proxy by an area's alias, the area three
+# components deep (bucket e2e-s3, keys below e2e/<project>/): it writes, reads, lists and
+# probes an object there unsigned, the proxy lending the job's token, and is refused another
+# alias and a bucket its token does not cover. busybox wget sends neither PUT nor HEAD, so the
+# requests go over nc. The token stays out of the trace.
+sc_registry_s3() {
+  local ci p j
+  hub namespaces add "$REG_ID" e2e-s3 --path 'e2e-s3/{gitlab}/{project_id}' \
+    --alias s3area --grant 'rw:own project' >>"$LOGS/hub-cli.log" 2>&1 || {
+    bad "vk-hub namespaces add e2e-s3 failed"
+    return 1
+  }
+  ci=$({
+    ci_header
+    cat <<'EOF'
+s3:
+  script:
+    - |
+      H=${VK_REGISTRY#http://}
+      HOST=${H%%:*} PORT=80
+      case $H in *:*) PORT=${H##*:} ;; esac
+      req() {
+        printf '%s %s HTTP/1.0\r\nHost: %s\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
+          "$1" "$2" "$H" "${#3}" "${3:-}" | nc "$HOST" "$PORT" | tr -d '\r'
+      }
+      code() { req "$@" | awk 'NR == 1 { print $2 }'; }
+      BODY=s3-probe-$CI_PIPELINE_ID
+      echo "put=$(code PUT /s3/job/s3area/probe "$BODY")"
+      echo "get=$(code GET /s3/job/s3area/probe)"
+      echo "get-body=$(req GET /s3/job/s3area/probe | sed '1,/^$/d')"
+      LIST=$(req GET '/s3/job/s3area?list-type=2')
+      echo "list=$(printf '%s\n' "$LIST" | awk 'NR == 1 { print $2 }')"
+      echo "list-key=$(printf '%s' "$LIST" | grep -c '<Key>probe</Key>')"
+      echo "list-name=$(printf '%s' "$LIST" | sed -n 's:.*<Name>\([^<]*\)</Name>.*:\1:p')"
+      echo "head=$(code HEAD /s3/job/s3area/probe)"
+      echo "head-length=$(req HEAD /s3/job/s3area/probe | sed -n 's/^[Cc]ontent-[Ll]ength: *//p')"
+      echo "put-nope=$(code PUT /s3/job/nope/x x)"
+      echo "put-images=$(code PUT /s3/images/x x)"
+EOF
+  })
+  p=$(push_scenario registry_s3 <<<"$ci") || return 1
+  wait_pipeline "$p" success || return 1
+  j=$(job "$p" s3)
+  keep_job "$j"
+  local body=s3-probe-$p want
+  for want in put=200 get=200 "get-body=$body" list=200 list-key=1 list-name=s3area head=200 \
+    "head-length=${#body}" put-nope=403 put-images=403; do
+    grep -qE "${LINE}${want}\$" "$RUN/jobs/$j.log" || bad "job $j's trace lacks a line '$want'"
+  done
+  trace_lacks "$j" vkt_
+  SC_DETAIL="pipeline $p: an area's S3 alias written, read, listed and probed; others refused"
+}
+
 sc_services() {
   local p j
   p=$({

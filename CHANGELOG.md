@@ -4,6 +4,45 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **The registry's plain-file area is also served as S3.** Under `/s3/` on `vk-registry`,
+  each top-level directory of the WebDAV `files/` area is a bucket, so `sccache`'s S3 backend
+  and other S3 clients can share a compiler cache or files with it: point them at
+  `https://<registry>/s3` with any region (a bucket is made by the first write into it, so
+  `sccache` needs none made beforehand), and use the registry credential (an API key, a hub
+  token or the shared bearer) as both the access key and the secret access key, or the shared
+  Basic user and its password. Objects can be written, read with conditional headers and
+  checksums (in every algorithm S3 has, checked on upload and kept with the object, and a
+  CRC64NVME computed for an upload that sends none, as S3 does), given
+  metadata and deleted, and listed page by page (as object versions too, for
+  tools that empty a bucket that way), and are the same files WebDAV and `vk registry get`
+  see; a key limited to a directory of a bucket can list that directory.
+  The chunked uploads AWS SDKs and the CLI send are taken, their signatures and checksums
+  checked, and objects can be read in byte ranges, as the AWS CLI downloads large files.
+  Buckets can be created and removed, objects copied without their bytes being stored twice
+  (or with the checksum a copy asks for computed from them) and deleted in batches — only while still the ETag, modification time or size a delete
+  names, when it names one, as S3's conditional deletes — and the configuration probes tools send before using a bucket
+  (versioning, ACLs, tagging and the like) are answered as for a bucket with none set, and a
+  write asking for one of them — encryption under the client's own key, tags, an ACL, a
+  storage class, a redirect, a retention lock — is refused rather than stored without it, and
+  a refused upload sees its refusal rather than a dropped connection; every refusal carries
+  the error code, status and message S3 answers with. Large
+  files can be uploaded in parts, as the AWS CLI uploads them, every part but the last at
+  least 5 MiB as S3 requires, each part and the completion
+  held to the checksum the upload was created with, and the object given S3's composite or
+  full-object checksum of them, completed once however many
+  completions of the upload are sent, at once or as retries (each answered as the first while
+  the object is still the one it made), read back a part at a time,
+  parts copied from other objects,
+  and unfinished uploads listed, aborted, or cleaned up by `gc` once idle; `status` counts
+  them. Set `s3 = false` in the server config to turn it off. A newly created API key is also
+  shown as the S3 key pair, ready to paste. With wildcard DNS, setting `s3_host` also serves
+  each bucket at its own host name, as clients using virtual-hosted style address it. Jobs a
+  fleet hub places with their own registry token reach it too through the guest registry
+  proxy, holding no credential: `sccache` there takes bucket `job` with its area's alias as the
+  key prefix.
+
 ## [0.106.0] - 2026-11-05
 
 ### Added

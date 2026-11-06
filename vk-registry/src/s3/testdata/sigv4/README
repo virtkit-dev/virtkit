@@ -1,0 +1,14 @@
+AWS Signature Version 4 signing test suite, header-signing cases
+
+Source: awslabs/aws-c-auth, tests/aws-signing-test-suite/v4
+https://github.com/awslabs/aws-c-auth/tree/3281f8692e6fd10562c4585a4dded5c16b322698/tests/aws-signing-test-suite/v4
+(the last commit touching that directory). Licensed under the Apache License 2.0; see
+LICENSE beside this file.
+
+Each directory is one case, copied unchanged: context.json (credentials, region, service,
+timestamp, whether the path is normalised and the body signed), request.txt (the request
+before signing), header-signed-request.txt (the same, signed in the Authorization header),
+header-canonical-request.txt, header-string-to-sign.txt and header-signature.txt. The
+query-* files (presigned URLs, which vk-registry refuses) are left out.
+
+s3::sigv4's tests read them from here (the_aws_signing_suite_verifies).

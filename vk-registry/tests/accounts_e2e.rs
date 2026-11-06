@@ -665,9 +665,24 @@ async fn settings_keys_round_trips_create_and_revoke_with_csrf() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    let minted = resp.text().await.unwrap();
     let keys = db.list_api_keys(&user.id).unwrap();
     assert_eq!(keys.len(), 1);
     assert!(keys[0].revoked_at.is_none());
+    // shown once, as the bearer and as the S3 pair, the same token both times
+    let shown = minted
+        .split("<pre>")
+        .nth(1)
+        .and_then(|s| s.split("</pre>").next())
+        .unwrap();
+    let after_prefix = shown.strip_prefix("vkr_").unwrap_or_default();
+    assert!(after_prefix.starts_with(&keys[0].token_prefix), "{minted}");
+    assert!(
+        minted.contains(&format!(
+            "AWS_ACCESS_KEY_ID={shown} AWS_SECRET_ACCESS_KEY={shown}"
+        )),
+        "{minted}"
+    );
 
     // An API key cannot manage keys, even authenticated.
     let (_, token) = db
@@ -1366,6 +1381,8 @@ async fn a_relayed_blob_becomes_a_member_of_the_repo_it_was_fetched_for() {
         auth: Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
         webdav: true,
+        s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     }));
@@ -1471,6 +1488,8 @@ async fn shared_secret_mode_is_unchanged_by_repo_scoping() {
         auth: Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
         webdav: true,
+        s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     }));
@@ -1691,6 +1710,8 @@ async fn deleting_a_manifest_on_an_open_server() {
         auth: Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
         webdav: true,
+        s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     }));
@@ -2185,6 +2206,8 @@ async fn a_cross_site_write_is_refused_on_an_open_server() {
         auth: Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
         webdav: true,
+        s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     }));

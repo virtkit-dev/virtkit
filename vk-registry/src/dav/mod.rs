@@ -90,7 +90,7 @@ async fn root(
                     entries.push(Entry::collection(href(&["repos"], true), repos));
                     entries.push(Entry::collection(
                         href(&["files"], true),
-                        store.repos_path_modified(files::FILES_REPO),
+                        store.repos_path_modified(crate::files::FILES_REPO),
                     ));
                 }
                 Ok(multistatus(&entries))
@@ -175,7 +175,7 @@ pub(crate) fn parse(rest: &str) -> Option<(Vec<String>, bool)> {
 
 /// Percent-decode one path component: `%XX` escapes only, `+` being itself in a path, and
 /// the decoded bytes must be UTF-8. `None` for a malformed escape or invalid UTF-8.
-fn decode_segment(raw: &str) -> Option<String> {
+pub(crate) fn decode_segment(raw: &str) -> Option<String> {
     fn hex(c: u8) -> Option<u8> {
         match c {
             b'0'..=b'9' => Some(c - b'0'),
@@ -228,7 +228,7 @@ pub(crate) fn href(segments: &[&str], collection: bool) -> String {
 
 /// Root enumeration requires configured credentials. Accounts-mode listings also filter by
 /// scope.
-fn may_enumerate(state: &ServerState) -> bool {
+pub(crate) fn may_enumerate(state: &ServerState) -> bool {
     match &state.auth {
         Authenticator::Accounts { .. } => true,
         Authenticator::Shared(auth) => auth.enabled(),

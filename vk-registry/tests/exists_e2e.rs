@@ -61,6 +61,8 @@ async fn batch_probe_answers_every_tag_in_order() {
         auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
         webdav: true,
+        s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     }));

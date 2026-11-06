@@ -1,0 +1,4 @@
+# Tests expected to fail, one id per line; rewritten by run.sh --accept.
+# Remove a line once the server passes its test.
+# Empty until the first run against the finished server: run.sh then lists every failure,
+# and run.sh --accept records them as the baseline to hold.

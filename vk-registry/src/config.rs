@@ -87,6 +87,12 @@ pub struct ServerConfig {
     /// objects already stored under `files/` stay reachable over `/v2/` and expire under `gc`
     /// like any tag.
     pub webdav: bool,
+    /// Enable `/s3/` (default: true). When disabled, requests return 404 after auth; the
+    /// objects already stored under `files/` stay reachable over `/dav/` and `/v2/`.
+    pub s3: bool,
+    /// The domain whose subdomains name S3 buckets, virtual-hosted style: a request sent to
+    /// `<bucket>.<s3_host>` is served as `/s3/<bucket>/<path>`. Path-style keeps working.
+    pub s3_host: Option<String>,
     /// Connections served at once; past it, new ones wait in the listen backlog.
     pub max_connections: usize,
     /// Connections served at once from one client address (an IPv6 /64); past it, new ones
@@ -258,6 +264,10 @@ struct FileConfig {
     admin_socket: Option<FileAdminSocket>,
     /// Enable `/dav/`; defaults to true.
     webdav: Option<bool>,
+    /// Enable `/s3/`; defaults to true.
+    s3: Option<bool>,
+    /// Serve `<bucket>.<s3_host>` as `/s3/<bucket>/`; unset by default.
+    s3_host: Option<String>,
     max_connections: Option<usize>,
     max_connections_per_client: Option<usize>,
     oidc: Option<FileOidc>,
@@ -378,6 +388,8 @@ impl ServerConfig {
             admin_socket: AdminSocket::Unset,
             oidc: None,
             webdav: true,
+            s3: true,
+            s3_host: None,
             max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             max_connections_per_client: crate::DEFAULT_MAX_CONNECTIONS_PER_CLIENT,
             hub: HubSettings::default(),
@@ -451,6 +463,14 @@ impl ServerConfig {
         );
         if *tokens {
             described.push_str(" tokens=true");
+        }
+        // Only when off, so a registry that leaves it on keeps the hash it had.
+        if !self.s3 {
+            described.push_str(" s3=false");
+        }
+        // Only when set, so a registry that leaves it unset keeps the hash it had.
+        if let Some(host) = &self.s3_host {
+            described.push_str(&format!(" s3_host={host}"));
         }
         // Only when set, so a registry that leaves it keeps the hash it had.
         if *update_drain_minutes != DEFAULT_UPDATE_DRAIN_MINUTES {
@@ -669,6 +689,8 @@ impl ServerConfig {
                 public_url: o.public_url,
             }),
             webdav: f.webdav.unwrap_or(true),
+            s3: f.s3.unwrap_or(true),
+            s3_host: f.s3_host,
             max_connections: f.max_connections.unwrap_or(crate::DEFAULT_MAX_CONNECTIONS),
             max_connections_per_client: f
                 .max_connections_per_client
@@ -688,6 +710,11 @@ impl ServerConfig {
             gc_prefixes: f.gc.map(|g| g.prefix).unwrap_or_default(),
         };
         cfg.check_connection_limits()?;
+        if let Some(host) = &cfg.s3_host {
+            check_s3_host(host)?;
+            let public_url = cfg.oidc.as_ref().map(|o| o.public_url.as_str());
+            check_s3_host_apart(host, cfg.s3, public_url)?;
+        }
         cfg.check_hub()?;
         check_gc_prefixes(&cfg.gc_prefixes)?;
         // Also here, not only in `build_auth`: `load` is where a file becomes a config, so
@@ -952,6 +979,8 @@ impl ServerConfig {
             auth,
             tls: None,
             webdav: self.webdav,
+            s3: self.s3,
+            s3_host: self.s3_host,
             tokens: Default::default(),
             handover: Default::default(),
         })
@@ -1003,6 +1032,61 @@ impl UpstreamSpec {
 fn parse_addr(addr: Option<String>) -> Result<Option<SocketAddr>> {
     addr.map(|a| a.parse().with_context(|| format!("parsing addr {a:?}")))
         .transpose()
+}
+
+/// `s3_host` is a host name its buckets are subdomains of: lowercase DNS labels, as a
+/// wildcard certificate and record name them, and no port, which a request's own `Host`
+/// carries and the match ignores.
+fn check_s3_host(host: &str) -> Result<()> {
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    if host.len() > 253 || !host.split('.').all(label_ok) {
+        bail!(
+            "s3_host {host:?} is not a host name: lowercase labels of a-z, 0-9 and -, joined \
+             by dots, with no port or trailing dot"
+        );
+    }
+    Ok(())
+}
+
+/// `s3_host` serves only S3, and the registry's own name, `public_url`'s host, is not below
+/// it: every request to `<label>.<s3_host>` is served as that bucket, so a registry named
+/// there would have its `/v2/`, `/login` and `/browse` taken for objects. The name itself is
+/// not a bucket's, and stays the registry's.
+fn check_s3_host_apart(host: &str, s3: bool, public_url: Option<&str>) -> Result<()> {
+    if !s3 {
+        bail!("s3_host = {host:?} needs S3 on: drop it, or s3 = false");
+    }
+    let Some(url) = public_url else {
+        return Ok(());
+    };
+    // `scheme://[userinfo@]host[:port][/…]`, as `[oidc] public_url` is checked to be.
+    let authority = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // A port goes; an IPv6 literal, which holds colons of its own, is no name below a host.
+    let own = match authority.rsplit_once(':') {
+        Some((name, port)) if !name.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => {
+            name
+        }
+        _ => authority,
+    };
+    let below = own.len() > host.len()
+        && own
+            .get(own.len() - host.len() - 1..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(&format!(".{host}")));
+    if below {
+        bail!(
+            "s3_host = {host:?} would take the registry's own name {own:?} ([oidc] public_url) \
+             for a bucket: the registry must not be named below s3_host"
+        );
+    }
+    Ok(())
 }
 
 /// Each `[[gc.prefix]]` names a repository prefix, once, with a window of a day or more.
@@ -1885,6 +1969,110 @@ mod tests {
         let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), "/s".into());
         assert_eq!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
         cfg.hub.update_drain_minutes = 5;
+        assert_ne!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `s3` defaults to on, reads both ways, and changes the config hash only when off.
+    #[test]
+    fn s3_defaults_to_on_and_changes_the_config_hash_only_when_off() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-s3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let load = |body: &str| {
+            let p = dir.join("c.toml");
+            std::fs::write(&p, body).unwrap();
+            ServerConfig::load(&p, None, None).unwrap()
+        };
+        assert!(load("").s3);
+        assert!(load("s3 = true\n").s3);
+        let off = load("s3 = false\n");
+        assert!(!off.s3);
+        let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), "/s".into());
+        assert!(cfg.s3);
+        assert_eq!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
+        cfg.s3 = false;
+        assert_ne!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `s3_host` is a lowercase host name or nothing, and changes the config hash only when
+    /// set.
+    #[test]
+    fn s3_host_is_a_host_name_and_changes_the_config_hash_only_when_set() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-s3h-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let load = |body: &str| {
+            let p = dir.join("c.toml");
+            std::fs::write(&p, body).unwrap();
+            ServerConfig::load(&p, None, None)
+        };
+        assert_eq!(load("").unwrap().s3_host, None);
+        for ok in ["s3.example.com", "localhost", "a-1.b2.example", "x"] {
+            let cfg = load(&format!("s3_host = {ok:?}\n")).unwrap();
+            assert_eq!(cfg.s3_host.as_deref(), Some(ok));
+        }
+        let long_label = "a".repeat(64);
+        let long_host = vec!["a".repeat(63); 4].join(".");
+        for bad in [
+            "",
+            "S3.example.com",
+            "s3.example.com:443",
+            "s3.example.com.",
+            ".s3.example.com",
+            "s3..example.com",
+            "-s3.example.com",
+            "s3-.example.com",
+            "s3_x.example.com",
+            "*.example.com",
+            "https://s3.example.com",
+            "[::1]",
+            "10.0.0.1:9000",
+            &long_label,
+            &long_host,
+        ] {
+            let Err(err) = load(&format!("s3_host = {bad:?}\n")) else {
+                panic!("{bad:?} was accepted");
+            };
+            assert!(format!("{err:#}").contains("s3_host"), "{bad:?}: {err:#}");
+        }
+        // With S3 off it would serve nothing, and the registry's own name is not below it.
+        let Err(err) = load("s3 = false\ns3_host = \"s3.example.com\"\n") else {
+            panic!("s3_host was taken with S3 off");
+        };
+        assert!(format!("{err:#}").contains("s3_host"), "{err:#}");
+        let accounts = |s3_host: &str, public_url: &str| {
+            load(&format!(
+                "mode = \"accounts\"\ns3_host = {s3_host:?}\n[oidc]\n\
+                 issuer = \"https://login.example.com\"\nclient_id = \"r\"\n\
+                 client_secret_file = \"/s\"\npublic_url = {public_url:?}\n"
+            ))
+        };
+        for (s3_host, own) in [
+            ("example.com", "https://reg.example.com"),
+            ("example.com", "https://a.b.example.com:8443/"),
+            ("example.com", "https://REG.Example.com/base"),
+            ("s3.example.com", "https://reg.s3.example.com"),
+        ] {
+            let Err(err) = accounts(s3_host, own) else {
+                panic!("{s3_host} was taken over {own}");
+            };
+            assert!(format!("{err:#}").contains("public_url"), "{own}: {err:#}");
+        }
+        for (s3_host, own) in [
+            ("s3.example.com", "https://reg.example.com"),
+            ("reg.example.com", "https://reg.example.com"),
+            ("example.com", "https://example.com:443"),
+            ("example.com", "https://regexample.com"),
+            ("example.com", "https://[::1]:5000"),
+        ] {
+            let cfg = accounts(s3_host, own).unwrap();
+            assert_eq!(cfg.s3_host.as_deref(), Some(s3_host), "{own}");
+        }
+        let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), "/s".into());
+        assert_eq!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
+        cfg.s3_host = Some("s3.example.com".into());
         assert_ne!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
         let _ = std::fs::remove_dir_all(&dir);
     }

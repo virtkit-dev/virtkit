@@ -4304,13 +4304,17 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "crc",
+ "crc32fast",
  "futures",
+ "hmac",
  "http-body-util",
  "httpdate",
  "hyper",
  "hyper-util",
  "jemallocator",
  "libc",
+ "md5",
  "oci-client",
  "rand",
  "redb",
@@ -4318,6 +4322,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "tokio",
  "tokio-rustls",
@@ -4328,6 +4333,8 @@ dependencies = [
  "vk-oidc",
  "vk-peer",
  "vk-selfupdate",
+ "xxhash-rust",
+ "zeroize",
  "zstd",
 ]
 
@@ -4820,6 +4827,12 @@ dependencies = [
  "libc",
  "rustix",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yoke"

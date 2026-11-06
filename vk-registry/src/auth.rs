@@ -4,8 +4,7 @@
 //! `GET /v2/` version probe — its 401 + `WWW-Authenticate` is how OCI clients discover
 //! they must authenticate before the real blob requests.
 
-use hyper::body::Incoming;
-use hyper::{Request, Response};
+use hyper::{HeaderMap, Response};
 
 use crate::Body;
 
@@ -26,14 +25,15 @@ impl Auth {
         !matches!(self, Auth::None)
     }
 
-    /// Whether `req` carries valid credentials (always true when disabled).
-    pub fn allows(&self, req: &Request<Incoming>) -> bool {
+    /// Whether a request with `headers` carries valid credentials (always true when
+    /// disabled).
+    pub fn allows(&self, headers: &HeaderMap) -> bool {
         match self {
             Auth::None => true,
-            Auth::Bearer { token } => authorization(req)
+            Auth::Bearer { token } => authorization(headers)
                 .and_then(|v| v.strip_prefix("Bearer "))
                 .is_some_and(|t| constant_eq(t.as_bytes(), token.as_bytes())),
-            Auth::Basic { user, pass } => authorization(req)
+            Auth::Basic { user, pass } => authorization(headers)
                 .and_then(|v| v.strip_prefix("Basic "))
                 .and_then(|b| base64_decode(b.trim()))
                 .and_then(|raw| String::from_utf8(raw).ok())
@@ -45,6 +45,16 @@ impl Auth {
                     }
                     None => false,
                 }),
+        }
+    }
+
+    /// The secret a SigV4 access key id `id` signs with, when it is not `id` itself: in Basic
+    /// mode, the password when `id` is the user (compared in constant time), so the secret
+    /// never crosses the wire. `None` otherwise, a bearer included: its id is its secret.
+    pub(crate) fn secret_for(&self, id: &str) -> Option<&str> {
+        match self {
+            Auth::Basic { user, pass } if constant_eq(id.as_bytes(), user.as_bytes()) => Some(pass),
+            _ => None,
         }
     }
 
@@ -73,8 +83,8 @@ impl Auth {
 pub(crate) const BASIC_CHALLENGE: &str = "Basic realm=\"vk-registry\"";
 const BEARER_CHALLENGE: &str = "Bearer realm=\"vk-registry\"";
 
-fn authorization(req: &Request<Incoming>) -> Option<&str> {
-    req.headers()
+fn authorization(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(hyper::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
 }
@@ -131,6 +141,20 @@ mod tests {
         assert_eq!(base64_decode("Zm9v").unwrap(), b"foo");
         assert_eq!(base64_decode("Zm9vYg==").unwrap(), b"foob");
         assert!(base64_decode("not base64!").is_none());
+    }
+
+    #[test]
+    fn only_the_basic_user_has_a_secret_other_than_itself() {
+        let basic = Auth::Basic {
+            user: "ci".into(),
+            pass: "pa55".into(),
+        };
+        assert_eq!(basic.secret_for("ci"), Some("pa55"));
+        assert_eq!(basic.secret_for("pa55"), None);
+        assert_eq!(basic.secret_for("c"), None);
+        let bearer = Auth::Bearer { token: "t".into() };
+        assert_eq!(bearer.secret_for("t"), None);
+        assert_eq!(Auth::None.secret_for("x"), None);
     }
 
     #[test]

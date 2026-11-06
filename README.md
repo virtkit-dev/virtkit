@@ -855,6 +855,22 @@ with `read:files/<dir>/*` only reads it. Cached files expire under `vk-registry 
 retention like any other tag, unless their manifest keeps or expires them. Set
 `webdav = false` in the server config to disable WebDAV.
 
+The same plain-file area is served as S3 under `/s3/`, a bucket being a top-level directory
+of `/dav/files/`, so `sccache`'s S3 backend, the AWS CLI and SDKs and other S3 clients can use
+it. The access key is the registry credential — an API key, a hub token, or the shared bearer —
+and the secret access key is the same string; with a shared Basic user, the user name and its
+password. For `sccache`:
+
+```bash
+SCCACHE_BUCKET=sccache SCCACHE_ENDPOINT=https://<registry>/s3 SCCACHE_REGION=auto \
+SCCACHE_S3_KEY_PREFIX=<dir> AWS_ACCESS_KEY_ID=$KEY AWS_SECRET_ACCESS_KEY=$KEY sccache …
+```
+
+Object keys follow the store's names (`A-Z a-z 0-9 . _ -` between slashes, at most 1024
+bytes); objects are at most 4 GiB; presigned URLs are refused. Set `s3 = false` to disable
+it. With wildcard DNS, `s3_host = "s3.example.com"` also serves each bucket virtual-hosted
+style, as `https://<bucket>.s3.example.com/<key>`.
+
 `vk registry put [--dir <dir>] [--ttl 7d | --keep] <file>...` stores files there, each once by
 digest (`/dav/files/sha256/<hex>`) and, with `--dir`, by name (`/dav/files/<dir>/<name>`), and
 `vk registry get <sha256:hex | dir/name>` fetches one back, checked against its digest;
@@ -883,7 +899,7 @@ See [`docs/registry-hub.md`](docs/registry-hub.md).
 | --- | --- |
 | `vk` | Host CLI, VMM, image builder, userspace network, compose runner, and GitLab executor. It embeds the default guest kernel and `vk-agent`. |
 | `vk-agent` | Guest PID 1 and command server. It configures mounts, networking, hostname, shared directories, optional SSH, and host-driven execution over vsock. |
-| `vk-registry` | Optional OCI-distribution server with a pull-through cache, a WebDAV view of the store with a plain-file area for compiler caches, and build-once locking. |
+| `vk-registry` | Optional OCI-distribution server with a pull-through cache, a WebDAV view of the store with a plain-file area for compiler caches, also served as S3, and build-once locking. |
 | `vk-hub` | Experimental hub for a fleet of `vk node` hosts, and a web UI for the VMs on this machine: `vk-hub local` serves it on loopback. See the [fleet design](docs/fleet-design.md) and [prototype reference](docs/fleet-prototype.md). |
 | `vk-gitlab` | Experimental GitLab runner for a `vk-hub` fleet: takes jobs from GitLab and has the hub run each on a `vk node`. See [GitLab dispatch](docs/gitlab-dispatch.md). |
 | `vk-runnerctl` | Optional root-side helper that adjusts GitLab runner concurrency within an administrator-configured range. |

@@ -21,6 +21,7 @@
 //!                                 which is what makes a blob read repo-scoped
 //!   uploads/<id>                  in-progress blob uploads (this process only)
 //!   uploads/owners/<id>           the repository that upload session was opened for
+//!   uploads/s3/<id>/              an S3 multipart upload: its `meta.json` and parts
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -51,6 +52,7 @@ pub(crate) mod captions;
 pub mod client;
 pub mod config;
 pub(crate) mod dav;
+pub(crate) mod files;
 pub(crate) mod forms;
 pub mod handover;
 pub(crate) mod html;
@@ -60,6 +62,7 @@ pub(crate) mod keys;
 pub mod lock;
 pub mod oidc;
 pub mod relay;
+pub(crate) mod s3;
 pub(crate) mod tags;
 pub(crate) mod upload;
 
@@ -106,6 +109,10 @@ pub struct ServerState {
     pub tls: Option<tokio_rustls::TlsAcceptor>,
     /// Enable WebDAV routes.
     pub webdav: bool,
+    /// Enable the S3 routes under `/s3/`.
+    pub s3: bool,
+    /// The domain whose subdomains name S3 buckets, virtual-hosted style, when S3 is on.
+    pub s3_host: Option<String>,
     /// The hub tokens taken, once enrolled with `[hub] tokens = true`.
     pub tokens: hubtoken::TokenGate,
     /// The listeners served through, to hand to a release.
@@ -132,7 +139,7 @@ impl ServerState {
 /// lock service, sign-ins, keys and captions (the accounts db, not the store) do not touch
 /// it, and the batched exists probe is a read sent as a POST; a tag deleted from the settings
 /// pages is a write.
-fn is_store_write(method: &Method, path: &str) -> bool {
+pub(crate) fn is_store_write(method: &Method, path: &str) -> bool {
     match method.as_str() {
         "GET" | "HEAD" | "OPTIONS" | "PROPFIND" => false,
         _ if path.starts_with("/lock/") || path == EXISTS_PATH => false,
@@ -262,6 +269,42 @@ fn stream_body(reader: impl std::io::Read + Send + Sync + 'static, what: &str) -
         }
     });
     StreamBody::new(stream).boxed()
+}
+
+/// What [`Store::serve_blob_range`] serves: the blob's canonical length, and the part.
+pub(crate) struct BlobPart {
+    pub(crate) total: u64,
+    pub(crate) body: Body,
+}
+
+/// A reader that discards the first `skip` bytes of `inner` on its first read, through the
+/// caller's buffer: a ranged read of a zstd-stored blob decodes what precedes the range on
+/// the blocking pool the stream reads on, not before the answer's headers are sent.
+struct Skip<R> {
+    inner: R,
+    skip: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for Skip<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // Counted down as it goes, so a read retried after `Interrupted` resumes where the
+        // one before stopped.
+        while self.skip > 0 {
+            let want = usize::try_from(self.skip).map_or(buf.len(), |s| s.min(buf.len()));
+            let n = self.inner.read(&mut buf[..want])?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the blob ends before the range starts",
+                ));
+            }
+            self.skip = self.skip.saturating_sub(n as u64);
+        }
+        self.inner.read(buf)
+    }
 }
 
 /// Capability header a cooperating server sets on its `GET /v2/` response, so an
@@ -444,6 +487,17 @@ pub(crate) struct StagedBlob {
 }
 
 impl StagedBlob {
+    /// `tmp` installed as it is, the canonical bytes, with no compression pass: for a writer
+    /// whose objects will be read back in ranges, which a plain blob serves by seeking (see
+    /// [`Store::serve_blob_range`]). A blob already held keeps the form it has.
+    pub(crate) fn uncompressed(tmp: &Path) -> Self {
+        StagedBlob {
+            install: tmp.to_path_buf(),
+            discard: None,
+            zstd: false,
+        }
+    }
+
     /// Drop the staged files without installing anything — for a caller that gives up
     /// between staging and promoting. `gc` would sweep `uploads/` eventually anyway, so an
     /// unlink that fails is not worth reporting over whatever made the caller give up.
@@ -555,12 +609,7 @@ impl Store {
     pub(crate) fn stage_file(&self) -> Result<(PathBuf, std::fs::File)> {
         let dir = self.uploads_dir();
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let path = self.upload_path(&format!(
-            "{}-{}-{}",
-            std::process::id(),
-            self.next_upload.fetch_add(1, Ordering::Relaxed),
-            accounts::random_token(16),
-        ));
+        let path = self.upload_path(&self.new_upload_id());
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -572,6 +621,59 @@ impl Store {
             .open(&path)
             .with_context(|| format!("creating {}", path.display()))?;
         Ok((path, file))
+    }
+
+    /// A fresh upload id, `<pid>-<n>-<random hex>`: the counter keeps ids unique within a
+    /// process, the pid across the servers sharing a store, and the random tail unguessable,
+    /// so one client cannot reach another's in-flight upload by enumerating ids. Always a
+    /// [`valid_upload_id`].
+    fn new_upload_id(&self) -> String {
+        format!(
+            "{}-{}-{}",
+            std::process::id(),
+            self.next_upload.fetch_add(1, Ordering::Relaxed),
+            accounts::random_token(16),
+        )
+    }
+
+    /// Where S3 multipart uploads are staged, a directory each. A subdirectory of `uploads/`
+    /// whose name no upload id can take, so the OCI sessions beside it never collide with it.
+    fn multipart_root(&self) -> PathBuf {
+        self.root.join("uploads").join(MULTIPART_DIR)
+    }
+
+    /// The directory of S3 multipart upload `id`, whether or not it exists; `None` for an id
+    /// this server cannot have minted, which so never names anything outside it.
+    pub(crate) fn multipart_dir(&self, id: &str) -> Option<PathBuf> {
+        valid_upload_id(id).then(|| self.multipart_root().join(id))
+    }
+
+    /// A new S3 multipart upload's directory, private to this user from its creation: its id
+    /// and path. [`Store::gc`] sweeps it once nothing in it has been written for the grace
+    /// window.
+    pub(crate) fn create_multipart(&self) -> Result<(String, PathBuf)> {
+        use std::os::unix::fs::DirBuilderExt;
+        let root = self.multipart_root();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)
+            .with_context(|| format!("creating {}", root.display()))?;
+        let id = self.new_upload_id();
+        let dir = root.join(&id);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        Ok((id, dir))
+    }
+
+    /// The S3 multipart uploads in progress, by id: their directories.
+    pub(crate) fn multipart_uploads(&self) -> Vec<(String, PathBuf)> {
+        multipart_dirs(&self.multipart_root())
+            .into_iter()
+            .filter_map(|dir| Some((dir.file_name()?.to_str()?.to_string(), dir)))
+            .collect()
     }
 
     /// The repositories one level below `name` (`""` for the top level), sorted: the
@@ -614,6 +716,12 @@ impl Store {
         valid_name(name)
             && std::fs::symlink_metadata(self.root.join("repos").join(name))
                 .is_ok_and(|m| m.is_dir())
+    }
+
+    /// Whether anything is at `repos/<name>`, a directory or not: what keeps a name from
+    /// becoming a repository.
+    pub(crate) fn repo_path_taken(&self, name: &str) -> bool {
+        valid_name(name) && std::fs::symlink_metadata(self.root.join("repos").join(name)).is_ok()
     }
 
     /// Create an empty `tags/` directory and any missing ancestors for WebDAV `MKCOL`.
@@ -742,8 +850,9 @@ impl Store {
         self.put_raw_file_annotated(name, tag, layer_hex, size, title, &BTreeMap::new())
     }
 
-    /// [`Store::put_raw_file`] with `annotations` on the manifest: a [`Retention`].
-    fn put_raw_file_annotated(
+    /// [`Store::put_raw_file`] with `annotations` on the manifest: a [`Retention`], or what
+    /// a `files/` front keeps beside an object.
+    pub(crate) fn put_raw_file_annotated(
         &self,
         name: &str,
         tag: &str,
@@ -1110,6 +1219,77 @@ impl Store {
         std::fs::rename(&install, &dest).with_context(|| format!("promoting the blob {hex}"))?;
         drop_discard();
         Ok(())
+    }
+
+    /// `len` of blob `hex`'s canonical bytes from `start`, streamed through the body a whole
+    /// blob is, with the blob's canonical length; `None` when the blob is absent, and an error
+    /// when the part does not lie within it. Read as [`Store::read_blob_range`] reads it, and
+    /// served from that descriptor, as [`serve_blob`] is. Nothing is read for `head`.
+    pub(crate) fn serve_blob_range(
+        &self,
+        hex: &str,
+        start: u64,
+        len: u64,
+        head: bool,
+    ) -> Result<Option<BlobPart>> {
+        let Some((total, reader)) = self.read_blob_range(hex, start, len)? else {
+            return Ok(None);
+        };
+        let body = if head || len == 0 {
+            body_of(Bytes::new())
+        } else {
+            stream_body(reader, &format!("sha256:{hex}"))
+        };
+        Ok(Some(BlobPart { total, body }))
+    }
+
+    /// A blocking reader of `len` of blob `hex`'s canonical bytes from `start`, with the
+    /// blob's canonical length; `None` when the blob is absent, and an error when the part
+    /// does not lie within it. Opened once and read from that descriptor, and measured
+    /// without reading it.
+    ///
+    /// A plain blob is read from `start` after a seek. A zstd-stored one is decoded from the
+    /// frame's start and its first `start` bytes discarded by the reader's first read: O(`start`)
+    /// of decoding, with the decoder's window as memory, before the part's first byte. A
+    /// client reading a large zstd blob in consecutive ranges so pays quadratically, which is
+    /// why the S3 view stores its large writes plain ([`StagedBlob::uncompressed`]).
+    pub(crate) fn read_blob_range(
+        &self,
+        hex: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<Option<(u64, Box<dyn std::io::Read + Send + Sync>)>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let Some((path, is_zstd)) = self.find_blob(hex) else {
+            return Ok(None);
+        };
+        let mut file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        let total = if is_zstd {
+            zstd_canonical_len(&mut file)
+                .with_context(|| format!("measuring the stored blob {hex}"))?
+        } else {
+            file.metadata()
+                .with_context(|| format!("stat {}", path.display()))?
+                .len()
+        };
+        if start.checked_add(len).is_none_or(|end| end > total) {
+            bail!("bytes {start}+{len} of the blob {hex}, which holds {total}");
+        }
+        let reader: Box<dyn Read + Send + Sync> = if is_zstd {
+            let decoder =
+                zstd::stream::read::Decoder::new(file).context("opening a stored blob")?;
+            let skipped = Skip {
+                inner: decoder,
+                skip: start,
+            };
+            Box::new(skipped.take(len))
+        } else {
+            file.seek(SeekFrom::Start(start))
+                .with_context(|| format!("seeking in {}", path.display()))?;
+            Box::new(file.take(len))
+        };
+        Ok(Some((total, reader)))
     }
 
     /// Return a blob's decompressed bytes, or `None` if absent or larger than `cap`.
@@ -2002,6 +2182,11 @@ impl Store {
                 .into_iter()
                 .map(Last::Owner),
         );
+        last.extend(
+            multipart_dirs(&self.multipart_root())
+                .into_iter()
+                .map(Last::Multipart),
+        );
         let last_done = spells.run(Phase::Last, &mut plan, &idle, last, |plan, _, item| {
             match item {
                 Last::Sidecar(sidecar) => {
@@ -2035,6 +2220,30 @@ impl Store {
                         remove_if_present(&self.upload_owner_path(id))?;
                     }
                     remove(&upload)?;
+                    report.uploads_dropped += 1;
+                }
+                // An S3 multipart upload is idle when nothing in it has been written for the
+                // window: its directory's own mtime does not move when a part is rewritten in
+                // place, so the newest of its entries' says when it was last used. It goes
+                // whole, parts and all.
+                Last::Multipart(dir) => {
+                    let idle = newest_mtime(&dir)
+                        .and_then(|m| now.duration_since(m).ok())
+                        .is_some_and(|age| age > policy.grace);
+                    if !idle {
+                        return Ok(());
+                    }
+                    if !dry_run {
+                        match std::fs::remove_dir_all(&dir) {
+                            Ok(()) => {}
+                            // Gone since the listing: completed, aborted or swept meanwhile.
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                            Err(e) => {
+                                return Err(e)
+                                    .with_context(|| format!("removing {}", dir.display()));
+                            }
+                        }
+                    }
                     report.uploads_dropped += 1;
                 }
                 // An owner record whose session is already gone (dropped by an earlier sweep,
@@ -2652,6 +2861,7 @@ impl Store {
             s.uploads += 1;
             s.upload_bytes += std::fs::metadata(&up).map(|m| m.len()).unwrap_or(0);
         }
+        (s.multipart_uploads, s.multipart_bytes) = multipart_usage(&self.multipart_root());
 
         // per-repo content: a repo is a dir under repos/ holding any of its own
         // subdirectories. `blobs/` counts — a pull-through cache serving tag pulls holds
@@ -2930,7 +3140,27 @@ pub fn raw_file_title(manifest: &[u8]) -> Option<String> {
 /// any other shape: an image pushed over `/v2/` into a `files/` repository is not a file
 /// the WebDAV view serves.
 pub fn raw_file_layer(manifest: &[u8]) -> Option<(String, u64)> {
+    raw_file_layer_of(&serde_json::from_slice(manifest).ok()?)
+}
+
+/// [`raw_file_layer`] and the manifest's string annotations, from one parse; an annotation
+/// whose value is not a string is left out.
+pub(crate) fn raw_file_parts(manifest: &[u8]) -> Option<(String, u64, BTreeMap<String, String>)> {
     let v: serde_json::Value = serde_json::from_slice(manifest).ok()?;
+    let (hex, size) = raw_file_layer_of(&v)?;
+    let annotations = v
+        .pointer("/annotations")
+        .and_then(|a| a.as_object())
+        .map(|a| {
+            a.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((hex, size, annotations))
+}
+
+fn raw_file_layer_of(v: &serde_json::Value) -> Option<(String, u64)> {
     let [layer] = v.pointer("/layers")?.as_array()?.as_slice() else {
         return None;
     };
@@ -3015,6 +3245,7 @@ pub struct GcReport {
     pub blobs_dropped: usize,
     /// the space the dropped blobs took on disk (allocated blocks)
     pub bytes_freed: u64,
+    /// idle upload sessions and staging files, and idle S3 multipart uploads
     pub uploads_dropped: usize,
     /// membership markers removed because the blob they named is gone
     pub blob_markers_dropped: usize,
@@ -3210,6 +3441,8 @@ enum Last {
     Marker(PathBuf, String),
     Upload(PathBuf),
     Owner(PathBuf),
+    /// an S3 multipart upload's directory under `uploads/s3/`
+    Multipart(PathBuf),
 }
 
 /// The exclusive spells of one [`Store::gc_with`] pass.
@@ -3382,6 +3615,9 @@ pub struct StoreStats {
     pub zstd_bytes: u64,
     pub uploads: usize,
     pub upload_bytes: u64,
+    /// S3 multipart uploads in progress, and the bytes of their parts so far
+    pub multipart_uploads: usize,
+    pub multipart_bytes: u64,
     pub total_tags: usize,
     pub total_manifests: usize,
     /// membership markers across every repo, summed — the inode cost of repo-scoping
@@ -3617,6 +3853,55 @@ fn dir_files(dir: &Path) -> Vec<PathBuf> {
         .map(|e| e.path())
         .filter(|p| p.is_file())
         .collect()
+}
+
+/// The directory multipart uploads are staged in, under `uploads/` (see
+/// [`Store::create_multipart`]).
+const MULTIPART_DIR: &str = "s3";
+
+/// The S3 multipart upload directories directly inside `dir`, by `lstat`: real directories
+/// named like an upload id, so nothing else there is ever swept as one (a missing dir reads
+/// as empty).
+fn multipart_dirs(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| e.file_name().to_str().is_some_and(valid_upload_id))
+        .map(|e| e.path())
+        .collect()
+}
+
+/// When anything in `dir` was last written: the newest mtime of the directory and of the
+/// entries directly in it, by `lstat`. `None` when the directory cannot be read, which a
+/// sweep takes as fresh: never delete on uncertain evidence.
+fn newest_mtime(dir: &Path) -> Option<SystemTime> {
+    let mut newest = std::fs::symlink_metadata(dir).ok()?.modified().ok()?;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let modified = entry.ok()?.metadata().ok()?.modified().ok()?;
+        newest = newest.max(modified);
+    }
+    Some(newest)
+}
+
+/// The record an S3 multipart upload in progress keeps in its directory: a completed upload's
+/// directory, kept for a while to answer its completion again, has none.
+pub(crate) const MULTIPART_RECORD: &str = "meta.json";
+
+/// What the S3 multipart uploads in progress in `dir` hold: how many there are, and their
+/// files' bytes.
+fn multipart_usage(dir: &Path) -> (usize, u64) {
+    let uploads: Vec<PathBuf> = multipart_dirs(dir)
+        .into_iter()
+        .filter(|d| d.join(MULTIPART_RECORD).is_file())
+        .collect();
+    let bytes = uploads
+        .iter()
+        .flat_map(|d| dir_files(d))
+        .map(|f| std::fs::metadata(f).map_or(0, |m| m.len()))
+        .sum();
+    (uploads.len(), bytes)
 }
 
 /// A held store lock (see [`Store::lock_shared`]); released when dropped (flock
@@ -4041,6 +4326,11 @@ async fn serve_refusing(
     if !state.webdav {
         eprintln!("vk-registry: WebDAV off (webdav = false): /dav/ answers 404");
     }
+    if !state.s3 {
+        eprintln!("vk-registry: S3 off (s3 = false): /s3/ answers 404");
+    } else if let Some(host) = &state.s3_host {
+        eprintln!("vk-registry: S3 buckets also served as <bucket>.{host}");
+    }
     let slots = Arc::new(tokio::sync::Semaphore::new(limits.connections));
     let peers = PeerCounts::default();
     let mut refused = RefusalLog::default();
@@ -4380,7 +4670,7 @@ fn closing_after_refusal(mut resp: Response<Body>, has_body: bool) -> Response<B
 
 /// Whether the browser says another site made this request (`Sec-Fetch-Site`). A browser
 /// that predates the header, and every non-browser client, sends none.
-fn cross_site(headers: &hyper::HeaderMap) -> bool {
+pub(crate) fn cross_site(headers: &hyper::HeaderMap) -> bool {
     headers
         .get("sec-fetch-site")
         .and_then(|v| v.to_str().ok())
@@ -4408,6 +4698,15 @@ fn token_challenge(auth: &Authenticator) -> Response<Body> {
 }
 
 async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Response<Body>> {
+    // A host naming a bucket under `s3_host` makes the whole path an S3 key, so this comes
+    // before any route a path selects: an object may be called `login`.
+    if state.s3
+        && let Some(s3_host) = &state.s3_host
+        && let Some(bucket) = s3::host_of(&req).and_then(|h| s3::virtual_bucket(s3_host, h))
+    {
+        let bucket = bucket.to_string();
+        return s3::route(&state, Some(&bucket), req).await;
+    }
     let path = req.uri().path().to_string();
 
     // OIDC login/callback/logout must be reachable without a principal — gating the
@@ -4415,6 +4714,14 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     // the auth gate below, the same way `/lock/` is exempt from `/v2/` routing.
     if matches!(path.as_str(), "/login" | "/auth/callback" | "/logout") {
         return oidc::route(&state, req).await;
+    }
+
+    // S3 clients get S3's answers from the gate too — a 403 in XML where the other routes
+    // challenge with a 401, and a SigV4 signature checked where they take a bearer — so
+    // `/s3/` passes through a gate of its own, built on the same resolvers. Disabled, it is
+    // the 404 below after this gate, as a disabled `/dav/` is.
+    if state.s3 && s3::is_path(&path) {
+        return s3::route(&state, None, req).await;
     }
 
     // Client auth on every other path, including the `/v2/` version probe. Returning
@@ -4497,7 +4804,7 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
             resolved
         }
         Authenticator::Shared(auth) => {
-            if auth.enabled() && !auth.allows(&req) {
+            if auth.enabled() && !auth.allows(req.headers()) {
                 return Ok(auth.challenge());
             }
             None
@@ -4852,15 +5159,9 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
 
 /// POST /v2/<name>/blobs/uploads/ — open an upload session (an empty temp file).
 fn start_upload(store: &Store, name: &str) -> Result<Response<Body>> {
-    // The counter keeps ids unique within a process; the random tail keeps them
-    // unguessable, so one client cannot append to another's in-flight upload by
+    // Unguessable, so one client cannot append to another's in-flight upload by
     // enumerating session ids.
-    let id = format!(
-        "{}-{}-{}",
-        std::process::id(),
-        store.next_upload.fetch_add(1, Ordering::Relaxed),
-        accounts::random_token(16),
-    );
+    let id = store.new_upload_id();
     // The binding first, the session second: `upload_is_for` fails closed, so a session
     // file that existed before its binding would be a session nothing could finish — and,
     // worse, the gc's orphaned-binding sweep keys on "a binding whose session is absent".
@@ -5293,6 +5594,34 @@ impl Authz<'_> {
     /// Whether this caller may read `repo`.
     fn may_read(&self, repo: &str) -> bool {
         self.may(accounts::Action::Read, repo)
+    }
+
+    /// Whether this caller may read `repo` or a repository below it: what a probe of a
+    /// directory needs, whose contents the caller may see only part of. A scope or grant
+    /// reaches below `repo` when what it covers starts there.
+    fn may_read_below(&self, repo: &str) -> bool {
+        use vk_hub_proto::token::under;
+        if self.may_read(repo) {
+            return true;
+        }
+        match self {
+            Authz::NoScopes => true,
+            Authz::Accounts(accounts::Principal::Session(_)) => false,
+            // Either action reads; `*` and every pattern above `repo` passed `may_read`.
+            Authz::Accounts(accounts::Principal::ApiKey(key)) => key.scopes.iter().any(|s| {
+                let root = s.repo_pattern.strip_suffix("/*").unwrap_or(&s.repo_pattern);
+                under(repo, root)
+            }),
+            // A grant covers `<prefix>` and `files/<prefix>`, as `Claims::allows_repo` reads it.
+            Authz::Token(claims) => claims.grants.iter().any(|g| {
+                g.read
+                    && (under(repo, &g.prefix)
+                        || repo
+                            .strip_prefix(files::FILES_REPO)
+                            .and_then(|r| r.strip_prefix('/'))
+                            .is_some_and(|r| under(r, &g.prefix)))
+            }),
+        }
     }
 
     /// Whether this caller may do `action` on `repo`.
@@ -6065,6 +6394,14 @@ fn status_to(out: &mut impl std::io::Write, cmd: &str, root: PathBuf) -> Result<
             s.uploads,
         )?;
     }
+    if s.multipart_uploads > 0 {
+        writeln!(
+            out,
+            "  Multipart uploads in progress: {} ({} uploads, separate from stored blobs)",
+            human_bytes(s.multipart_bytes),
+            s.multipart_uploads,
+        )?;
+    }
     if !s.repos.is_empty() {
         writeln!(out)?;
         writeln!(out, "  {:<40} {:>5}", "REPOSITORY", "TAGS")?;
@@ -6413,6 +6750,8 @@ mod tests {
             auth: Authenticator::Shared(auth),
             tls,
             webdav: false,
+            s3: false,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         });
@@ -6854,6 +7193,8 @@ mod tests {
                 auth: Authenticator::Shared(auth::Auth::None),
                 tls: acceptor,
                 webdav: false,
+                s3: false,
+                s3_host: None,
                 tokens: Default::default(),
                 handover: Default::default(),
             });
@@ -7953,6 +8294,61 @@ mod tests {
         assert_eq!(report.manifests_dropped, 1);
         assert_eq!(report.blobs_dropped, 3);
         assert_eq!(report.uploads_dropped, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An S3 multipart upload is idle when nothing in it was written for the grace window:
+    /// one whose part was rewritten lately stays, however old its directory, as does one
+    /// holding only a fresh record; an idle one goes whole. `status` counts the ones left.
+    #[test]
+    fn gc_sweeps_idle_multipart_uploads_by_their_newest_entry() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let (_, idle) = store.create_multipart().unwrap();
+        let (_, busy) = store.create_multipart().unwrap();
+        let (_, fresh) = store.create_multipart().unwrap();
+        for up in [&idle, &busy] {
+            std::fs::write(up.join("meta.json"), b"{}").unwrap();
+            std::fs::write(up.join("part-1"), b"part").unwrap();
+            std::fs::write(up.join("part-1.json"), b"{}").unwrap();
+        }
+        std::fs::write(fresh.join("meta.json"), b"{}").unwrap();
+        // Completed lately: kept, and not counted as in progress.
+        let (_, done) = store.create_multipart().unwrap();
+        std::fs::write(done.join("completed.json"), b"{}").unwrap();
+        // Not an upload's name: never taken for one.
+        std::fs::create_dir_all(dir.join("uploads/s3/not-an-upload")).unwrap();
+
+        let old = SystemTime::now() - DAY * 100;
+        backdate_all(&dir, old);
+        for up in [&idle, &busy, &fresh, &dir.join("uploads/s3/not-an-upload")] {
+            std::fs::File::open(up).unwrap().set_modified(old).unwrap();
+        }
+        touch(&busy.join("part-1"));
+        touch(&fresh.join("meta.json"));
+        touch(&done.join("completed.json"));
+        let s = store.stats().unwrap();
+        assert_eq!((s.multipart_uploads, s.multipart_bytes), (3, 8 + 8 + 2));
+        let mut out = Vec::new();
+        status_to(&mut out, "vk-registry", dir.clone()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("Multipart uploads in progress: 18 B (3 uploads"),
+            "{out}"
+        );
+
+        let dry = store.gc(DAY * 30, DAY, true).unwrap();
+        assert_eq!(dry.uploads_dropped, 1);
+        assert!(idle.is_dir(), "a dry run removes nothing");
+        let report = store.gc(DAY * 30, DAY, false).unwrap();
+        assert_eq!(report.uploads_dropped, 1);
+        assert!(!idle.exists());
+        assert!(busy.join("part-1").is_file());
+        assert!(fresh.join("meta.json").is_file());
+        assert!(done.join("completed.json").is_file());
+        assert!(dir.join("uploads/s3/not-an-upload").is_dir());
+        assert_eq!(store.stats().unwrap().multipart_uploads, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9973,6 +10369,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A caller may read below a repository when it may read the repository, or when a
+    /// scope or grant covers something that starts below it, cut at a component.
+    #[test]
+    fn reading_below_a_repository_follows_what_scopes_and_grants_cover() {
+        let key = |scopes: &[(accounts::Action, &str)]| {
+            accounts::Principal::ApiKey(accounts::ApiKey {
+                id: "hash".to_string(),
+                owner_user_id: None,
+                name: "k".to_string(),
+                token_prefix: "0123abcd".to_string(),
+                scopes: scopes
+                    .iter()
+                    .map(|(action, pattern)| accounts::Scope {
+                        action: *action,
+                        repo_pattern: pattern.to_string(),
+                    })
+                    .collect(),
+                created_at: SystemTime::UNIX_EPOCH,
+                expires_at: None,
+                last_used_at: None,
+                revoked_at: None,
+            })
+        };
+        let read = accounts::Action::Read;
+        let prefix = key(&[(read, "files/b/p/*")]);
+        let authz = Authz::Accounts(&prefix);
+        assert!(authz.may_read_below("files/b"));
+        assert!(authz.may_read_below("files"));
+        assert!(authz.may_read_below("files/b/p"));
+        assert!(authz.may_read_below("files/b/p/q"));
+        assert!(!authz.may_read("files/b"));
+        assert!(!authz.may_read_below("files/c"));
+        assert!(!authz.may_read_below("files/bb"));
+        assert!(!authz.may_read_below("files/b/pp"));
+        let exact = key(&[(accounts::Action::Write, "files/b/p")]);
+        assert!(Authz::Accounts(&exact).may_read_below("files/b"));
+        assert!(!Authz::Accounts(&exact).may_read_below("files/b/p/q"));
+        let any = key(&[(read, "*")]);
+        assert!(Authz::Accounts(&any).may_read_below("files/x"));
+        let none = key(&[]);
+        assert!(!Authz::Accounts(&none).may_read_below("files/b"));
+        assert!(Authz::NoScopes.may_read_below("files/b"));
+
+        let c = claims(&[("b/p", "r"), ("w/only", "w"), ("images", "r")]);
+        let authz = Authz::Token(&c);
+        assert!(authz.may_read_below("files/b"));
+        assert!(authz.may_read_below("files/b/p/q"));
+        assert!(authz.may_read_below("b"));
+        assert!(authz.may_read_below("files/images"));
+        assert!(!authz.may_read_below("files/w"));
+        assert!(!authz.may_read_below("files/bp"));
+        assert!(!authz.may_read_below("files/c"));
+    }
+
     /// A prefix's window drops its idle tags well inside the store-wide one, and holds a far
     /// `expires` annotation to itself, and a `keep` too under a window the config sets; under
     /// one the hub added, `keep` and a far `expires` hold, and a past `expires` does not.
@@ -10183,6 +10633,66 @@ mod tests {
             shown.contains("sha256:beef") && shown.contains("the disk went away"),
             "the error must name the blob and the cause, got {shown}"
         );
+    }
+
+    /// A range of a blob is the same bytes stored plain (a seek) or as a zstd frame (decoded
+    /// and skipped), across chunk boundaries, at either end and whole; a HEAD reads nothing,
+    /// and a part not within the blob is an error, not a short body.
+    #[tokio::test]
+    async fn a_blob_range_is_the_same_bytes_plain_or_zstd() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-range-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        // Compressible, so `put_blob` keeps a frame; long enough for several chunks.
+        let raw: Vec<u8> = (0..3 * STREAM_CHUNK + 17)
+            .map(|i| (i / 1000 % 251) as u8)
+            .collect();
+        let zstd = store.put_blob(&raw).unwrap();
+        let zstd = zstd.trim_start_matches("sha256:");
+        assert!(store.zstd_blob_path(zstd).is_file());
+        let mut other = raw.clone();
+        other[0] ^= 1;
+        let plain = sha256_hex_raw(&other);
+        atomic_write(&store.blob_path(&plain), &other).unwrap();
+        let total = raw.len() as u64;
+
+        for (hex, raw) in [(zstd, &raw), (plain.as_str(), &other)] {
+            let read = async |start: u64, len: u64| {
+                let part = store
+                    .serve_blob_range(hex, start, len, false)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(part.total, total);
+                part.body.collect().await.unwrap().to_bytes().to_vec()
+            };
+            let at = |start: usize, len: usize| raw[start..start + len].to_vec();
+            assert_eq!(read(0, 1).await, at(0, 1));
+            assert_eq!(read(0, 100).await, at(0, 100));
+            let middle = STREAM_CHUNK as u64 - 5;
+            assert_eq!(
+                read(middle, STREAM_CHUNK as u64 + 10).await,
+                at(middle as usize, STREAM_CHUNK + 10),
+                "across a chunk"
+            );
+            assert_eq!(read(total - 1, 1).await, at(raw.len() - 1, 1));
+            assert_eq!(read(0, total).await, *raw);
+            assert!(read(total, 0).await.is_empty(), "a zero-length tail");
+
+            let head = store.serve_blob_range(hex, 5, 10, true).unwrap().unwrap();
+            assert_eq!(head.total, total);
+            assert!(head.body.collect().await.unwrap().to_bytes().is_empty());
+            assert!(store.serve_blob_range(hex, total, 1, false).is_err());
+            assert!(store.serve_blob_range(hex, 1, total, false).is_err());
+            assert!(store.serve_blob_range(hex, u64::MAX, 2, false).is_err());
+        }
+        let absent = sha256_hex_raw(b"absent");
+        assert!(
+            store
+                .serve_blob_range(&absent, 0, 1, false)
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A reader whose length is an exact multiple of the chunk ends on the empty read,

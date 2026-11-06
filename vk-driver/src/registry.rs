@@ -5660,6 +5660,8 @@ pub(crate) mod tests {
             auth: vk_registry::Authenticator::Shared(auth),
             tls: None,
             webdav: true,
+            s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }))
@@ -5707,6 +5709,8 @@ pub(crate) mod tests {
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
             webdav: true,
+            s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }));
@@ -5742,6 +5746,8 @@ pub(crate) mod tests {
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
             webdav: true,
+            s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }));
@@ -5855,6 +5861,8 @@ pub(crate) mod tests {
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
             webdav: true,
+            s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }));
@@ -6104,6 +6112,8 @@ pub(crate) mod tests {
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
             webdav: true,
+            s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }));
@@ -6162,6 +6172,8 @@ pub(crate) mod tests {
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
             webdav: true,
+            s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }));
@@ -6203,6 +6215,8 @@ pub(crate) mod tests {
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
             webdav: true,
+            s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }));
@@ -6239,6 +6253,8 @@ pub(crate) mod tests {
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
             webdav: true,
+            s3: true,
+            s3_host: None,
             tokens: Default::default(),
             handover: Default::default(),
         }));

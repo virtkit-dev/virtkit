@@ -632,8 +632,8 @@ though within them it can claim protection.
 
 ### 4b: registry access from inside a job
 
-- **The proxy.** When it injects a job token, the credential proxy forwards `/lock/` and
-  `/dav/files/` as well as `/v2/`. With the node's credential it keeps refusing anything
+- **The proxy.** When it injects a job token, the credential proxy forwards `/lock/`,
+  `/dav/files/` and the S3 view (`/s3`) as well as `/v2/`. With the node's credential it keeps refusing anything
   outside `/v2/`, since that credential is not scoped. The proxy filters no namespace
   itself: the registry enforces the token.
   - It sets no response timeout of its own: `/lock/acquire` long-polls for up to an hour by
@@ -674,12 +674,21 @@ though within them it can claim protection.
     (`name=job/<alias>/…:<key>`, decoded as the registry decodes it). The mapped URL goes
     through the proxy's checks again. Any other path is forwarded as it is; `job/…` naming no
     alias of the job is refused with 403 and not forwarded.
+  - On the S3 view, `/s3/job/<alias>/<key…>` is likewise the key below the area's prefix, and
+    `x-amz-copy-source: /job/<alias>/<key>` the same. A prefix `a/b/c` is bucket `a` and key
+    prefix `b/c/`. `/s3/job/<alias>` alone is the area as a bucket: its listings go to bucket
+    `a` with `b/c/` put before their `prefix`, `start-after`, `marker` and `key-marker` and
+    into their `continuation-token` (base64url of a key), so they stay in the area; when the
+    prefix has more than one component, only reads pass there. The guest's SigV4
+    `Authorization`, with dummy keys or none, is replaced by the token, as any other.
   - No other query parameter is mapped: an OCI cross-repository mount's `from=job/<alias>/…`
     reaches the registry as it is.
   - Only requests are mapped. The registry answers with real names, an upload's `Location`
     among them, which the proxy forwards unchanged, so a client continues on the real path.
     A `PROPFIND`'s hrefs are mapped back to the alias, since a WebDAV client resolves a
-    listing against the root it asked for.
+    listing against the root it asked for, and so are the names in an S3 document answering
+    a request through an area — the bucket, keys, prefixes, markers, continuation tokens, a
+    `Location` and an error's `Resource` — and a created bucket's `Location`.
   - No namespace's path may start with `job`. The hub refuses an alias while one stored
     before that rule has such a path, and gives no job any alias until it moves.
   - The hub sends a job's areas (`JobRegistry.areas`) only to a node announcing
@@ -694,7 +703,17 @@ though within them it can claim protection.
 - **In-job tools.** task-rs takes `vk: http://registry.vk/job/task-cache` as its cache:
   entries under the alias and lock names `job/task-cache/<namespace>:<key>`. sccache uses
   `$VK_REGISTRY/dav/files/job/<alias>` as its WebDAV endpoint (the alias in the endpoint, not
-  in `key_prefix`, so it never creates `/dav/files/job/` itself). Neither holds a credential.
+  in `key_prefix`, so it never creates `/dav/files/job/` itself), or the S3 view:
+
+  ```sh
+  SCCACHE_BUCKET=job SCCACHE_S3_KEY_PREFIX=<alias>/ SCCACHE_ENDPOINT=$VK_REGISTRY/s3 \
+    SCCACHE_REGION=auto SCCACHE_S3_NO_CREDENTIALS=true
+  ```
+
+  `SCCACHE_S3_NO_CREDENTIALS` sends unsigned requests; dummy `AWS_ACCESS_KEY_ID` and
+  `AWS_SECRET_ACCESS_KEY` do as well, since the proxy drops the signature. Other S3 clients
+  list an area as the bucket `<alias>` at the endpoint `$VK_REGISTRY/s3/job`, path-style
+  (`aws --endpoint-url $VK_REGISTRY/s3/job s3 ls s3://<alias>/`). None holds a credential.
 
 ### 4c: pipeline caches and captures
 

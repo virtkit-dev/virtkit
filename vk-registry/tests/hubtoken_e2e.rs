@@ -90,6 +90,8 @@ fn shared_with(
         auth: vk_registry::Authenticator::Shared(auth),
         tls: None,
         webdav: true,
+        s3: true,
+        s3_host: None,
         tokens: Default::default(),
         handover: Default::default(),
     });

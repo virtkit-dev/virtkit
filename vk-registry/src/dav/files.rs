@@ -1,164 +1,29 @@
-//! Plain files under `/dav/files/<dir>/` share the OCI pool. Directories map to repositories
-//! under `files/`; each leaf is a tag on a single-layer raw-file manifest, as written by
-//! `/upload`, whose layer holds the file bytes. `PUT` streams to `uploads/` while hashing,
-//! promotes the blob, then writes the manifest and tag. `MKCOL` creates an empty repository;
-//! `DELETE` removes a tag or an empty repository. Authorization uses the resource's repository,
-//! so `files/<dir>/*` covers a whole tree. Entries expire under gc's tag retention and blob
-//! grace windows.
+//! The WebDAV view of the plain-file area, under `/dav/files/<dir>/`, over the object layer in
+//! [`crate::files`]: this module maps WebDAV verbs, statuses and bodies onto it. `PUT` stages
+//! and commits an object; `MKCOL` creates an empty repository; `DELETE` removes a tag or an
+//! empty repository. Authorization uses the resource's repository, so `files/<dir>/*` covers
+//! a whole tree.
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
-use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, LAST_MODIFIED};
 use hyper::{Request, Response, StatusCode};
-use sha2::{Digest, Sha256};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::{
     ALLOWED_FILES, ALLOWED_READ, Depth, Entry, blocking, created, href, http_date,
     method_not_allowed, multistatus, no_content, not_found, options, propfind_depth, refuse,
 };
-use crate::{Authz, Body, RepoRemoval, STREAM_CHUNK, ServerState, Store, accounts, error_response};
-
-/// The repository every `/dav/files/` path lives under.
-pub(super) const FILES_REPO: &str = "files";
-
-/// Maximum object size, checked both against Content-Length and while streaming.
-const MAX_OBJECT: u64 = 4 << 30;
+use crate::files::{
+    DELETE_LOCK_WAIT, FILES_REPO, MAX_OBJECT, Node, Object, PutError, Unwritable, Written, allowed,
+    drain_into, namespace, object_of, repo_name, resolve, under_object,
+};
+use crate::{Authz, Body, RepoRemoval, ServerState, Store, accounts, error_response};
 
 /// What every object is served as, matching `/v2/` blobs.
 const OBJECT_TYPE: &str = "application/octet-stream";
-
-/// Minimum idle age before a `GET` refreshes the tag's mtime — the "last used" record the
-/// gc's retention keys on — so a cache read is a metadata write at most once an hour.
-const TOUCH_AFTER: Duration = Duration::from_secs(3600);
-
-/// Serialize `files/` checks and namespace changes (`PUT` tags, `MKCOL`, `DELETE`) in this
-/// server so a `PUT` and `MKCOL` of the same path cannot both succeed. Acquire before the
-/// store lock, never while holding it. `/v2/` writes into `files/` do not take this lock.
-static NAMESPACE: Mutex<()> = Mutex::new(());
-
-/// The namespace held, in this process and against any other serving the store: a registry
-/// and the release it hands over to serve it together for a while.
-struct Namespace {
-    _process: std::sync::MutexGuard<'static, ()>,
-    _store: crate::LockGuard,
-}
-
-/// Hold [`NAMESPACE`], then the store's namespace lock. Accept a poisoned mutex: it guards
-/// no data that a panic could leave inconsistent.
-fn namespace(store: &Store) -> Result<Namespace> {
-    let process = NAMESPACE.lock().unwrap_or_else(PoisonError::into_inner);
-    Ok(Namespace {
-        _process: process,
-        _store: store.lock_namespace()?,
-    })
-}
-
-/// What a `files/` path names once the store has been looked at.
-enum Node {
-    /// A repository under `files/`, or a path component above one: a directory.
-    Dir(String),
-    /// A tag on a raw-file manifest: an object.
-    Object(Object),
-    /// A tag on any other manifest — an image pushed over `/v2/` into a `files/`
-    /// repository. Absent to reads; a write there is 409, so nothing here replaces or
-    /// deletes it.
-    Foreign(String),
-}
-
-/// An object's tag and what its manifest says about the layer.
-struct Object {
-    repo: String,
-    tag: String,
-    /// the layer blob's hex
-    layer: String,
-    /// the layer's canonical length
-    size: u64,
-    /// the tag's mtime
-    modified: SystemTime,
-}
-
-impl Node {
-    /// The repository this node authorizes as.
-    fn repo(&self) -> &str {
-        match self {
-            Node::Dir(r) | Node::Foreign(r) => r,
-            Node::Object(o) => &o.repo,
-        }
-    }
-}
-
-/// The repository a run of path components names: `files/<segs…>`.
-fn repo_name(segs: &[String]) -> String {
-    let mut name = String::from(FILES_REPO);
-    for s in segs {
-        name.push('/');
-        name.push_str(s);
-    }
-    name
-}
-
-/// The repository and tag an object at `segs` would have: the last component is the tag.
-fn object_of(segs: &[String]) -> Option<(String, &str)> {
-    let (leaf, parents) = segs.split_last()?;
-    (!parents.is_empty()).then(|| (repo_name(parents), leaf.as_str()))
-}
-
-/// What is at `segs`: a directory, an object, a foreign tag, or nothing. A directory is any
-/// path under `repos/files/` that is one — a repository, or the parent a nested repository's
-/// name created — so the tree reads as the client wrote it.
-fn resolve(store: &Store, segs: &[String]) -> Result<Option<Node>> {
-    let dir = repo_name(segs);
-    if store.repo_dir_exists(&dir) {
-        return Ok(Some(Node::Dir(dir)));
-    }
-    let Some((repo, tag)) = object_of(segs) else {
-        return Ok(None);
-    };
-    let Some((manifest_hex, modified)) = store.tag_target(&repo, tag) else {
-        return Ok(None);
-    };
-    let layer = match store.get_blob(&manifest_hex)? {
-        Some(manifest) => crate::raw_file_layer(&manifest),
-        None => None,
-    };
-    Ok(Some(match layer {
-        Some((layer, size)) => Node::Object(Object {
-            repo,
-            tag: tag.to_string(),
-            layer,
-            size,
-            modified,
-        }),
-        None => Node::Foreign(repo),
-    }))
-}
-
-/// Whether an ancestor of `segs` is a tag. Writing below one would make its path a directory
-/// too, and [`resolve`] would then find the directory and hide the tag: RFC 4918 wants a 409
-/// for a parent that is not a collection. A top-level name is always a directory.
-fn under_object(store: &Store, segs: &[String]) -> Result<bool> {
-    for n in 2..segs.len() {
-        if matches!(
-            resolve(store, &segs[..n])?,
-            Some(Node::Object(_) | Node::Foreign(_))
-        ) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Whether this caller may `action` on `repo`.
-fn allowed(authz: &Authz<'_>, action: accounts::Action, repo: &str) -> bool {
-    crate::authorize_or_forbidden(authz, action, repo).is_none()
-}
 
 /// Serve one `files/` request; `segs` are the decoded components after `/dav/files/`, and
 /// `collection` whether the path ended in a slash — which an object's path never does.
@@ -339,12 +204,8 @@ fn get(
     if resp.status() == StatusCode::OK {
         // A GET served is a use, which is what keeps the tag from the gc's retention.
         // Refreshed only once idle, so a hot entry is not a metadata write per hit.
-        if !head
-            && SystemTime::now()
-                .duration_since(obj.modified)
-                .is_ok_and(|idle| idle > TOUCH_AFTER)
-        {
-            store.touch_tag(&obj.repo, &obj.tag);
+        if !head {
+            crate::files::touch_if_idle(store, &obj);
         }
         let headers = resp.headers_mut();
         // Prevent uploaded content from rendering on the `/browse` origin.
@@ -419,44 +280,13 @@ fn propfind(
     }
 }
 
-/// Why a streamed `PUT` stopped short.
-enum PutError {
-    /// the body crossed [`MAX_OBJECT`] — a 413, decided while reading
-    TooLarge,
-    /// the read or the write failed — a 500
-    Failed(anyhow::Error),
-}
-
-/// A staging file under `uploads/`, unlinked when dropped unless its bytes were promoted —
-/// including when the handler's future is dropped with the connection mid-body.
-struct Staging {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl Drop for Staging {
-    fn drop(&mut self) {
-        if self.armed {
-            // Gone already (a promotion that renamed it, or a discard) is the goal; any
-            // other failure leaves it to the gc's sweep of idle uploads.
-            let _ = std::fs::remove_file(&self.path);
-        }
+/// The answer to a `PUT` at a path that takes no object: a top-level name or a directory is
+/// 405, a foreign tag there or any tag above it 409.
+fn put_refusal(why: Unwritable, href: &str) -> Response<Body> {
+    match why {
+        Unwritable::TopLevel | Unwritable::Directory => method_not_allowed(href, ALLOWED_FILES),
+        Unwritable::Foreign | Unwritable::UnderObject => parent_is_object(href),
     }
-}
-
-/// Why `segs` cannot take an object, re-checked under [`NAMESPACE`] before the tag is
-/// written: a top-level name or a directory is 405, a foreign tag there or any tag above
-/// it 409. `None` when the `PUT` may proceed.
-fn put_refusal(store: &Store, segs: &[String], href: &str) -> Result<Option<Response<Body>>> {
-    if object_of(segs).is_none() {
-        return Ok(Some(method_not_allowed(href, ALLOWED_FILES)));
-    }
-    Ok(match resolve(store, segs)? {
-        Some(Node::Dir(_)) => Some(method_not_allowed(href, ALLOWED_FILES)),
-        Some(Node::Foreign(_)) => Some(parent_is_object(href)),
-        _ if under_object(store, segs)? => Some(parent_is_object(href)),
-        _ => None,
-    })
 }
 
 /// Stream an object into staging, hashing it on the way, then promote the blob and write the
@@ -492,27 +322,18 @@ async fn put(
     // Refused before the body is staged when the answer is already known; checked again
     // once it is, under the namespace lock.
     let early = {
-        let (store, segs, href) = (Arc::clone(&state.store), segs.clone(), href.to_string());
-        tokio::task::spawn_blocking(move || put_refusal(&store, &segs, &href))
+        let (store, segs) = (Arc::clone(&state.store), segs.clone());
+        tokio::task::spawn_blocking(move || crate::files::unwritable(&store, &segs))
             .await
             .context("checking a PUT panicked")??
     };
-    if let Some(resp) = early {
-        return refuse(req, resp, href).await;
+    if let Some(why) = early {
+        return refuse(req, put_refusal(why, href), href).await;
     }
 
     // Stream uploads to bound memory use; the digest falls out of the same pass.
-    let (path, file) = state.store.stage_file()?;
-    let staging = Staging { path, armed: true };
-    let mut file = tokio::fs::File::from_std(file);
-    let written = drain_into(&mut file, req.into_body(), MAX_OBJECT).await;
-    let flushed = file
-        .flush()
-        .await
-        .map_err(|e| PutError::Failed(anyhow::Error::from(e).context("writing an object")));
-    drop(file);
-    let (size, hex) = match written.and_then(|w| flushed.map(|()| w)) {
-        Ok(w) => w,
+    let staged = match crate::files::stage(&state.store, req.into_body(), &mut |_| {}).await {
+        Ok(staged) => staged,
         Err(PutError::TooLarge) => {
             return Ok(error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -522,48 +343,30 @@ async fn put(
         }
         Err(PutError::Failed(e)) => return Err(e),
     };
-
-    // Off the runtime: staging compresses, and a large object would otherwise block a tokio
-    // worker for seconds. The locks are taken inside, after that pass — the store lock as
-    // the relay takes it.
-    let store = Arc::clone(&state.store);
-    let href = href.to_string();
-    tokio::task::spawn_blocking(move || -> Result<Response<Body>> {
-        let mut staging = staging;
-        let staged = store.stage_promotion(&hex, &staging.path)?;
-        let _namespace = namespace(&store)?;
-        // shared store lock (vs. an exclusive gc) across the promote and the manifest that
-        // references it; see Store::lock_shared. A `MKCOL` or another `PUT` may have changed
-        // the path while the body streamed, so it is checked again.
-        let checked = store.lock_shared().and_then(|lock| {
-            let existed = matches!(resolve(&store, &segs)?, Some(Node::Object(_)));
-            Ok((lock, put_refusal(&store, &segs, &href)?, existed))
-        });
-        let (_lock, existed) = match checked {
-            Ok((lock, None, existed)) => (lock, existed),
-            Ok((_, Some(resp), _)) => {
-                staged.discard();
-                return Ok(resp);
-            }
-            Err(e) => {
-                staged.discard();
-                return Err(e);
-            }
-        };
-        store.promote_staged(&hex, staged)?;
-        staging.armed = false;
-        let (repo, tag) = object_of(&segs).context("a PUT past its checks names an object")?;
-        store.put_raw_file(&repo, tag, &hex, size, None)?;
-        Ok(if existed { no_content() } else { created() })
-    })
-    .await
-    .context("the object's promotion panicked")?
+    Ok(
+        match crate::files::commit(Arc::clone(&state.store), segs, staged, Default::default())
+            .await?
+        {
+            Written::Created => created(),
+            Written::Replaced => no_content(),
+            Written::Refused(why) => put_refusal(why, href),
+            // Unreachable: no precondition was asked for.
+            Written::PreconditionFailed { .. } => no_content(),
+        },
+    )
 }
 
 /// Read a request's body through and discard it: a status sent with request bytes unread
 /// resets the connection. `Some(413)` if the body crosses the object cap on the way.
 pub(super) async fn drain(req: Request<Incoming>, href: &str) -> Result<Option<Response<Body>>> {
-    match drain_into(&mut tokio::io::sink(), req.into_body(), MAX_OBJECT).await {
+    match drain_into(
+        &mut tokio::io::sink(),
+        req.into_body(),
+        MAX_OBJECT,
+        &mut |_| {},
+    )
+    .await
+    {
         Ok(_) => Ok(None),
         Err(PutError::TooLarge) => Ok(Some(error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -589,55 +392,9 @@ fn parent_is_object(href: &str) -> Response<Body> {
     error_response(StatusCode::CONFLICT, "DENIED", href)
 }
 
-/// Stream `body` to `out`, coalescing small frames and enforcing `cap`, including for chunked
-/// bodies; `(bytes written, sha256 hex)` on success. `out` may be a sink when draining a
-/// rejected PUT. The generic body allows tests with a small cap.
-async fn drain_into<B>(
-    out: &mut (impl AsyncWrite + Unpin),
-    mut body: B,
-    cap: u64,
-) -> std::result::Result<(u64, String), PutError>
-where
-    B: hyper::body::Body<Data = Bytes> + Unpin,
-    B::Error: std::error::Error + Send + Sync + 'static,
-{
-    let mut buf: Vec<u8> = Vec::with_capacity(STREAM_CHUNK);
-    let mut hasher = Sha256::new();
-    let mut total: u64 = 0;
-    let io = |e: std::io::Error| PutError::Failed(anyhow::Error::from(e).context("writing"));
-    while let Some(frame) = body.frame().await {
-        let frame = frame
-            .map_err(|e| PutError::Failed(anyhow::Error::from(e).context("reading a PUT body")))?;
-        // Trailers carry no content; a body that has them simply ends after them.
-        let Ok(data) = frame.into_data() else {
-            continue;
-        };
-        total = total.saturating_add(data.len() as u64);
-        if total > cap {
-            return Err(PutError::TooLarge);
-        }
-        hasher.update(&data);
-        // A frame already worth a write goes straight out rather than through the
-        // coalescing buffer, which is there for the small ones.
-        if buf.is_empty() && data.len() >= STREAM_CHUNK {
-            out.write_all(&data).await.map_err(io)?;
-            continue;
-        }
-        buf.extend_from_slice(&data);
-        if buf.len() >= STREAM_CHUNK {
-            out.write_all(&buf).await.map_err(io)?;
-            buf.clear();
-        }
-    }
-    if !buf.is_empty() {
-        out.write_all(&buf).await.map_err(io)?;
-    }
-    Ok((total, crate::hex_of(&hasher.finalize())))
-}
-
 /// Create a directory — an empty repository — and its missing ancestors: 201, 405 when the
 /// path is already mapped (a directory or a tag), or 409 when a tag is above it. Checked and
-/// created under [`NAMESPACE`].
+/// created under the [`namespace`] lock.
 fn mkcol(store: &Store, segs: &[String], href: &str) -> Result<Response<Body>> {
     let _namespace = namespace(store)?;
     match resolve(store, segs)? {
@@ -650,9 +407,6 @@ fn mkcol(store: &Store, segs: &[String], href: &str) -> Result<Response<Body>> {
     }
 }
 
-/// Longest a directory `DELETE` waits for the exclusive store lock before answering 503.
-const DELETE_LOCK_WAIT: Duration = Duration::from_secs(30);
-
 /// Delete an object, or a directory with nothing in it (204); 403 for a directory with
 /// members or for a caller that may read the resource but not write it, 409 for a directory
 /// still holding fresh records a deleted object does not account for (see
@@ -660,9 +414,9 @@ const DELETE_LOCK_WAIT: Duration = Duration::from_secs(30);
 /// caller. Recursive deletion is unsupported. An object's bytes stay in the pool until the
 /// gc finds them unreferenced.
 ///
-/// A directory's removal needs the store lock exclusive. It is tried under [`NAMESPACE`],
-/// which is released between attempts so other `files/` writes proceed; past
-/// [`DELETE_LOCK_WAIT`] of shared holders or a gc, the answer is 503.
+/// A directory's removal needs the store lock exclusive. It is tried under the
+/// [`namespace`] lock, which is released between attempts so other `files/` writes proceed;
+/// past [`DELETE_LOCK_WAIT`] of shared holders or a gc, the answer is 503.
 fn delete(
     store: &Store,
     authz: &Authz<'_>,
@@ -717,88 +471,5 @@ fn delete(
             }
         };
         return Ok(resp);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The namespace held here is held against another process's open of the store: the
-    /// lock file another descriptor cannot take until it is released.
-    #[test]
-    fn the_namespace_is_held_against_other_processes() {
-        use std::os::fd::AsRawFd;
-        let dir = std::env::temp_dir().join(format!("vk-reg-files-ns-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::new(dir.clone()).unwrap();
-        let try_lock = || {
-            let file = std::fs::File::open(dir.join(".files.lock")).unwrap();
-            // SAFETY: flock on a descriptor `file` owns.
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
-        };
-        let held = namespace(&store).unwrap();
-        assert!(!try_lock());
-        drop(held);
-        assert!(try_lock());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Verify the streaming size cap with a small limit and multiple frames, and the digest
-    /// of what went through.
-    #[tokio::test]
-    async fn a_body_over_the_cap_stops_being_written() {
-        let dir = std::env::temp_dir().join(format!("vk-reg-files-cap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("staged");
-
-        // Several frames, so the cap is crossed part way through rather than at the first.
-        let frames = || {
-            let chunks: Vec<std::result::Result<hyper::body::Frame<Bytes>, std::io::Error>> = (0
-                ..4)
-                .map(|_| Ok(hyper::body::Frame::data(Bytes::from(vec![1u8; 100]))))
-                .collect();
-            http_body_util::StreamBody::new(futures::stream::iter(chunks))
-        };
-
-        let mut file = tokio::fs::File::create(&path).await.unwrap();
-        assert!(matches!(
-            drain_into(&mut file, frames(), 250).await,
-            Err(PutError::TooLarge)
-        ));
-        drop(file);
-        // Refused where the count crossed, so the partial file is bounded by the cap plus
-        // the frame that crossed it — never the whole body.
-        let staged = std::fs::metadata(&path).unwrap().len();
-        assert!(staged <= 300, "wrote {staged} bytes past a 250-byte cap");
-
-        // Exactly at the cap is not over it, and the digest is the body's.
-        let mut file = tokio::fs::File::create(&path).await.unwrap();
-        let (n, hex) = drain_into(&mut file, frames(), 400).await.ok().unwrap();
-        file.flush().await.unwrap();
-        drop(file);
-        assert_eq!(n, 400);
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 400);
-        assert_eq!(hex, crate::sha256_hex_raw(&vec![1u8; 400]));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn paths_map_onto_repositories_and_tags() {
-        let segs = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(repo_name(&segs(&[])), "files");
-        assert_eq!(
-            repo_name(&segs(&["sccache", "a", "b"])),
-            "files/sccache/a/b"
-        );
-        assert!(
-            object_of(&segs(&["sccache"])).is_none(),
-            "a top-level name is a directory"
-        );
-        let key = segs(&["sccache", "a", "b", "abcdef"]);
-        let (repo, tag) = object_of(&key).unwrap();
-        assert_eq!((repo.as_str(), tag), ("files/sccache/a/b", "abcdef"));
     }
 }
