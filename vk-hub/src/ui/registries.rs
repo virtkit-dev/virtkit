@@ -362,7 +362,13 @@ fn areas_table(h: &mut Html, areas: &[&super::access::Area]) {
             .text(&a.label)
             .raw("</strong><div class=\"sub\"><code>")
             .text(&a.path)
-            .raw("</code></div></td><td>");
+            .raw("</code></div>");
+        if !a.isolated.is_empty() {
+            h.raw("<div class=\"sub\">Kept apart for refs matching ")
+                .text(a.isolated.join(" "))
+                .raw("</div>");
+        }
+        h.raw("</td><td>");
         lines(h, &a.readers);
         h.raw("</td><td>");
         lines(h, &a.publishers);

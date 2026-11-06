@@ -606,6 +606,7 @@ mod tests {
             project_id: 42,
             project_path: path.into(),
             git_ref: git_ref.into(),
+            ref_type: None,
             protected,
             pipeline_id: 7,
         }

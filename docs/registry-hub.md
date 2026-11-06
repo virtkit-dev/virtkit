@@ -493,7 +493,13 @@ namespace ci-pipeline  path = "ci-pipeline/{gitlab}/{project_id}/{pipeline_id}" 
   only, so two namespaces never collide:
   - `{gitlab}`, the name the hub gave the job's GitLab instance (see *Trust*);
   - `{project_id}` and `{pipeline_id}`, GitLab's numeric IDs;
-  - `{protection}`, which is `protected` or `unprotected`.
+  - `{protection}`, which is `protected` or `unprotected`;
+  - `{scope}`, `all` unless the job's ref matches one of the namespace's isolated refs
+    (`--isolate <glob>`), which then gets a scope of its own: `ref-`, the ref slugged to at
+    most 32 characters, `-` and 32 hex digits of the SHA-256 of `<branch|tag>:<ref>`. Scopes
+    are siblings, so no grant on one covers another. A job whose ref matches but whose kind
+    GitLab did not name, or a job without a ref, fills no `{scope}` path in a namespace that
+    isolates refs ([build caches](build-cache-design.md)).
 
   The hub checks a path at its longest filling against the registry's names (255
   characters, 16 components, none named `tags`, `manifests` or `blobs`), so no job's filling
@@ -820,12 +826,14 @@ records of its projects remain. Only relays submit GitLab jobs, each of its serv
 projects ([Placed jobs](fleet-prototype.md#placed-jobs)).
 
 **Namespaces.** `vk-hub namespaces list|show <registry> [<name>]`, `namespaces add <registry>
-<name> --path <template> [--retention-days <n>] --grant <rights>:<subject> [--grant …]` (adding
-an existing name replaces it) and `namespaces remove <registry> <name>`, audited under the
-registry. A registry holds at most 64 namespaces, a token's grants. A path is a repository name
-whose components may be `{gitlab}`, `{project_id}`, `{pipeline_id}` or `{protection}` whole; it
-starts with a fixed component. Rights are some of `r`, `w`, `l`. A subject is comma-separated
-terms that must all hold:
+<name> --path <template> [--retention-days <n>] [--isolate <glob>] [--isolate …] --grant
+<rights>:<subject> [--grant …]` (adding an existing name replaces it) and `namespaces remove
+<registry> <name>`, audited under the registry. A registry holds at most 64 namespaces, a
+token's grants. A path is a repository name whose components may be `{gitlab}`,
+`{project_id}`, `{pipeline_id}`, `{protection}` or `{scope}` whole; it starts with a fixed
+component. `--isolate` needs `{scope}` in the path, and a namespace takes at most 32 of them;
+an older CLI replacing a namespace keeps its isolated refs. Rights are some of `r`, `w`, `l`.
+A subject is comma-separated terms that must all hold:
 
 | Term | Selects |
 |---|---|

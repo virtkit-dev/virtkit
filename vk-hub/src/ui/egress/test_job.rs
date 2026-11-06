@@ -94,6 +94,7 @@ impl Query {
             project_id: self.project_id.parse().unwrap_or_default(),
             project_path: self.project.clone(),
             git_ref: self.git_ref.clone(),
+            ref_type: None,
             protected: self.protection == "protected",
             pipeline_id: 0,
         })

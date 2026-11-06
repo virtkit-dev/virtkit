@@ -480,6 +480,7 @@ fn retention_goes_only_to_a_registry_allowing_gc_and_follows_namespaces() {
         path: "images".into(),
         retention_days: Some(30),
         alias: None,
+        isolate: Vec::new(),
         grants: vec![crate::store::NsGrant::parse("r:*").unwrap()],
         created_at: 1,
         created_by: "u".into(),
@@ -494,6 +495,31 @@ fn retention_goes_only_to_a_registry_allowing_gc_and_follows_namespaces() {
     assert_eq!(windows, ["ci-pipeline=2", "images=30"]);
 }
 
+/// A CLI that knows no isolated refs leaves out `isolate` when it replaces a namespace: the
+/// namespace keeps the refs it isolated rather than letting them fall back into `all`.
+#[test]
+fn an_older_cli_replacing_a_namespace_keeps_its_isolated_refs() {
+    let hub = test_hub();
+    let id = enrolled_registry(&hub, "aa");
+    let put = |isolate: Option<&[&str]>| {
+        let mut call = serde_json::json!({
+            "op": "put-namespace", "id": id, "name": "tc",
+            "path": "tc/{gitlab}/{project_id}/{protection}/{scope}",
+            "retention_days": null, "grants": ["rwl:own project"],
+        });
+        if let Some(isolate) = isolate {
+            call["isolate"] = serde_json::json!(isolate);
+        }
+        let body = serde_json::json!({"v": 1, "call": call});
+        crate::admin::dispatch(&serde_json::to_vec(&body).unwrap(), &hub, 0).unwrap();
+        let stored = hub.db.namespaces(&id).unwrap();
+        stored.into_iter().find(|n| n.name == "tc").unwrap().isolate
+    };
+    assert_eq!(put(Some(&["main"])), ["main"]);
+    assert_eq!(put(None), ["main"]);
+    assert!(put(Some(&[])).is_empty());
+}
+
 #[test]
 fn a_removed_registry_takes_its_namespaces() {
     let hub = test_hub();
@@ -503,6 +529,7 @@ fn a_removed_registry_takes_its_namespaces() {
         path: "images".into(),
         retention_days: None,
         alias: None,
+        isolate: Vec::new(),
         grants: vec![crate::store::NsGrant::parse("r:*").unwrap()],
         created_at: 1,
         created_by: "u".into(),

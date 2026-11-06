@@ -170,6 +170,10 @@ enum Call {
         /// Absent from an older client: no alias.
         #[serde(default)]
         alias: Option<String>,
+        /// Older clients omit this: preserve the replaced namespace's isolated refs so they
+        /// do not fall back into `all`.
+        #[serde(default)]
+        isolate: Option<Vec<String>>,
         grants: Vec<String>,
     },
     RemoveNamespace {
@@ -754,6 +758,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             path,
             retention_days,
             alias,
+            isolate,
             grants,
         } => {
             let grants = grants
@@ -761,16 +766,18 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
                 .map(|g| crate::store::NsGrant::parse(g))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| anyhow!(e))?;
+            let keep_isolate = isolate.is_none();
             let ns = crate::store::NamespaceRow {
                 name,
                 path,
                 retention_days,
                 alias,
+                isolate: isolate.unwrap_or_default(),
                 grants,
                 created_at: crate::now_secs(),
                 created_by: actor.clone(),
             };
-            crate::registries::put_namespace(hub, &actor, &id, &ns)?;
+            let ns = crate::registries::put_namespace_with(hub, &actor, &id, ns, keep_isolate)?;
             eprintln!(
                 "vk-hub: admin: {actor} set namespace {} of registry {}",
                 vk_hub_proto::display_safe(&ns.name),
@@ -1125,6 +1132,16 @@ fn audit(hub: &Hub, node: Option<&str>, limit: usize) -> Result<Vec<AuditRow>> {
     Ok(rows)
 }
 
+/// Namespace input from the CLI; the hub parses its grant lines.
+pub struct NamespaceInput {
+    pub name: String,
+    pub path: String,
+    pub retention_days: Option<u64>,
+    pub alias: Option<String>,
+    pub isolate: Vec<String>,
+    pub grants: Vec<String>,
+}
+
 /// The running hub, reached over its admin socket. One short connection per call.
 pub struct Client {
     path: PathBuf,
@@ -1189,19 +1206,16 @@ impl Client {
     pub fn put_namespace(
         &self,
         id: &str,
-        name: &str,
-        path: &str,
-        retention_days: Option<u64>,
-        alias: Option<&str>,
-        grants: Vec<String>,
+        ns: NamespaceInput,
     ) -> Result<crate::store::NamespaceRow> {
         self.call(Call::PutNamespace {
             id: id.to_string(),
-            name: name.to_string(),
-            path: path.to_string(),
-            retention_days,
-            alias: alias.map(str::to_string),
-            grants,
+            name: ns.name,
+            path: ns.path,
+            retention_days: ns.retention_days,
+            alias: ns.alias,
+            isolate: Some(ns.isolate),
+            grants: ns.grants,
         })
     }
 

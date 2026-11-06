@@ -3,14 +3,16 @@
 //! select it grant ([`resolve`]); the registry enforces the token and never sees this policy.
 //!
 //! A path is a template: `{gitlab}` (the hub's name for the job's GitLab instance),
-//! `{project_id}`, `{pipeline_id}` and `{protection}` (`protected` or `unprotected`) are
-//! filled from the job's claims when its token is minted. Only identifiers fill it, so two
-//! namespaces never collide on a project's path.
+//! `{project_id}`, `{pipeline_id}`, `{protection}` (`protected` or `unprotected`) and
+//! `{scope}` ([`scope`]) are filled from the job's claims when its token is minted. Only
+//! identifiers fill it, so two namespaces never collide on a project's path.
 
 use anyhow::{Context, Result, bail};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use vk_hub_proto::dispatch::Area;
+use vk_hub_proto::job::RefType;
 use vk_hub_proto::registry::PrefixRetention;
 use vk_hub_proto::token::{
     ALIAS_ROOT, Grant, MAX_PREFIX_COMPONENTS, MAX_PREFIX_LEN, RESERVED_COMPONENTS, servable_prefix,
@@ -38,7 +40,23 @@ const MAX_GRANTS: usize = 32;
 pub const MAX_RETENTION_DAYS: u64 = 3650;
 
 /// The placeholders a path may hold.
-const PLACEHOLDERS: [&str; 4] = ["{gitlab}", "{project_id}", "{pipeline_id}", "{protection}"];
+pub const PLACEHOLDERS: [&str; 5] = [
+    "{gitlab}",
+    "{project_id}",
+    "{pipeline_id}",
+    "{protection}",
+    "{scope}",
+];
+
+/// The most isolated ref globs a namespace takes.
+const MAX_ISOLATE: usize = 32;
+
+/// How many characters of a ref [`scope`] keeps, and how many hex digits of its hash.
+const SCOPE_SLUG: usize = 32;
+const SCOPE_HASH: usize = 32;
+
+/// `{scope}` for a job whose ref no isolated glob matches.
+const SHARED_SCOPE: &str = "all";
 
 /// A namespace as stored.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +71,10 @@ pub struct NamespaceRow {
     /// repository name component, unique on the registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
+    /// Ref globs whose jobs get a `{scope}` of their own ([`scope`]); none fills `all` for
+    /// every job.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub isolate: Vec<String>,
     pub grants: Vec<NsGrant>,
     pub created_at: u64,
     pub created_by: String,
@@ -125,6 +147,20 @@ impl NamespaceRow {
                 RESERVED_COMPONENTS.join(", ")
             ));
         }
+        if self.isolate.len() > MAX_ISOLATE {
+            return Err(format!(
+                "a namespace takes at most {MAX_ISOLATE} isolated ref globs"
+            ));
+        }
+        for glob in &self.isolate {
+            crate::subject::check_glob(glob)?;
+        }
+        if !self.isolate.is_empty() && !self.has_scope() {
+            return Err(format!(
+                "{:?}: isolating refs needs {{scope}} in the path, which their jobs fill apart",
+                self.path
+            ));
+        }
         if self.path.starts_with('{') {
             return Err(format!(
                 "{:?}: a path starts with a fixed component, which keeps namespaces apart",
@@ -174,6 +210,11 @@ impl NamespaceRow {
             }
         }
         Ok(())
+    }
+
+    /// Whether the path holds `{scope}`.
+    pub fn has_scope(&self) -> bool {
+        self.path.split('/').any(|c| c == "{scope}")
     }
 
     /// Whether the path starts at [`ALIAS_ROOT`], which [`NamespaceRow::check`] refuses for a
@@ -254,6 +295,7 @@ fn longest_path(path: &str) -> Option<String> {
             "{gitlab}" => "a".repeat(super::gitlabs::MAX_GITLAB_NAME),
             "{project_id}" | "{pipeline_id}" => u64::MAX.to_string(),
             "{protection}" => "unprotected".to_string(),
+            "{scope}" => format!("ref-{}-{}", "a".repeat(SCOPE_SLUG), "0".repeat(SCOPE_HASH)),
             other if other.contains(['{', '}']) => return None,
             other => other.to_string(),
         });
@@ -261,11 +303,57 @@ fn longest_path(path: &str) -> Option<String> {
     Some(out.join("/"))
 }
 
-/// `path` filled from `c`; `None` when a component holds anything but one whole placeholder
-/// or none, or a value is missing (no pipeline) or does not fit a repository name.
-pub fn render(path: &str, c: &JobClaims) -> Option<String> {
+/// `{scope}` for the job claiming `c`, in a namespace isolating the refs `isolate`:
+/// - `all` when none of the globs matches its ref;
+/// - when one does, `ref-`, the ref lowercased with each run of characters outside `[a-z0-9]`
+///   turned into `-`, cut to 32 characters and trimmed of `-` (`x` if nothing is left), then
+///   `-` and the first 32 hex digits of the SHA-256 of `<kind>:<ref>`, so two refs, or a
+///   branch and a tag of one name, do not share one in practice;
+/// - `None`, giving the job nothing, when one does but GitLab named no ref kind the hub
+///   knows, or the job has no ref while the namespace isolates any.
+///
+/// `all` and `ref-…` never coincide and neither is under the other, so no grant on one covers
+/// another.
+pub fn scope(isolate: &[String], c: &JobClaims) -> Option<String> {
+    if isolate.is_empty() {
+        return Some(SHARED_SCOPE.to_string());
+    }
+    if c.git_ref.is_empty() {
+        return None;
+    }
+    if !isolate
+        .iter()
+        .any(|g| crate::subject::glob_match(g, &c.git_ref))
+    {
+        return Some(SHARED_SCOPE.to_string());
+    }
+    let kind = match c.ref_type? {
+        RefType::Branch => "branch",
+        RefType::Tag => "tag",
+    };
+    let mut slug = String::new();
+    for ch in c.git_ref.chars().map(|ch| ch.to_ascii_lowercase()) {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            slug.push(ch);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.truncate(SCOPE_SLUG);
+    let slug = match slug.trim_end_matches('-') {
+        "" => "x",
+        s => s,
+    };
+    let hash = vk_hub_proto::to_hex(&Sha256::digest(format!("{kind}:{}", c.git_ref).as_bytes()));
+    Some(format!("ref-{slug}-{}", &hash[..SCOPE_HASH]))
+}
+
+/// `ns`'s path filled from `c`; `None` when a component holds anything but one whole
+/// placeholder or none, or a value is missing (no pipeline, no [`scope`]) or does not fit a
+/// repository name.
+pub fn render(ns: &NamespaceRow, c: &JobClaims) -> Option<String> {
     let mut out = Vec::new();
-    for component in path.split('/') {
+    for component in ns.path.split('/') {
         let value = match component {
             "{gitlab}" => c.gitlab.clone(),
             "{project_id}" => c.project_id.to_string(),
@@ -277,6 +365,7 @@ pub fn render(path: &str, c: &JobClaims) -> Option<String> {
                 "unprotected"
             }
             .to_string(),
+            "{scope}" => scope(&ns.isolate, c)?,
             other if other.contains(['{', '}']) => return None,
             other => other.to_string(),
         };
@@ -303,7 +392,7 @@ pub struct Resolved {
 pub fn resolve(ns: &[NamespaceRow], c: &JobClaims) -> Resolved {
     let mut out = Resolved::default();
     for n in ns {
-        let Some(prefix) = render(&n.path, c) else {
+        let Some(prefix) = render(n, c) else {
             continue;
         };
         let mut grant = Grant {
@@ -376,6 +465,7 @@ pub fn defaults(now: u64) -> Vec<NamespaceRow> {
             path: "ci-cache/{gitlab}/{project_id}/{protection}".into(),
             retention_days: None,
             alias: None,
+            isolate: Vec::new(),
             grants: vec![grant("rw:own project")],
             created_at: now,
             created_by: "hub".into(),
@@ -385,6 +475,7 @@ pub fn defaults(now: u64) -> Vec<NamespaceRow> {
             path: "ci-pipeline/{gitlab}/{project_id}/{pipeline_id}".into(),
             retention_days: Some(2),
             alias: None,
+            isolate: Vec::new(),
             grants: vec![grant("rwl:own project, own pipeline")],
             created_at: now,
             created_by: "hub".into(),
@@ -428,6 +519,7 @@ fn refusal(
 impl Db {
     /// Store namespace `ns` on registry `registry`, replacing one of its name, audited as
     /// `actor`'s.
+    #[cfg(test)]
     pub fn put_namespace(
         &self,
         registry: &str,
@@ -435,9 +527,20 @@ impl Db {
         actor: &str,
         now: u64,
     ) -> Result<()> {
-        if let Err(why) = ns.check() {
-            bail!("{why}");
-        }
+        self.put_namespace_with(registry, ns.clone(), false, actor, now)
+            .map(drop)
+    }
+
+    /// Like [`Db::put_namespace`], but preserves existing isolated refs when `keep_isolate`:
+    /// older CLIs omit them. Reads them in the same transaction; returns the stored namespace.
+    pub fn put_namespace_with(
+        &self,
+        registry: &str,
+        mut ns: NamespaceRow,
+        keep_isolate: bool,
+        actor: &str,
+        now: u64,
+    ) -> Result<NamespaceRow> {
         let txn = self.db.begin_write().context("starting a write")?;
         if txn.open_table(REGISTRIES)?.get(registry)?.is_none() {
             return Err(NotEnrolled(registry.to_string()).into());
@@ -445,16 +548,25 @@ impl Db {
         let replaced = {
             let mut table = txn.open_table(NAMESPACES)?;
             let key = format!("{registry}/{}", ns.name);
-            let replaced = table.get(key.as_str())?.is_some();
-            if let Some(why) = refusal(&table, registry, ns, replaced)? {
+            let old = table
+                .get(key.as_str())?
+                .map(|g| decode::<NamespaceRow>(g.value()))
+                .transpose()?;
+            if keep_isolate && let Some(old) = &old {
+                ns.isolate.clone_from(&old.isolate);
+            }
+            if let Err(why) = ns.check() {
                 bail!("{why}");
             }
-            table.insert(key.as_str(), encode(ns)?.as_slice())?;
-            replaced
+            if let Some(why) = refusal(&table, registry, &ns, old.is_some())? {
+                bail!("{why}");
+            }
+            table.insert(key.as_str(), encode(&ns)?.as_slice())?;
+            old.is_some()
         };
         let grants: Vec<String> = ns.grants.iter().map(ToString::to_string).collect();
         let event = format!(
-            "{actor} {} namespace {} at {}{}{} granting {}",
+            "{actor} {} namespace {} at {}{}{}{} granting {}",
             if replaced { "replaced" } else { "added" },
             ns.name,
             ns.path,
@@ -463,11 +575,16 @@ impl Db {
                 .map_or(String::new(), |a| format!(", alias {a},")),
             ns.retention_days
                 .map_or(String::new(), |d| format!(", retention {d} days,")),
+            if ns.isolate.is_empty() {
+                String::new()
+            } else {
+                format!(", isolating {},", ns.isolate.join(" "))
+            },
             grants.join("; ")
         );
         append_audit(&txn, Some(registry), actor, &event, now)?;
         txn.commit().context("storing a namespace")?;
-        Ok(())
+        Ok(ns)
     }
 
     /// Registry `registry`'s namespaces, by name.
@@ -564,6 +681,7 @@ mod tests {
             project_id: 42,
             project_path: "wab/core".into(),
             git_ref: "main".into(),
+            ref_type: Some(RefType::Branch),
             protected,
             pipeline_id,
         }
@@ -575,6 +693,7 @@ mod tests {
             path: path.into(),
             retention_days,
             alias: None,
+            isolate: Vec::new(),
             grants: grants.iter().map(|g| NsGrant::parse(g).unwrap()).collect(),
             created_at: 0,
             created_by: "t".into(),
@@ -584,6 +703,7 @@ mod tests {
     #[test]
     fn paths_fill_from_identifiers_only() {
         let c = claims(true, 7);
+        let render = |path: &str, c: &JobClaims| render(&ns("n", path, &["r:*"], None), c);
         assert_eq!(
             render("ci-cache/{gitlab}/{project_id}/{protection}", &c).as_deref(),
             Some("ci-cache/gl/42/protected")
@@ -592,6 +712,74 @@ mod tests {
         assert_eq!(render("p/x{project_id}", &c), None);
         assert_eq!(render("p/{project_path}", &c), None);
         assert_eq!(render("images", &c).as_deref(), Some("images"));
+        assert_eq!(render("p/{scope}", &c).as_deref(), Some("p/all"));
+    }
+
+    fn on_ref(git_ref: &str, ref_type: Option<RefType>) -> JobClaims {
+        JobClaims {
+            git_ref: git_ref.into(),
+            ref_type,
+            ..claims(true, 7)
+        }
+    }
+
+    #[test]
+    fn isolated_refs_fill_a_scope_of_their_own() {
+        let isolate = vec!["main".to_string(), "release/*".to_string()];
+        let branch = |r: &str| scope(&isolate, &on_ref(r, Some(RefType::Branch)));
+        assert_eq!(branch("dev").as_deref(), Some("all"));
+        assert_eq!(branch("release/1/x").as_deref(), Some("all"));
+        // The filling names repositories: it must not change.
+        let main = branch("main").unwrap();
+        assert_eq!(main, "ref-main-982786bd3f22691354ce8cf977cf260a");
+        let release = branch("Release/1.2_rc").unwrap_or_default();
+        assert_eq!(release, "all", "globs match the ref as it is");
+        let release = branch("release/1.2_RC").unwrap();
+        assert!(release.starts_with("ref-release-1-2-rc-"), "{release}");
+        // Refs slugging alike, and a branch and a tag of one name, never share a scope.
+        assert_ne!(branch("release/1.2"), branch("release/1-2"));
+        let tag = scope(&isolate, &on_ref("main", Some(RefType::Tag))).unwrap();
+        assert!(tag.starts_with("ref-main-") && tag != main, "{tag}");
+        // Nothing for an isolated ref of unknown kind, or no ref at all; a ref no glob
+        // matches shares `all` whatever its kind.
+        assert_eq!(scope(&isolate, &on_ref("main", None)), None);
+        assert_eq!(scope(&isolate, &on_ref("", Some(RefType::Branch))), None);
+        assert_eq!(
+            scope(&isolate, &on_ref("dev", None)).as_deref(),
+            Some("all")
+        );
+        assert_eq!(scope(&[], &on_ref("", None)).as_deref(), Some("all"));
+        // A slug keeps letters and digits only, at most 32 of them, `x` when none is left.
+        let only = vec!["**".to_string()];
+        let s = scope(&only, &on_ref("é/€", Some(RefType::Branch))).unwrap();
+        assert!(s.starts_with("ref-x-"), "{s}");
+        let s = scope(
+            &only,
+            &on_ref(&format!("{}-b", "a".repeat(31)), Some(RefType::Branch)),
+        )
+        .unwrap();
+        assert!(s.starts_with(&format!("ref-{}-", "a".repeat(31))), "{s}");
+        assert!(!s.contains("--"), "{s}");
+        let long = scope(&only, &on_ref(&"Ab".repeat(100), Some(RefType::Branch))).unwrap();
+        assert_eq!(long.len(), 4 + SCOPE_SLUG + 1 + SCOPE_HASH);
+        assert!(valid_component(&long));
+        let n = NamespaceRow {
+            isolate: only,
+            ..ns(
+                "n",
+                "p/{gitlab}/{project_id}/{scope}",
+                &["rwl:own project"],
+                None,
+            )
+        };
+        assert_eq!(
+            render(&n, &on_ref("main", Some(RefType::Branch))),
+            Some(format!(
+                "p/gl/42/{}",
+                scope(&n.isolate, &on_ref("main", Some(RefType::Branch))).unwrap()
+            ))
+        );
+        assert_eq!(render(&n, &on_ref("main", None)), None);
     }
 
     #[test]
@@ -613,6 +801,46 @@ mod tests {
             let err = ns("x", &path, &["r:*"], None).check().unwrap_err();
             assert!(err.contains("at its longest"), "{path}: {err}");
         }
+    }
+
+    #[test]
+    fn a_scoped_namespace_is_checked_with_its_isolated_refs() {
+        use super::super::gitlabs::MAX_GITLAB_NAME;
+        let ok = ns(
+            "x",
+            "p/{gitlab}/{project_id}/{protection}/{scope}",
+            &["r:*"],
+            None,
+        );
+        ok.check().unwrap();
+        let isolating = |isolate: Vec<String>| NamespaceRow {
+            isolate,
+            ..ok.clone()
+        };
+        isolating(vec!["main".into()]).check().unwrap();
+        let unscoped = NamespaceRow {
+            isolate: vec!["main".into()],
+            ..ns("x", "p/{gitlab}/{project_id}", &["r:*"], None)
+        };
+        assert!(unscoped.check().unwrap_err().contains("needs {scope}"));
+        assert!(isolating(vec!["a b".into()]).check().is_err());
+        let many = (0..=MAX_ISOLATE).map(|i| format!("r{i}")).collect();
+        assert!(
+            isolating(many)
+                .check()
+                .unwrap_err()
+                .contains("at most 32 isolated ref globs")
+        );
+        // {scope} at its longest is 69 characters, with a fourth slash before it.
+        let tail = "{gitlab}/{project_id}/{protection}/{scope}";
+        let fixed = "a".repeat(MAX_PREFIX_LEN - 4 - MAX_GITLAB_NAME - 20 - 11 - 69);
+        ns("x", &format!("{fixed}/{tail}"), &["r:*"], None)
+            .check()
+            .unwrap();
+        let err = ns("x", &format!("{fixed}a/{tail}"), &["r:*"], None)
+            .check()
+            .unwrap_err();
+        assert!(err.contains("at its longest"), "{err}");
     }
 
     #[test]

@@ -9146,6 +9146,7 @@ async fn a_registry_page_shows_its_job_access_and_settings_in_tabs() {
         path: "wab".into(),
         retention_days: None,
         alias: None,
+        isolate: Vec::new(),
         grants: vec![
             NsGrant::parse("rwl:gitlab gl, projects wab/**, protected").unwrap(),
             NsGrant::parse("r:gitlab gl, projects wab/**").unwrap(),

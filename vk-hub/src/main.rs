@@ -766,6 +766,10 @@ enum NamespacesCmd {
         /// /v2/ and /dav/files/ and in lock names: one repository name component, as task-cache
         #[arg(long, value_name = "ALIAS")]
         alias: Option<String>,
+        /// A ref glob whose jobs get a {scope} of their own instead of sharing `all`, as main or
+        /// 'release/*'; repeat for several. The path must hold {scope}
+        #[arg(long = "isolate", value_name = "GLOB")]
+        isolate: Vec<String>,
         /// A grant line, <rights>:<subject>, as 'rw:own project' or 'r:*'; repeat for several
         #[arg(long = "grant", value_name = "LINE", required = true)]
         grants: Vec<String>,
@@ -2733,6 +2737,9 @@ fn namespaces_blocking(client: &admin::Client, cmd: NamespacesCmd) -> Result<()>
             out.push_str(&format!(" (retention {d} days)"));
         }
         out.push('\n');
+        if !ns.isolate.is_empty() {
+            out.push_str(&format!("  isolate {}\n", ns.isolate.join(" ")));
+        }
         for g in &ns.grants {
             out.push_str(&format!("  {g}\n"));
         }
@@ -2760,15 +2767,19 @@ fn namespaces_blocking(client: &admin::Client, cmd: NamespacesCmd) -> Result<()>
             path,
             retention_days,
             alias,
+            isolate,
             grants,
         } => {
             let ns = client.put_namespace(
                 &registry,
-                &name,
-                &path,
-                retention_days,
-                alias.as_deref(),
-                grants,
+                admin::NamespaceInput {
+                    name,
+                    path,
+                    retention_days,
+                    alias,
+                    isolate,
+                    grants,
+                },
             )?;
             print!("{}", show(&ns));
         }

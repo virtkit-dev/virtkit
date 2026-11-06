@@ -658,16 +658,31 @@ pub fn set_url(hub: &Hub, actor: &str, id: &str, url: Option<&str>) -> Result<bo
 }
 
 /// Store namespace `ns` on registry `id` as `actor`, and send the retention it sets.
+#[cfg(test)]
 pub fn put_namespace(
     hub: &Hub,
     actor: &str,
     id: &str,
     ns: &crate::store::NamespaceRow,
 ) -> Result<()> {
-    hub.db.put_namespace(id, ns, actor, crate::now_secs())?;
+    put_namespace_with(hub, actor, id, ns.clone(), false).map(drop)
+}
+
+/// Like [`put_namespace`], but preserves existing isolated refs when `keep_isolate`
+/// ([`crate::store::Db::put_namespace_with`]). Returns the stored namespace.
+pub fn put_namespace_with(
+    hub: &Hub,
+    actor: &str,
+    id: &str,
+    ns: crate::store::NamespaceRow,
+    keep_isolate: bool,
+) -> Result<crate::store::NamespaceRow> {
+    let ns = hub
+        .db
+        .put_namespace_with(id, ns, keep_isolate, actor, crate::now_secs())?;
     sync_after_namespaces(hub, id);
     hub.changed(id);
-    Ok(())
+    Ok(ns)
 }
 
 /// Remove namespace `name` of registry `id` as `actor`; whether there was one.

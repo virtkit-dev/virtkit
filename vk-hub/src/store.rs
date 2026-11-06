@@ -82,7 +82,9 @@ pub use keys::{
     ANY_POOL, ApiPrincipal, KeyOp, KeyPolicy, KeyRefused, KeyRow, KeysChanged, MAX_KEY_TTL,
     MAX_NAME, PrincipalKind, Scope, envelope_text, valid_name,
 };
-pub use namespaces::{CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant, prefix_retention, resolve};
+pub use namespaces::{
+    CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant, PLACEHOLDERS, prefix_retention, resolve,
+};
 pub use observed::{
     Coverages, MAX_OBSERVED_CONTACTS, ObservedFilter, ObservedSubject, ObservedUse, UNREPORTED,
 };

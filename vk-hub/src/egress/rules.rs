@@ -130,6 +130,7 @@ pub fn resolve(hub: &Hub, c: &Claims) -> Result<HubEgress> {
             project_id: c.project_id,
             project_path: c.project_path.clone(),
             git_ref: c.git_ref.clone(),
+            ref_type: None,
             protected: c.protected,
             pipeline_id: 0,
         }),
@@ -154,6 +155,7 @@ pub fn claims_of(j: &JobRow) -> Option<JobClaims> {
         project_id: j.project_id.unwrap_or_default(),
         project_path: j.project.clone().unwrap_or_default(),
         git_ref: j.git_ref.clone().unwrap_or_default(),
+        ref_type: None,
         protected: j.protected == Some(true),
         pipeline_id: j.pipeline.unwrap_or_default(),
     })
@@ -182,6 +184,7 @@ pub fn claims_for(
         project_id: *project_id,
         project_path: project_path.unwrap_or_default().to_string(),
         git_ref: git_ref.to_string(),
+        ref_type: None,
         protected: protection == "protected",
         pipeline_id: 0,
     })

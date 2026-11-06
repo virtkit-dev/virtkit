@@ -28,6 +28,10 @@ pub struct JobClaims {
     pub project_id: u64,
     pub project_path: String,
     pub git_ref: String,
+    /// The ref's kind; `None` when GitLab named none the hub knows, or for a record or a test
+    /// made without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_type: Option<vk_hub_proto::job::RefType>,
     pub protected: bool,
     /// 0 when the job names none.
     pub pipeline_id: u64,
@@ -41,6 +45,7 @@ impl JobClaims {
             project_id: ci.job.project_id,
             project_path: ci.job.project_path.clone(),
             git_ref: ci.sources.git_ref.clone(),
+            ref_type: (!ci.sources.ref_type_unknown).then_some(ci.sources.ref_type),
             protected: ci.sources.protected == Some(true),
             pipeline_id: ci.job.pipeline_id,
         }
@@ -198,7 +203,7 @@ impl std::fmt::Display for Subject {
     }
 }
 
-fn check_glob(glob: &str) -> Result<(), String> {
+pub(crate) fn check_glob(glob: &str) -> Result<(), String> {
     if glob.is_empty() || glob.len() > 255 || glob.contains(char::is_whitespace) {
         return Err(format!("{glob:?} is not a glob"));
     }
@@ -272,6 +277,7 @@ mod tests {
             project_id: 42,
             project_path: "wab/core/bastion".into(),
             git_ref: "release/10.0".into(),
+            ref_type: None,
             protected: true,
             pipeline_id: 7,
         }

@@ -736,6 +736,7 @@ mod tests {
             project_id: 42,
             project_path: "acme/web".into(),
             git_ref: "main".into(),
+            ref_type: None,
             protected: true,
             pipeline_id: 0,
         };

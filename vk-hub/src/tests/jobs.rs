@@ -5767,6 +5767,7 @@ async fn a_relay_s_approved_job_gets_a_token_for_its_node_s_registry() {
         path: "task-cache/{gitlab}/{project_id}/{protection}".into(),
         retention_days: None,
         alias: Some("task-cache".into()),
+        isolate: Vec::new(),
         grants: vec![crate::store::NsGrant::parse("rwl:own project").unwrap()],
         created_at: 0,
         created_by: "t".into(),

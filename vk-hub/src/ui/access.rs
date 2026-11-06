@@ -5,11 +5,8 @@
 use vk_hub_proto::token::Grant;
 
 use crate::egress::blocked::{Instances, instance_tag};
-use crate::store::{CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant};
+use crate::store::{CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant, PLACEHOLDERS};
 use crate::subject::{Projects, Subject};
-
-/// The placeholders a namespace's path may hold.
-const PLACEHOLDERS: [&str; 4] = ["{gitlab}", "{project_id}", "{pipeline_id}", "{protection}"];
 
 /// Rights in plain words: `Read, Publish, Coordinate builds`, or `No access`.
 pub(super) fn rights(read: bool, write: bool, lock: bool) -> String {
@@ -67,6 +64,8 @@ pub(super) struct Area {
     /// What the page calls it.
     pub label: String,
     pub path: String,
+    /// The ref globs whose jobs get an area of their own, apart from every other ref's.
+    pub isolated: Vec<String>,
     /// Who may read, one line per access rule.
     pub readers: Vec<String>,
     /// Who may publish, one line per access rule, saying when they also coordinate builds;
@@ -93,6 +92,7 @@ pub(super) fn area(ns: &NamespaceRow, instances: Instances<&str>) -> Area {
         name: ns.name.clone(),
         label: label(&ns.name),
         path: ns.path.clone(),
+        isolated: ns.isolate.clone(),
         readers: ns.grants.iter().filter(|g| g.read).map(line).collect(),
         publishers: ns
             .grants
@@ -245,6 +245,7 @@ mod tests {
             path: path.into(),
             retention_days: None,
             alias: None,
+            isolate: Vec::new(),
             grants: grants.iter().map(|g| NsGrant::parse(g).unwrap()).collect(),
             created_at: 0,
             created_by: "uid 0".into(),
