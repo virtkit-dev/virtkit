@@ -2744,12 +2744,14 @@ async fn echoed_text_holds_no_control_character() {
             .await
             .is(400, "InvalidArgument");
     }
-    send(
-        &host,
-        Req::new("GET", "/s3/b").query("uploads&prefix=a&key-marker=k&upload-id-marker=u"),
-    )
-    .await
-    .ok(200);
+    for good in [
+        "uploads&prefix=a&key-marker=k",
+        "uploads&upload-id-marker=u",
+    ] {
+        send(&host, Req::new("GET", "/s3/b").query(good))
+            .await
+            .ok(200);
+    }
     for key in ["a&#1;", "a\u{1}"] {
         send(
             &host,
@@ -2759,6 +2761,86 @@ async fn echoed_text_holds_no_control_character() {
         .is(400, "MalformedXML");
     }
     is_object(&send(&host, Req::new("GET", "/s3/b/k")).await, HELLO);
+}
+
+/// Uploads are listed by key, then a key's in the order they were initiated, and paged by
+/// the key and upload id markers as S3 pages them.
+#[tokio::test]
+async fn uploads_are_paged_by_key_and_upload_id() {
+    let dir = tmp("upload-pages");
+    let host = spawn(open_state(&dir, true));
+    let list = |q: &str| Req::new("GET", "/s3/b").query(&format!("uploads&{q}"));
+    send(&host, Req::new("PUT", "/s3/b")).await.ok(200);
+    let mut made = Vec::new();
+    // Twelve uploads of a key, so their ids' counters reach two digits and order as numbers.
+    for (key, count) in [("bar", 12), ("baz", 3), ("foo", 1)] {
+        for _ in 0..count {
+            let resp = send(
+                &host,
+                Req::new("POST", &format!("/s3/b/{key}")).query("uploads="),
+            )
+            .await;
+            resp.ok(200);
+            made.push((key.to_string(), element(&resp.body, "UploadId")));
+        }
+    }
+    let ids = |body: &str| elements(body, "UploadId");
+    let all: Vec<String> = made.iter().map(|(_, id)| id.clone()).collect();
+
+    let resp = send(&host, list("")).await;
+    resp.ok(200);
+    assert_eq!(ids(&resp.body), all);
+    assert!(!resp.body.contains("<Prefix>"), "{}", resp.body);
+    // The last upload is named whether or not more follow.
+    assert_eq!(element(&resp.body, "IsTruncated"), "false");
+    assert_eq!(element(&resp.body, "NextKeyMarker"), "foo");
+    assert_eq!(element(&resp.body, "NextUploadIdMarker"), all[15]);
+    let resp = send(&host, list("prefix=")).await;
+    assert!(resp.body.contains("<Prefix></Prefix>"), "{}", resp.body);
+
+    // Paged by both markers, every upload once.
+    let mut seen = Vec::new();
+    let mut q = "max-uploads=5".to_string();
+    loop {
+        let resp = send(&host, list(&q)).await;
+        resp.ok(200);
+        seen.extend(ids(&resp.body));
+        if element(&resp.body, "IsTruncated") == "false" {
+            break;
+        }
+        q = format!(
+            "key-marker={}&max-uploads=5&upload-id-marker={}",
+            element(&resp.body, "NextKeyMarker"),
+            element(&resp.body, "NextUploadIdMarker")
+        );
+    }
+    assert_eq!(seen, all);
+
+    // A key marker alone: past that key's uploads.
+    let resp = send(&host, list("key-marker=bar")).await;
+    assert_eq!(ids(&resp.body), &all[12..]);
+    // An upload id marker alone is ignored.
+    let resp = send(&host, list(&format!("upload-id-marker={}", all[3]))).await;
+    resp.ok(200);
+    assert_eq!(ids(&resp.body), all);
+    assert_eq!(element(&resp.body, "UploadIdMarker"), "");
+    // A key marker that is no upload's key: the upload id is one of the next key's.
+    let resp = send(
+        &host,
+        list(&format!("key-marker=bat&upload-id-marker={}", all[13])),
+    )
+    .await;
+    resp.ok(200);
+    assert_eq!(ids(&resp.body), &all[14..]);
+    assert_eq!(element(&resp.body, "UploadIdMarker"), all[13]);
+    // Else the upload id marker names nothing to start after.
+    for q in [
+        format!("key-marker=bar&upload-id-marker={}", all[13]),
+        "key-marker=bar&upload-id-marker=1-2-3".to_string(),
+        format!("key-marker=zzz&upload-id-marker={}", all[15]),
+    ] {
+        send(&host, list(&q)).await.is(400, "InvalidArgument");
+    }
 }
 
 /// A query's names are taken decoded, as the signature takes them, wherever they dispatch;

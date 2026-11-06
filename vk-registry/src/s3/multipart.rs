@@ -1348,11 +1348,27 @@ struct Listed {
     created: u64,
 }
 
+impl Listed {
+    /// Where the upload is listed: by key, then as S3 lists a key's uploads, by when each was
+    /// initiated, which the counter in its id (`<pid>-<n>-<random>`) orders within the second
+    /// for the uploads one server made.
+    fn order(&self) -> (&str, u64, u64, u64, &str) {
+        let mut n = self
+            .id
+            .splitn(3, '-')
+            .map(|n| n.parse().unwrap_or(u64::MAX));
+        let (pid, count) = (n.next().unwrap_or(u64::MAX), n.next().unwrap_or(u64::MAX));
+        (&self.key, self.created, pid, count, &self.id)
+    }
+}
+
 /// `GET /s3/<bucket>?uploads`: the uploads in progress into the bucket whose key starts with
-/// `prefix`, by key then id, after `key-marker` (and, for that key, `upload-id-marker`),
-/// `max-uploads` of them (at most and by default 1000). Admitted as a listing of the bucket
-/// with that prefix is, and shows only the uploads whose key the caller may read. Every
-/// upload's record is read: the cost is the store's uploads in progress, not the bucket's.
+/// `prefix`, in [`Listed::order`], after `key-marker`, `max-uploads` of them (at most and by
+/// default 1000). With `upload-id-marker` too, after that upload, which has to be one of the
+/// first key from `key-marker` on, as S3 takes it; without `key-marker` it is ignored.
+/// Admitted as a listing of the bucket with that prefix is, and shows only the uploads whose
+/// key the caller may read. Every upload's record is read: the cost is the store's uploads
+/// in progress, not the bucket's.
 pub(super) async fn list_uploads(
     state: &ServerState,
     authz: &Authz<'_>,
@@ -1383,7 +1399,7 @@ pub(super) async fn list_uploads(
     };
     // Each is echoed in the listing, so held to what a bucket listing's prefix is.
     let echoed = |name| list::text(param(&params, name).unwrap_or_default().to_string());
-    let (prefix, key_marker, id_marker) = match (
+    let (prefix, key_marker, mut id_marker) = match (
         echoed("prefix"),
         echoed("key-marker"),
         echoed("upload-id-marker"),
@@ -1393,6 +1409,10 @@ pub(super) async fn list_uploads(
             return refuse(req, invalid(ctx, why), ctx).await;
         }
     };
+    if key_marker.is_empty() {
+        id_marker.clear();
+    }
+    let prefix_sent = param(&params, "prefix").is_some();
     if !list::admitted(authz, &bucket, &prefix) {
         return refuse(req, ctx.access_denied(), ctx).await;
     }
@@ -1410,8 +1430,8 @@ pub(super) async fn list_uploads(
             let Some(meta) = read_record::<Meta>(&dir.join(META)) else {
                 continue;
             };
-            let after = meta.key > key_marker
-                || (meta.key == key_marker && !id_marker.is_empty() && id > id_marker);
+            // Past the key marker; at it too when an upload of the first key is to be found.
+            let after = meta.key > key_marker || (meta.key == key_marker && !id_marker.is_empty());
             let segs: Vec<String> = std::iter::once(bucket.clone())
                 .chain(meta.key.split('/').map(str::to_string))
                 .collect();
@@ -1427,7 +1447,22 @@ pub(super) async fn list_uploads(
                 });
             }
         }
-        uploads.sort_by(|a, b| (&a.key, &a.id).cmp(&(&b.key, &b.id)));
+        uploads.sort_by(|a, b| a.order().cmp(&b.order()));
+        if !id_marker.is_empty() {
+            let first = uploads.first().map(|u| u.key.clone());
+            let Some(at) = uploads
+                .iter()
+                .take_while(|u| Some(&u.key) == first.as_ref())
+                .position(|u| u.id == id_marker)
+            else {
+                return Ok(ctx.error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "upload-id-marker names none of the uploads of the first key from key-marker",
+                ));
+            };
+            uploads.drain(..=at);
+        }
         let truncated = uploads.len() > max;
         uploads.truncate(max);
         let enc = |s: &str| {
@@ -1443,11 +1478,14 @@ pub(super) async fn list_uploads(
             xml::element("KeyMarker", &enc(&key_marker)),
             xml::element("UploadIdMarker", &id_marker),
         );
-        if let (true, Some(last)) = (truncated, uploads.last()) {
+        // S3 names the page's last upload whether or not more follow.
+        if let Some(last) = uploads.last() {
             out.push_str(&xml::element("NextKeyMarker", &enc(&last.key)));
             out.push_str(&xml::element("NextUploadIdMarker", &last.id));
         }
-        out.push_str(&xml::element("Prefix", &enc(&prefix)));
+        if prefix_sent {
+            out.push_str(&xml::element("Prefix", &enc(&prefix)));
+        }
         if url {
             out.push_str(&xml::element("EncodingType", "url"));
         }
