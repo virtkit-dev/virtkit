@@ -343,6 +343,94 @@ fn current_wave(row: &RolloutRow) -> Option<u32> {
         .min()
 }
 
+/// The release and drain/update timeouts used to assess a node's update.
+#[derive(Clone, Copy, Debug)]
+pub struct Update<'a> {
+    pub release: &'a str,
+    pub version: &'a str,
+    pub node_timeout_secs: u64,
+    pub drain_timeout_secs: u64,
+}
+
+impl<'a> Update<'a> {
+    pub fn of(row: &'a RolloutRow) -> Self {
+        Update {
+            release: &row.release,
+            version: &row.version,
+            node_timeout_secs: row.node_timeout_secs,
+            drain_timeout_secs: row.drain_timeout_secs,
+        }
+    }
+}
+
+/// Assess the update in `status` at `now` from `f` (`None` for a removed node).
+/// Returns `Ok` once the node runs the release and is back, `Err` with the failure reason
+/// and whether the update may have run, or `None` while still under way. Records in `status`
+/// when the node was first seen past its drain. No timeout is judged before `not_before`.
+pub fn judge(
+    update: &Update,
+    status: &mut NodeStatus,
+    f: Option<&Facts>,
+    now: u64,
+    not_before: u64,
+) -> Option<Result<(), (String, bool)>> {
+    let NodeStatus::Updating {
+        since,
+        resume,
+        drained_at,
+        ..
+    } = status
+    else {
+        return None;
+    };
+    let (timeout, drain_timeout) = (update.node_timeout_secs, update.drain_timeout_secs);
+    if drained_at.is_none()
+        && f.and_then(|f| f.phase)
+            .is_some_and(|p| p != vk_hub_proto::UpdatePhase::Draining)
+    {
+        *drained_at = Some(now);
+    }
+    let on_target = |f: &Facts| f.runs(update.release, update.version);
+    // An operator may drain or undrain a node during its update, so it may end either way.
+    let back = |f: &Facts| matches!(f.state, Some(NodeState::Ready | NodeState::Drained));
+    // A failure says whether its update may have run: only a refusal or an expiry ran none.
+    match f.and_then(|f| f.outcome.as_ref()) {
+        _ if f.is_none() => Some(Err(("the node was removed from the hub".to_string(), true))),
+        Some(Outcome::Done) if f.is_some_and(|f| on_target(f) && back(f)) => Some(Ok(())),
+        Some(Outcome::Done) if f.is_some_and(|f| f.state == Some(NodeState::Quarantined)) => {
+            Some(Err(("quarantined during its update".into(), true)))
+        }
+        Some(Outcome::Failed { message }) => Some(Err((message.clone(), true))),
+        Some(Outcome::Refused { reason }) => Some(Err((format!("refused: {reason}"), false))),
+        Some(Outcome::Expired) => Some(Err(("the update expired before it ran".into(), false))),
+        _ if now < not_before => None,
+        _ => match *drained_at {
+            None if now.saturating_sub(*since)
+                >= drain_timeout.saturating_add(GIVE_UP_GRACE_SECS) =>
+            {
+                Some(Err((
+                    format!(
+                        "still draining after {}",
+                        crate::human_duration(Duration::from_secs(drain_timeout))
+                    ),
+                    true,
+                )))
+            }
+            Some(at) if now.saturating_sub(at) >= timeout.saturating_add(GIVE_UP_GRACE_SECS) => {
+                Some(Err((
+                    format!(
+                        "not updated and back {} within {} of its drain",
+                        crate::store::state_name(*resume),
+                        crate::human_duration(Duration::from_secs(timeout))
+                    ),
+                    true,
+                )))
+            }
+            _ => None,
+        },
+    }
+}
+
 /// Advance `row` in place using `facts` at `now`, returning effects for the store.
 /// Removed nodes have no facts. Do not judge timeouts before `not_before`.
 pub fn step(
@@ -354,68 +442,20 @@ pub fn step(
     let mut effects = Vec::new();
     let mut failed = Vec::new();
     let version = row.version.clone();
-    let (timeout, drain_timeout) = (row.node_timeout_secs, row.drain_timeout_secs);
     let target = row.clone();
+    let update = Update::of(&target);
     for node in &mut row.nodes {
-        let NodeStatus::Updating {
-            command,
-            since,
-            resume,
-            drained_at,
-        } = &mut node.status
-        else {
+        let NodeStatus::Updating { command, .. } = &node.status else {
             continue;
         };
-        let f = facts.get(&node.id);
-        if drained_at.is_none()
-            && f.and_then(|f| f.phase)
-                .is_some_and(|p| p != vk_hub_proto::UpdatePhase::Draining)
-        {
-            *drained_at = Some(now);
-        }
-        // An operator may drain or undrain a node during its update, so it may end either way.
-        let back = |f: &Facts| matches!(f.state, Some(NodeState::Ready | NodeState::Drained));
-        // A failure says whether its update may have run: only a refusal or an expiry ran none.
-        let verdict = match f.and_then(|f| f.outcome.as_ref()) {
-            _ if f.is_none() => Some(Err(("the node was removed from the hub".to_string(), true))),
-            Some(Outcome::Done) if f.is_some_and(|f| on_target(&target, f) && back(f)) => {
-                Some(Ok(()))
-            }
-            Some(Outcome::Done) if f.is_some_and(|f| f.state == Some(NodeState::Quarantined)) => {
-                Some(Err(("quarantined during its update".into(), true)))
-            }
-            Some(Outcome::Failed { message }) => Some(Err((message.clone(), true))),
-            Some(Outcome::Refused { reason }) => Some(Err((format!("refused: {reason}"), false))),
-            Some(Outcome::Expired) => Some(Err(("the update expired before it ran".into(), false))),
-            _ if now < not_before => None,
-            _ => match *drained_at {
-                None if now.saturating_sub(*since)
-                    >= drain_timeout.saturating_add(GIVE_UP_GRACE_SECS) =>
-                {
-                    Some(Err((
-                        format!(
-                            "still draining after {}",
-                            crate::human_duration(Duration::from_secs(drain_timeout))
-                        ),
-                        true,
-                    )))
-                }
-                Some(at)
-                    if now.saturating_sub(at) >= timeout.saturating_add(GIVE_UP_GRACE_SECS) =>
-                {
-                    Some(Err((
-                        format!(
-                            "not updated and back {} within {} of its drain",
-                            crate::store::state_name(*resume),
-                            crate::human_duration(Duration::from_secs(timeout))
-                        ),
-                        true,
-                    )))
-                }
-                _ => None,
-            },
-        };
         let command = command.clone();
+        let verdict = judge(
+            &update,
+            &mut node.status,
+            facts.get(&node.id),
+            now,
+            not_before,
+        );
         match verdict {
             None => {}
             Some(Ok(())) => {

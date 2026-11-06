@@ -1873,49 +1873,7 @@ impl Db {
     /// two rollouts at once would update the same nodes against each other.
     pub fn create_rollout(&self, id: &str, row: &RolloutRow, actor: &str) -> Result<()> {
         let txn = self.db.begin_write().context("starting a write")?;
-        {
-            // Checked here, in the write: a release removed since it was looked up is gone.
-            if txn
-                .open_table(RELEASES)?
-                .get(row.release.as_str())?
-                .is_none()
-            {
-                bail!("there is no release {}", row.release);
-            }
-            let mut table = txn.open_table(ROLLOUTS)?;
-            for entry in table.iter()? {
-                let (other, value) = entry?;
-                let other_row = decode::<RolloutRow>(value.value())?;
-                if other_row.state.active() {
-                    bail!(
-                        "rollout {} is still {}; abort it, or let it finish, first",
-                        crate::rollout::short_id(other.value()),
-                        other_row.state.name()
-                    );
-                }
-            }
-            table.insert(id, encode(row)?.as_slice())?;
-            let event = format!(
-                "{actor} started rollout {} of vk {} ({}) to {} node(s), {} skipped from the \
-                 start, batches of {}{}, at most {} failure(s)",
-                crate::rollout::short_id(id),
-                row.version,
-                short(&row.release),
-                row.nodes.len(),
-                row.nodes
-                    .iter()
-                    .filter(|n| matches!(n.status, NodeStatus::Skipped { .. }))
-                    .count(),
-                row.batch,
-                if row.canary_per_profile {
-                    " after a canary per profile"
-                } else {
-                    ""
-                },
-                row.max_failures
-            );
-            append_audit(&txn, None, actor, &event, row.created_at)?;
-        }
+        insert_rollout(&txn, id, row, actor)?;
         txn.commit().context("recording a rollout")
     }
 
@@ -1982,7 +1940,11 @@ impl Db {
             return Ok((false, Vec::new()));
         };
         let before = row.clone();
-        let facts = rollout_facts(&txn, &row, now)?;
+        let facts = node_facts(
+            &txn,
+            row.nodes.iter().map(|n| (n.id.as_str(), &n.status)),
+            now,
+        )?;
         let effects = crate::rollout::step(&mut row, &facts, now, not_before);
         let actor = format!("rollout {}", crate::rollout::short_id(id));
         let release = release_in(&txn, &row.release)?;
@@ -2809,6 +2771,57 @@ fn insert_command(
     Ok(command)
 }
 
+/// [`Db::create_rollout`] inside `txn`.
+fn insert_rollout(
+    txn: &redb::WriteTransaction,
+    id: &str,
+    row: &RolloutRow,
+    actor: &str,
+) -> Result<()> {
+    // Checked here, in the write: a release removed since it was looked up is gone.
+    if txn
+        .open_table(RELEASES)?
+        .get(row.release.as_str())?
+        .is_none()
+    {
+        bail!("there is no release {}", row.release);
+    }
+    let mut table = txn.open_table(ROLLOUTS)?;
+    for entry in table.iter()? {
+        let (other, value) = entry?;
+        let other_row = decode::<RolloutRow>(value.value())?;
+        if other_row.state.active() {
+            bail!(
+                "rollout {} is still {}; abort it, or let it finish, first",
+                crate::rollout::short_id(other.value()),
+                other_row.state.name()
+            );
+        }
+    }
+    table.insert(id, encode(row)?.as_slice())?;
+    let event = format!(
+        "{actor} started rollout {} of vk {} ({}) to {} node(s), {} skipped from the \
+         start, batches of {}{}, at most {} failure(s)",
+        crate::rollout::short_id(id),
+        row.version,
+        short(&row.release),
+        row.nodes.len(),
+        row.nodes
+            .iter()
+            .filter(|n| matches!(n.status, NodeStatus::Skipped { .. }))
+            .count(),
+        row.batch,
+        if row.canary_per_profile {
+            " after a canary per profile"
+        } else {
+            ""
+        },
+        row.max_failures
+    );
+    append_audit(txn, None, actor, &event, row.created_at)?;
+    Ok(())
+}
+
 /// The running or paused rollout that still has node `id` to update, by ID, with its state's
 /// name.
 fn rollout_holding(
@@ -2829,34 +2842,35 @@ fn rollout_holding(
     Ok(None)
 }
 
-/// What `txn` says at `now` of each of `row`'s nodes still in the hub, for
-/// [`crate::rollout::step`].
-fn rollout_facts(
+/// Facts from `txn` at `now` for the supplied node IDs and their rollout or target-update
+/// statuses, excluding removed nodes. Used by [`crate::rollout::step`] or
+/// [`crate::rollout::judge`].
+fn node_facts<'a>(
     txn: &redb::WriteTransaction,
-    row: &RolloutRow,
+    nodes_of: impl IntoIterator<Item = (&'a str, &'a NodeStatus)>,
     now: u64,
 ) -> Result<std::collections::HashMap<String, Facts>> {
     let nodes = txn.open_table(NODES)?;
     let commands = txn.open_table(COMMANDS)?;
     let mut facts = std::collections::HashMap::new();
-    for n in &row.nodes {
-        let Some(node) = nodes.get(n.id.as_str())? else {
+    for (id, status) in nodes_of {
+        let Some(node) = nodes.get(id)? else {
             continue;
         };
         let node = decode::<NodeRow>(node.value())?;
-        let command = match &n.status {
+        let command = match status {
             NodeStatus::Updating { command, .. } => Some(command.as_str()),
             _ => None,
         };
         let outcome = match command {
             Some(command) => commands
-                .get(format!("{}/{command}", n.id).as_str())?
+                .get(format!("{id}/{command}").as_str())?
                 .map(|g| decode::<CommandRow>(g.value()))
                 .transpose()?
                 .and_then(|c| c.outcome),
             None => None,
         };
-        let (start, end) = command_range(&n.id);
+        let (start, end) = command_range(id);
         let mut own_update = false;
         for entry in commands.range(start.as_str()..end.as_str())? {
             let c = decode::<CommandRow>(entry?.1.value())?;
@@ -2865,7 +2879,7 @@ fn rollout_facts(
                 && Some(c.command.id.as_str()) != command;
         }
         facts.insert(
-            n.id.clone(),
+            id.to_string(),
             Facts {
                 outcome,
                 // Only the phase of this rollout's command: one before it says nothing of it.
