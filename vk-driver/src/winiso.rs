@@ -96,8 +96,8 @@ impl Pinned {
         })
     }
 
-    /// Check the file's digest, remembering a match (by path, size and mtime) under `cache` so
-    /// an 8 GB ISO is hashed once.
+    /// Check the file's digest, remembering a match (by path, size, mtime, inode and ctime)
+    /// under `cache` so an 8 GB ISO is hashed once.
     fn verify(&self, cache: &Path) -> Result<()> {
         let stamp = self.stamp(cache)?;
         if stamp.exists() {
@@ -119,12 +119,16 @@ impl Pinned {
     fn stamp(&self, cache: &Path) -> Result<PathBuf> {
         let meta =
             std::fs::metadata(&self.path).with_context(|| format!("{}", self.path.display()))?;
+        // The inode and change time too: a stamp names this very file, which nothing can
+        // replace keeping both, so a stamp for another file at the same path is no stamp.
         Ok(cache.join("verified").join(hex(&Sha256::digest(
             format!(
-                "{}\0{}\0{}\0{}",
+                "{}\0{}\0{}\0{}\0{}\0{}",
                 self.path.display(),
                 meta.len(),
                 meta.mtime(),
+                meta.ino(),
+                meta.ctime(),
                 self.sha256
             )
             .as_bytes(),
@@ -143,14 +147,18 @@ impl Pinned {
 
     /// Use the medium at the Dockerfile's path, or fetch it once by digest from `registry`
     /// into `cache` ([`crate::files`]). Preserve its file name: the install script uses it.
+    /// With `approved`, only those digests are taken from outside the build context
+    /// ([`Pinned::check_approved`]).
     fn local_or_fetched(
         &self,
         cache: &Path,
         registry: Option<&crate::config::Registry>,
+        approved: Option<&[String]>,
     ) -> Result<Pinned> {
         if self.path.exists() {
             return Ok(self.clone());
         }
+        self.check_approved(approved)?;
         let name = self
             .path
             .file_name()
@@ -177,7 +185,13 @@ impl Pinned {
         if let Some(other) = fetched
             && std::fs::hard_link(&other, &local.path).is_ok()
         {
+            // The link changed the inode's ctime: restamp both names.
             local.remember_verified(cache)?;
+            Pinned {
+                path: other,
+                sha256: self.sha256.clone(),
+            }
+            .remember_verified(cache)?;
             return Ok(local);
         }
         let Some(rg) = registry else {
@@ -206,6 +220,20 @@ impl Pinned {
         // The fetch checked the digest as the bytes came in.
         local.remember_verified(cache)?;
         Ok(local)
+    }
+
+    /// Refuse the medium when `approved` is given and lacks its digest: the registry's file
+    /// store holds whatever anyone put there, and a placed job's Dockerfile names the digest.
+    fn check_approved(&self, approved: Option<&[String]>) -> Result<()> {
+        if approved.is_some_and(|a| !a.contains(&self.sha256)) {
+            bail!(
+                "{}: not in the build context, and its digest {} is not one this node takes \
+                 for a job: list it in [executor] windows_media",
+                self.path.display(),
+                self.sha256
+            );
+        }
+        Ok(())
     }
 
     /// The file itself, past any symlink: the helper VM sees only the directory mounted for it.
@@ -559,20 +587,25 @@ fn count_reinstall(path: &Path) -> Result<()> {
 }
 
 /// Where a build's install media come from: their cache `dir`, its entries keyed by the
-/// pinned digests, and the `registry` missing ones are fetched from by digest.
+/// pinned digests, and the `registry` missing ones are fetched from by digest. With
+/// `approved`, a medium not in the build context must have one of those digests, whether it
+/// would be fetched or found in the cache.
 #[derive(Clone, Copy)]
 pub(crate) struct MediaSource<'a> {
     pub dir: &'a Path,
     pub registry: Option<&'a crate::config::Registry>,
+    pub approved: Option<&'a [String]>,
 }
 
 /// Mark the media `source` pins as in use in `rg`, so the registry's retention keeps them for
 /// as long as builds use what was installed from them. Best effort: only the asking matters,
 /// not the answer, and an unreachable registry costs each build the client's timeout per
-/// medium, not the build.
-fn keep_media(rg: &crate::config::Registry, source: &Source) {
+/// medium, not the build. With `approved`, only those digests are asked for.
+fn keep_media(rg: &crate::config::Registry, source: &Source, approved: Option<&[String]>) {
     for pinned in [&source.iso, &source.drivers] {
-        crate::files::exists(rg, &pinned.sha256);
+        if approved.is_none_or(|a| a.contains(&pinned.sha256)) {
+            crate::files::exists(rg, &pinned.sha256);
+        }
     }
 }
 
@@ -618,12 +651,12 @@ pub(crate) fn base(
     if let Some(base) = read_base(&dir, &key)? {
         eprintln!("virtkit: winiso: base {} (cached)", &key[..12]);
         if let Some(rg) = media.registry {
-            keep_media(rg, source);
+            keep_media(rg, source, media.approved);
         }
         return here(base);
     }
     if let Some(rg) = media.registry {
-        keep_media(rg, source);
+        keep_media(rg, source, media.approved);
     }
     let Some(rg) = registry else {
         return here(make_base(
@@ -836,10 +869,22 @@ fn make_base(
     read_base(&dir, key)?.context("the base just placed has no record")
 }
 
-/// The install medium of `source`, cached in `from.dir` or built in a helper VM. Only building
-/// the medium reads and verifies the ISOs, fetching missing ones from `from.registry`.
+/// The install medium of `source`, cached in `from.dir` or built in a helper VM. Building the
+/// medium reads and verifies the ISOs, fetching missing ones from `from.registry`; with
+/// approved media, a cached medium's ISOs are checked first too.
 fn media(source: &Source, from: MediaSource<'_>, refs: &crate::wincache::Refs) -> Result<PathBuf> {
     let (cache, registry) = (from.dir, from.registry);
+    // With approved media, check context files against their pinned digests and external
+    // media against the approval list before trusting the cache, whoever built it.
+    if from.approved.is_some() {
+        for pinned in [&source.iso, &source.drivers] {
+            if pinned.path.exists() {
+                pinned.verify(cache)?;
+            } else {
+                pinned.check_approved(from.approved)?;
+            }
+        }
+    }
     let dir = cache.join("media").join(source.media_key());
     // Referenced into `refs` before each is looked at, so a sweep cannot take it between.
     refs.reference(&dir)?;
@@ -853,8 +898,12 @@ fn media(source: &Source, from: MediaSource<'_>, refs: &crate::wincache::Refs) -
         }
     }
     let source = &Source {
-        iso: source.iso.local_or_fetched(cache, registry)?,
-        drivers: source.drivers.local_or_fetched(cache, registry)?,
+        iso: source
+            .iso
+            .local_or_fetched(cache, registry, from.approved)?,
+        drivers: source
+            .drivers
+            .local_or_fetched(cache, registry, from.approved)?,
         ..source.clone()
     };
     source.iso.verify(cache)?;
@@ -1642,10 +1691,13 @@ mod tests {
             path: dir.join("context/ws2025.iso"),
             sha256: sha256.clone(),
         };
-        let err = format!("{:#}", missing.local_or_fetched(&cache, None).unwrap_err());
+        let err = format!(
+            "{:#}",
+            missing.local_or_fetched(&cache, None, None).unwrap_err()
+        );
         assert!(err.contains("no build cache registry"), "{err}");
 
-        let local = missing.local_or_fetched(&cache, Some(&rg)).unwrap();
+        let local = missing.local_or_fetched(&cache, Some(&rg), None).unwrap();
         assert_eq!(
             local.path,
             cache.join("iso").join(&sha256).join("ws2025.iso")
@@ -1658,7 +1710,10 @@ mod tests {
         // Fetched once: the registry is not asked again.
         let _ = std::fs::remove_dir_all(dir.join("store"));
         assert_eq!(
-            missing.local_or_fetched(&cache, Some(&rg)).unwrap().path,
+            missing
+                .local_or_fetched(&cache, Some(&rg), None)
+                .unwrap()
+                .path,
             local.path
         );
         // Nor for the same bytes pinned under another name.
@@ -1666,7 +1721,7 @@ mod tests {
             path: dir.join("context/renamed.iso"),
             sha256: sha256.clone(),
         }
-        .local_or_fetched(&cache, Some(&rg))
+        .local_or_fetched(&cache, Some(&rg), None)
         .unwrap();
         assert_eq!(
             renamed.path,
@@ -1680,7 +1735,7 @@ mod tests {
                 path: src.clone(),
                 sha256: sha256.clone()
             }
-            .local_or_fetched(&cache, Some(&rg))
+            .local_or_fetched(&cache, Some(&rg), None)
             .unwrap()
             .path,
             src
@@ -1692,9 +1747,99 @@ mod tests {
         };
         let err = format!(
             "{:#}",
-            absent.local_or_fetched(&cache, Some(&rg)).unwrap_err()
+            absent
+                .local_or_fetched(&cache, Some(&rg), None)
+                .unwrap_err()
         );
         assert!(err.contains("vk registry put"), "{err}");
+
+        // With approved digests, another one is not fetched; a file in the context needs none.
+        let err = format!(
+            "{:#}",
+            missing
+                .local_or_fetched(&cache, Some(&rg), Some(&["cd".repeat(32)]))
+                .unwrap_err()
+        );
+        assert!(err.contains("[executor] windows_media"), "{err}");
+        assert_eq!(
+            missing
+                .local_or_fetched(&cache, Some(&rg), Some(std::slice::from_ref(&sha256)))
+                .unwrap()
+                .path,
+            local.path
+        );
+        assert_eq!(
+            Pinned {
+                path: src.clone(),
+                sha256: sha256.clone()
+            }
+            .local_or_fetched(&cache, None, Some(&[]))
+            .unwrap()
+            .path,
+            src
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A medium outside the build context is taken only with an approved digest, whether it
+    /// would be fetched or is in the media cache already; one in the context only when its
+    /// bytes have the pinned digest.
+    #[test]
+    fn approved_media_hold_even_for_a_cached_medium() {
+        let dir = std::env::temp_dir().join(format!("vk-winiso-approved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = dir.join("winiso");
+        let (iso, drivers) = ("11".repeat(32), "22".repeat(32));
+        let source = Source {
+            iso: Pinned {
+                path: dir.join("context/ws.iso"),
+                sha256: iso.clone(),
+            },
+            drivers: Pinned {
+                path: dir.join("context/virtio.iso"),
+                sha256: drivers.clone(),
+            },
+            edition: None,
+            product_key: None,
+        };
+        // A medium another build made from those digests.
+        let made = cache.join("media").join(source.media_key());
+        std::fs::create_dir_all(&made).unwrap();
+        std::fs::write(made.join("complete"), b"").unwrap();
+        let refs = crate::wincache::Refs::default();
+        fn with<'a>(cache: &'a Path, approved: Option<&'a [String]>) -> MediaSource<'a> {
+            MediaSource {
+                dir: cache,
+                registry: None,
+                approved,
+            }
+        }
+        assert_eq!(
+            media(&source, with(&cache, None), &refs).unwrap(),
+            made.join("media.img")
+        );
+        let only_iso = [iso.clone()];
+        let err = format!(
+            "{:#}",
+            media(&source, with(&cache, Some(&only_iso)), &refs).unwrap_err()
+        );
+        assert!(
+            err.contains("[executor] windows_media") && err.contains(&drivers),
+            "{err}"
+        );
+        let both = [iso.clone(), drivers.clone()];
+        assert_eq!(
+            media(&source, with(&cache, Some(&both)), &refs).unwrap(),
+            made.join("media.img")
+        );
+        // In the context with other bytes: refused before the cached medium is trusted.
+        std::fs::create_dir_all(dir.join("context")).unwrap();
+        std::fs::write(&source.drivers.path, b"not the pinned bytes").unwrap();
+        let err = format!(
+            "{:#}",
+            media(&source, with(&cache, Some(&only_iso)), &refs).unwrap_err()
+        );
+        assert!(err.contains("the Dockerfile pins"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1743,6 +1888,7 @@ mod tests {
         let from = MediaSource {
             dir: &cache,
             registry: Some(&rg),
+            approved: None,
         };
         let base = base(
             &source,
@@ -1820,6 +1966,7 @@ mod tests {
         let from = MediaSource {
             dir: &cache,
             registry: None,
+            approved: None,
         };
         let base = base(
             &source, size, 1, "1G", &cache, from, false, None, true, &refs,
@@ -1863,6 +2010,7 @@ mod tests {
         let from = MediaSource {
             dir: &cache,
             registry: None,
+            approved: None,
         };
         assert!(media(&source, from, &refs).is_err());
         assert!(linked.join("virtio.iso").exists(), "the drivers are linked");

@@ -164,6 +164,9 @@ pub(crate) struct Options {
     /// Registry for fetching install media missing from the build context by digest;
     /// `None` disables fetching.
     pub media_registry: Option<crate::config::Registry>,
+    /// The only media digests a medium outside the build context may have, for a placed job
+    /// ([`crate::winiso::MediaSource::approved`]); `None` for any.
+    pub approved_media: Option<Vec<String>>,
     /// Whether to take layers from the build cache. When false, the build still locks and
     /// pushes its own layers and fetches install media.
     pub pull_layers: bool,
@@ -436,6 +439,7 @@ fn build_with(opts: &Options) -> Result<Vec<crate::cachelock::Guard>> {
     let media = crate::winiso::MediaSource {
         dir: &media_dir,
         registry: opts.media_registry.as_ref(),
+        approved: opts.approved_media.as_deref(),
     };
     let started = Instant::now();
     let refs = Refs::default();
@@ -1770,6 +1774,7 @@ mod tests {
             reinstall: false,
             registry: None,
             media_registry: None,
+            approved_media: None,
             pull_layers: true,
             ceiling,
         };
@@ -2331,6 +2336,7 @@ mod tests {
             reinstall: false,
             registry: None,
             media_registry: None,
+            approved_media: None,
             pull_layers: true,
             ceiling: None,
         };
@@ -2342,6 +2348,7 @@ mod tests {
             media: crate::winiso::MediaSource {
                 dir: &media_dir,
                 registry: None,
+                approved: None,
             },
             built: HashMap::new(),
             reinstalled: Vec::new(),

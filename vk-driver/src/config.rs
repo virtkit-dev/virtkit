@@ -612,6 +612,13 @@ pub struct Executor {
     /// install under a layer it just published, and a sweep that scanned the layers before the
     /// publish would then take that install at once.
     pub windows_cache_idle_secs: Option<std::num::NonZeroU64>,
+    /// Approved sha256 digests for install media (ISOs, drivers) outside a placed job's Windows
+    /// build context, fetched from the registry's file store or found in the host's media cache.
+    /// Applies on nodes caching placed jobs' builds by scope. The store holds whatever anyone
+    /// put there, accessed under the node's credential, while the job's Dockerfile names the
+    /// digest. Empty: none. Each is 64 hex digits, read lowercased.
+    #[serde(default, deserialize_with = "media_digests")]
+    pub windows_media: Vec<String>,
     /// Mount the `host_checkout` tree in the guest behind a tmpfs-backed overlayfs (default
     /// on). The share is then exported read-only — the guest can never touch the host tree —
     /// and every in-job write runs at guest-native speed instead of a 50–90µs synchronous
@@ -737,6 +744,7 @@ impl Default for Executor {
             checkout_dir: None,
             checkout_cache_idle_secs: None,
             windows_cache_idle_secs: None,
+            windows_media: Vec::new(),
             checkout_overlay: true,
             checkout_overlay_size: CHECKOUT_OVERLAY_SIZE.to_string(),
             checkout_tmpfs: true,
@@ -1164,6 +1172,24 @@ pub struct Share {
     pub dir: PathBuf,
     #[serde(default = "default_true")]
     pub readonly: bool,
+}
+
+/// `[executor] windows_media`: sha256 digests, lowercased, refused unless 64 hex digits each.
+fn media_digests<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let digests: Vec<String> = Deserialize::deserialize(d)?;
+    digests
+        .into_iter()
+        .map(|digest| {
+            let lower = digest.to_ascii_lowercase();
+            if lower.len() == 64 && lower.bytes().all(|b| b.is_ascii_hexdigit()) {
+                Ok(lower)
+            } else {
+                Err(serde::de::Error::custom(format!(
+                    "windows_media: {digest:?} is not a sha256 digest (64 hex digits)"
+                )))
+            }
+        })
+        .collect()
 }
 
 fn default_true() -> bool {
@@ -2151,6 +2177,24 @@ mod tests {
             std::num::NonZeroU32::new(3)
         );
         assert!(toml::from_str::<Config>("[executor.schedule]\nmax_concurrency = 0\n").is_err());
+    }
+
+    /// `windows_media` entries must be sha256 digests.
+    #[test]
+    fn windows_media_are_sha256_digests() {
+        let digest = "AB".repeat(32);
+        let cfg =
+            toml::from_str::<Config>(&format!("[executor]\nwindows_media = [\"{digest}\"]\n"))
+                .unwrap();
+        assert_eq!(cfg.executor.windows_media, ["ab".repeat(32)]);
+        assert!(Config::default().executor.windows_media.is_empty());
+        for bad in ["ab", &"zz".repeat(32), &"ab".repeat(33)] {
+            let err =
+                toml::from_str::<Config>(&format!("[executor]\nwindows_media = [\"{bad}\"]\n"))
+                    .unwrap_err()
+                    .to_string();
+            assert!(err.contains("not a sha256 digest"), "{err}");
+        }
     }
 
     /// A Windows cache lifetime of zero is refused at load time: it would let a sweep take the

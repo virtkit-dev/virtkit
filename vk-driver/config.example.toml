@@ -288,6 +288,10 @@
 #                        # after the next Windows build of a CI job; one a kept layer stands
 #                        # on stays. 7 days; 0 is refused, as it would let a sweep take the
 #                        # install under a layer a build is publishing
+# windows_media = []     # approved sha256 digests for install media (ISOs, drivers) outside
+#                        # a placed job's Windows build context, fetched from the registry
+#                        # or found in the media cache; applies on nodes caching placed jobs'
+#                        # builds by scope; none by default
 # checkout_overlay = true  # build on a guest tmpfs overlay over the read-only host tree,
 #                        # so writes run at guest speed and the guest cannot touch the host
 #                        # tree; false shares it read-write, and the checkout is re-cloned

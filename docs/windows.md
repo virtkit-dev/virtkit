@@ -139,7 +139,10 @@ build shares its layers as Linux build steps do (`wincache`):
   repository nor every host holds the ISOs. Each build that uses an install marks its media as
   used, so the registry's retention keeps them as long as the install is in use, unless they
   were put with `--ttl`, which drops them on time. `vk registry put --keep` keeps them
-  regardless.
+  regardless. A hub-placed job's Windows build, on a node caching placed jobs' builds by
+  scope ([build caches](build-cache-design.md)), takes a medium outside its build context only
+  when `[executor] windows_media` lists its sha256, whether fetched or already in the host's
+  media cache: the file store holds whatever anyone put there, and the job names the digest.
 
 A store on disk — the builtin one, or a `cache_registry` naming a path — is not used: it would
 only hold a second copy of the host's own layer cache, and `--cache-registry` naming one is

@@ -1370,6 +1370,10 @@ fn build_windows_unit(
         reinstall: false,
         registry,
         media_registry,
+        // A placed job on a node caching by scope takes only approved media from outside its
+        // build context.
+        approved_media: (ctx.cache_dest().local != crate::jobctx::LocalScope::Unscoped)
+            .then(|| cfg.executor.windows_media.clone()),
         pull_layers: true,
         // A job's Dockerfile sizes its build guests no larger than its services.
         ceiling: Some(service_ceiling(cfg)?),
