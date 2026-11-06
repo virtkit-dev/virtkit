@@ -17,6 +17,12 @@ All notable changes to virtkit will be documented in this file.
 - **`vk dev` environments can have the VGA console: `vga = true` in `[dev]`.** `vk vga` run in
   the workspace attaches to it.
 
+### Fixed
+
+- **No kernel warning at boot.** Every Linux guest logged a `free_init_pages` warning and
+  stack trace while it started, and was marked tainted by it; a guest booted with
+  `panic_on_warn` would have crashed.
+
 ## [0.106.0] - 2026-11-05
 
 ### Added

@@ -494,6 +494,14 @@ An idle share costs one wakeup per 10s. Covered by
 `a_stall_the_recovery_does_not_clear_is_warned_once` and
 `describe_names_masks_pending_bits_and_routes`.
 
+### Initrd on a page
+
+`src/arch/src/x86_64/mod.rs` — the initrd starts on a page: at the top of low RAM, rounded
+down to 4 KiB, as GRUB places it. Upstream ends it exactly at the top, so its start fell
+inside a page whenever its size was not a whole number of pages (a cpio archive is padded to
+4 bytes only), and every Linux guest warned in `free_init_pages` when it freed the unpacked
+initrd. Covered by `an_initrd_of_any_size_starts_on_a_page`.
+
 ### Not carried from the 1.19 tree
 
 - Initrd placement below 4 GiB: upstream in 2.0.

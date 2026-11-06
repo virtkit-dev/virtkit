@@ -203,7 +203,10 @@ pub fn arch_memory_regions(
         // To be filled later using GuestMemory.
         guest_last_addr: 0,
         page_size,
-        initrd_addr: ram_last_addr.min(MMIO_MEM_START) - initrd_size,
+        // At the top of low RAM, on a page as a boot loader puts it: Linux frees the initrd
+        // by whole pages once unpacked, and warns when it does not start on one.
+        initrd_addr: (ram_last_addr.min(MMIO_MEM_START) - initrd_size)
+            & !(crate::PAGE_SIZE as u64 - 1),
         firmware_addr,
     };
     (info, regions)
@@ -673,7 +676,10 @@ mod tests {
         );
         let initrd_end = info.initrd_addr + initrd_size;
 
-        assert_eq!(info.initrd_addr, MMIO_MEM_START - initrd_size);
+        assert_eq!(
+            info.initrd_addr,
+            (MMIO_MEM_START - initrd_size) & !(crate::PAGE_SIZE as u64 - 1)
+        );
         assert!(regions.iter().any(|(start, size)| {
             let start = start.raw_value();
             let end = start + *size as u64;
@@ -689,6 +695,27 @@ mod tests {
 
         assert_initrd_in_low_ram(3330usize << 20, INITRD_SIZE);
         assert_initrd_in_low_ram(4096usize << 20, INITRD_SIZE);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn an_initrd_of_any_size_starts_on_a_page() {
+        // A cpio archive is padded to 4 bytes only, so its size is rarely a whole page.
+        for initrd_size in [(32 << 20) + 0x5d4, (60 << 20) + 1, (16 << 20) + 0xfff] {
+            for memory_size in [1024usize << 20, 4096usize << 20] {
+                let (info, _) = arch_memory_regions(
+                    memory_size,
+                    Some(KERNEL_LOAD_ADDR),
+                    KERNEL_SIZE,
+                    initrd_size,
+                    None,
+                );
+                let top = info.ram_last_addr.min(MMIO_MEM_START);
+                assert_eq!(info.initrd_addr % crate::PAGE_SIZE as u64, 0);
+                assert!(info.initrd_addr + initrd_size <= top);
+                assert!(top - (info.initrd_addr + initrd_size) < crate::PAGE_SIZE as u64);
+            }
+        }
     }
 
     #[test]
