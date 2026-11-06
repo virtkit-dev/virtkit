@@ -172,12 +172,12 @@ with the source `default`.
   means no vCPU gate: the admission ledger counts each job guest's vCPUs, against the online
   CPUs times the ratio, rounded down. A job waits for vCPUs as it waits for memory, and a
   node refuses an offer past them; a `MICROVM_CPUS` is held to the budget, and an unset
-  `cpus` too. The heartbeat reports vCPUs committed and the budget, and `vk tune` counts
-  only the jobs both budgets have room for.
+  `cpus` too. The heartbeat reports vCPUs committed and the budget, `vk tune` counts only the
+  jobs both budgets have room for, and the hub places on a node no more vCPUs than its budget
+  has left, less those it has asked of the node since.
 
 Proposed:
 
-- **vCPUs placed.** The hub stops placing on a node past its vCPU budget.
 - **Registry.** With no `[registry]` in the local file, the node uses the one the hub names —
   a registry the hub manages, by URL, CA and pipeline root — with no credential of its own:
   guests get the job's token (`guest_credential = "job"`), so only jobs the hub places reach

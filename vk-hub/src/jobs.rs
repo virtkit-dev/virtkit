@@ -1949,6 +1949,7 @@ fn room(
     let mut add = |e: Envelope| {
         pending.mem_mib = pending.mem_mib.saturating_add(e.mem_mib);
         pending.disk_bytes = pending.disk_bytes.saturating_add(e.disk_bytes);
+        pending.cpus = pending.cpus.saturating_add(e.cpus);
     };
     if let Some(e) = extra {
         add(e);
@@ -1973,6 +1974,12 @@ fn room(
         mem_room(heartbeat, inventory.hardware.mem_total_mib)?.saturating_sub(pending.mem_mib);
     let mut fits = below_cap.min(MAX_FITS);
     if let Some(n) = mem_free.checked_div(env.mem_mib) {
+        fits = fits.min(n);
+    }
+    if let Some(n) = cpu_room(heartbeat)
+        .map(|free| free.saturating_sub(u64::from(pending.cpus)))
+        .and_then(|free| free.checked_div(u64::from(env.cpus)))
+    {
         fits = fits.min(n);
     }
     if let Some(free) = heartbeat
@@ -2006,6 +2013,14 @@ fn mem_room(heartbeat: &vk_hub_proto::Heartbeat, total_mib: Option<u64>) -> Opti
         (Some(b), Some(l)) => Some(b.min(l)),
         (b, l) => b.or(l),
     }
+}
+
+/// The vCPUs a node's budget has uncommitted as of its `heartbeat`; `None` from a node with no
+/// vCPU budget, or older than reporting one.
+fn cpu_room(heartbeat: &vk_hub_proto::Heartbeat) -> Option<u64> {
+    let admission = heartbeat.admission.as_ref()?;
+    let committed = admission.committed_cpus.unwrap_or(0);
+    Some(u64::from(admission.cpu_budget?.saturating_sub(committed)))
 }
 
 /// How much placed work `node` holds as the hub counts it against the node's ceiling, one
@@ -5719,6 +5734,24 @@ mod tests {
         assert_eq!(mem_room(&beat(None, Some(60_000)), None), Some(60_000));
         assert_eq!(mem_room(&beat(None, Some(10_000)), total), Some(0));
         assert_eq!(mem_room(&beat(None, None), total), None);
+    }
+
+    /// A node's vCPU room is its budget less what it has committed, and none without a budget.
+    #[test]
+    fn a_nodes_vcpu_room_is_its_budget_less_what_is_committed() {
+        let beat = |committed, budget| vk_hub_proto::Heartbeat {
+            admission: Some(vk_hub_proto::Admission {
+                committed_cpus: committed,
+                cpu_budget: budget,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(cpu_room(&beat(Some(6), Some(16))), Some(10));
+        assert_eq!(cpu_room(&beat(Some(20), Some(16))), Some(0));
+        assert_eq!(cpu_room(&beat(None, Some(16))), Some(16));
+        assert_eq!(cpu_room(&beat(Some(6), None)), None);
+        assert_eq!(cpu_room(&vk_hub_proto::Heartbeat::default()), None);
     }
 
     /// A node of 8 CPUs reporting `load1_hundredths`, and how long it keeps idle images.

@@ -4218,6 +4218,42 @@ async fn a_start_on_a_reservation_counts_against_room_until_a_heartbeat_shows_it
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_is_placed_no_more_vcpus_than_its_budget_has_left() {
+    let dir = scratch("room-cpus");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let node_key = keypair();
+    let id = new_node(addr, &hub, &node_key).await;
+    // Memory for four envelopes, vCPUs for two and a half of 2 each.
+    let mut beat = heartbeat(16384, None);
+    if let Some(admission) = beat.admission.as_mut() {
+        (admission.committed_cpus, admission.cpu_budget) = (Some(3), Some(8));
+    }
+    let mut node = connect_beating(
+        addr,
+        &id,
+        &node_key,
+        V3,
+        beat,
+        Some(Held::default()),
+        Duration::from_secs(3600),
+    )
+    .await;
+    wait_until(|| crate::jobs::testing::linked(&hub, &id) && heard(&hub, &id)).await;
+    let fits = || async {
+        crate::jobs::capacity(&hub, &placement())
+            .await
+            .unwrap()
+            .fits
+    };
+    assert_eq!(fits().await, 2);
+    // A reservation the heartbeat does not show yet counts against the room.
+    reserve_on(addr, &key, &mut node, 1, Some("test")).await;
+    assert_eq!(fits().await, 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The next start the hub sends `node`, past the other job messages.
 async fn next_start(node: &mut FakeNode) -> Box<vk_hub_proto::dispatch::JobStart> {
     loop {
