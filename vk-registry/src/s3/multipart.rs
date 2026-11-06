@@ -676,7 +676,8 @@ fn copy_range(value: &str) -> Option<(u64, u64)> {
 /// object, whole or the bytes `x-amz-copy-source-range` names, read as CopyObject reads its
 /// source and checked against the same `x-amz-copy-source-if-*` conditions. The bytes are
 /// copied into the upload (a part is the upload's own until it completes), off the runtime,
-/// hashed on the way. 200 with `CopyPartResult`.
+/// hashed on the way: their MD5, and the checksum of the upload's algorithm, which the part
+/// is recorded with and the answer names. 200 with `CopyPartResult`.
 async fn copy_part(
     state: &ServerState,
     authz: &Authz<'_>,
@@ -765,6 +766,9 @@ async fn copy_part(
         };
         let mut staged = Staged::written(path, 0, String::new());
         let mut md5 = md5::Context::new();
+        // The checksum of the upload's algorithm, which the part is recorded with.
+        let header = up.meta.checksum.as_ref().and_then(Asked::header);
+        let mut hasher = header.and_then(checksum::Hasher::any);
         let mut buf = vec![0u8; STREAM_CHUNK];
         loop {
             let got = match reader.read(&mut buf) {
@@ -775,12 +779,22 @@ async fn copy_part(
             };
             let data = buf.get(..got).unwrap_or_default();
             md5.consume(data);
+            if let Some(h) = &mut hasher {
+                h.update(data);
+            }
             file.write_all(data).context("writing a copied part")?;
             staged.size = staged.size.saturating_add(got as u64);
         }
         drop(file);
         let md5 = crate::hex_of(&md5.finalize().0);
-        match install_part(&up.dir, n, staged, &md5, None) {
+        let made = header.zip(hasher).and_then(|(header, h)| {
+            checksum::annotation(header, &vk_hub_proto::to_base64(&h.finalize()))
+        });
+        let element = made.as_ref().map_or(String::new(), |(_, kept)| {
+            let (algorithm, value) = kept.split_once(':').unwrap_or_default();
+            xml::element(&format!("Checksum{algorithm}"), value)
+        });
+        match install_part(&up.dir, n, staged, &md5, made.map(|(_, kept)| kept)) {
             Ok(()) => {}
             Err(_) if !up.dir.is_dir() => return Ok(no_such_upload(&ctx, &id)),
             Err(e) => return Err(e),
@@ -788,7 +802,7 @@ async fn copy_part(
         Ok(xml::document(
             "CopyPartResult",
             &format!(
-                "{}{}",
+                "{}{}{element}",
                 xml::element("LastModified", &list::iso8601(SystemTime::now())),
                 xml::element("ETag", &format!("\"{md5}\""))
             ),

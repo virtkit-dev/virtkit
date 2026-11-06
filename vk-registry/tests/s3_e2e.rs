@@ -5078,6 +5078,96 @@ async fn an_upload_holds_its_parts_to_the_checksum_it_was_created_with() {
     );
 }
 
+/// A copy asking for a checksum algorithm has the object's checksum in it, computed from the
+/// source's bytes unless the source kept one in it, and named in the result; a part copied
+/// into an upload created with a checksum has the upload's computed.
+#[tokio::test]
+async fn a_copy_computes_the_checksum_it_asks_for() {
+    let dir = tmp("copy-checksum");
+    let host = spawn(open_state(&dir, true));
+    let data = bytes_of_len(70_000);
+    let put = Req::new("PUT", "/s3/b/src")
+        .header("x-amz-checksum-crc32c", &crc32c_b64(&data))
+        .body(data.clone());
+    send(&host, put).await.ok(200);
+    let copy = |dst: &str, algorithm: Option<&str>| {
+        let req = Req::new("PUT", dst).header("x-amz-copy-source", "/b/src");
+        match algorithm {
+            Some(a) => req.header("x-amz-checksum-algorithm", a),
+            None => req,
+        }
+    };
+    let head = |path: &str| Req::new("HEAD", path).header("x-amz-checksum-mode", "ENABLED");
+    // The source's own, carried.
+    let resp = send(&host, copy("/s3/b/same", None)).await;
+    resp.ok(200);
+    assert_eq!(element(&resp.body, "ChecksumCRC32C"), crc32c_b64(&data));
+    assert_eq!(element(&resp.body, "ChecksumType"), "FULL_OBJECT");
+    // Another algorithm, computed in its place.
+    for (algorithm, header, value) in [
+        ("SHA1", "x-amz-checksum-sha1", sha1_b64(&data)),
+        (
+            "sha256",
+            "x-amz-checksum-sha256",
+            b64(&sha2::Sha256::digest(&data)),
+        ),
+        (
+            "CRC64NVME",
+            "x-amz-checksum-crc64nvme",
+            crc64nvme_b64(&data),
+        ),
+    ] {
+        let resp = send(&host, copy("/s3/b/other", Some(algorithm))).await;
+        resp.ok(200);
+        let name = header
+            .trim_start_matches("x-amz-checksum-")
+            .to_ascii_uppercase();
+        assert_eq!(element(&resp.body, &format!("Checksum{name}")), value);
+        assert!(!resp.body.contains("ChecksumCRC32C"), "{}", resp.body);
+        let resp = send(&host, head("/s3/b/other")).await;
+        assert_eq!(resp.header(header), Some(value.as_str()), "{algorithm}");
+        assert_eq!(resp.header("x-amz-checksum-crc32c"), None);
+    }
+    // Onto itself, with its metadata replaced.
+    let resp = send(
+        &host,
+        copy("/s3/b/src", Some("CRC32")).header("x-amz-metadata-directive", "REPLACE"),
+    )
+    .await;
+    resp.ok(200);
+    assert_eq!(element(&resp.body, "ChecksumCRC32"), crc32_b64(&data));
+    // An algorithm S3 does not have is said before a copy onto itself is refused.
+    send(&host, copy("/s3/b/src", Some("CRC31")))
+        .await
+        .is(400, "InvalidRequest")
+        .says(
+            "Checksum algorithm provided is unsupported. Please try again with any of the valid \
+             types: [CRC32, CRC32C, CRC64NVME, MD5, SHA1, SHA256, SHA512, XXHASH128, XXHASH3, \
+             XXHASH64]",
+        );
+
+    // A part copied into a CRC32 upload has its CRC32, which the completion names.
+    let path = "/s3/b/parts";
+    let create = Req::new("POST", path)
+        .query("uploads=")
+        .header("x-amz-checksum-algorithm", "CRC32");
+    let id = element(&send(&host, create).await.body, "UploadId");
+    let req = Req::new("PUT", path)
+        .query(&part_query(&id, 1))
+        .header("x-amz-copy-source", "/b/src")
+        .header("x-amz-copy-source-range", "bytes=0-999");
+    let resp = send(&host, req).await;
+    resp.ok(200);
+    let part = data.get(..1000).unwrap();
+    let crc = crc32_b64(part);
+    assert_eq!(element(&resp.body, "ChecksumCRC32"), crc);
+    let etag = format!("\"{}\"", md5_hex(part));
+    let done = Req::new("POST", path)
+        .query(&format!("uploadId={id}"))
+        .body(complete_doc_with(&[(1, &etag, &[("ChecksumCRC32", &crc)])]));
+    send(&host, done).await.ok(200);
+}
+
 /// An upload in three parts, as the AWS CLI sends a large file (the first part SigV4-signed
 /// `aws-chunked`, the second with its `Content-MD5`, the last with its SHA-256 signed and an
 /// `x-amz-checksum-sha256`), one part replaced, listed, refused when completed wrong, then

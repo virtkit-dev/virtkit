@@ -237,8 +237,9 @@ pub(super) fn header(algorithm: &str) -> Option<&'static str> {
 }
 
 /// A digest of a body as it streams, in the algorithm `header` names: SHA-256 is left to
-/// the store, which names every blob by it.
+/// the store, which names every blob by it, but where bytes are read back ([`Hasher::any`]).
 pub(super) enum Hasher {
+    Sha256(sha2::Sha256),
     Crc32(crc32fast::Hasher),
     Crc32c(crc::Digest<'static, u32>),
     Sha1(sha1::Sha1),
@@ -273,8 +274,17 @@ impl Hasher {
         })
     }
 
+    /// [`Hasher::for_`], SHA-256 included.
+    pub(super) fn any(header: &str) -> Option<Self> {
+        if header == "x-amz-checksum-sha256" {
+            return Some(Hasher::Sha256(sha2::Sha256::new()));
+        }
+        Self::for_(header)
+    }
+
     pub(super) fn update(&mut self, data: &[u8]) {
         match self {
+            Hasher::Sha256(h) => h.update(data),
             Hasher::Crc32(h) => h.update(data),
             Hasher::Crc32c(h) => h.update(data),
             Hasher::Sha1(h) => h.update(data),
@@ -290,6 +300,7 @@ impl Hasher {
     /// XXHASHes (XXH128's high half first), as xxHash's canonical form is.
     pub(super) fn finalize(self) -> Vec<u8> {
         match self {
+            Hasher::Sha256(h) => h.finalize().to_vec(),
             Hasher::Crc32(h) => h.finalize().to_be_bytes().to_vec(),
             Hasher::Crc32c(h) => h.finalize().to_be_bytes().to_vec(),
             Hasher::Sha1(h) => h.finalize().to_vec(),
@@ -306,12 +317,41 @@ impl Hasher {
 /// The checksum of `data` in the algorithm `header` names, SHA-256 included; `None` for a
 /// header that names none.
 pub(super) fn of(header: &str, data: &[u8]) -> Option<Vec<u8>> {
-    if header == "x-amz-checksum-sha256" {
-        return Some(sha2::Sha256::digest(data).to_vec());
-    }
-    let mut hasher = Hasher::for_(header)?;
+    let mut hasher = Hasher::any(header)?;
     hasher.update(data);
     Some(hasher.finalize())
+}
+
+/// The checksum, in base64, of the `size` bytes of the blob `layer` (their SHA-256, in hex)
+/// in the algorithm `header` names: SHA-256's is the blob's name, any other's is read off it.
+/// `None` when the blob is gone.
+pub(super) fn of_blob(
+    store: &crate::Store,
+    layer: &str,
+    size: u64,
+    header: &str,
+) -> anyhow::Result<Option<String>> {
+    use std::io::Read as _;
+    if header == "x-amz-checksum-sha256" {
+        return Ok(super::object::hex_bytes(layer).map(|b| vk_hub_proto::to_base64(&b)));
+    }
+    let Some(mut hasher) = Hasher::for_(header) else {
+        return Ok(None);
+    };
+    let Some((_, mut reader)) = store.read_blob_range(layer, 0, size)? else {
+        return Ok(None);
+    };
+    let mut buf = vec![0u8; crate::STREAM_CHUNK];
+    loop {
+        let got = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(got) => got,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(anyhow::Error::from(e).context("reading an object to hash it")),
+        };
+        hasher.update(buf.get(..got).unwrap_or_default());
+    }
+    Ok(Some(vk_hub_proto::to_base64(&hasher.finalize())))
 }
 
 /// What an object's annotation keeps: the algorithm, by S3's name, and the checksum in

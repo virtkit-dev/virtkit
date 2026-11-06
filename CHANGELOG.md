@@ -20,7 +20,7 @@ All notable changes to virtkit will be documented in this file.
   The chunked uploads AWS SDKs and the CLI send are taken, their signatures and checksums
   checked, and objects can be read in byte ranges, as the AWS CLI downloads large files.
   Buckets can be created and removed, objects copied without their bytes being stored twice
-  and deleted in batches — only while still the ETag, modification time or size a delete
+  (or with the checksum a copy asks for computed from them) and deleted in batches — only while still the ETag, modification time or size a delete
   names, when it names one, as S3's conditional deletes — and the configuration probes tools send before using a bucket
   (versioning, ACLs, tagging and the like) are answered as for a bucket with none set, and a
   write asking for one of them — encryption under the client's own key, tags, an ACL, a
