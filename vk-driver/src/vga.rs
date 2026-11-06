@@ -273,6 +273,16 @@ pub(crate) enum Mode {
     Detached,
 }
 
+/// The mode as it is spelled on the command line (`tty`, not `Tty`).
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match clap::ValueEnum::to_possible_value(self) {
+            Some(value) => f.write_str(value.get_name()),
+            None => Ok(()),
+        }
+    }
+}
+
 /// What a VM's VGA console is wanted for: the mode and the named files (`--vga-input`,
 /// `--vga-output`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -318,7 +328,7 @@ pub(crate) fn resolve(
     if opts.input.is_some() || opts.output.is_some() {
         if !matches!(opts.mode, Mode::Auto | Mode::Stdio) {
             bail!(
-                "--vga-input/--vga-output name files: they go with --vga=stdio (or auto), not --vga={:?}",
+                "--vga-input/--vga-output name files: they go with --vga=stdio (or auto), not --vga={}",
                 opts.mode
             );
         }
@@ -342,11 +352,7 @@ pub(crate) fn resolve(
         Mode::Tty | Mode::Stdio if command_uses_stdio => bail!(
             "--vga={} needs this process's stdin and stdout, which the guest command uses; \
              use --vga=window, --vga-output FILE, or attach with `vk vga` (--vga=detached)",
-            if opts.mode == Mode::Tty {
-                "tty"
-            } else {
-                "stdio"
-            }
+            opts.mode
         ),
         Mode::Tty if !(stdin_tty && stdout_tty) => {
             bail!("--vga=tty needs stdin and stdout to be a terminal")
@@ -1016,7 +1022,8 @@ mod tests {
             output: Some("s".into()),
             ..Options::default()
         };
-        assert!(resolve(&window_files, false, true, true, true).is_err());
+        let err = resolve(&window_files, false, true, true, true).unwrap_err();
+        assert!(err.to_string().ends_with("not --vga=window"), "{err}");
     }
 
     #[test]
