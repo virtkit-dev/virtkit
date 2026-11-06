@@ -11,7 +11,9 @@
 //! directory then goes, and the parts' sizes stay on the manifest ([`PARTS_ANNOTATION`]),
 //! so a read may ask for one part of the object as it was uploaded (`?partNumber=<n>`) and
 //! GetObjectAttributes may list them. The gc sweeps an upload nothing has been written into
-//! for its grace window, as it sweeps an idle OCI upload.
+//! for its grace window, as it sweeps an idle OCI upload. A completion or an abort holds
+//! the upload's directory locked until it is done ([`open_held`]), so two of them at once run
+//! one after the other.
 //!
 //! Authorized as a PutObject is: `Write` on the key's parent repository, `Read` there for
 //! ListParts, and ListMultipartUploads as a listing of the bucket. The upload id must name an
@@ -271,6 +273,40 @@ fn open(store: &Store, id: &str, segs: &[String]) -> Option<Upload> {
         dir,
         meta,
     })
+}
+
+/// An upload held for its end: [`open`]'s, once the lock on its directory is had.
+struct Held {
+    /// the directory, open and locked exclusive (`flock`) until dropped
+    _lock: std::fs::File,
+    up: Upload,
+}
+
+/// The upload `id` names for the object at `segs`, held so no other completion or abort of
+/// it, in this process or another on the store, runs until the hold is dropped: blocks
+/// while one does, then looks the upload up afresh, so the one that waited finds it as
+/// that one left it. Only completions and aborts take the hold; a part written meanwhile is
+/// caught by the MD5 a completion checks as it reads it.
+fn open_held(store: &Store, id: &str, segs: &[String]) -> Result<Option<Held>> {
+    let Some(dir) = store.multipart_dir(id) else {
+        return Ok(None);
+    };
+    let lock = match std::fs::File::open(&dir) {
+        Ok(lock) => lock,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("opening {}", dir.display()))),
+    };
+    lock.lock()
+        .with_context(|| format!("locking {}", dir.display()))?;
+    Ok(open(store, id, segs).map(|up| Held { _lock: lock, up }))
+}
+
+/// [`open_held`], off the runtime.
+async fn open_held_async(state: &ServerState, id: &str, segs: &[String]) -> Result<Option<Held>> {
+    let (store, id, segs) = (Arc::clone(&state.store), id.to_string(), segs.to_vec());
+    tokio::task::spawn_blocking(move || open_held(&store, &id, &segs))
+        .await
+        .context("holding an upload panicked")?
 }
 
 fn no_such_upload(ctx: &Ctx) -> Response<Body> {
@@ -948,19 +984,21 @@ async fn complete(
     let assembled = {
         let (store, segs) = (Arc::clone(&state.store), segs.clone());
         tokio::task::spawn_blocking(move || -> Result<_> {
-            let Some(up) = open(&store, &id, &segs) else {
+            let Some(held) = open_held(&store, &id, &segs)? else {
                 return Ok(None);
             };
-            let assembled = assemble(&store, &up, &parts, whole.as_ref())?;
-            Ok(Some((up, assembled)))
+            let assembled = assemble(&store, &held.up, &parts, whole.as_ref())?;
+            Ok(Some((held, assembled)))
         })
         .await
         .context("assembling an upload panicked")??
     };
-    let (up, assembled) = match assembled {
+    // Held until the upload is gone, so a completion racing this one waits, then finds it
+    // completed rather than its parts going from under it.
+    let (Held { _lock, up }, assembled) = match assembled {
         None => return Ok(no_such_upload(ctx)),
         Some((_, Err((status, code, message)))) => return Ok(ctx.error(status, code, message)),
-        Some((up, Ok(assembled))) => (up, assembled),
+        Some((held, Ok(assembled))) => (held, assembled),
     };
     let Assembled {
         staged,
@@ -1040,11 +1078,10 @@ async fn abort(
     if let Some(resp) = drain(req, ctx).await? {
         return Ok(resp);
     }
-    let Some(up) = open_async(state, &id, &segs).await? else {
+    // Held until the upload is gone: an abort racing a completion waits for it to end.
+    let Some(Held { _lock, up }) = open_held_async(state, &id, &segs).await? else {
         return Ok(no_such_upload(ctx));
     };
-    // An upload's creation time never changes, so a concurrent abort or completion leaves
-    // nothing for the check to be wrong about.
     if initiated.is_some_and(|t| t != up.meta.created) {
         return Ok(ctx.error(
             StatusCode::PRECONDITION_FAILED,
