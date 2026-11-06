@@ -13,7 +13,9 @@
 //! GetObjectAttributes may list them. The gc sweeps an upload nothing has been written into
 //! for its grace window, as it sweeps an idle OCI upload. A completion or an abort holds
 //! the upload's directory locked until it is done ([`open_held`]), so two of them at once run
-//! one after the other.
+//! one after the other. A completed upload's directory keeps only `completed.json`, what the
+//! completion made ([`Completed`]), until the gc sweeps it as an idle upload: the same
+//! completion sent again is answered as it was while the key holds that object.
 //!
 //! Authorized as a PutObject is: `Write` on the key's parent repository, `Read` there for
 //! ListParts, and ListMultipartUploads as a listing of the bucket. The upload id must name an
@@ -58,7 +60,7 @@ const MAX_ELEMENTS: usize = 6 * MAX_PARTS as usize + 16;
 const MAX_LISTED: usize = 1000;
 
 /// What an upload records of itself, in its directory.
-const META: &str = "meta.json";
+const META: &str = crate::MULTIPART_RECORD;
 
 /// The manifest annotation holding the sizes of the parts an object was completed from, in
 /// order: each in decimal, a run of equal sizes as `<size>x<count>`, joined by commas, so an
@@ -288,6 +290,15 @@ struct Held {
 /// that one left it. Only completions and aborts take the hold; a part written meanwhile is
 /// caught by the MD5 a completion checks as it reads it.
 fn open_held(store: &Store, id: &str, segs: &[String]) -> Result<Option<Held>> {
+    let Some((lock, _)) = hold(store, id)? else {
+        return Ok(None);
+    };
+    Ok(open(store, id, segs).map(|up| Held { _lock: lock, up }))
+}
+
+/// The directory of upload `id`, open and locked exclusive, with its path: [`open_held`]'s
+/// hold, before anything in the directory is read.
+fn hold(store: &Store, id: &str) -> Result<Option<(std::fs::File, PathBuf)>> {
     let Some(dir) = store.multipart_dir(id) else {
         return Ok(None);
     };
@@ -298,7 +309,7 @@ fn open_held(store: &Store, id: &str, segs: &[String]) -> Result<Option<Held>> {
     };
     lock.lock()
         .with_context(|| format!("locking {}", dir.display()))?;
-    Ok(open(store, id, segs).map(|up| Held { _lock: lock, up }))
+    Ok(Some((lock, dir)))
 }
 
 /// [`open_held`], off the runtime.
@@ -928,8 +939,10 @@ fn assemble(
 /// document's parts make, in the order given, tagged at the key as a PutObject's body is
 /// (the key checked again, `If-None-Match: *`/`If-Match` checked where the tag is written),
 /// with the user metadata recorded at the upload's creation, the multipart ETag, the
-/// whole-object checksum that held and the parts' sizes; the upload then goes. A refusal
-/// leaves the upload as it was, to be completed again.
+/// whole-object checksum that held and the parts' sizes; the upload then goes, leaving what
+/// it made ([`settle`]). A refusal leaves the upload as it was, to be completed again. A
+/// completed upload is answered as it was when the same parts are named again and the key
+/// still holds the object it made ([`completed`]), and is `NoSuchUpload` otherwise.
 async fn complete(
     state: &ServerState,
     authz: &Authz<'_>,
@@ -981,24 +994,33 @@ async fn complete(
             ));
         }
     };
-    let assembled = {
+    let found = {
         let (store, segs) = (Arc::clone(&state.store), segs.clone());
         tokio::task::spawn_blocking(move || -> Result<_> {
-            let Some(held) = open_held(&store, &id, &segs)? else {
-                return Ok(None);
+            let Some((lock, dir)) = hold(&store, &id)? else {
+                return Ok(Found::Gone);
             };
-            let assembled = assemble(&store, &held.up, &parts, whole.as_ref())?;
-            Ok(Some((held, assembled)))
+            let Some(up) = open(&store, &id, &segs) else {
+                return Ok(match completed(&store, &dir, &segs, &parts)? {
+                    Some(done) => Found::Completed(done),
+                    None => Found::Gone,
+                });
+            };
+            let assembled = assemble(&store, &up, &parts, whole.as_ref())?;
+            Ok(Found::Assembled(Held { _lock: lock, up }, parts, assembled))
         })
         .await
         .context("assembling an upload panicked")??
     };
-    // Held until the upload is gone, so a completion racing this one waits, then finds it
-    // completed rather than its parts going from under it.
-    let (Held { _lock, up }, assembled) = match assembled {
-        None => return Ok(no_such_upload(ctx)),
-        Some((_, Err((status, code, message)))) => return Ok(ctx.error(status, code, message)),
-        Some((held, Ok(assembled))) => (held, assembled),
+    // Held until the upload is completed, so a completion racing this one waits, then finds
+    // it completed rather than its parts going from under it.
+    let (Held { _lock, up }, parts, assembled) = match found {
+        Found::Gone => return Ok(no_such_upload(ctx)),
+        Found::Completed(done) => return Ok(done.result(ctx)),
+        Found::Assembled(_, _, Err((status, code, message))) => {
+            return Ok(ctx.error(status, code, message));
+        }
+        Found::Assembled(held, parts, Ok(assembled)) => (held, parts, assembled),
     };
     let Assembled {
         staged,
@@ -1015,6 +1037,14 @@ async fn complete(
         annotations.insert(name, value);
     }
     let kept = checksum::stored(&annotations).map_or(String::new(), |kept| kept.elements());
+    let done = Completed {
+        bucket: up.meta.bucket,
+        key: up.meta.key,
+        parts,
+        etag,
+        layer: staged.hex.clone(),
+        kept,
+    };
     let how = Commit {
         annotations,
         precondition: conditions.precondition(),
@@ -1025,17 +1055,120 @@ async fn complete(
         Written::Refused(why) => return Ok(unwritable(why, ctx)),
         Written::PreconditionFailed => return Ok(copy::failed(ctx)),
     }
-    remove(up.dir).await?;
-    Ok(xml::document(
-        "CompleteMultipartUploadResult",
-        &format!(
-            "{}{}{}{}{kept}",
-            xml::element("Location", &ctx.url),
-            xml::element("Bucket", &up.meta.bucket),
-            xml::element("Key", &up.meta.key),
-            xml::element("ETag", &format!("\"{etag}\""))
-        ),
-    ))
+    let resp = done.result(ctx);
+    let dir = up.dir;
+    let settled = {
+        let dir = dir.clone();
+        tokio::task::spawn_blocking(move || settle(&dir, &done))
+            .await
+            .context("recording a completion panicked")?
+    };
+    if settled.is_err() {
+        // The object is made; an upload that could not be remembered as completed only
+        // answers a retry of its completion 404, as one completed before this did.
+        remove(dir).await?;
+    }
+    Ok(resp)
+}
+
+/// What [`complete`] found of an upload, held.
+enum Found {
+    /// no upload of the key by that id, or one completed otherwise than asked
+    Gone,
+    /// completed as asked, into the object still at the key
+    Completed(Completed),
+    /// in progress: its parts assembled as asked, or why not
+    Assembled(
+        Held,
+        Vec<(u32, String)>,
+        std::result::Result<Assembled, Refused>,
+    ),
+}
+
+/// What a completed upload leaves in its directory, in place of its record and parts.
+const COMPLETED: &str = "completed.json";
+
+/// What an upload's completion made, remembered so that the same completion sent again (an
+/// SDK retrying one whose answer it lost) is answered as it was.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Completed {
+    bucket: String,
+    key: String,
+    /// the parts the completion named, as [`document`] reads them
+    parts: Vec<(u32, String)>,
+    /// the object's ETag, unquoted
+    etag: String,
+    /// the object's bytes, by the hex of their SHA-256
+    layer: String,
+    /// the checksum elements of the answer
+    kept: String,
+}
+
+impl Completed {
+    /// The `CompleteMultipartUploadResult` of this completion.
+    fn result(&self, ctx: &Ctx) -> Response<Body> {
+        xml::document(
+            "CompleteMultipartUploadResult",
+            &format!(
+                "{}{}{}{}{}",
+                xml::element("Location", &ctx.url),
+                xml::element("Bucket", &self.bucket),
+                xml::element("Key", &self.key),
+                xml::element("ETag", &format!("\"{}\"", self.etag)),
+                self.kept
+            ),
+        )
+    }
+}
+
+/// The completion `dir` remembers, when it named `parts` for the object at `segs` and that
+/// object is still the one it made: the same bytes under the same multipart ETag. An object
+/// written over or deleted since, or another list of parts, finds none.
+fn completed(
+    store: &Store,
+    dir: &Path,
+    segs: &[String],
+    parts: &[(u32, String)],
+) -> Result<Option<Completed>> {
+    let Some(done) = read_record::<Completed>(&dir.join(COMPLETED)) else {
+        return Ok(None);
+    };
+    if done.bucket != bucket_of(segs) || done.key != key_of(segs) || done.parts != parts {
+        return Ok(None);
+    }
+    let same = match files::resolve(store, segs)? {
+        Some(files::Node::Object(obj)) => {
+            obj.layer == done.layer && obj.annotations.get(MD5_ANNOTATION) == Some(&done.etag)
+        }
+        _ => false,
+    };
+    Ok(same.then_some(done))
+}
+
+/// Leave the completed upload in `dir` as `done` only: its record removed first, so it is no
+/// upload in progress from then on, then `done` written, then its parts and whatever else is
+/// there removed. The directory then goes as an idle upload's does, once the gc's grace
+/// window has passed.
+fn settle(dir: &Path, done: &Completed) -> Result<()> {
+    std::fs::remove_file(dir.join(META))
+        .with_context(|| format!("removing {}", dir.join(META).display()))?;
+    vk_fs::write_atomic_unsynced(&dir.join(COMPLETED), &serde_json::to_vec(done)?, 0o600)?;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))? {
+        let entry = entry?;
+        if entry.file_name() != COMPLETED {
+            let path = entry.path();
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(
+                        anyhow::Error::from(e).context(format!("removing {}", path.display()))
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Remove an upload's directory, off the runtime; one already gone is gone.

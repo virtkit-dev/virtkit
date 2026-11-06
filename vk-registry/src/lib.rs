@@ -3885,9 +3885,17 @@ fn newest_mtime(dir: &Path) -> Option<SystemTime> {
     Some(newest)
 }
 
-/// What the S3 multipart uploads in `dir` hold: how many there are, and their files' bytes.
+/// The record an S3 multipart upload in progress keeps in its directory: a completed upload's
+/// directory, kept for a while to answer its completion again, has none.
+pub(crate) const MULTIPART_RECORD: &str = "meta.json";
+
+/// What the S3 multipart uploads in progress in `dir` hold: how many there are, and their
+/// files' bytes.
 fn multipart_usage(dir: &Path) -> (usize, u64) {
-    let uploads = multipart_dirs(dir);
+    let uploads: Vec<PathBuf> = multipart_dirs(dir)
+        .into_iter()
+        .filter(|d| d.join(MULTIPART_RECORD).is_file())
+        .collect();
     let bytes = uploads
         .iter()
         .flat_map(|d| dir_files(d))
@@ -8306,6 +8314,9 @@ mod tests {
             std::fs::write(up.join("part-1.json"), b"{}").unwrap();
         }
         std::fs::write(fresh.join("meta.json"), b"{}").unwrap();
+        // Completed lately: kept, and not counted as in progress.
+        let (_, done) = store.create_multipart().unwrap();
+        std::fs::write(done.join("completed.json"), b"{}").unwrap();
         // Not an upload's name: never taken for one.
         std::fs::create_dir_all(dir.join("uploads/s3/not-an-upload")).unwrap();
 
@@ -8316,6 +8327,7 @@ mod tests {
         }
         touch(&busy.join("part-1"));
         touch(&fresh.join("meta.json"));
+        touch(&done.join("completed.json"));
         let s = store.stats().unwrap();
         assert_eq!((s.multipart_uploads, s.multipart_bytes), (3, 8 + 8 + 2));
         let mut out = Vec::new();
@@ -8334,6 +8346,7 @@ mod tests {
         assert!(!idle.exists());
         assert!(busy.join("part-1").is_file());
         assert!(fresh.join("meta.json").is_file());
+        assert!(done.join("completed.json").is_file());
         assert!(dir.join("uploads/s3/not-an-upload").is_dir());
         assert_eq!(store.stats().unwrap().multipart_uploads, 2);
         let _ = std::fs::remove_dir_all(&dir);
