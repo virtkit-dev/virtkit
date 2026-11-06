@@ -14,8 +14,8 @@
 //! while it is connected, in the placement's pool, carries its labels and reports itself
 //! ready. Its room is what its last heartbeat left — the admission ledger's budget less what
 //! it has committed, or the memory available, and the jobs filesystem's free space — less
-//! what the hub has asked of it since: reservations accepted after that heartbeat, offers
-//! and starts not yet answered. Offers and starts go to the least loaded node first ([`load`]),
+//! what the hub has asked of it since: reservations and jobs accepted after that heartbeat,
+//! offers and starts not yet answered. Offers and starts go to the least loaded node first ([`load`]),
 //! then the roomiest, then by ID.
 //!
 //! **Image affinity.** A job whose image a node builds from the job's checkout (`dockerfile:`
@@ -744,9 +744,11 @@ struct LiveJob {
     blocked: Option<&'static str>,
     /// The most output stored for it.
     output_cap: u64,
-    /// When the node accepted the reservation it was sent on, as [`Resv::accepted_at`]: until
-    /// a heartbeat from after that, its start is counted against the node's room.
-    reservation_accepted_at: u64,
+    /// Since when its node's admission ledger holds it, on the hub's clock in seconds: when the
+    /// node accepted the reservation it was sent on ([`Resv::accepted_at`]) or, without one, the
+    /// job itself. Until a heartbeat from after that, it is counted against the node's room;
+    /// `None` while it is not held, as a start without a reservation, always counted.
+    committed_at: Option<u64>,
     /// Its [`image_key`], from its spec; `None` for a job recovered after a restart whose
     /// spec expired.
     image_key: Option<String>,
@@ -1401,6 +1403,7 @@ async fn on_held(hub: &Hub, node: &str, held: Held) -> Result<Vec<HubJobMsg>> {
                 job.row.state = JobState::Running;
                 job.row.started_at.get_or_insert(now);
                 job.spec = None;
+                job.committed_at.get_or_insert(now);
             }
             // Where it is now: the node tells only what changes from here.
             if let RunState::Running {
@@ -1627,6 +1630,7 @@ async fn on_job_state(hub: &Hub, node: &str, id: &str, run: RunState) -> Result<
                 row.started_at.get_or_insert_with(crate::now_secs);
                 job.spec = None;
                 job.reservation = None;
+                job.committed_at.get_or_insert_with(crate::now_secs);
             }
             RunState::Refused { reason, message } => {
                 if row.state != JobState::Starting {
@@ -1662,6 +1666,7 @@ async fn on_job_state(hub: &Hub, node: &str, id: &str, run: RunState) -> Result<
                 row.started_at.get_or_insert(now);
                 job.spec = None;
                 job.reservation = None;
+                job.committed_at.get_or_insert(now);
                 note_stage(row, &stage, activity, guest, now);
             }
             RunState::Finished => return Ok(Vec::new()),
@@ -1962,10 +1967,13 @@ fn room(
         }
     }
     for j in state.jobs.values() {
-        // On a reservation, the heartbeat counts it once it counts the reservation.
+        let counted = match j.committed_at {
+            Some(at) => at >= since,
+            None => j.row.state == JobState::Starting,
+        };
         if j.node() == Some(node)
-            && j.row.state == JobState::Starting
-            && (j.reservation.is_none() || j.reservation_accepted_at >= since)
+            && matches!(j.row.state, JobState::Starting | JobState::Running)
+            && counted
         {
             add(j.row.placement.envelope);
         }
@@ -3448,7 +3456,7 @@ pub fn admit(
             round_ended: None,
             blocked: None,
             output_cap: limit.saturating_add(OUTPUT_SLACK).min(MAX_OUTPUT),
-            reservation_accepted_at: 0,
+            committed_at: None,
             image_key,
             mint_key,
             egress: EgressWritten::default(),
@@ -3796,7 +3804,7 @@ pub async fn recover(hub: &Hub) -> Result<()> {
                     // Its spec, and its limit, are gone: what it has stored, and the default
                     // limit's worth past it.
                     output_cap: limit.saturating_add(DEFAULT_OUTPUT_LIMIT).min(MAX_OUTPUT),
-                    reservation_accepted_at: 0,
+                    committed_at: None,
                     image_key: None,
                     mint_key: None,
                     egress: EgressWritten {
@@ -3819,7 +3827,7 @@ pub async fn recover(hub: &Hub) -> Result<()> {
                 round_ended: None,
                 blocked: None,
                 output_cap: 0,
-                reservation_accepted_at: 0,
+                committed_at: None,
                 image_key: None,
                 mint_key: None,
                 egress: EgressWritten::default(),
@@ -4501,10 +4509,10 @@ fn place(
         }
     }
     let reserved = reserved.filter(|_| given_up.is_none());
-    let mut accepted_at = 0;
+    let mut accepted_at = None;
     let (node, reservation, envelope) = match reserved {
         Some((r, node, envelope, at)) => {
-            accepted_at = at;
+            accepted_at = Some(at);
             (node, Some(r), envelope)
         }
         None => {
@@ -4566,7 +4574,7 @@ fn place(
     let job = state.jobs.get_mut(id)?;
     // Kept until the node answers, to release it should the node refuse the job.
     job.reservation = reservation;
-    job.reservation_accepted_at = accepted_at;
+    job.committed_at = accepted_at;
     job.row.state = JobState::Starting;
     job.row.node = Some(node.clone());
     job.row.registry_access = shown;
@@ -5806,7 +5814,7 @@ mod tests {
             round_ended: None,
             blocked: None,
             output_cap: 0,
-            reservation_accepted_at: 0,
+            committed_at: None,
             image_key: None,
             mint_key: None,
             egress: EgressWritten::default(),

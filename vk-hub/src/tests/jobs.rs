@@ -4215,6 +4215,26 @@ async fn a_start_on_a_reservation_counts_against_room_until_a_heartbeat_shows_it
     view_until(addr, &key, &job.id, |v| v.state == JobState::Starting).await;
     assert_eq!(crate::jobs::testing::reservations(&hub), 0);
     assert_eq!(fits().await, 1);
+    // Accepted, it still counts until a heartbeat shows it.
+    node.send(NodeJobMsg::Job {
+        job: job.id.clone(),
+        state: RunState::Accepted,
+    });
+    view_until(addr, &key, &job.id, |v| v.state == JobState::Running).await;
+    assert_eq!(fits().await, 1);
+    // A heartbeat from a later second includes the job without double-counting it.
+    let accepted = now_secs();
+    while now_secs() <= accepted {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut beat = heartbeat(8192, None);
+    if let Some(admission) = beat.admission.as_mut() {
+        admission.committed_mib = 4096;
+    }
+    node.outbox.send(NodeMsg::Heartbeat(beat)).unwrap();
+    wait_until(|| (hub.db.node(&id).unwrap()).is_some_and(|r| r.heartbeat_at > Some(accepted)))
+        .await;
+    assert_eq!(fits().await, 1);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -4251,6 +4271,9 @@ async fn a_node_is_placed_no_more_vcpus_than_its_budget_has_left() {
     // A reservation the heartbeat does not show yet counts against the room.
     reserve_on(addr, &key, &mut node, 1, Some("test")).await;
     assert_eq!(fits().await, 1);
+    // So does a job the node has accepted.
+    running_job(addr, &key, &mut node, 2).await;
+    assert_eq!(fits().await, 0);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

@@ -1272,8 +1272,9 @@ Its room is the smaller of its last heartbeat's admission budget less committed 
 memory available less 15 % of its inventory's `MemTotal` — either alone when the node reports
 only one, memory available whole with no `MemTotal` — its vCPU budget less the vCPUs committed,
 where it reports a budget, and the job filesystem's most free space, less what
-the hub asked of it since: offers not yet answered, reservations accepted after that heartbeat,
-and starts not yet answered that are not on a reservation. `fits` is the sum of each node's room
+the hub asked of it since: unanswered offers, unanswered starts without reservations, and
+reservations and jobs accepted after that heartbeat. Jobs on reservations use the reservation's
+acceptance time. `fits` is the sum of each node's room
 in envelopes, at most 1024 a node, and at most what its cap leaves.
 
 **The ceiling.** The hub counts offered reservations that have not been refused, unfinished jobs

@@ -98,6 +98,9 @@ All notable changes to virtkit will be documented in this file.
 - **GitLab jobs without `MICROVM_CPUS` or `MICROVM_MEM` respect
   `[executor.vm] max_cpus` and `max_mem`.** Previously, they used `cpus` and `mem` even
   when those exceeded the ceilings.
+- **vk-hub counts accepted jobs until a later heartbeat reports them.** Previously, they
+  stopped counting against memory and vCPUs before the node reported them, allowing offers
+  the node would refuse.
 
 ## [0.106.1] - 2026-11-06
 
