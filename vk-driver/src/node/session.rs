@@ -1216,6 +1216,7 @@ mod tests {
                 allowed: f.node.core.acquire(),
                 halt: halted,
                 abort: aborted,
+                starting: f.node.core.starting(),
             },
             runner_tx,
         ));

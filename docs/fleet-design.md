@@ -127,10 +127,11 @@ setting resolves in three layers, a later one winning:
 built-in or autodetected default  <-  hub value  <-  the node's config.toml
 ```
 
-Built today: the local file alone, over built-in defaults. The hub steers through desired state
-— a concurrency ceiling, stopped acquisition, its [egress layer](#job-egress-from-the-hub) —
-and through commands: drain, quarantine, and the release a node updates to, within what the
-node allows. The rest of this section is proposed.
+Built today: the local file, over built-in defaults, and on the node the hub settings below,
+which the hub has no way to set yet. The hub steers through desired state — a concurrency
+ceiling, stopped acquisition, its [egress layer](#job-egress-from-the-hub) — and through
+commands: drain, quarantine, and the release a node updates to, within what the node allows.
+The rest of this section is proposed.
 
 - **The local file wins.** A key `config.toml` sets, even to its default, is never overridden.
   This preserves host exceptions and tuning for hosts with much RAM and slow network disks
@@ -139,8 +140,10 @@ node allows. The rest of this section is proposed.
 - **The hub fills in from an allowlist**, an explicit list in the code: capacity and VM sizing
   — `[executor.schedule]` `mem_budget`, `cpu_overcommit`, `from_history`, `disk_admission`,
   `disk_default`, `wait_timeout_secs`; `[executor.vm]` `cpus`, `mem`, `max_cpus`, `max_mem`;
-  `image_cache_idle_secs` — and `[registry]` (below). The concurrency ceiling stays desired
-  state of its own. Any other key is refused. The hub never sets `state_dir`; `[node]`
+  `image_cache_idle_secs` — and `[registry]` (below), whose `ca_file`, `username`,
+  `password_file` and `token_file` the hub never names, nor a store on the host.
+  `cpu_overcommit` joins the list with the vCPU admission it sets. The concurrency ceiling stays
+  desired state of its own. Any other key is refused. The hub never sets `state_dir`; `[node]`
   `release_keys`, `require_signed`, `allow_downgrade` or `validate`; `[egress]`, which its
   egress layer narrows instead; a path or a credential file; or anything that widens what a
   job VM can reach. The trust model's [routine fields](trust-model.md#routine-and-sensitive)
@@ -183,8 +186,10 @@ node allows. The rest of this section is proposed.
 - **Loading.** Every `vk` reads the file after the local one, when the host is enrolled with
   the hub and node ID it names, and fills in each listed key the local file leaves unset. A
   file it cannot read is warned about and ignored, leaving local settings and defaults. Jobs
-  take a change from their next run; `vk node run` reloads on a generation that changes
-  settings.
+  take a change from their next run; `vk node run` executes itself anew in place on a
+  generation that changes what its configuration takes — once no update, reset, tools build
+  or job cleanup is under way — as across any restart: placed jobs run on, and a managed
+  runner is adopted.
 - **Reported back.** With each applied generation, the node reports every listed key's
   effective value and its source — `local`, `hub` or `default`, autodetected included — and
   each hub entry it refused, with the reason. A refusal does not fail the generation: the

@@ -55,6 +55,8 @@ pub struct Signals {
     pub halt: watch::Receiver<bool>,
     /// Stop waiting: `SIGTERM` to the runner — which abandons its jobs — and return.
     pub abort: watch::Receiver<bool>,
+    /// Held from spawning the runner to recording it ([`super::core::Core::starting`]).
+    pub starting: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 /// Supervise the runner until `halt` — or `abort` — says to stop, reporting its process on
@@ -82,7 +84,24 @@ pub async fn supervise(spec: Spec, mut sig: Signals, state: watch::Sender<Runner
             continue;
         }
         state.send_replace(RunnerState::Running);
-        let mut child = match command(&spec).spawn() {
+        // Recorded before the node may execute itself anew, which would otherwise lose it.
+        let spawned = {
+            let _starting = sig
+                .starting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let spawned = command(&spec).spawn();
+            if let Some(pid) = spawned
+                .as_ref()
+                .ok()
+                .and_then(|c| c.id())
+                .and_then(|p| i32::try_from(p).ok())
+            {
+                record(&spec, pid);
+            }
+            spawned
+        };
+        let mut child = match spawned {
             Ok(child) => child,
             Err(e) => {
                 state.send_replace(RunnerState::Stopped);
@@ -100,9 +119,6 @@ pub async fn supervise(spec: Spec, mut sig: Signals, state: watch::Sender<Runner
         };
         let started = Instant::now();
         let pid = child.id().and_then(|p| i32::try_from(p).ok());
-        if let Some(pid) = pid {
-            record(&spec, pid);
-        }
         say!("gitlab-runner started (pid {})", pid.unwrap_or(0));
         let quit = tokio::select! {
             status = child.wait() => {
@@ -372,6 +388,7 @@ mod tests {
             allowed,
             halt: halted,
             abort: aborted,
+            starting: Default::default(),
         };
         let task = tokio::spawn(supervise(spec.clone(), sig, state_tx));
         Harness {

@@ -737,6 +737,19 @@ impl Jobs {
         Ok(())
     }
 
+    /// Run `f` with job driver and cleanup starts excluded and no cleanup still running.
+    /// `f` re-execs the node, which would lose track of an active cleanup and its deadline.
+    /// Return `None` without running `f` while a cleanup is active.
+    pub fn quiesced<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        let state = lock(&self.state);
+        let cleaning = state.jobs.values().any(|t| {
+            t.cleaning
+                .as_ref()
+                .is_some_and(|done| !done.load(Ordering::Acquire))
+        });
+        (!cleaning).then(f)
+    }
+
     /// `vk` with this node's configuration, its output appended to the job's driver log.
     fn detached(&self, dir: &Path) -> Result<std::process::Command> {
         let log = std::fs::OpenOptions::new()

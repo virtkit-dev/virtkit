@@ -6,6 +6,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **A fleet node takes settings from its hub.** Capacity and VM sizing settings and the
+  registry may come from the hub; anything the node's own config file sets still wins, and
+  every `vk` on the node uses the result. The node refuses anything else the hub sends and
+  reports each setting's value and where it comes from. `vk node run` restarts itself in
+  place when they change. The hub cannot set them yet.
 - **vk-hub namespaces can keep chosen branches' and tags' caches apart.** A namespace path may
   hold the new `{scope}`, which is `all` for most jobs, so the namespace stays per project
   and protection; `vk-hub namespaces add … --isolate <glob>` gives the refs it matches a scope

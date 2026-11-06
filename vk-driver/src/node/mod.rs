@@ -40,6 +40,7 @@ macro_rules! say {
 
 pub(crate) mod ci_user;
 mod core;
+pub(crate) mod hub_settings;
 mod inventory;
 pub mod jobs;
 mod reset;
@@ -343,6 +344,8 @@ async fn enroll_here(
             vk_fs::write_atomic(&path, pem, 0o600)
                 .with_context(|| format!("writing {}", path.display()))?;
         }
+        // Settings, like generations, count for one hub and one enrollment.
+        hub_settings::remove(&dir)?;
         let enrollment = Enrollment {
             hub: hub.to_string(),
             node_id: node_id.clone(),
@@ -439,6 +442,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
     update::arm_trial_deadline(&dir, session::now_secs())?;
     update::note_installed(&dir)?;
+    reap_inherited();
     let enrollment = read_enrollment(&dir).map_err(not_enrolled)?;
     inventory::labels(&cfg)?;
     let local_runner = ci_user::local_runner(&cfg);
@@ -499,7 +503,9 @@ pub async fn run(cfg: Config) -> Result<()> {
         vk_hub_proto::RunnerMode::External => core::Runner::External,
         vk_hub_proto::RunnerMode::None => core::Runner::None,
     };
+    let held = hub_settings::Held::new(&cfg, &dir, &issuer);
     let core = core::Core::open(&dir, issuer, runner)?;
+    core.set_settings(held);
     core.set_allow_downgrade(cfg.node.allow_downgrade);
     core.set_release_policy(policy);
     core.set_placed(vk_hub_proto::PlacedIntake {
@@ -513,6 +519,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             allowed: core.acquire(),
             halt: halted,
             abort,
+            starting: core.starting(),
         };
         tokio::spawn(runner::supervise(spec, signals, runner_tx))
     });
@@ -548,6 +555,11 @@ pub async fn run(cfg: Config) -> Result<()> {
         stop.clone(),
     ));
     tokio::spawn(sweep_node_caches(cfg.clone(), stop.clone()));
+    tokio::spawn(reload_on_settings(
+        core.clone(),
+        node.jobs.clone(),
+        stop.clone(),
+    ));
     tokio::spawn(update::maintain(core, cfg, node.clone(), stop.clone()));
     let ended = hold_sessions(&node, &mut gatherer, &mut stop).await;
     // Stopping, or refused for good, the node quits a managed runner and waits for its jobs to
@@ -564,6 +576,87 @@ pub async fn run(cfg: Config) -> Result<()> {
         }
     }
     ended
+}
+
+/// Wait for each child this process has before it starts any, so none is left a zombie: those
+/// a node that executed itself anew left running — job drivers, cleanups, a managed runner —
+/// whose waiters went with the old image. A runner is adopted all the same, by its pid.
+fn reap_inherited() {
+    // SAFETY: `getpid` reads this process's own id and cannot fail.
+    let me = unsafe { libc::getpid() };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        // Field 4, after the name in parentheses, which may hold anything.
+        let ppid = std::fs::read_to_string(entry.path().join("stat"))
+            .ok()
+            .and_then(|stat| {
+                let (_, rest) = stat.rsplit_once(')')?;
+                rest.split_whitespace().nth(1)?.parse::<i32>().ok()
+            });
+        if ppid == Some(me) {
+            std::thread::spawn(move || {
+                let mut status = 0;
+                // SAFETY: waits for a child of this process, which nothing else here waits for:
+                // it was started before this image ran.
+                unsafe { libc::waitpid(pid, &mut status, 0) };
+            });
+        }
+    }
+}
+
+/// How often a node due to execute itself anew checks whether its job cleanups have ended.
+const RELOAD_DEFERRED: Duration = Duration::from_secs(5);
+
+/// How long a node that failed to execute itself anew waits before it tries again.
+const RELOAD_RETRY: Duration = Duration::from_secs(60);
+
+/// Execute `vk node run` anew in this process's place once the hub's settings change what its
+/// config would be, so everything it runs follows the new one; not while an update, a reset or
+/// a tools build is under way, nor while starting a job or cleaning up after one. Placed jobs run on in their own
+/// processes, and a managed runner is adopted, as across any restart of the node.
+async fn reload_on_settings(
+    core: Arc<core::Core>,
+    jobs: Arc<jobs::Jobs>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut changes = core.subscribe();
+    loop {
+        if core.reload_due() && !*stop.borrow() {
+            let (core, jobs) = (core.clone(), jobs.clone());
+            let wait =
+                match tokio::task::spawn_blocking(move || jobs.quiesced(|| core.reload())).await {
+                    // Something got under way meanwhile: its end is a change too.
+                    Ok(Some(None)) => continue,
+                    // A cleanup still running, which says nothing when it ends.
+                    Ok(None) => RELOAD_DEFERRED,
+                    Ok(Some(Some(e))) => {
+                        say!("starting again failed: {e:#}");
+                        RELOAD_RETRY
+                    }
+                    Err(e) => {
+                        say!("starting again failed: {e}");
+                        RELOAD_RETRY
+                    }
+                };
+            tokio::select! {
+                () = tokio::time::sleep(wait) => continue,
+                () = session::stopped(&mut stop) => return,
+            }
+        }
+        tokio::select! {
+            changed = changes.changed() => if changed.is_err() { return },
+            () = session::stopped(&mut stop) => return,
+        }
+    }
 }
 
 /// Warn when the managed runner's config runs the vk executor with another vk config than

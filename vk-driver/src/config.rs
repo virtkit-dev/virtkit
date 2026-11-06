@@ -3,7 +3,8 @@
 //! (`~/.config/virtkit/config.toml`), the system config
 //! (/etc/virtkit/config.toml). Every field has a default so the file can stay
 //! minimal; no file at all yields the defaults (enough for `config`, not for
-//! `prepare`, which validates the image paths).
+//! `prepare`, which validates the image paths). On a host enrolled with a fleet hub, the
+//! hub's settings fill in the keys that file leaves unset; see [`crate::node::hub_settings`].
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -76,6 +77,19 @@ pub struct Config {
     /// found). Set by [`Config::load`], not a config key.
     #[serde(skip)]
     pub source: Option<PathBuf>,
+    /// The layers used by [`Config::load`]. Not a config key.
+    #[serde(skip)]
+    pub layers: Layers,
+}
+
+/// What a loaded config was made of: the local file and, on a host enrolled with a fleet hub,
+/// the hub's settings under it, filling in what the file leaves unset.
+#[derive(Debug, Default, Clone)]
+pub struct Layers {
+    /// The local file as read; empty with no file.
+    pub local: toml::Table,
+    /// The hub's settings taken, by dotted key: those the local file leaves unset.
+    pub hub: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// VMM backend selector for the `vmm` config key. `cloud-hypervisor` and its old aliases
@@ -235,6 +249,9 @@ pub struct Schedule {
     /// capped at the filesystem's size.
     pub disk_default: Option<String>,
 }
+
+/// `[executor.schedule] wait_timeout_secs` when unset.
+pub const WAIT_TIMEOUT_SECS: u64 = 600;
 
 /// What `vk gc` collects beyond the image and checkout caches, and when the commands that fill
 /// them run it in the background. Every key has a default, so a host needs none of them; an
@@ -1253,19 +1270,56 @@ pub fn user_path() -> Option<PathBuf> {
 
 /// The pure tail of [`Config::load`]: read `explicit` when given (any failure,
 /// including absence, is an error — the caller named that file), else the first
-/// existing fallback; nothing found = the built-in defaults. The loaded file is
+/// existing fallback; nothing found = the built-in defaults. On a host enrolled with a fleet
+/// hub, the hub's settings fill in what the file leaves unset; when they would leave the
+/// config unloadable, they are warned about and ignored. The loaded file is
 /// recorded in `Config::source`. Split from `load` so tests can drive it
 /// without mutating the process environment.
 fn load_resolved(explicit: Option<PathBuf>, fallbacks: &[PathBuf]) -> Result<Config> {
     let path = match explicit {
-        Some(p) => p,
-        None => match fallbacks.iter().find(|p| p.is_file()) {
-            Some(p) => p.clone(),
-            None => return Ok(Config::default()),
-        },
+        Some(p) => Some(p),
+        None => fallbacks.iter().find(|p| p.is_file()).cloned(),
     };
+    let local = match &path {
+        Some(path) => read_local(path)?,
+        None => toml::Table::new(),
+    };
+    let shown = path.as_deref().map(Path::display);
+    let parsing = || match &shown {
+        Some(path) => format!("parsing {path}"),
+        None => "loading the built-in defaults".to_string(),
+    };
+    let mut cfg = from_table(local.clone()).with_context(parsing)?;
+    if let Some(hub) = crate::node::hub_settings::layer(cfg.state_dir()) {
+        let mut merged = local.clone();
+        let taken = crate::node::hub_settings::merge(&mut merged, &hub);
+        match from_table(merged) {
+            Ok(with_hub) => {
+                cfg = with_hub;
+                cfg.layers.hub = taken;
+            }
+            Err(e) => eprintln!(
+                "virtkit: warning: ignoring the fleet hub's settings, which leave the \
+                 configuration unloadable: {e:#}"
+            ),
+        }
+    }
+    for warning in ineffective_settings(&cfg) {
+        match &shown {
+            Some(path) => eprintln!("virtkit: warning: {path}: {warning}"),
+            None => eprintln!("virtkit: warning: {warning}"),
+        }
+    }
+    cfg.layers.local = local;
+    cfg.source = path;
+    Ok(cfg)
+}
+
+/// The local config file at `path` as a table, refused when it uses a key that moved and
+/// stripped of keys that no longer do anything, with a warning.
+fn read_local(path: &Path) -> Result<toml::Table> {
     let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut table: toml::Table =
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     reject_migrated_keys(&table).with_context(|| format!("parsing {}", path.display()))?;
@@ -1275,14 +1329,13 @@ fn load_resolved(explicit: Option<PathBuf>, fallbacks: &[PathBuf]) -> Result<Con
             path.display()
         );
     }
-    let mut cfg: Config = table
-        .try_into()
-        .with_context(|| format!("parsing {}", path.display()))?;
-    refuse_conflicts(&cfg).with_context(|| format!("parsing {}", path.display()))?;
-    for warning in ineffective_settings(&cfg) {
-        eprintln!("virtkit: warning: {}: {warning}", path.display());
-    }
-    cfg.source = Some(path);
+    Ok(table)
+}
+
+/// The config `table` holds, refused when it sets what it cannot keep.
+pub(crate) fn from_table(table: toml::Table) -> Result<Config> {
+    let cfg: Config = table.try_into()?;
+    refuse_conflicts(&cfg)?;
     Ok(cfg)
 }
 
@@ -1381,7 +1434,8 @@ fn ineffective_settings(cfg: &Config) -> Vec<&'static str> {
 impl Config {
     /// Load the config from the first file found: the `--config` flag, then
     /// `$VIRTKIT_CONFIG`, then the user config, then the system config (see the
-    /// module doc). Exactly one file is read — no merging across tiers.
+    /// module doc). Exactly one file is read — no merging across tiers — with the hub's
+    /// settings under it on an enrolled host.
     pub fn load(flag: Option<&Path>) -> Result<Config> {
         let explicit = flag
             .map(Path::to_path_buf)
@@ -1550,6 +1604,52 @@ mod tests {
         let cfg = load_resolved(Some(explicit.clone()), std::slice::from_ref(&fallback)).unwrap();
         assert_eq!(cfg.executor.vm.cpus, 7);
         assert_eq!(cfg.source.as_deref(), Some(explicit.as_path()));
+    }
+
+    /// On an enrolled host the hub's settings fill in what the file leaves unset; they are
+    /// ignored for another enrollment, or when unreadable.
+    #[test]
+    fn hub_settings_fill_in_under_the_file_on_an_enrolled_host() {
+        let dir = Dir::new("hub-settings");
+        let state = dir.0.join("state");
+        let node = state.join("node");
+        std::fs::create_dir_all(&node).unwrap();
+        let node_id = "ab".repeat(16);
+        std::fs::write(
+            node.join("enrollment.json"),
+            format!(r#"{{"hub": "https://hub.example", "node_id": "{node_id}"}}"#),
+        )
+        .unwrap();
+        let settings = |hub: &str| {
+            std::fs::write(
+                node.join("settings.json"),
+                format!(
+                    r#"{{"hub": "{hub}", "node_id": "{node_id}", "generation": 3,
+                        "settings": {{"executor.vm.cpus": 8, "executor.vm.max_cpus": 16,
+                                      "state_dir": "/elsewhere"}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+        settings("https://hub.example");
+        let file = dir.file(
+            "c.toml",
+            &format!("state_dir = {state:?}\n[executor.vm]\ncpus = 4\n"),
+        );
+        let cfg = load_resolved(Some(file.clone()), &[]).unwrap();
+        assert_eq!(cfg.executor.vm.cpus, 4);
+        assert_eq!(cfg.executor.vm.max_cpus, Some(16));
+        assert_eq!(cfg.state_dir.as_deref(), Some(state.as_path()));
+        assert_eq!(
+            cfg.layers.hub.keys().collect::<Vec<_>>(),
+            ["executor.vm.max_cpus"]
+        );
+        settings("https://other.example");
+        let cfg = load_resolved(Some(file.clone()), &[]).unwrap();
+        assert_eq!(cfg.executor.vm.max_cpus, None);
+        std::fs::write(node.join("settings.json"), "{").unwrap();
+        let cfg = load_resolved(Some(file), &[]).unwrap();
+        assert_eq!((cfg.executor.vm.cpus, cfg.executor.vm.max_cpus), (4, None));
     }
 
     #[test]

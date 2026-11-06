@@ -18,6 +18,7 @@ use vk_hub_proto::{
     Operation, PlacedIntake, Report, RunnerMode, RunnerState,
 };
 
+use super::hub_settings::Held;
 use super::state::{Abilities, Issuer, Persisted, Work};
 use super::update::Binary;
 use crate::config::Config;
@@ -64,6 +65,10 @@ pub struct Core {
     release_policy: Mutex<crate::release_key::Policy>,
     /// The node's configured intake of hub-placed jobs.
     placed: Mutex<PlacedIntake>,
+    /// The hub's settings, as the node took them; `None` until set.
+    settings: Mutex<Option<Held>>,
+    /// Held while a managed runner is started and recorded.
+    starting: Arc<Mutex<()>>,
 }
 
 impl Core {
@@ -109,6 +114,8 @@ impl Core {
             allow_downgrade: AtomicBool::new(false),
             release_policy: Mutex::new(crate::release_key::Policy::default()),
             placed: Mutex::new(PlacedIntake::default()),
+            settings: Mutex::new(None),
+            starting: Arc::default(),
         }))
     }
 
@@ -144,8 +151,59 @@ impl Core {
         self.changed.subscribe()
     }
 
+    /// Apply `desired` unless a generation at least as new is applied, its hub settings first:
+    /// saved before the generation is recorded, since one recorded is never taken again.
     pub fn apply_desired(&self, desired: DesiredState) -> Result<bool> {
+        let issuer = {
+            let persisted = lock(&self.persisted);
+            if persisted
+                .applied
+                .as_ref()
+                .is_some_and(|a| a.generation >= desired.generation)
+            {
+                return Ok(false);
+            }
+            persisted.issuer.clone()
+        };
+        if let (Some(held), Some(issuer)) = (lock(&self.settings).as_mut(), issuer) {
+            held.take(&self.dir, &issuer, &desired)?;
+        }
         self.update(|p| p.apply_desired(desired))
+    }
+
+    /// What a managed runner's supervisor holds from starting the runner to recording it, so
+    /// [`Core::reload`] never comes between.
+    pub fn starting(&self) -> Arc<Mutex<()>> {
+        self.starting.clone()
+    }
+
+    /// Hold the hub's settings as `held`, which the node was started with.
+    pub fn set_settings(&self, held: Held) {
+        *lock(&self.settings) = Some(held);
+        self.bump();
+    }
+
+    /// Whether the hub's settings changed what the node's config would be, and nothing under
+    /// way — an update, a reset, a tools build — keeps the node from loading it again now.
+    pub fn reload_due(&self) -> bool {
+        Self::due(&lock(&self.persisted), &self.settings)
+    }
+
+    /// Re-exec this binary with the same arguments to reload the config. Recheck
+    /// [`Core::reload_due`] under the state lock and hold it through exec, preventing an
+    /// update, reset or tools build from starting. `None` when no longer due;
+    /// otherwise returns only on failure.
+    pub fn reload(&self) -> Option<anyhow::Error> {
+        let _starting = lock(&self.starting);
+        let persisted = lock(&self.persisted);
+        if !Self::due(&persisted, &self.settings) {
+            return None;
+        }
+        say!("the hub's settings changed: starting again to load them");
+        Some(match Binary::open(Path::new("/proc/self/exe"), None) {
+            Ok(binary) => (self.exec)(&binary, None),
+            Err(e) => e,
+        })
     }
 
     /// Journal `command` and carry it out. An external runner cannot be stopped, so a reset is
@@ -342,8 +400,16 @@ impl Core {
             update: persisted.update.clone(),
             tools: persisted.tools_progress.clone(),
             placed: Some(placed),
+            settings: lock(&self.settings).as_ref().map(|h| h.report().clone()),
             ..Report::default()
         }
+    }
+
+    /// [`Core::reload_due`], on the state `persisted`.
+    fn due(persisted: &Persisted, settings: &Mutex<Option<Held>>) -> bool {
+        persisted.job.is_none()
+            && persisted.tools.is_none()
+            && lock(settings).as_ref().is_some_and(Held::changed)
     }
 
     /// Set the runner's concurrency every `every`, and whenever the state or a managed runner
@@ -612,6 +678,66 @@ mod tests {
             expires_at: u64::MAX,
             op: Operation::Drain,
         }
+    }
+
+    fn not_executed(_: &Binary, _: Option<u64>) -> anyhow::Error {
+        anyhow::anyhow!("not executed in a test")
+    }
+
+    /// The hub's settings are on disk before their generation is recorded, the report says
+    /// what came of them, and the node starts again only once nothing under way holds it.
+    #[tokio::test]
+    async fn hub_settings_are_saved_before_their_generation_and_reload_the_node() {
+        let dir = scratch("settings");
+        let mut core = Core::open(&dir, issuer(), Runner::None).unwrap();
+        Arc::get_mut(&mut core).unwrap().set_exec(not_executed);
+        let cfg = cfg(&dir);
+        core.set_settings(Held::new(&cfg, &dir, &issuer()));
+        assert!(!core.reload_due());
+        let desired = |generation, settings: serde_json::Value| DesiredState {
+            generation,
+            ceiling: None,
+            acquisition: Acquisition::Run,
+            egress: None,
+            settings: serde_json::from_value(settings).unwrap(),
+        };
+        let wanted = serde_json::json!({"executor.vm.max_cpus": 16, "state_dir": "/x"});
+        assert!(core.apply_desired(desired(2, wanted.clone())).unwrap());
+        let saved = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(saved.contains("max_cpus") && saved.contains("\"generation\": 2"));
+        let report = core.report().settings.unwrap();
+        assert_eq!(report.refused.keys().collect::<Vec<_>>(), ["state_dir"]);
+        assert!(core.reload_due());
+        // Applied already: not taken again.
+        assert!(
+            !core
+                .apply_desired(desired(2, serde_json::json!({})))
+                .unwrap()
+        );
+        assert!(dir.join("settings.json").exists());
+        // An update under way holds the reload back.
+        core.change(|p| {
+            p.tools = Some(super::super::state::ToolsJob {
+                command: "c".into(),
+                version: "v".into(),
+                sha256: "ab".into(),
+                size: 1,
+            })
+        })
+        .unwrap();
+        assert!(!core.reload_due());
+        core.change(|p| p.tools = None).unwrap();
+        assert!(core.reload_due());
+        let e = core.reload().unwrap();
+        assert!(format!("{e:#}").contains("not executed"), "{e:#}");
+        // None any more: the file goes, and the node is back to what it was started with.
+        assert!(
+            core.apply_desired(desired(3, serde_json::json!({})))
+                .unwrap()
+        );
+        assert!(!dir.join("settings.json").exists());
+        assert!(!core.reload_due());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -4035,7 +4035,13 @@ fn admit(ctx: &JobCtx, mem: &str, services_mib: u64) -> Result<Option<crate::adm
     // it was admitted to. The wait for another eviction counts against the job's own for
     // admission.
     let keep = crate::image::remembered_bases(&ctx.images_dir(), &ctx.usage_key());
-    let timeout = Duration::from_secs(ctx.cfg.executor.schedule.wait_timeout_secs.unwrap_or(600));
+    let timeout = Duration::from_secs(
+        ctx.cfg
+            .executor
+            .schedule
+            .wait_timeout_secs
+            .unwrap_or(crate::config::WAIT_TIMEOUT_SECS),
+    );
     let deadline = Instant::now() + timeout;
     let reclaim = |need| {
         let (state_dir, idle) = (ctx.cfg.state_dir(), ctx.cfg.image_cache_idle());
