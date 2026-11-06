@@ -809,11 +809,13 @@ pub fn claim_tuning(cfg: &Config) -> Result<Option<TuneClaim>> {
 /// each job, with the job's token, or not at all, and never in `[build] cache_registry`. It
 /// announces so (`job_build_cache`) and the hub then sends the prefix.
 ///
-/// Not yet: build-once locks and failure memos, the local tier and Windows builds still use
-/// names and storage shared across scopes. Once they do, this holds when the guest's proxy
-/// never lends the node's own credential, which would reach every scope.
-pub fn caches_jobs_by_scope(_cfg: &Config) -> bool {
-    false
+/// Disabled when the guest's registry proxy lends the node's credential
+/// (`proxy_guests` without `guest_credential = "job"`): that credential reaches
+/// every scope's cache, defeating build isolation.
+pub fn caches_jobs_by_scope(cfg: &Config) -> bool {
+    !cfg.registry
+        .as_ref()
+        .is_some_and(crate::config::Registry::lends_node_credential)
 }
 
 /// Last persisted hub concurrency ceiling, or `None` without a fleet enrollment or when the
@@ -908,6 +910,36 @@ fn read_enrollment(dir: &Path) -> Result<Enrollment> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node caches placed jobs' builds by scope, and says so, unless its guests' proxy
+    /// lends its own registry credential.
+    #[test]
+    fn a_node_caches_by_scope_unless_its_guests_get_its_credential() {
+        let cfg = |toml: &str| toml::from_str::<Config>(toml).unwrap();
+        for (toml, by_scope) in [
+            ("", true),
+            ("[registry]\nrepo = \"reg.example/n\"\n", true),
+            (
+                "[registry]\nrepo = \"reg.example/n\"\nproxy_guests = true\nguest_credential = \"job\"\n",
+                true,
+            ),
+            (
+                "[registry]\nrepo = \"reg.example/n\"\nproxy_guests = true\n",
+                false,
+            ),
+            (
+                "[registry]\nrepo = \"reg.example/n\"\nproxy_guests = true\nguest_credential = \"node\"\n",
+                false,
+            ),
+            // A local store's proxy still lends the node's access: refused too.
+            (
+                "[registry]\nrepo = \"/srv/store\"\nproxy_guests = true\n",
+                false,
+            ),
+        ] {
+            assert_eq!(caches_jobs_by_scope(&cfg(toml)), by_scope, "{toml}");
+        }
+    }
 
     #[test]
     fn the_executor_config_a_runner_names_is_found() {

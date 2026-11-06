@@ -274,6 +274,29 @@ every pipeline's images included. `true` beside one is refused when the config l
 lend job tokens or run no proxy; see the
 [pipeline images design](pipeline-images-design.md#host-side).
 
+### Build caches of placed jobs
+
+A node announces `job_build_cache` unless its guests' registry proxy lends its own credential.
+A job the hub places on such a node builds its `dockerfile:` and `compose:` images, its
+`vk-agent build` images and its Windows services with the cache its start names, never in
+`[build] cache_registry`:
+
+- Under its `ci-build` prefix on the node's `[registry]`, with the job's token: layers at
+  `<prefix>/build-cache`, their build-once locks and failure memos under the same names. The
+  hub fills the prefix per project, protection and scope ([build caches](build-cache-design.md)).
+- With the cache off when the start names no token or prefix (an older hub, a registry the
+  hub mints no tokens for, or one without a `ci-build` namespace), the prefix is not a
+  repository name, the token has expired, or the node has no `[registry]` or a local one. The
+  job's trace says why once.
+
+Local build-tier entries and Windows caches (`<data>/windows/scopes/<scope>`) are isolated
+by prefix. Jobs sharing a prefix share these caches, which are swept when idle. With the
+build cache off, they belong to the job alone and are removed when it ends. A Windows build
+of such a job fetches install media missing from its build context only when
+`[executor] windows_media` lists their sha256. Jobs of a local gitlab-runner and builds outside
+jobs keep `[build] cache_registry` and the unscoped caches.
+Pulled `image:` references still go through `[build] cache_registry`.
+
 ## Resource usage
 
 Each phase reports what it cost the runner. A job that builds its own image

@@ -13,13 +13,22 @@ All notable changes to virtkit will be documented in this file.
   namespace may reach it, so grants cannot add up across scopes.
 - **vk-hub adds a `ci-build` namespace for build caches,** one per project, protection and
   isolated ref, kept 14 days, to every registry taking tokens, existing ones included unless a
-  namespace already uses that name or root. Nodes do not use it yet.
+  namespace already uses that name or root.
 - **`[jobs] require_job_build_cache` in hub.toml** places jobs only on nodes that cache their
-  builds by project, protection and scope; `vk-hub nodes` says why another takes none. No node
-  announces it yet: turning it on now stops all placement.
+  builds by project, protection and scope; `vk-hub nodes` says why another takes none.
 
 ### Changed
 
+- **A node keeps each placed job's builds to its project, protection and scope.** Built
+  images, layers, build locks and Windows builds are cached under the job's `ci-build` prefix
+  with its token, or not at all, no longer in `[build] cache_registry`, and what the node
+  built for one scope is not found by another. A node whose guests' registry proxy lends its
+  own credential (`proxy_guests` without `guest_credential = "job"`) keeps the old behaviour.
+  A placed job's Windows build takes install media from outside its build context only when
+  `[executor] windows_media` lists them. Placed jobs build with the cache off, and say why,
+  when the hub is older (upgrade it first), mints no tokens for the node's `[registry]`, or
+  has no `ci-build` namespace there because another namespace held that name or root, or
+  when the node's `[registry]` is missing or local.
 - **vk-hub validates namespace paths for every job.** Paths that could exceed the registry's
   limits with a job's identifiers are rejected when stored, instead of leaving that job
   without access.

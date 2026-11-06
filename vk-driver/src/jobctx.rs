@@ -912,7 +912,8 @@ fn cache_dest(
     };
     let Some(prefix) = registry.build_prefix.as_deref() else {
         return off(
-            "the hub gave this job no build cache: its registry has no ci-build namespace for it",
+            "the hub gave this job no build cache: its registry has no ci-build namespace for \
+             it, or the hub predates build caches",
         );
     };
     if !vk_hub_proto::token::valid_prefix(prefix) {
