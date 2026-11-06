@@ -5,7 +5,9 @@
 //! destination is written as PutObject writes, its `If-None-Match: *`/`If-Match` checked
 //! where the tag is written. The source's MD5, and so its ETag, comes along, with the
 //! checksum its write kept and its parts; its user metadata too, unless
-//! `x-amz-metadata-directive: REPLACE` gives the request's instead.
+//! `x-amz-metadata-directive: REPLACE` gives the request's instead. A copy that asks for a
+//! checksum algorithm (`x-amz-checksum-algorithm`) other than the one the source kept has
+//! it computed from the source's bytes, read once.
 
 use anyhow::Result;
 use hyper::body::Incoming;
@@ -21,6 +23,9 @@ use crate::{Authz, Body, ServerState, Store, accounts};
 
 /// The header naming a copy's source.
 pub(super) const COPY_SOURCE: &str = "x-amz-copy-source";
+
+/// The header a copy names the algorithm of the checksum its object is to have in.
+const CHECKSUM_ALGORITHM: &str = "x-amz-checksum-algorithm";
 
 /// What `x-amz-copy-source` names.
 #[derive(Debug, PartialEq, Eq)]
@@ -190,6 +195,13 @@ pub(super) async fn copy(
         ));
         return refuse(req, resp, ctx).await;
     }
+    let algorithm = match headers.get(CHECKSUM_ALGORITHM) {
+        None => None,
+        Some(v) => match checksum::named(v.as_bytes()).and_then(checksum::header) {
+            Some(header) => Some(header),
+            None => return refuse(req, ctx.error(checksum::UNKNOWN_ALGORITHM), ctx).await,
+        },
+    };
     if src == segs && !replace {
         let resp = ctx.error(Refusal::said(
             Code::InvalidRequest,
@@ -242,6 +254,19 @@ pub(super) async fn copy(
                 annotations.insert(name.to_string(), value.clone());
             }
         }
+        // Another algorithm than the one kept: computed, in place of it.
+        let kept = checksum::stored(&obj.annotations);
+        if let Some(header) = algorithm
+            && kept.is_none_or(|k| checksum::header(k.algorithm) != Some(header))
+        {
+            let Some(value) = checksum::of_blob(store, &obj.layer, obj.size, header)? else {
+                return Ok(no_such_key(&ctx, &src));
+            };
+            if let Some((name, value)) = checksum::annotation(header, &value) {
+                annotations.insert(name, value);
+            }
+        }
+        let checksum = checksum::stored(&annotations).map_or(String::new(), |k| k.elements());
         let etag = conditional::etag(&obj.layer, &annotations);
         let how = Commit {
             annotations,
@@ -259,7 +284,7 @@ pub(super) async fn copy(
         Ok(xml::document(
             "CopyObjectResult",
             &format!(
-                "{}{}",
+                "{}{}{checksum}",
                 xml::element("LastModified", &list::iso8601(modified)),
                 xml::element("ETag", &etag)
             ),

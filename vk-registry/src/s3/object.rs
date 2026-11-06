@@ -78,7 +78,7 @@ fn sha256_base64(layer: &str) -> String {
     vk_hub_proto::to_base64(&hex_bytes(layer).unwrap_or_default())
 }
 
-fn hex_bytes(hex: &str) -> Option<Vec<u8>> {
+pub(super) fn hex_bytes(hex: &str) -> Option<Vec<u8>> {
     let b = hex.as_bytes();
     if !b.len().is_multiple_of(2) {
         return None;
