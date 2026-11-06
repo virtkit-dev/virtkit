@@ -12,6 +12,8 @@ All notable changes to virtkit will be documented in this file.
   the keys typed (or read from a file) going to the guest's keyboard. `vk vga` attaches to it
   later. It needs a guest kernel with VT, VGA console and PS/2 keyboard support, such as a
   distribution's kernel booted with `--kernel image`; UEFI guests cannot use it.
+- **Compose services can have the VGA console too: `x-virtkit: vga: true`.** `vk vga --service
+  NAME` shows a service's console; on the service booted as the primary, `--vga` says how.
 
 ## [0.106.0] - 2026-11-05
 

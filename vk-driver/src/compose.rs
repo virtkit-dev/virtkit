@@ -94,6 +94,9 @@ pub struct Unit {
     /// applied identically primary or sibling — a service that is itself a hypervisor
     /// (a vk builder, a nested test runner). `false` = no nesting, the default.
     pub nested: bool,
+    /// Whether this unit's guest gets a VGA text console as its tty0 (compose
+    /// `x-virtkit.vga`), served for `vk vga` to attach to. `false`, the default: none.
+    pub vga: bool,
     /// How many NICs this unit's guest gets on the run LAN (compose `x-virtkit.nics`),
     /// applied identically primary or sibling. `1` (the default) is eth0 alone; more adds
     /// eth1 upward, each with its own address on the same segment — what an appliance that
@@ -1243,7 +1246,7 @@ fn map_service(
     };
     // The per-service axes (compose `x-virtkit`): absent key/subkey = the defaults,
     // so an unmarked service keeps today's agent-as-PID1 pinned-kernel 2-vCPU/1G boot.
-    let (init, kernel, cpus, mem, reclaim, dax, nested, nics, persist_root, tap) =
+    let (init, kernel, cpus, mem, reclaim, dax, nested, vga, nics, persist_root, tap) =
         match svc.x_virtkit {
             Some(x) => (
                 x.init()?,
@@ -1253,6 +1256,7 @@ fn map_service(
                 x.reclaim()?,
                 x.dax()?,
                 x.nested()?,
+                x.vga()?,
                 x.nics()?,
                 x.persist_root()?,
                 x.tap()?,
@@ -1264,6 +1268,7 @@ fn map_service(
                 None,
                 None,
                 None,
+                false,
                 false,
                 1,
                 false,
@@ -1301,6 +1306,7 @@ fn map_service(
                 (reclaim.is_some(), "x-virtkit.reclaim"),
                 (dax.is_some(), "x-virtkit.dax"),
                 (nested, "x-virtkit.nested"),
+                (vga, "x-virtkit.vga"),
                 (nics != 1, "x-virtkit.nics"),
                 (persist_root, "x-virtkit.persist_root"),
             ];
@@ -1360,6 +1366,7 @@ fn map_service(
         reclaim,
         dax,
         nested,
+        vga,
         nics,
         persist_root_backing,
         tap,
@@ -2321,7 +2328,8 @@ struct ComposeService {
 /// parsed into [`crate::run::InitSource`] / [`crate::run::KernelSource`], plus the
 /// guest sizing (`cpus`/`mem`), idle page-cache trimming (`reclaim`), the DAX window its
 /// shares get (`dax`), nested virtualization (`nested`), NIC count (`nics`) and root
-/// persistence (`persist_root`), and a host tap for eth0 (`tap`). An absent subkey defaults to
+/// persistence (`persist_root`), a host tap for eth0 (`tap`) and a VGA text console (`vga`). An
+/// absent subkey defaults to
 /// `Default`/unset/off.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2343,6 +2351,9 @@ struct XVirtkit {
     /// into a string, and both spellings must reach the same parse
     #[serde(default)]
     nested: Option<Scalar>,
+    /// scalar, not bool, for the same reason as `nested`
+    #[serde(default)]
+    vga: Option<Scalar>,
     /// scalar, not u32: a `${VAR}` reference interpolates into a YAML string
     #[serde(default)]
     nics: Option<Scalar>,
@@ -2484,6 +2495,18 @@ impl XVirtkit {
                 "true" => Ok(true),
                 "false" => Ok(false),
                 _ => bail!("x-virtkit.nested: expected true or false, got {s:?}"),
+            },
+        }
+    }
+
+    /// `vga: true|false` → whether the guest gets a VGA text console as its tty0.
+    fn vga(&self) -> Result<bool> {
+        match self.vga.clone().map(Scalar::into_string) {
+            None => Ok(false),
+            Some(s) => match s.to_ascii_lowercase().as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => bail!("x-virtkit.vga: expected true or false, got {s:?}"),
             },
         }
     }
@@ -3010,6 +3033,7 @@ mod tests {
             ("x-virtkit.reclaim", "    x-virtkit:\n      reclaim: auto\n"),
             ("x-virtkit.dax", "    x-virtkit:\n      dax: off\n"),
             ("x-virtkit.nested", "    x-virtkit:\n      nested: true\n"),
+            ("x-virtkit.vga", "    x-virtkit:\n      vga: true\n"),
             ("x-virtkit.nics", "    x-virtkit:\n      nics: 2\n"),
             (
                 "x-virtkit.persist_root",
@@ -4470,6 +4494,24 @@ mod tests {
         }
         // zero and garbage fail the load, not a later boot
         for marker in ["{ cpus: 0 }", "{ cpus: two }", "{ mem: 0 }", "{ mem: big }"] {
+            assert!(
+                parse(
+                    &format!("services:\n  s:\n    image: x\n    x-virtkit: {marker}\n"),
+                    Path::new("/b")
+                )
+                .is_err(),
+                "{marker} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn x_virtkit_vga_asks_one_service_for_a_console() {
+        assert!(!one("services:\n  s:\n    image: x\n").vga);
+        assert!(one("services:\n  s:\n    image: x\n    x-virtkit: { vga: true }\n").vga);
+        assert!(!one("services:\n  s:\n    image: x\n    x-virtkit: { vga: false }\n").vga);
+        assert!(one("services:\n  s:\n    image: x\n    x-virtkit: { vga: \"True\" }\n").vga);
+        for marker in ["{ vga: yes }", "{ vga: tty }"] {
             assert!(
                 parse(
                     &format!("services:\n  s:\n    image: x\n    x-virtkit: {marker}\n"),

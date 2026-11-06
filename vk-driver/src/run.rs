@@ -2585,7 +2585,16 @@ async fn build_and_boot(
     }
     // The VGA console (`--vga`): its socket in the run directory, and the view resolved now,
     // so a view that cannot work is refused before the boot.
-    let vga_view = match &args.vga {
+    // A `--primary` service's `x-virtkit.vga` asks for the console as `--vga=detached` would;
+    // `--vga` says how to show it.
+    let primary_vga = primary_idx
+        .and_then(|i| compose_units.get(i))
+        .is_some_and(|u| u.vga)
+        .then(|| crate::vga::Options {
+            mode: crate::vga::Mode::Detached,
+            ..crate::vga::Options::default()
+        });
+    let vga_view = match args.vga.as_ref().or(primary_vga.as_ref()) {
         Some(opts) => {
             use std::io::IsTerminal;
             // The command (or a shell) holds this process's stdio; a detached run lets go of it.

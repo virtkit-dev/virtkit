@@ -81,6 +81,7 @@ pub fn to_units(services: Vec<Service>) -> Vec<crate::compose::Unit> {
             reclaim: None,
             dax: None,
             nested: false,
+            vga: false,
             nics: 1,
             persist_root_backing: None,
             tap: None,

@@ -1506,8 +1506,11 @@ enum Cmd {
     Vga {
         /// which VM: a directory (default: the current directory), as `vk exec` resolves it
         target: Option<String>,
+        /// a compose service's console (one with `x-virtkit: vga: true`), not the primary's
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
         /// the console's socket (`vga.sock` in the run directory), instead of finding the VM
-        #[arg(long, value_name = "PATH", conflicts_with = "target")]
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["target", "service"])]
         socket: Option<PathBuf>,
         /// where to show it (auto: this terminal, else stdin and stdout as files)
         #[arg(long, value_enum, default_value_t = vga::Mode::Auto)]
@@ -5261,6 +5264,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         }
         Cmd::Vga {
             target,
+            service,
             socket,
             mode,
             input,
@@ -5275,12 +5279,37 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 }
                 None => match vms::resolve_one(target.as_deref().map(Path::new)) {
                     Ok(entry) => {
-                        let socket = entry.state_dir.join(vga::SOCKET);
+                        let dir = match service.as_deref() {
+                            None => entry.state_dir.clone(),
+                            // `vsock-auto://<svc-dir>/vsock.sock:4444`: the service's directory.
+                            Some(name) => match resolve_service_addr(&entry, name) {
+                                Ok(SocketAddr::VsockAuto { path, .. }) => match path.parent() {
+                                    Some(d) => d.to_path_buf(),
+                                    None => {
+                                        return fail(
+                                            &anyhow::anyhow!("service {name:?}: odd exec address"),
+                                            2,
+                                        );
+                                    }
+                                },
+                                Ok(other) => {
+                                    return fail(
+                                        &anyhow::anyhow!(
+                                            "service {name:?}: exec address {other} names no directory"
+                                        ),
+                                        2,
+                                    );
+                                }
+                                Err(e) => return fail(&e, 2),
+                            },
+                        };
+                        let socket = dir.join(vga::SOCKET);
                         if !socket.exists() {
                             return fail(
                                 &anyhow::anyhow!(
-                                    "{} has no VGA console: boot it with `vk run --vga`",
-                                    entry.state_dir.display()
+                                    "{} has no VGA console: boot it with `vk run --vga` (a \
+                                     compose service with `x-virtkit: vga: true`)",
+                                    dir.display()
                                 ),
                                 2,
                             );

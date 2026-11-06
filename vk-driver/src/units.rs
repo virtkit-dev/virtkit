@@ -67,6 +67,9 @@ pub struct Provisioned {
     /// Whether this service's guest gets VMX/SVM and so a `/dev/kvm` of its own (its
     /// compose `x-virtkit.nested`). Uniform with the primary path.
     pub nested: bool,
+    /// Whether this service's guest gets a VGA text console, served in its directory for
+    /// `vk vga --service` (its compose `x-virtkit.vga`).
+    pub vga: bool,
     /// Addresses of this service's NICs after eth0 (its compose `x-virtkit.nics`), in
     /// interface order — eth1 first. Empty for the one-NIC default. The owner allocates
     /// them from the LAN's static region ([`ExtraNics`]) because they have to be unique
@@ -346,6 +349,7 @@ pub fn provisioned(
         reclaim: unit.reclaim,
         dax: unit.dax,
         nested: unit.nested,
+        vga: unit.vga,
         extra_ips,
         persist_root_backing: unit.persist_root_backing.clone(),
         tap: unit.tap.clone(),
@@ -811,7 +815,7 @@ pub fn boot_unit(
             tpm_state: None,
             serial_input: None,
             control: None,
-            vga: None,
+            vga: svc.vga.then(|| dir.join(crate::vga::SOCKET)),
             restore_from: None,
         };
         let vmm = crate::vmm::selected();
