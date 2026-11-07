@@ -742,8 +742,11 @@ but not counted. A node is skipped from the start, so canaries are picked among 
 when it is monitored only (its latest session at protocol version 1), already runs the
 release, is quarantined, has not reported its state yet, or — unless `--force` — has an
 external runner that `vk node` cannot drain. When its wave comes, a node is skipped for any of
-these, when it has been removed, when it is draining or in maintenance of its own, or when an
-update an operator issued it before the rollout reached it is still under way.
+these, when it has been removed, when it is draining or in maintenance of its own, when an
+update an operator issued it before the rollout reached it is still under way, or when it has
+moved since the rollout was planned to a version at or past the release's, so the rollout never
+takes back a node updated by hand meanwhile; a node already on such a version when the rollout
+was planned is still sent the release, which its own downgrade check judges.
 `rollout status [<id>]`, `pause`, `resume` and `abort` steer it; pausing or aborting issues
 nothing more, and updates under way finish and are still recorded. `rollout delete <id>`
 forgets an ended rollout, done or aborted, once no update it issued is under way; its audit

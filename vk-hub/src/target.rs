@@ -125,7 +125,7 @@ pub fn orderable(version: &str) -> bool {
 }
 
 /// How `a` orders against `b`, both `MAJOR.MINOR.PATCH`; `None` when either is not.
-fn order(a: &str, b: &str) -> Option<Ordering> {
+pub fn order(a: &str, b: &str) -> Option<Ordering> {
     Some(fields(a)?.cmp(&fields(b)?))
 }
 

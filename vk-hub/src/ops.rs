@@ -1,6 +1,7 @@
 //! Shared fleet operations for every front end. Mutations take an actor (`uid <n>` on the
 //! admin socket), which the store audits with the change.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -449,6 +450,7 @@ pub fn plan_rollout(hub: &Hub, plan: &RolloutPlan) -> Result<(Release, Vec<Rollo
         bail!("there is no node to roll out to");
     }
     let (mut skipped, mut to_do) = (Vec::new(), Vec::new());
+    let mut planned_vk = HashMap::new();
     for (id, row) in chosen {
         let facts = crate::rollout::Facts::of(&row);
         let profile = crate::rollout::profile(row.inventory.as_ref());
@@ -461,10 +463,16 @@ pub fn plan_rollout(hub: &Hub, plan: &RolloutPlan) -> Result<(Release, Vec<Rollo
         };
         match skip {
             Some(reason) => skipped.push((id, row.hostname, profile, reason)),
-            None => to_do.push((id, row.hostname, profile)),
+            None => {
+                planned_vk.insert(id.clone(), facts.vk);
+                to_do.push((id, row.hostname, profile));
+            }
         }
     }
     let mut nodes = crate::rollout::plan(to_do, plan.batch, plan.canary_per_profile);
+    for node in &mut nodes {
+        node.planned_vk = planned_vk.remove(&node.id).flatten();
+    }
     nodes.extend(
         skipped
             .into_iter()
@@ -474,6 +482,7 @@ pub fn plan_rollout(hub: &Hub, plan: &RolloutPlan) -> Result<(Release, Vec<Rollo
                 profile,
                 wave: 0,
                 status: NodeStatus::Skipped { reason },
+                planned_vk: None,
             }),
     );
     Ok((release, nodes))

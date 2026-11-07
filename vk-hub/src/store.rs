@@ -4513,6 +4513,7 @@ mod tests {
             hostname: "ci-1".into(),
             profile: "p".into(),
             wave: 0,
+            planned_vk: None,
             status,
         };
         let updating = NodeStatus::Updating {

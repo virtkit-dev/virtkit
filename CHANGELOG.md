@@ -101,6 +101,10 @@ All notable changes to virtkit will be documented in this file.
 - **vk-hub counts accepted jobs until a later heartbeat reports them.** Previously, they
   stopped counting against memory and vCPUs before the node reported them, allowing offers
   the node would refuse.
+- **A vk-hub rollout no longer sends an older release to a node updated by hand meanwhile.**
+  A node that has reached the release's version or a newer one since the rollout started is
+  skipped when its wave comes, instead of refusing the update and pausing or aborting the
+  rollout, or being downgraded.
 
 ## [0.106.1] - 2026-11-06
 

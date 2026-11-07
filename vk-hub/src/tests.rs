@@ -1882,6 +1882,14 @@ async fn a_rollout_updates_wave_by_wave_and_pauses_on_a_failure() {
     };
     assert!(skipped(&old).contains("protocol version 1"));
     assert!(skipped(&c).contains("already runs"));
+    // Keep each pending node's version at planning to detect later changes.
+    assert!(
+        rollout
+            .row
+            .nodes
+            .iter()
+            .all(|n| (n.status == rollout::NodeStatus::Pending) == n.planned_vk.is_some())
+    );
     // One rollout at a time.
     let err = ops::create_rollout(&hub, "uid 0", &plan).unwrap_err();
     assert!(format!("{err:#}").contains("still running"), "{err:#}");
@@ -2378,6 +2386,7 @@ fn a_rollout_status_shows_each_node_by_wave() {
                 hostname: "a".into(),
                 profile: "big".into(),
                 wave: 0,
+                planned_vk: None,
                 status: rollout::NodeStatus::Succeeded { at: 1_800_000_060 },
             },
             rollout::RolloutNode {
@@ -2385,6 +2394,7 @@ fn a_rollout_status_shows_each_node_by_wave() {
                 hostname: "b".into(),
                 profile: "big".into(),
                 wave: 1,
+                planned_vk: None,
                 status: rollout::NodeStatus::Failed {
                     reason: "rolled back".into(),
                     at: 1_800_000_120,
@@ -2396,6 +2406,7 @@ fn a_rollout_status_shows_each_node_by_wave() {
                 hostname: "c".into(),
                 profile: "big".into(),
                 wave: 2,
+                planned_vk: None,
                 status: rollout::NodeStatus::Pending,
             },
         ],

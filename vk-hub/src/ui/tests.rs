@@ -3602,6 +3602,7 @@ fn rollout_of(hub: &Hub, hostname: &str) -> String {
                 hostname: hostname.into(),
                 profile: format!("{hostname} CPU · 64G · jobs fast"),
                 wave: 0,
+                planned_vk: None,
                 status: crate::rollout::NodeStatus::Failed {
                     reason: format!("refused: {hostname}"),
                     at: 2,
@@ -3613,6 +3614,7 @@ fn rollout_of(hub: &Hub, hostname: &str) -> String {
                 hostname: "ci-2".into(),
                 profile: "ci-2 CPU · 64G · jobs fast".into(),
                 wave: 1,
+                planned_vk: None,
                 status: crate::rollout::NodeStatus::Pending,
             },
         ],
@@ -6109,6 +6111,7 @@ async fn an_operator_deletes_an_ended_rollout_that_updated_no_node() {
             hostname: "ci-2".into(),
             profile: "p".into(),
             wave: 0,
+            planned_vk: None,
             status,
         }],
     };

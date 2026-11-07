@@ -25,7 +25,10 @@
 //! grace to reconnect and report: what its database says of them predates its downtime.
 //!
 //! A node whose latest session ran a protocol version below [`vk_hub_proto::STEERING`] is
-//! monitored only: it takes no command, so a rollout skips it rather than wait on it.
+//! monitored only: it takes no command, so a rollout skips it rather than wait on it. A node
+//! that has moved since the rollout was planned to the release's version or past it, updated by
+//! hand meanwhile, is skipped when its wave comes rather than sent a release it would refuse,
+//! or be taken back by.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -148,6 +151,10 @@ pub struct RolloutNode {
     /// Waves go in order; with canaries, wave 0 holds one node of each profile.
     pub wave: u32,
     pub status: NodeStatus,
+    /// The node's reported `vk` version at planning. If it changes to the release's version
+    /// or newer, skip the node when its wave comes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_vk: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -548,6 +555,12 @@ pub fn step(
                     protocol: Some(v), ..
                 }) if *v < vk_hub_proto::STEERING => Some(monitoring_only(*v)),
                 Some(f) if on_target(&target, f) => Some("already runs the release".to_string()),
+                Some(f) if let Some(vk) = caught_up(node.planned_vk.as_deref(), f, &version) => {
+                    Some(format!(
+                        "already runs vk {vk}, the release's version or newer, since the \
+                         rollout was planned"
+                    ))
+                }
                 Some(f) => ineligible(f, target.force)
                     .or(match f.state {
                         Some(
@@ -579,6 +592,15 @@ pub fn step(
     }
 }
 
+/// The version reported in `f` if it has changed from `planned` to `version` or newer.
+/// Skipping nodes updated by hand since planning avoids downgrades or same-version updates.
+/// A node already there at planning is left to the rollout for an intentional rollback.
+fn caught_up<'a>(planned: Option<&str>, f: &'a Facts, version: &str) -> Option<&'a str> {
+    let (planned, vk) = (planned?, f.vk.as_deref()?);
+    let past = crate::target::order(vk, version)? != std::cmp::Ordering::Less;
+    (past && vk != planned).then_some(vk)
+}
+
 /// Why a node at protocol `version` is skipped: it can be monitored, not updated.
 pub fn monitoring_only(version: u32) -> String {
     format!("monitored only: its vk speaks fleet protocol version {version}, which takes no update")
@@ -603,6 +625,7 @@ pub fn plan(
                 profile,
                 wave: 0,
                 status: NodeStatus::Pending,
+                planned_vk: None,
             });
         } else {
             rest.push((id, hostname, profile));
@@ -618,6 +641,7 @@ pub fn plan(
             profile,
             wave,
             status: NodeStatus::Pending,
+            planned_vk: None,
         });
     }
     out
@@ -1062,6 +1086,42 @@ mod tests {
             "{:?}",
             r.nodes[0].status
         );
+    }
+
+    /// A node updated by hand to the release's version or past it since the rollout was planned
+    /// is skipped when its wave comes, not sent the release; one that was already there when
+    /// it was planned, which an operator may mean to take back, is not.
+    #[test]
+    fn a_node_moved_to_the_release_or_past_it_since_planned_is_skipped() {
+        let mut r = row(plan(nodes(), 4, false), 0);
+        // n1, n3, n4, n2 in plan order; the release is 0.85.0.
+        for (node, planned) in r
+            .nodes
+            .iter_mut()
+            .zip(["0.84.0", "0.84.0", "0.86.0", "0.84.0"])
+        {
+            node.planned_vk = Some(planned.into());
+        }
+        let mut facts: HashMap<String, Facts> = ["n1", "n2", "n3", "n4"]
+            .iter()
+            .map(|n| (n.to_string(), ready(false)))
+            .collect();
+        facts.get_mut("n1").unwrap().vk = Some("0.86.0".into());
+        facts.get_mut("n3").unwrap().vk = Some("0.85.0".into());
+        facts.get_mut("n4").unwrap().vk = Some("0.86.0".into());
+        assert_eq!(issued(&step(&mut r, &facts, 0, 0)), [2, 3]);
+        let skipped: Vec<(&str, &str)> = r
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.status {
+                NodeStatus::Skipped { reason } => Some((n.id.as_str(), reason.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        assert!(skipped[0].0 == "n1" && skipped[0].1.contains("vk 0.86.0"));
+        assert!(skipped[1].0 == "n3" && skipped[1].1.contains("vk 0.85.0"));
+        assert_eq!(r.failures, 0);
     }
 
     /// A node drains when it runs its runner or runs none; one that reports no mode, or an
