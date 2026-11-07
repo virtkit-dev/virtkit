@@ -151,8 +151,7 @@ pub fn resolve_ref(
     crate::image::resolve_ref(cfg, state_dir, image)
 }
 
-/// `pipeline/build/<spec>`, pulled with the node's credential (the job's token on a node with
-/// none, see [`crate::jobctx::JobCtx`]), always by tag.
+/// `pipeline/build/<spec>`, pulled with the job's token ([`pull_registry`]), always by tag.
 fn resolve_build(
     cfg: &Config,
     state_dir: &Path,
@@ -160,7 +159,7 @@ fn resolve_build(
     spec: &str,
 ) -> Result<ResolvedImage> {
     let r = BuildRef::parse(spec)?;
-    let rg = builds(cfg, prefix(job)?, None)?;
+    let rg = pull_registry(cfg, job)?;
     let found =
         crate::registry::resolve_tag(cfg, state_dir, &rg, &r.name, &r.tag(), r.digest.as_deref())
             .with_context(|| format!("image {r}"))?;
@@ -174,6 +173,14 @@ fn resolve_build(
             bail!("image {r} is not in this pipeline: it expired or was never published")
         }
     }
+}
+
+/// Pull from the pipeline's `builds/` with its job token, scoped by the hub to that pipeline,
+/// as [`publication`] does. The node's credential needs no read access to the pipeline
+/// namespace; it applies after token expiry ([`crate::config::Registry::live_job_token`]).
+fn pull_registry(cfg: &Config, job: Option<&JobRegistry>) -> Result<crate::config::Registry> {
+    let prefix = prefix(job)?;
+    builds(cfg, prefix, job.map(crate::config::JobToken::of))
 }
 
 /// Refuse `image` when one of the node's credentials would pull it from a repository in the
@@ -839,20 +846,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A resolution sends the node's credential, not the job's token.
+    /// Resolution uses the job's token, as publication does; the node's credential needs
+    /// no read access to the pipeline namespace. After token expiry, it uses the node's
+    /// credential. Separate state directories prevent resolutions from sharing cached images.
     #[test]
-    fn resolution_sends_the_nodes_credential() {
-        let dir = tmpdir("node-cred");
+    fn resolution_sends_the_job_token() {
+        let dir = tmpdir("job-token-pull");
         let (for_job, for_node) = token_gated(&dir);
         let own = job(Some("ci-pipeline/gl/42/7"));
         let d = publish_build(&for_job, Some(&own), "11", "runner", &bundle(&dir, 1))
             .unwrap()
             .digest
             .unwrap();
-        let state = dir.join("state");
         let pinned = format!("pipeline/build/runner:job-11@{d}");
-        assert!(resolve_ref(&for_job, &state, Some(&own), &pinned).is_err());
-        resolve_ref(&for_node, &state, Some(&own), &pinned).unwrap();
+        assert!(resolve_ref(&for_node, &dir.join("s1"), Some(&own), &pinned).is_err());
+        resolve_ref(&for_job, &dir.join("s2"), Some(&own), &pinned).unwrap();
+        let expired = JobRegistry {
+            expires_at: 0,
+            ..job(Some("ci-pipeline/gl/42/7"))
+        };
+        assert!(resolve_ref(&for_job, &dir.join("s3"), Some(&expired), &pinned).is_err());
+        resolve_ref(&for_node, &dir.join("s4"), Some(&expired), &pinned).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

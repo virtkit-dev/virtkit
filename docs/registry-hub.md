@@ -639,7 +639,8 @@ though within them it can claim protection.
   job whose start names none keeps today's caches (`ci-cache/<host>/<project>`, with the
   node's credential); only under `"job"` does it run without caches, with a warning in its
   trace.
-- **Unchanged in this step.** These keep the node's credential: image pulls and relays,
+- **Unchanged in this step.** These keep the node's credential: image pulls and relays
+  (a `pipeline/build/` pull uses the job's token, as its publication does),
   `vk build`'s build cache, and the build-once locks and failure memos `vk` takes around a
   build. Under `"job"`, a node without its own credential uses the placed job's token for image
   pulls, relays and locks; this includes nodes using the registry their hub names

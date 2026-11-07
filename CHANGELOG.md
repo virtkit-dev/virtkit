@@ -64,6 +64,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **`pipeline/build/` images are pulled with the job's token,** as they are published, even
+  when the node has its own registry credential. That credential needs no read access to
+  the pipeline namespace; pulls use it when the job's token expires.
 - **Nodes that lend guests the job's registry token and have no registry credential
   now use that token to pull placed jobs' images,** replacing anonymous pulls; once the token
   has expired, they pull anonymously again.

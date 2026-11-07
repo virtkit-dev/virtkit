@@ -144,15 +144,15 @@ included, bypassing `vk-agent build`. That stays within the pipeline, whose jobs
 share its namespace with write (registry hub 4c): a pipeline's images are as trusted as its
 jobs, and no more.
 
-Pulls keep the node's credential until image pulls use the job's token; until then the
-resolver is a consumer's only guard. The resolver guards names, not digests: a digest is
-readable through any repository the caller may read, held there or not, as long as the
-caller may read some repository that holds it, and through any repository at all when the
-credential has no per-repository scopes (`vk-registry`'s `readable_through`). A node
-credential that reads the pipeline namespace therefore lets a job that learns another
-pipeline's digest boot it through any `virtkit/` reference the node may read. Until pulls use the job's token, a pipeline image's digest
-must be treated as readable by the fleet's jobs, and an image must not hold secrets the
-pipeline's jobs would not share. Captures are in the same position.
+A `pipeline/build/` pull uses the job's token, as its publication does, so the node's
+credential need not read the pipeline namespace; it applies only once the token has
+expired. The resolver still guards names, not digests: a digest is readable through any
+repository the caller may read, held there or not, as long as the caller may read some
+repository that holds it, and through any repository at all when the credential has no
+per-repository scopes (`vk-registry`'s `readable_through`). A node credential that reads
+the pipeline namespace therefore lets a job that learns another pipeline's digest boot it
+through any `virtkit/` reference the node may read; an operator keeps the namespace out of
+the nodes' credentials. Captures are in the same position.
 
 ## Lifetime
 
