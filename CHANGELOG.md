@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.107.0] - 2026-11-07
+
 ### Added
 
 - **vk-hub manages node settings from the CLI and web UI.** Use `vk-hub settings set` and
@@ -5313,7 +5315,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.106.1...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.107.0...HEAD
+[0.107.0]: https://github.com/virtkit-dev/virtkit/compare/v0.106.1...v0.107.0
 [0.106.1]: https://github.com/virtkit-dev/virtkit/compare/v0.106.0...v0.106.1
 [0.106.0]: https://github.com/virtkit-dev/virtkit/compare/v0.105.1...v0.106.0
 [0.105.1]: https://github.com/virtkit-dev/virtkit/compare/v0.105.0...v0.105.1
