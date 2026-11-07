@@ -984,7 +984,11 @@ restarted node holds none, and the hub releases what it thought held.
 (`0600`). Repeated starts are answered from the journal. The reservation's ledger entry is
 renamed to the GitLab job ID and passed to the driver by descriptor, preserving its queue
 position and claim. Executor admission then waits only for additional resources and returns
-any excess. A start without a held reservation is admitted immediately or refused
+any excess. It counts the job's guest and its services, while the hub places and counts the job
+at its envelope alone: a job whose services take it past its envelope waits on the node for the
+difference, at most `wait_timeout_secs`, and one whose guest and services together pass the
+node's whole memory or vCPU budget is refused, so a runner whose jobs run services needs an
+envelope that covers them. A start without a held reservation is admitted immediately or refused
 (`no_reservation` if it named one). The node assigns the lowest free `CI_CONCURRENT_ID`
 among its jobs and `CI_CONCURRENT_PROJECT_ID` within the project.
 

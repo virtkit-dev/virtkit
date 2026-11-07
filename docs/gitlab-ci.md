@@ -917,7 +917,10 @@ By default the budget counts what a job **declares** (`MICROVM_MEM`, or `[execut
 is nearly always far more than it uses — so a runner gated this way runs fewer jobs than it
 could. A job's services count too, each at its `x-virtkit.mem`, else a Windows Dockerfile's
 `# vk: mem=`, else the default, held under the same ceilings; a job and services that together
-exceed the whole budget are refused. Under `from_history` the job's history already holds its
+exceed the whole budget are refused. The fleet hub counts a placed job at its runner's
+envelope alone. An envelope that leaves out services lets the hub place a job that then
+waits on the node for them ([Placed jobs on the node](fleet-prototype.md#placed-jobs-on-the-node)).
+Under `from_history` the job's history already holds its
 services, whose VMs are the supervisor's children, so it is capped at the guest's and the
 services' declared sizes together. With `host_checkout` and `net.mode = "switch"`, a
 `compose:` job is admitted against memory or vCPU budgets after checkout supplies its service
@@ -1192,7 +1195,8 @@ needs neither. With a memory budget too, `vk tune` asks the runner for no more j
 `MICROVM_CPUS` above the whole budget is clamped to it, as a `MICROVM_MEM` is to the memory budget; an `[executor.vm] cpus` above it,
 unless `max_cpus` holds it under, fails every job that sets no `MICROVM_CPUS`. Services count as they do for memory, each at its `x-virtkit.cpus` or a Windows
 Dockerfile's `# vk: cpus=` held under the same ceilings, else the default; a job and services
-that together exceed the whole budget are refused. A job prepared by an older `vk` counts none.
+that together exceed the whole budget are refused, and as for memory a fleet hub's envelope
+leaves them out. A job prepared by an older `vk` counts none.
 Unset there is no vCPU gate — except on a [fleet node](fleet-design.md#defaults-on-an-enrolled-node),
 where it is 2.
 

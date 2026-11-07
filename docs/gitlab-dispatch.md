@@ -154,6 +154,12 @@ envelope = { mem = "16G", cpus = 8, disk = "16G" }
 request_concurrency = 1
 ```
 
+A runner's `envelope` is what the hub sets aside on a node and counts there for each of its
+jobs. The node admits the job's guest and its services, each service VM at its own size, so
+the envelope should cover both: a job whose services take it past its envelope waits on the
+node for the difference, and one whose guest and services together pass the node's whole
+budget is refused ([Placed jobs on the node](fleet-prototype.md#placed-jobs-on-the-node)).
+
 `concurrent` and each runner's `request_concurrency` are at most 128, and a daemon has at most
 64 runners: vk-gitlab refuses a configuration past them, and the hub ends the session of a
 relay whose inventory lists more runners or a larger `request_concurrency`.

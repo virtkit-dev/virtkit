@@ -661,7 +661,9 @@ the prototype's automatic generation bump; they are not implemented yet.
 Placed jobs — [GitLab jobs](#gitlab-jobs) first, generic jobs after — require
 **reservations**, which phase 1 lacks. The hub asks a node to set a resource envelope aside;
 the node accepts or refuses immediately through its admission ledger. When the workload
-starts, its ledger entry takes over the envelope. Leases run on the node's clock and expire
+starts, its ledger entry takes over the envelope, and claims what the job's guest and its
+services need beyond it — the hub's envelope does not count services, so one too small for them
+leaves the job waiting on the node. Leases run on the node's clock and expire
 unless renewed. All workload types — CI job VMs, their services, image builds and placed
 jobs — must use that ledger before sharing a node.
 
