@@ -17,8 +17,8 @@
 # test; VK_HUB_V1, an older vk-hub mounted beside it in the primary as vk-hub-v1 (HUB_BIN
 # picks which one hub_start and hub run); VK_NEXT, a vk mounted in the primary as
 # /usr/local/share/vk-next, for the hub to hold as a release; IMAGE, the node services' base
-# image (tests/fleet/node/Dockerfile otherwise); E2E_REQUIRE_KVM=1 fails, rather than skips,
-# on a host without KVM or nesting.
+# image (tests/fleet/node/Dockerfile otherwise); HUB_TOML, lines appended to the hub's
+# hub.toml; E2E_REQUIRE_KVM=1 fails, rather than skips, on a host without KVM or nesting.
 # Needs: KVM with nesting, openssl, and a registry to pull alpine.
 
 FLEET_LIB=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -111,6 +111,7 @@ data_dir = "/var/lib/vk-hub"
 EOF
   [ "${HUB_UI:-}" != 1 ] ||
     printf '%s\n' 'ui_addr = "0.0.0.0:8444"' 'ui_url = "https://hub:8444"' >>"$FLEET/hub/hub.toml"
+  [ -z "${HUB_TOML:-}" ] || printf '%s\n' "$HUB_TOML" >>"$FLEET/hub/hub.toml"
   cp -r "$FLEET_LIB/node" "$FLEET/node"
   {
     echo "services:"
