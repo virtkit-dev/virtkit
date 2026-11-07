@@ -9,7 +9,7 @@
 # restarts. A node service's vk config can be set with node_config before it boots, and a
 # gitlab-runner stand-in is in its /seed (tests/fleet/node/gitlab-runner). `fleet_kvm_node`
 # runs one more node on the test host itself, enrolled through the hub's port published on
-# loopback.
+# loopback. HUB_UI=1 also publishes the hub's web UI on loopback; `hub_ui` reads its pages.
 #
 # Source it, then call fleet_up; everything is torn down on exit.
 #
@@ -44,6 +44,7 @@ FLEET=$(mktemp -d "${TMPDIR:-/tmp}/vk-fleet.XXXXXX")
 RUN=$FLEET/run
 HUB_CONFIG=/etc/vk-hub/hub.toml
 HUB_PORT=
+UI_PORT=
 HUB_BIN=vk-hub
 KVM_VK=$VK
 KVM_NODE_PID=
@@ -108,6 +109,8 @@ tls_cert = "/etc/vk-hub/cert.pem"
 tls_key = "/etc/vk-hub/key.pem"
 data_dir = "/var/lib/vk-hub"
 EOF
+  [ "${HUB_UI:-}" != 1 ] ||
+    printf '%s\n' 'ui_addr = "0.0.0.0:8444"' 'ui_url = "https://hub:8444"' >>"$FLEET/hub/hub.toml"
   cp -r "$FLEET_LIB/node" "$FLEET/node"
   {
     echo "services:"
@@ -144,19 +147,26 @@ EOF
     --detach --inactivity-timeout 0 >"$FLEET/run.log" 2>&1) ||
     { cat "$FLEET/run.log"; fail "the fleet did not boot"; }
   hub_start
+  fleet_publish hub 8443 HUB_PORT
+  [ "${HUB_UI:-}" != 1 ] || fleet_publish ui 8444 UI_PORT
+}
+
+# fleet_publish <name> <port> <var>: publish the primary's <port> on a free test-host loopback
+# port and store that port in <var>.
+fleet_publish() {
   local port rc
   for port in $(shuf -i 20000-60000 -n 20); do
     rc=0
-    "$VK" publish ensure --name hub --listen "tcp://127.0.0.1:$port" \
-      --to tcp://127.0.0.1:8443 "$RUN" >"$FLEET/publish.log" 2>&1 || rc=$?
+    "$VK" publish ensure --name "$1" --listen "tcp://127.0.0.1:$port" \
+      --to "tcp://127.0.0.1:$2" "$RUN" >"$FLEET/publish.log" 2>&1 || rc=$?
     # 4: the port is taken; try another. Anything else will not go away.
     case $rc in
-      0) HUB_PORT=$port && break ;;
+      0) printf -v "$3" %s "$port" && return ;;
       4) ;;
-      *) cat "$FLEET/publish.log"; fail "could not publish the hub (exit $rc)" ;;
+      *) cat "$FLEET/publish.log"; fail "could not publish the $1 (exit $rc)" ;;
     esac
   done
-  [ -n "$HUB_PORT" ] || fail "could not publish the hub on a loopback port"
+  fail "could not publish the $1 on a loopback port"
 }
 
 # `vk-hub <args>` in the primary, against the hub's config.
@@ -175,6 +185,18 @@ hub_kill() {
   # kill returns before the process is gone, and until then its admin socket answers: a hub
   # started meanwhile refuses the data directory as served.
   wait_for 30 "$VK" exec "$RUN" -- sh -c "! pidof $HUB_BIN" || fail "$HUB_BIN outlived kill -9"
+}
+
+# hub_ui <path>: a page of the hub's web UI (HUB_UI=1), as a viewer signed in on first use.
+hub_ui() {
+  local get=(curl -sSf --cacert "$FLEET/ca.pem" --connect-to "hub:8444:127.0.0.1:$UI_PORT"
+    -H 'Sec-Fetch-Site: none' -b "$FLEET/ui.cookies" -c "$FLEET/ui.cookies")
+  if ! grep -qs vk-hub "$FLEET/ui.cookies"; then
+    local link
+    link=$(hub ui login 2>/dev/null) || return 1
+    "${get[@]}" -o /dev/null --data-urlencode "t=${link##*t=}" https://hub:8444/login || return 1
+  fi
+  "${get[@]}" "https://hub:8444$1"
 }
 
 # hub_audit <id>: node <id>'s lines of the audit log.
@@ -301,6 +323,11 @@ node_is() {
 fleet_kvm_node() {
   KVM_VK=${1:-$VK}
   node_join kvm >/dev/null || fail "the test host's node could not join"
-  VIRTKIT_CONFIG=$FLEET/kvm/config.toml "$KVM_VK" node run >"$FLEET/kvm/node.log" 2>&1 &
+  kvm_node_run
+}
+
+# Run the test host's enrolled node, logging to kvm/node.log.
+kvm_node_run() {
+  VIRTKIT_CONFIG=$FLEET/kvm/config.toml "$KVM_VK" node run >>"$FLEET/kvm/node.log" 2>&1 &
   KVM_NODE_PID=$!
 }
