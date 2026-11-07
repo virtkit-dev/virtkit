@@ -67,11 +67,23 @@ const SUPERSEDED: &str = "superseded by a newer session of this relay";
 /// moved, so that a burst of changes, such as a job's output arriving, makes one notice.
 const NOTICE_COALESCE: Duration = Duration::from_millis(50);
 
-/// Run a relay's session on `ws` to its end, logging why it ended. `conn` is the relay's
-/// HTTP/2 connection the session's stream belongs to, which the session marks as the relay's
-/// before its welcome; `None` for a session over HTTP/1.1.
+/// Run a relay's session on `ws`, log why it ended, then end its stream. `conn` is the HTTP/2
+/// connection carrying the session, bound to the relay before its welcome; `None` for HTTP/1.1.
 pub(crate) async fn run(
     mut ws: Ws,
+    hub: Arc<Hub>,
+    peer: SocketAddr,
+    exported: Exported,
+    permit: OwnedSemaphorePermit,
+    conn: Option<RelayConn>,
+) {
+    session(&mut ws, hub, peer, exported, permit, conn).await;
+    crate::session::finish(ws).await;
+}
+
+/// [`run`]'s session, up to its stream's end.
+async fn session(
+    ws: &mut Ws,
     hub: Arc<Hub>,
     peer: SocketAddr,
     exported: Exported,
@@ -83,19 +95,18 @@ pub(crate) async fn run(
     } else {
         RELAY_HTTP1
     };
-    let handshake =
-        crate::session::handshake(&mut ws, &hub, exported, PeerKind::Relay, versions).await;
+    let handshake = crate::session::handshake(ws, &hub, exported, PeerKind::Relay, versions).await;
     let relay = match handshake {
         Ok(r) => r,
-        Err(r) => return turn_away(&mut ws, peer, r).await,
+        Err(r) => return turn_away(ws, peer, r).await,
     };
     let (session, ending) = hub.open_session(&relay.id);
-    let welcomed = welcome(&mut ws, &hub, &relay, session, conn.as_ref()).await;
+    let welcomed = welcome(ws, &hub, &relay, session, conn.as_ref()).await;
     drop(permit);
     if let Err(r) = welcomed {
         hub.close_session(&relay.id, session);
         crate::jobs::relay_disconnected(&hub, &relay.id, session);
-        return turn_away(&mut ws, peer, r).await;
+        return turn_away(ws, peer, r).await;
     }
     eprintln!(
         "vk-hub: {peer}: relay {} ({}) connected at protocol version {}",
@@ -105,7 +116,7 @@ pub(crate) async fn run(
     hub.clients_changed();
     // `/updates` shows whether each relay is connected.
     hub.touch();
-    let ended = serve(&mut ws, &hub, &relay, session, &ending).await;
+    let ended = serve(ws, &hub, &relay, session, &ending).await;
     hub.close_session(&relay.id, session);
     crate::jobs::relay_disconnected(&hub, &relay.id, session);
     hub.changed(&relay.id);

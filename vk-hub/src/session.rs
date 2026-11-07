@@ -123,6 +123,15 @@ pub(crate) async fn turn_away(ws: &mut Ws, peer: SocketAddr, r: Refusal) {
     refuse(ws, r.code, &r.reason).await;
 }
 
+/// End the stream of a session over once what was sent on it is on its way. On a relay's
+/// HTTP/2 connection a stream dropped while still open is reset, which discards the data it
+/// still buffers — a refusal, or the close after it — so the peer would read an error instead.
+/// Ending it first sends that data, then the end. Best effort, bounded as a step.
+pub(crate) async fn finish(mut ws: Ws) {
+    use tokio::io::AsyncWriteExt;
+    let _ = tokio::time::timeout(HANDSHAKE_STEP, ws.get_mut().shutdown()).await;
+}
+
 /// Tell the peer why and close. Best effort: the peer is being turned away, and a failure to
 /// tell it so leaves nothing to clean up.
 async fn refuse(ws: &mut Ws, code: RefusalCode, reason: &str) {

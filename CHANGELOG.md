@@ -105,6 +105,9 @@ All notable changes to virtkit will be documented in this file.
   A node that has reached the release's version or a newer one since the rollout started is
   skipped when its wave comes, instead of refusing the update and pausing or aborting the
   rollout, or being downgraded.
+- **A vk-gitlab relay whose session vk-hub ends is told why.** A relay superseded by a newer
+  session, removed or refused could previously see its connection fail instead of reading the
+  hub's reason.
 
 ## [0.106.1] - 2026-11-06
 
