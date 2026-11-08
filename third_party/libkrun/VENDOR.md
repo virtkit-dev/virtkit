@@ -291,6 +291,13 @@ header (short, or all write-only) is returned used without a frame. Upstream and
 tree handed it to the backend, whose `write_frame` asserts on it, so a guest could panic the
 net worker. Covered by `a_header_only_transmit_chain_is_returned_without_a_frame`.
 
+`src/devices/src/virtio/net/tap.rs` — unless the driver negotiated `VIRTIO_NET_F_CSUM`, the
+tap backend zeroes the virtio-net header of each frame the guest sends. The tap is opened
+with `IFF_VNET_HDR`, so the host kernel trusts that header's checksum and GSO fields whatever
+was negotiated, and a hostile guest's `csum_start` reached the IPv4 fragmentation read fixed
+upstream in Linux `6785011f8b16`. Covered by `header_is_cleared_without_tx_offloads` and
+`header_is_kept_with_tx_offloads`.
+
 `src/devices/src/virtio/net/{device.rs,backend.rs,tap.rs,worker/{mod.rs,unix.rs}}` — virtio-net
 resets on unix hosts. The worker thread stops on an eventfd of the device's and returns its
 backend, which the device keeps for the next activation: opened once, because an `*Fd`

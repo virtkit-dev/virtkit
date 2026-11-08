@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A VM on a tap can no longer pass checksum or segmentation offload requests to the host
+  kernel.** A guest could otherwise reach host-kernel bugs in that path, such as the IPv4
+  fragmentation flaw fixed in Linux 7.3 and backported to 7.2 and the longterm kernels; patching
+  the host kernel is still recommended.
+
 ## [0.107.0] - 2026-11-07
 
 ### Added
