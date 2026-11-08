@@ -8,6 +8,11 @@
 //! else the build stores there. The build uses the node's `[build]` settings, runs one stage
 //! at a time (`--build-jobs 1`), and has [`BUILD_TIMEOUT`] to finish.
 //!
+//! Its RUN steps reach only what each stage of the definition declares (`# vk: allow-ip=…
+//! allow-name=…` above its `FROM`), within the node's `[egress.build]`: a stage that declares
+//! nothing has no network. What they contacted and were refused is kept in the manifest of
+//! the tools installed, and said with the failure of a build that fails.
+//!
 //! The stage is exported as raw ext4. [`crate::ext4_read`] reads its root in-process:
 //! regular files and symlinks to regular files beside them (`git-remote-https` →
 //! `git-remote-http`). Directories such as `lost+found` are skipped.
@@ -18,10 +23,12 @@
 //! Nodes requiring signed releases run the tools only in job VMs and report no versions.
 //!
 //! Tools are installed in `<state_dir>/tools/<sha256>/` (directory and files `0755`), with
-//! a `<sha256>.json` manifest beside it. Renaming a new link over `current` switches tools
-//! for future jobs. Each job keeps the directory it resolves at startup ([`crate::vm`]).
-//! The previous tools remain available; older ones are removed unless a job directory's
-//! `tools.root` still names them.
+//! a `<sha256>.json` manifest beside it recording each file's sha256 and each link's target.
+//! Renaming a new link over `current` switches tools for future jobs. Each job keeps the
+//! directory it resolves at startup ([`crate::vm`]), and is not given tools that are no longer
+//! what their manifest records ([`for_job`]); the inventory says whether they still are, so
+//! the hub has them installed again. The previous tools remain available; older ones are
+//! removed unless a job directory's `tools.root` still names them.
 //!
 //! One build runs at a time in the background, without interrupting the session. After a
 //! node stops, its next start restarts the build from the beginning.
@@ -36,8 +43,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::watch;
-use vk_hub_proto::{ToolsInstalled, ToolsPhase};
+use vk_hub_proto::{ToolsCheck, ToolsEgress, ToolsFile, ToolsInstalled, ToolsPhase};
 
 use super::core::Core;
 use super::session::Node;
@@ -73,7 +81,7 @@ const PROBE_MAX: u64 = 4096;
 const PROBED: [&str; 3] = ["git", "git-lfs", "gitlab-runner"];
 
 /// The most files a tools stage's root may hold, and the largest one.
-const MAX_FILES: usize = 64;
+const MAX_FILES: usize = vk_hub_proto::MAX_TOOLS_FILES;
 const MAX_TOOL: u64 = 256 << 20;
 
 /// The most entries a definition's tar may hold.
@@ -84,12 +92,77 @@ fn root(cfg: &Config) -> PathBuf {
     cfg.state_dir().join(TOOLS_DIR)
 }
 
+/// The link `[executor] tools_dir` names to give jobs the tools installed here, current or not.
+pub fn current_path(cfg: &Config) -> PathBuf {
+    root(cfg).join(CURRENT)
+}
+
 /// What is kept beside an installed tools directory, `<sha256>.json`.
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Manifest {
     version: String,
     #[serde(default)]
     tools: BTreeMap<String, String>,
+    /// What the build that made them reached and was refused.
+    #[serde(default)]
+    egress: ToolsEgress,
+    /// Each entry installed, by name, as it was installed. Empty from a `vk` that recorded none.
+    #[serde(default)]
+    files: BTreeMap<String, ToolsFile>,
+}
+
+/// The most hosts a failed build's message names as refused.
+const REFUSED_SHOWN: usize = 16;
+
+/// Under a build's home: where its `vk build` records its egress.
+const EGRESS_RECORD: &str = "egress";
+
+/// What the build whose home is `home` recorded of its egress: every stage's, from every build
+/// directory `vk build` made under [`EGRESS_RECORD`].
+fn build_egress(home: &Path) -> ToolsEgress {
+    let mut contacted = std::collections::BTreeSet::new();
+    let mut refused = std::collections::BTreeSet::new();
+    let Ok(dirs) = std::fs::read_dir(home.join(EGRESS_RECORD)) else {
+        return ToolsEgress::default();
+    };
+    for dir in dirs.flatten() {
+        let dir = dir.path();
+        let audit = dir.join(crate::run::AUDIT_LOG);
+        let contacts = crate::egress_report::read_contacts(&audit)
+            .into_iter()
+            .chain(crate::egress_report::read_ip_contacts(&audit));
+        contacted.extend(contacts.map(|(target, _)| target));
+        let denied = crate::jobctx::JobCtx::egress_denied_log_in(&dir);
+        let (denials, _) = crate::egress_report::read_records_since(&denied, 0);
+        refused.extend(denials.into_iter().map(|(d, _)| d.target));
+    }
+    ToolsEgress {
+        contacted: contacted.into_iter().collect(),
+        refused: refused.into_iter().collect(),
+    }
+}
+
+/// How the tools build's RUN steps reach the network: only as each stage declares, and within
+/// the node's `[egress.build]` where it sets one; not at all where that allows nothing.
+fn build_net_args(cfg: &Config) -> Vec<String> {
+    let build = &cfg.egress.build;
+    if build.allow_ip.is_none() && build.allow_name.is_none() {
+        return vec!["--build-net".into(), "declared".into()];
+    }
+    let ips = build.allow_ip.as_deref().unwrap_or_default();
+    let names = build.allow_name.as_deref().unwrap_or_default();
+    // No flags would read as no cap at all.
+    if ips.is_empty() && names.is_empty() {
+        return vec!["--build-net".into(), "none".into()];
+    }
+    let mut args = vec!["--build-net".into(), "declared".into()];
+    for ip in ips {
+        args.extend(["--build-allow-ip".into(), ip.clone()]);
+    }
+    for name in names {
+        args.extend(["--build-allow-name".into(), name.clone()]);
+    }
+    args
 }
 
 fn manifest_path(root: &Path, sha256: &str) -> PathBuf {
@@ -108,28 +181,151 @@ fn current(root: &Path) -> Option<String> {
     vk_hub_proto::valid_sha256(name).then(|| name.to_string())
 }
 
-/// Whether the tools of `sha256` are installed whole: their directory, and its manifest,
-/// which is written first.
+/// Whether the tools of `sha256` are installed whole and as recorded: their directory, and
+/// its manifest, which is written first, recording what the directory holds. Tools a `vk`
+/// that recorded nothing installed are built again.
 fn installed_here(root: &Path, sha256: &str) -> bool {
     std::fs::symlink_metadata(root.join(sha256)).is_ok_and(|m| m.is_dir())
-        && read_manifest(root, sha256).is_some()
+        && read_manifest(root, sha256)
+            .is_some_and(|m| check(&root.join(sha256), &m) == ToolsCheck::Intact)
 }
 
-/// The tools [`CURRENT`] names, as the inventory reports them.
+/// The tools [`CURRENT`] names, as the inventory reports them, checked against their
+/// manifest.
 pub fn installed(cfg: &Config) -> Option<ToolsInstalled> {
     let root = root(cfg);
     let sha256 = current(&root)?;
     let manifest = read_manifest(&root, &sha256)?;
+    let check = check(&root.join(&sha256), &manifest);
+    let cut = |mut hosts: Vec<String>| {
+        hosts.truncate(vk_hub_proto::MAX_TOOLS_EGRESS_HOSTS);
+        hosts
+    };
     Some(ToolsInstalled {
         sha256,
         version: manifest.version,
         tools: manifest.tools,
         in_use: in_use(cfg),
-        // Not recorded yet.
-        files: Default::default(),
-        egress: None,
-        check: None,
+        files: manifest.files,
+        egress: Some(ToolsEgress {
+            contacted: cut(manifest.egress.contacted),
+            refused: cut(manifest.egress.refused),
+        }),
+        check: Some(check),
     })
+}
+
+/// `dir` against `manifest`: [`ToolsCheck::Modified`] names each entry it records that is
+/// missing, of another kind or mode, or holds other contents or another link, and each entry
+/// it does not record.
+fn check(dir: &Path, manifest: &Manifest) -> ToolsCheck {
+    if manifest.files.is_empty() {
+        return ToolsCheck::Unrecorded;
+    }
+    let mut entries = std::collections::BTreeSet::new();
+    match std::fs::read_dir(dir) {
+        Ok(listing) => {
+            for entry in listing {
+                let Ok(entry) = entry else {
+                    // Unreadable: nothing in it can be vouched for.
+                    entries.extend(manifest.files.keys().cloned());
+                    break;
+                };
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !manifest.files.contains_key(&name) {
+                    entries.insert(name);
+                }
+            }
+        }
+        Err(_) => entries.extend(manifest.files.keys().cloned()),
+    }
+    for (name, recorded) in &manifest.files {
+        // Only a plain name is one installed.
+        let plain = !name.is_empty() && !name.contains('/') && name != "." && name != "..";
+        if !plain || !entry_is(&dir.join(name), recorded) {
+            entries.insert(name.clone());
+        }
+    }
+    if entries.is_empty() {
+        ToolsCheck::Intact
+    } else {
+        ToolsCheck::Modified {
+            entries: entries.into_iter().collect(),
+        }
+    }
+}
+
+/// Whether `path` is what `recorded` says: the same link, or a regular file `0755` with the
+/// same contents.
+fn entry_is(path: &Path, recorded: &ToolsFile) -> bool {
+    match recorded {
+        ToolsFile::Link { target } => {
+            std::fs::read_link(path).is_ok_and(|t| t.as_os_str() == target.as_str())
+        }
+        ToolsFile::File { sha256, size } => {
+            let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+            else {
+                return false;
+            };
+            let Ok(meta) = file.metadata() else {
+                return false;
+            };
+            if !meta.is_file() || meta.permissions().mode() & 0o7777 != 0o755 || meta.len() != *size
+            {
+                return false;
+            }
+            let mut hasher = Sha256::new();
+            let (mut file, mut read, mut buf) = (file.take(*size + 1), 0u64, vec![0u8; 1 << 16]);
+            loop {
+                match file.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        hasher.update(&buf[..n]);
+                        read += n as u64;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return false,
+                }
+            }
+            read == *size && vk_hub_proto::to_hex(&hasher.finalize()) == *sha256
+        }
+    }
+}
+
+/// Before a job is given the tools directory `dir` (resolved, as its boot shares it): when it
+/// is tools this node installed for its hub, refuse them unless they are what their manifest
+/// records. Others are the operator's, and given as they are; tools a `vk` that recorded
+/// nothing installed are given unchecked.
+pub fn for_job(cfg: &Config, dir: &Path) -> Result<()> {
+    let Some(sha256) = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| vk_hub_proto::valid_sha256(n))
+    else {
+        return Ok(());
+    };
+    let Ok(root) = std::fs::canonicalize(root(cfg)) else {
+        return Ok(());
+    };
+    if dir.parent() != Some(root.as_path()) {
+        return Ok(());
+    }
+    let short = sha256.get(..12).unwrap_or(sha256);
+    let Some(manifest) = read_manifest(&root, sha256) else {
+        bail!("this node's CI tools {short} are not installed whole, so no job is given them");
+    };
+    match check(dir, &manifest) {
+        ToolsCheck::Intact | ToolsCheck::Unrecorded => Ok(()),
+        ToolsCheck::Modified { entries } => bail!(
+            "this node's CI tools {} ({short}) have changed since they were installed ({}), so \
+             no job is given them until they are installed again",
+            manifest.version,
+            entries.join(", ")
+        ),
+    }
 }
 
 /// Whether `[executor] tools_dir` is `<state_dir>/tools/current` itself — the same entry,
@@ -284,8 +480,9 @@ where
     let tar = blocking({
         let root = root.clone();
         let sha256 = job.sha256.clone();
+        let jobs = state.join("jobs");
         move || {
-            prepare_root(&root)?;
+            prepare_root(&root, &jobs)?;
             Ok(root.join(format!(".{sha256}.tar")))
         }
     })
@@ -350,19 +547,37 @@ async fn install(
                     .unwrap_or_else(|_| {
                         Err(anyhow!("the build took longer than {BUILD_TIMEOUT:?}"))
                     });
+            let egress = blocking({
+                let home = home.clone();
+                move || Ok(build_egress(&home))
+            })
+            .await?;
             if let Err(e) = built {
+                let mut message = format!("{e:#}");
+                if !egress.refused.is_empty() {
+                    let shown = &egress.refused[..egress.refused.len().min(REFUSED_SHOWN)];
+                    message.push_str(&format!(
+                        "; its network access was refused to {}",
+                        shown.join(", ")
+                    ));
+                    if egress.refused.len() > shown.len() {
+                        message
+                            .push_str(&format!(" and {} more", egress.refused.len() - shown.len()));
+                    }
+                }
                 return Err(Failed {
-                    message: format!("{e:#}"),
+                    message,
                     log: tail(&log, vk_hub_proto::MAX_TOOLS_LOG_LINES),
                 });
             }
             phase(ToolsPhase::Installing);
             let stage = root.join(format!(".stage-{sha256}"));
-            blocking({
+            let files = blocking({
                 let (out, stage) = (out.clone(), stage.clone());
                 move || {
-                    extract(&out, &stage)?;
-                    check(&stage)
+                    let files = extract(&out, &stage)?;
+                    check_stage(&stage)?;
+                    Ok(files)
                 }
             })
             .await?;
@@ -374,10 +589,12 @@ async fn install(
             let manifest = Manifest {
                 version: job.version.clone(),
                 tools,
+                egress,
+                files,
             };
             blocking({
-                let (root, sha256) = (root.to_path_buf(), sha256.clone());
-                move || publish(&root, &sha256, &stage, &manifest)
+                let (root, jobs, sha256) = (root.to_path_buf(), jobs.to_path_buf(), sha256.clone());
+                move || publish(&root, &sha256, &stage, &manifest, &jobs)
             })
             .await?;
         } else {
@@ -413,8 +630,9 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 }
 
 /// Create the tools directory if it is not there, and remove what a build cut short left in
-/// it: every name starting with `.`. One build runs at a time, under the node's lock.
-fn prepare_root(root: &Path) -> Result<()> {
+/// it: every name starting with `.`, but tools [`publish`] moved aside while a job dir under
+/// `jobs` names tools of their name. One build runs at a time, under the node's lock.
+fn prepare_root(root: &Path, jobs: &Path) -> Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o755)
@@ -422,7 +640,17 @@ fn prepare_root(root: &Path) -> Result<()> {
         .with_context(|| format!("creating {}", root.display()))?;
     for entry in std::fs::read_dir(root).with_context(|| format!("listing {}", root.display()))? {
         let entry = entry?;
-        if !entry.file_name().as_encoded_bytes().starts_with(b".") {
+        let name = entry.file_name();
+        let name = name.as_encoded_bytes();
+        if !name.starts_with(b".") {
+            continue;
+        }
+        let replaced = name
+            .strip_prefix(b".gone-")
+            .and_then(|rest| rest.get(..vk_hub_proto::SHA256_LEN * 2 + 1))
+            .and_then(|rest| rest.strip_suffix(b"-"))
+            .and_then(|sha| std::str::from_utf8(sha).ok());
+        if replaced.is_some_and(|sha| named_by_jobs(jobs, sha)) {
             continue;
         }
         // Best effort: a leftover costs space, not correctness.
@@ -543,6 +771,9 @@ fn vk_build<'a>(
                 "--build-jobs",
                 "1",
             ])
+            .args(build_net_args(cfg))
+            .arg("--egress-record")
+            .arg(home.join(EGRESS_RECORD))
             .env("XDG_CACHE_HOME", home.join("cache"))
             .env("XDG_DATA_HOME", home.join("data"))
             .current_dir(context)
@@ -601,8 +832,8 @@ fn tail(log: &Path, lines: usize) -> Vec<String> {
 
 /// Copy the root of the ext4 `image` into the new directory `stage`: its regular files, and
 /// its symlinks to a regular file beside them, all `0755`. The directory is `0755` once
-/// filled.
-fn extract(image: &Path, stage: &Path) -> Result<()> {
+/// filled. Returns what it holds, each file with its sha256.
+fn extract(image: &Path, stage: &Path) -> Result<BTreeMap<String, ToolsFile>> {
     use crate::ext4_read::{Ext4Reader, FileType};
     let fs = Ext4Reader::open(image).with_context(|| format!("reading {}", image.display()))?;
     let mut entries = fs.list_dir("/").context("listing the tools stage")?;
@@ -611,6 +842,7 @@ fn extract(image: &Path, stage: &Path) -> Result<()> {
         bail!("the tools stage holds more than {MAX_FILES} entries at its root");
     }
     private_dir(stage)?;
+    let mut files = BTreeMap::new();
     let regular = |name: &str| {
         entries
             .iter()
@@ -639,6 +871,13 @@ fn extract(image: &Path, stage: &Path) -> Result<()> {
                     .with_context(|| format!("setting the mode on {}", to.display()))?;
                 file.sync_all()
                     .with_context(|| format!("flushing {}", to.display()))?;
+                files.insert(
+                    name.clone(),
+                    ToolsFile::File {
+                        sha256: vk_hub_proto::to_hex(&Sha256::digest(&data)),
+                        size: data.len() as u64,
+                    },
+                );
             }
             FileType::Symlink => {
                 let target = fs
@@ -652,6 +891,7 @@ fn extract(image: &Path, stage: &Path) -> Result<()> {
                 }
                 std::os::unix::fs::symlink(&target, &to)
                     .with_context(|| format!("creating {}", to.display()))?;
+                files.insert(name.clone(), ToolsFile::Link { target });
             }
             // `lost+found`, and anything else the stage has besides its files.
             FileType::Dir | FileType::Other => {}
@@ -661,12 +901,13 @@ fn extract(image: &Path, stage: &Path) -> Result<()> {
     dir.set_permissions(std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("setting the mode on {}", stage.display()))?;
     dir.sync_all()
-        .with_context(|| format!("flushing {}", stage.display()))
+        .with_context(|| format!("flushing {}", stage.display()))?;
+    Ok(files)
 }
 
 /// Require each of [`vk_hub_proto::REQUIRED_TOOLS`] in `stage`, a static x86-64 ELF
 /// executable, reached through a link beside it or not.
-fn check(stage: &Path) -> Result<()> {
+fn check_stage(stage: &Path) -> Result<()> {
     for name in vk_hub_proto::REQUIRED_TOOLS {
         let path = stage.join(name);
         let mut file = match std::fs::File::open(&path) {
@@ -781,16 +1022,27 @@ async fn probe_versions(dir: &Path) -> BTreeMap<String, String> {
 }
 
 /// Install `stage` as the tools of `sha256`: the manifest beside where they go first, then
-/// the directory, by rename. A directory there without a manifest is not installed tools,
-/// and is removed first.
-fn publish(root: &Path, sha256: &str, stage: &Path, manifest: &Manifest) -> Result<()> {
+/// the directory, by rename. A directory there — without a manifest, or no longer what it
+/// records — is moved aside first, and removed unless a job dir under `jobs` names tools of
+/// that name: a running job keeps what it was given.
+fn publish(
+    root: &Path,
+    sha256: &str,
+    stage: &Path,
+    manifest: &Manifest,
+    jobs: &Path,
+) -> Result<()> {
     let dest = root.join(sha256);
     if std::fs::symlink_metadata(&dest).is_ok() {
-        let gone = gone_path(root, sha256);
+        let mut random = [0u8; 8];
+        super::fill_random(&mut random)?;
+        let gone = root.join(format!(".gone-{sha256}-{}", vk_hub_proto::to_hex(&random)));
         std::fs::rename(&dest, &gone)
             .with_context(|| format!("moving {} aside", dest.display()))?;
-        // Best effort: out of the way already, and swept as the next build starts.
-        let _ = std::fs::remove_dir_all(&gone);
+        if !named_by_jobs(jobs, sha256) {
+            // Best effort: out of the way already, and swept as a later build starts.
+            let _ = std::fs::remove_dir_all(&gone);
+        }
     }
     let json = serde_json::to_vec_pretty(manifest).context("encoding the manifest")?;
     let path = manifest_path(root, sha256);
@@ -879,9 +1131,8 @@ fn prune(root: &Path, keep: &[String], jobs: &Path) {
     }
 }
 
-/// The directories, by device and inode, that a job dir under `jobs` records as its tools
-/// root.
-fn given_to_jobs(jobs: &Path) -> Vec<(u64, u64)> {
+/// The tools roots the job dirs under `jobs` record.
+fn job_roots(jobs: &Path) -> Vec<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     let Ok(entries) = std::fs::read_dir(jobs) else {
         return Vec::new();
@@ -889,11 +1140,26 @@ fn given_to_jobs(jobs: &Path) -> Vec<(u64, u64)> {
     entries
         .flatten()
         .filter_map(|e| std::fs::read(crate::jobctx::JobCtx::tools_root_file_in(&e.path())).ok())
-        .filter_map(|bytes| {
-            std::fs::metadata(PathBuf::from(std::ffi::OsString::from_vec(bytes))).ok()
-        })
+        .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+        .collect()
+}
+
+/// The directories, by device and inode, that a job dir under `jobs` records as its tools
+/// root.
+fn given_to_jobs(jobs: &Path) -> Vec<(u64, u64)> {
+    job_roots(jobs)
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
         .map(|m| (m.dev(), m.ino()))
         .collect()
+}
+
+/// Whether a job dir under `jobs` records tools named `sha256` as its root, wherever they
+/// are now: tools replaced under the same name are told apart by nothing else.
+fn named_by_jobs(jobs: &Path, sha256: &str) -> bool {
+    job_roots(jobs)
+        .iter()
+        .any(|p| p.file_name().is_some_and(|n| n == sha256))
 }
 
 #[cfg(test)]
@@ -960,6 +1226,15 @@ mod tests {
             assert!(context.join("Dockerfile").is_file());
             assert!(context.join("sub/pins.txt").is_file());
             std::fs::create_dir_all(home)?;
+            // What `vk build --egress-record` keeps: a directory per build, its channels in it.
+            let record = home.join(EGRESS_RECORD).join("build-1");
+            std::fs::create_dir_all(&record)?;
+            let audit = record.join(crate::run::AUDIT_LOG);
+            let attrs = crate::egress_report::Attrs::default();
+            for name in ["github.com", "cache.nixos.org", "github.com"] {
+                crate::egress_report::append_contact(&audit, name, &attrs);
+            }
+            crate::egress_report::append_ip_contact(&audit, "192.0.2.1:443", &attrs);
             // `<dir>/state/tools/.build-<sha256>/context`: the stage is `<dir>/stage-src`.
             let dir = context.ancestors().nth(4).context("no test dir")?;
             crate::ext4::build_from_dir(&dir.join("stage-src"), out)
@@ -970,10 +1245,22 @@ mod tests {
         _: &'a Config,
         _: &'a Path,
         _: &'a Path,
-        _: &'a Path,
+        home: &'a Path,
         log: &'a Path,
     ) -> Building<'a> {
         Box::pin(async move {
+            let record = home.join(EGRESS_RECORD).join("build-1");
+            std::fs::create_dir_all(&record)?;
+            let denied = crate::jobctx::JobCtx::egress_denied_log_in(&record);
+            let attrs = crate::egress_report::Attrs::default();
+            for target in ["example.org", "198.51.100.7:80", "example.org"] {
+                let proto = if target.contains(':') {
+                    crate::egress_report::Proto::Tcp
+                } else {
+                    crate::egress_report::Proto::Dns
+                };
+                crate::egress_report::append(&denied, proto, target, &attrs);
+            }
             let mut text = String::new();
             for i in 0..60 {
                 text.push_str(&format!("line {i}\n"));
@@ -996,6 +1283,25 @@ mod tests {
         std::fs::write(src.join("gitlab-runner"), elf(false)).unwrap();
     }
 
+    /// What [`stage_source`] with a static `git` installs, as the manifest records it.
+    fn recorded() -> BTreeMap<String, ToolsFile> {
+        let file = || ToolsFile::File {
+            sha256: vk_hub_proto::to_hex(&Sha256::digest(elf(false))),
+            size: elf(false).len() as u64,
+        };
+        BTreeMap::from([
+            ("git".into(), file()),
+            ("git-remote-http".into(), file()),
+            (
+                "git-remote-https".into(),
+                ToolsFile::Link {
+                    target: "git-remote-http".into(),
+                },
+            ),
+            ("gitlab-runner".into(), file()),
+        ])
+    }
+
     fn job(sha256: &str) -> ToolsJob {
         ToolsJob {
             command: "ab".repeat(16),
@@ -1009,7 +1315,7 @@ mod tests {
     /// `<dir>/state/tools`.
     async fn install_as(dir: &Path, sha256: &str, build: Build) -> Result<(), Failed> {
         let root = dir.join("state/tools");
-        prepare_root(&root).unwrap();
+        prepare_root(&root, &dir.join("state/jobs")).unwrap();
         let tar = root.join(format!(".{sha256}.tar"));
         std::fs::copy(definition(dir), &tar).unwrap();
         let phases = std::sync::Mutex::new(Vec::new());
@@ -1032,6 +1338,31 @@ mod tests {
             .collect();
         assert!(dotted.is_empty(), "{dotted:?}");
         outcome
+    }
+
+    #[test]
+    fn the_build_reaches_only_what_the_definition_declares_within_the_node_s_cap() {
+        let mut cfg = Config::default();
+        assert_eq!(build_net_args(&cfg), ["--build-net", "declared"]);
+        cfg.egress.build.allow_name = Some(vec!["github.com".into()]);
+        assert_eq!(
+            build_net_args(&cfg),
+            [
+                "--build-net",
+                "declared",
+                "--build-allow-name",
+                "github.com"
+            ]
+        );
+        cfg.egress.build.allow_ip = Some(vec!["10.0.0.0/8".into()]);
+        cfg.egress.build.allow_name = None;
+        assert_eq!(
+            build_net_args(&cfg),
+            ["--build-net", "declared", "--build-allow-ip", "10.0.0.0/8"]
+        );
+        // A cap that allows nothing: no network, rather than no cap.
+        cfg.egress.build.allow_ip = Some(Vec::new());
+        assert_eq!(build_net_args(&cfg), ["--build-net", "none"]);
     }
 
     #[tokio::test]
@@ -1072,6 +1403,15 @@ mod tests {
             Manifest {
                 version: "2026.10".into(),
                 tools: BTreeMap::new(),
+                egress: ToolsEgress {
+                    contacted: vec![
+                        "192.0.2.1:443".into(),
+                        "cache.nixos.org".into(),
+                        "github.com".into()
+                    ],
+                    refused: Vec::new(),
+                },
+                files: recorded(),
             }
         );
 
@@ -1127,7 +1467,11 @@ mod tests {
         install_as(&dir, &a, fake_build).await.unwrap();
 
         let failed = install_as(&dir, &b, failing_build).await.unwrap_err();
-        assert_eq!(failed.message, "vk build failed (exit status: 1)");
+        assert_eq!(
+            failed.message,
+            "vk build failed (exit status: 1); its network access was refused to \
+             198.51.100.7:80, example.org"
+        );
         assert_eq!(failed.log.len(), vk_hub_proto::MAX_TOOLS_LOG_LINES);
         assert_eq!(failed.log.last().unwrap(), "ERROR: no stage tools[2J");
         assert_eq!(failed.log.first().unwrap(), "line 21");
@@ -1250,6 +1594,128 @@ mod tests {
         // Pinned to the tools of now rather than to the link: not what the hub switches.
         cfg.executor.tools_dir = Some(state.join("tools").join(&a));
         assert!(!in_use(&cfg));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Installed tools are checked against what their manifest records: as the inventory
+    /// reports them, before a job is given them, and before they are switched to again, which
+    /// builds them anew when they changed or were recorded by nothing.
+    #[tokio::test]
+    async fn tools_changed_since_installed_are_reported_given_to_no_job_and_rebuilt() {
+        let dir = scratch("check");
+        stage_source(&dir, &elf(false));
+        let a = "aa".repeat(32);
+        install_as(&dir, &a, fake_build).await.unwrap();
+        let state = dir.join("state");
+        let root = state.join("tools");
+        let cfg = Config {
+            state_dir: Some(state.clone()),
+            ..Config::default()
+        };
+        let installed_dir = root.join(&a).canonicalize().unwrap();
+        let reported = installed(&cfg).unwrap();
+        assert_eq!(reported.files, recorded());
+        assert_eq!(reported.check, Some(ToolsCheck::Intact));
+        assert_eq!(
+            reported.egress.unwrap().contacted,
+            ["192.0.2.1:443", "cache.nixos.org", "github.com"]
+        );
+        for_job(&cfg, &installed_dir).unwrap();
+        // Another directory is the operator's, given as it is.
+        for_job(&cfg, &dir).unwrap();
+
+        let modified = |entries: &[&str]| {
+            Some(ToolsCheck::Modified {
+                entries: entries.iter().map(|e| e.to_string()).collect(),
+            })
+        };
+        // One byte of git, the same size and mode.
+        let git = installed_dir.join("git");
+        let mut bytes = std::fs::read(&git).unwrap();
+        bytes[100] ^= 1;
+        std::fs::write(&git, &bytes).unwrap();
+        assert_eq!(installed(&cfg).unwrap().check, modified(&["git"]));
+        let err = for_job(&cfg, &installed_dir).unwrap_err().to_string();
+        assert!(
+            err.contains("changed since they were installed (git)"),
+            "{err}"
+        );
+        bytes[100] ^= 1;
+        std::fs::write(&git, &bytes).unwrap();
+        assert_eq!(installed(&cfg).unwrap().check, Some(ToolsCheck::Intact));
+        // A mode, a link's target, a file added, a file gone.
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let link = installed_dir.join("git-remote-https");
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("git", &link).unwrap();
+        std::fs::write(installed_dir.join("sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::remove_file(installed_dir.join("gitlab-runner")).unwrap();
+        assert_eq!(
+            installed(&cfg).unwrap().check,
+            modified(&["git", "git-remote-https", "gitlab-runner", "sh"])
+        );
+        assert!(for_job(&cfg, &installed_dir).is_err());
+        assert!(!installed_here(&root, &a));
+
+        // Asked for again, they are built anew rather than only switched to.
+        install_as(&dir, &a, fake_build).await.unwrap();
+        assert_eq!(installed(&cfg).unwrap().check, Some(ToolsCheck::Intact));
+        assert!(!root.join(&a).join("sh").exists());
+        for_job(&cfg, &root.join(&a).canonicalize().unwrap()).unwrap();
+
+        // Recorded by nothing: reported so and given unchecked, and built anew when asked for.
+        let mut legacy = read_manifest(&root, &a).unwrap();
+        legacy.files.clear();
+        std::fs::write(
+            manifest_path(&root, &a),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(installed(&cfg).unwrap().check, Some(ToolsCheck::Unrecorded));
+        for_job(&cfg, &root.join(&a).canonicalize().unwrap()).unwrap();
+        assert!(!installed_here(&root, &a));
+        install_as(&dir, &a, fake_build).await.unwrap();
+        assert_eq!(installed(&cfg).unwrap().check, Some(ToolsCheck::Intact));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tools replaced under their own name stay, moved aside, while a job dir names them, and
+    /// go once none does.
+    #[tokio::test]
+    async fn tools_replaced_under_a_job_stay_until_it_is_gone() {
+        let dir = scratch("replaced");
+        stage_source(&dir, &elf(false));
+        let a = "aa".repeat(32);
+        let (root, jobs) = (dir.join("state/tools"), dir.join("state/jobs"));
+        install_as(&dir, &a, fake_build).await.unwrap();
+        let job_dir = jobs.join("7");
+        std::fs::create_dir_all(&job_dir).unwrap();
+        std::fs::write(
+            crate::jobctx::JobCtx::tools_root_file_in(&job_dir),
+            root.join(&a).as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+        let old_git = root.join(&a).join("git");
+        std::fs::write(&old_git, b"changed").unwrap();
+        let manifest = read_manifest(&root, &a).unwrap();
+        let stage = root.join(".stage");
+        std::fs::create_dir(&stage).unwrap();
+        publish(&root, &a, &stage, &manifest, &jobs).unwrap();
+        let aside = |root: &Path| -> Vec<PathBuf> {
+            std::fs::read_dir(root)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.to_string_lossy().contains(".gone-"))
+                .collect()
+        };
+        let kept = aside(&root);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read(kept[0].join("git")).unwrap(), b"changed");
+        prepare_root(&root, &jobs).unwrap();
+        assert_eq!(aside(&root), kept);
+        std::fs::remove_dir_all(&job_dir).unwrap();
+        prepare_root(&root, &jobs).unwrap();
+        assert!(aside(&root).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1509,9 +1975,13 @@ mod tests {
             settle(&h.core, |p| p.tools.is_none()).await;
             let progress = h.core.persisted().tools_progress.unwrap();
             assert_eq!(progress.phase, ToolsPhase::Failed);
+            // What the build was refused goes with the failure to the hub.
             assert_eq!(
                 progress.message.as_deref(),
-                Some("vk build failed (exit status: 1)")
+                Some(
+                    "vk build failed (exit status: 1); its network access was refused to \
+                     198.51.100.7:80, example.org"
+                )
             );
             assert_eq!(progress.log.len(), vk_hub_proto::MAX_TOOLS_LOG_LINES);
             assert_eq!(current(&root).as_deref(), Some(a.as_str()));

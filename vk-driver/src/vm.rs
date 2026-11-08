@@ -1666,6 +1666,9 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         let dir = guest_writable
             .resolve(dir)
             .with_context(|| format!("resolving share root {}", dir.display()))?;
+        // Tools a fleet node installed reach a job only as they were installed. Checked on the
+        // directory resolved, which the VMM reopens: a change at rest is caught, not a race.
+        crate::node::tools::for_job(cfg, &dir)?;
         // The job's tools report names this directory, and a node's tools build keeps it
         // while a job dir names it: a job that cannot record it does not boot.
         let record = ctx.tools_root_file();

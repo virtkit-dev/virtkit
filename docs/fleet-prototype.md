@@ -840,12 +840,17 @@ The node downloads the definition into `<state_dir>/tools/` with mode `0600`, re
 only after checking its sha256 and the command's size limit. It unpacks only regular files
 and directories at plain relative paths into a private scratch directory beside it, then runs
 `vk build --file Dockerfile --context <it> --target tools --out <scratch>/tools.ext4 --no-journal
---cache-registry none --build-jobs 1`. This child of the running `vk` receives the node's
+--cache-registry none --build-jobs 1 --build-net declared`. This child of the running `vk` receives
+the node's
 `--config`, with `XDG_CACHE_HOME` and `XDG_DATA_HOME` pointing into the scratch directory.
 It neither reads nor writes the node's instruction cache, local or shared through
 `vk-registry`. The scratch directory and everything the build stores there are removed
 whether the build succeeds or fails. Stages run one at a time, sized by `[build]` settings
-or their own `# vk:` lines, with network access as in any `vk build`. The build has an hour.
+or their own `# vk:` lines. A stage's `RUN` steps reach only the hosts the stage declares
+(`# vk: allow-name=… allow-ip=…` above its `FROM`), within the node's `[egress.build]` where it
+sets one, which the build is given as `--build-allow-*` (a cap allowing nothing gives it no
+network at all); a stage that declares nothing has no network. The hub keeps no list of its own:
+the definition says what it needs. The build has an hour.
 Its microVMs belong to the child: neither the node's VM list nor its admission ledger counts
 them, so they run alongside jobs without reserved resources. Stopping the node ends the
 build; the next `vk node run` restarts it from the beginning.
@@ -864,31 +869,57 @@ there already; a node that requires signed releases runs them nowhere but in job
 reports no versions.
 
 The tools are installed as `<state_dir>/tools/<sha256>/`, `0755` with their files `0755`, with
-`<sha256>.json` beside it naming the label and versions, and `<state_dir>/tools/current` is
+`<sha256>.json` beside it naming the label and versions, the sha256 and size of each file and the
+target of each link, and what the build contacted and was refused, and
+`<state_dir>/tools/current` is
 pointed at them by renaming a new relative link over it. A job resolves `[executor] tools_dir` as
 it boots and keeps the directory it resolved, so jobs started from then on get the new tools and
 running ones keep theirs. The tools current before are kept, for the jobs started on them; older
 ones are removed, with their manifests, unless a job dir's `tools.root` still names them. A
 definition installed already — the previous one, asked for again — is switched to without a
-build. A failed build changes nothing: the tools current stay so. A tools build is refused while
+build, if its tools are still what the manifest records; otherwise they are built anew, and the
+directory they replace is kept aside while a job dir names tools of that name. A failed build
+changes nothing: the tools current stay so, and the failure the hub is
+told names the hosts the build was refused. A tools build is refused while
 an update or a reset is under way, and an update or a reset while it builds; a release on trial
 executes another binary, which would leave a build behind. A quarantine or a drain does not stop
 it.
 
-The node does not change configuration. Once `vk-hub nodes` shows the first build is done,
-set `[executor] tools_dir = "<state_dir>/tools/current"` (`/var/lib/virtkit/tools/current`
-by default). Until then the link does not exist, and jobs configured to use it fail to boot.
-The link is followed from `<state_dir>/tools/`, owned by the node user and outside any
+The node does not change configuration. Where its config sets no `[executor] tools_dir`, each
+job resolves it to `<state_dir>/tools/current` once that link exists, so the first build done
+gives the jobs started after it the tools; before, they get none. A config that sets one keeps
+it: set `[executor] tools_dir = "<state_dir>/tools/current"` (`/var/lib/virtkit/tools/current`
+by default) to use the hub's, once `vk-hub nodes` shows the first build is done — until then
+the link does not exist, and jobs configured to use it fail to boot. The link is followed from `<state_dir>/tools/`, owned by the node user and outside any
 guest-writable tree, so it passes `tools_dir`'s rules. If tools are installed but `tools_dir`
 names another directory, `vk node run` warns at startup and after each build,
 `vk check --feature gitlab` reports it, and inventory marks the tools as not in use.
 This includes a path directly to `<state_dir>/tools/<sha256>`, which stays pinned when
 `current` switches.
 
+**Checked before use.** A job boot that resolves `tools_dir` to tools the node installed for its
+hub — `<state_dir>/tools/<sha256>`, through `current` or not — checks them against their manifest
+first: every entry it records, of the same kind, a file `0755` with the same sha256, a link with
+the same target, and no other entry. Tools that fail fail the job before its VM boots, saying
+which entries changed: a job is never given them, nor others in their place. The check reads
+every file each time: for 30 MB, about 0.2 s of one core on a CPU without SHA instructions, several
+times less with them. A cache keyed on file metadata would save it, but adds a record to keep
+in step and trusts what can change without the metadata changing; the inventory's check, every
+minute, costs the same. It finds a change at rest, not one made between the check and
+the VM opening the directory, and the manifest is the node user's to rewrite as much as the
+tools. Tools installed by a
+`vk` that recorded no checksums are given unchecked. A `tools_dir` the operator names elsewhere is
+given as it is.
+
 The node's report carries the build's phase (`downloading`, `building`, `installing`, then `done`
 or `failed`, with the reason and the last 40 lines of a failed build's output), and its inventory
 the tools current: the definition, its label, the first line each tool printed for `--version`,
-and whether `[executor] tools_dir` names them. `vk-hub nodes` notes both under its table, a node's
+whether `[executor] tools_dir` names them, each file's sha256 and size and each link's target as
+recorded, what the build contacted and was refused (up to 64 hosts of each), and whether the tools
+are still as recorded — `intact`, `modified` with the entries that are not, or `unrecorded` — as
+checked each time the inventory is gathered, every minute. These are optional fields of protocol
+version 4: a hub that does not know them ignores them, and a hub reads a node that sends none as
+one that checks nothing. `vk-hub nodes` notes the build and the tools under its table, a node's
 page shows them under Versions and Steering, `/updates` lists the definitions held, and the
 audit log has each phase as the node reports it.
 

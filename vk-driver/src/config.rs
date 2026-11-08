@@ -1413,6 +1413,8 @@ fn load_resolved(explicit: Option<PathBuf>, fallbacks: &[PathBuf]) -> Result<Con
             crate::schedule::host_total_mib(),
             Some(crate::node::online_cpus()),
         );
+        let tools = crate::node::tools::current_path(&cfg);
+        enrolled_tools_dir(&mut cfg, tools);
     }
     for warning in ineffective_settings(&cfg) {
         match &shown {
@@ -1479,6 +1481,16 @@ fn enrolled_defaults(cfg: &mut Config, total_mib: Option<u64>, cpus: Option<u32>
     {
         cfg.executor.vm.mem = format!("{gib}G");
         cfg.layers.detected.insert("executor.vm.mem");
+    }
+}
+
+/// Give an enrolled host's jobs the CI tools the hub had it install, `tools` (the
+/// `<state_dir>/tools/current` link), where the local file sets no `[executor] tools_dir` —
+/// once the link is there: a job given a directory that is not there fails to boot. The hub
+/// never sets it.
+fn enrolled_tools_dir(cfg: &mut Config, tools: PathBuf) {
+    if cfg.executor.tools_dir.is_none() && std::fs::symlink_metadata(&tools).is_ok() {
+        cfg.executor.tools_dir = Some(tools);
     }
 }
 
@@ -1979,6 +1991,27 @@ mod tests {
             ["executor.schedule.mem_budget", "executor.vm.max_cpus"]
         );
         assert!(detected(None, None).is_empty());
+    }
+
+    /// An enrolled host's jobs get the tools the hub installed once there are any, unless its
+    /// file names a tools dir of its own.
+    #[test]
+    fn an_enrolled_host_gives_its_jobs_the_hubs_tools_once_installed() {
+        let dir = std::env::temp_dir().join(format!("vk-cfg-tools-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let current = dir.join("current");
+        let tools_dir = |text: &str| {
+            let mut cfg = from_table(toml::from_str(text).unwrap()).unwrap();
+            enrolled_tools_dir(&mut cfg, current.clone());
+            cfg.executor.tools_dir
+        };
+        assert_eq!(tools_dir(""), None, "nothing installed yet");
+        std::os::unix::fs::symlink("abc", &current).unwrap();
+        assert_eq!(tools_dir(""), Some(current.clone()));
+        let own = "[executor]\ntools_dir = \"/opt/tools\"\n";
+        assert_eq!(tools_dir(own), Some(PathBuf::from("/opt/tools")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An enrolled host's jobs get the switch's network unless its file sets a mode, even

@@ -178,6 +178,9 @@ with the source `detected` where the host's size supplied or held down the value
   unset `cpus` too. The heartbeat reports vCPUs committed and the budget, `vk tune` counts only
   the jobs both budgets have room for, though at least one, and the hub places on a node no more vCPUs than its
   budget has left, less those it has asked of the node since.
+- **CI tools.** An unset `[executor] tools_dir` is `<state_dir>/tools/current`, the
+  [CI tools](fleet-prototype.md#ci-tools) the hub had the node install, once there are any; until
+  then it stays unset. The hub does not set it.
 - **Job network.** An unset `[net] mode` is `switch`, where on a host that is not enrolled it is
   `none`: jobs reach out through the per-job switch, held to the node's `[egress]` and the
   hub's [egress layer](#job-egress-from-the-hub), and their guests reach the registry proxy
@@ -488,6 +491,13 @@ See the implemented [CI tools](fleet-prototype.md#ci-tools).
   also the rollback, a build of the previous definition being a switch back.
 - Version 4 of the protocol carries it; a node that does not speak it is skipped, not sent a
   command it could not parse.
+- Egress: the definition's Dockerfile declares the hosts each stage's `RUN` steps reach, and
+  the node holds the build to that within its `[egress.build]`; a stage declaring nothing has
+  no network. The hub keeps no list of its own. The node keeps what the build contacted and
+  was refused, and reports it with the tools.
+- Integrity: the node records each file it installed by sha256 and checks the tools against
+  that before every job that would get them, failing the job rather than giving it changed
+  tools, and in every inventory.
 - Trust: tools run in every job VM that lacks its own, with the job's token, so registering them
   is an admin operation. They run on a node's host only where the node already takes unsigned
   releases from its hub. Proposed: a signature on the definition, checked against node-pinned

@@ -36,11 +36,22 @@ All notable changes to virtkit will be documented in this file.
   area's `--grant` takes `guests` for them, within what the node itself is granted; such jobs
   then reach the registry at `registry.vk` with that access only, never the node's own. Jobs the
   hub places keep their own token alone. Nothing is granted unless an area says so.
+- **Fleet nodes give their jobs the CI tools the hub installed.** A node whose config names no
+  tools directory hands its jobs the tools it last built for the hub, once it has built any.
 - **`vk build` stages can declare the network their `RUN` steps need.** A `# vk:
   allow-name=… allow-ip=…` line above a stage's `FROM` holds its steps to those hosts, on top of
   whatever the build allows; `--build-net declared` gives a stage that declares nothing no
   network at all. CI job builds honor it too. A build that was refused any host ends by
   listing them.
+- **Fleet nodes build CI tools with only the network their definition declares.** Each stage
+  reaches the hosts its Dockerfile declares, within the node's `[egress.build]`, and nothing if
+  it declares none. The node keeps what the build contacted and was refused, and a failed build
+  names the hosts it was refused.
+- **Fleet nodes never give jobs CI tools that changed after they were installed.** A node
+  records a checksum of every file of the tools it installs and checks them before each job
+  that would get them; a job whose tools changed fails before it starts. The node reports the
+  checksums, whether its tools are still intact, and what their build contacted and was
+  refused.
 
 ## [0.107.1] - 2026-11-08
 

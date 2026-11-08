@@ -80,9 +80,9 @@ the tools of the jobs that start after it.
 On a fleet node the hub can provision it: `vk-hub tools add` holds a build context whose `tools`
 stage holds the tools — a definition need only provide `git` — and `vk-hub nodes tools` has nodes
 build it and install the result as `<state_dir>/tools/current`
-([CI tools](fleet-prototype.md#ci-tools)). Once the node's first build is done, as `vk-hub nodes`
-shows, point the executor there; before that the link does not exist, and jobs given it fail to
-boot:
+([CI tools](fleet-prototype.md#ci-tools)). An enrolled node whose config sets no `tools_dir`
+gives its jobs those tools once its first build is done, as `vk-hub nodes` shows; before that
+its jobs get none. A node that sets one points it there to use them:
 
 ```toml
 [executor]
