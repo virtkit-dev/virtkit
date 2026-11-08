@@ -3044,6 +3044,8 @@ fn spawn_switch(
             cfg.egress.allow_ip.as_deref(),
             cfg.egress.allow_name.as_deref(),
         )),
+        // The run phase: no Dockerfile declares its egress.
+        declared: None,
         vm_names,
         hub: hub_layer(ctx, EgressPhase::Run)?,
         // A placed job's switch records within a bound, for its report: its guests choose how

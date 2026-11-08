@@ -77,6 +77,21 @@ pub struct GuestHint {
     /// A Windows stage's directives (`disk`, `firmware`, `tpm`, `hyperv`, `generalize`,
     /// `warm`, `qga`), raw: the Windows build refuses each until it acts on it.
     pub windows: Vec<(String, String)>,
+    /// The egress this stage's RUN steps declare they need (`allow-ip=`, `allow-name=`);
+    /// `None` where the stage declares none.
+    pub egress: Option<StageEgress>,
+}
+
+/// What a stage's `# vk: allow-ip=… allow-name=…` lines declare its RUN steps reach: the
+/// union of every value given, as `--build-allow-ip` / `--build-allow-name` read them. A stage
+/// that declares any is held to it on top of the build's own policy, and an empty value
+/// declares nothing more, so `allow-name=` alone declares no network at all. Like the sizing,
+/// it never reaches a cache key: a stage restored from the cache ran under whatever it
+/// declared then.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct StageEgress {
+    pub ips: Vec<String>,
+    pub names: Vec<String>,
 }
 
 /// The `# vk:` keys only a Windows stage reads.
@@ -89,6 +104,10 @@ const WINDOWS_HINTS: [&str; 7] = [
     "warm",
     "qga",
 ];
+
+/// The `# vk:` keys declaring a stage's egress, each a comma-separated list.
+const ALLOW_IP: &str = "allow-ip";
+const ALLOW_NAME: &str = "allow-name";
 
 /// The comment prefix a stage's sizing line carries. Mid-file and stage-scoped, so it cannot
 /// collide with buildkit's file-scoped `# syntax=` / `# check=` parser directives, and any
@@ -175,9 +194,9 @@ pub fn parse(src: &str) -> Result<Dockerfile> {
             let hint = parse_guest_hints(&line.hints)?;
             match &mut instr {
                 Instruction::From(f) => f.guest = hint,
-                // A hint can size only a `FROM`; reject it elsewhere instead of ignoring it.
+                // A hint can only be about a stage; reject it elsewhere instead of ignoring it.
                 other => bail!(
-                    "`# {HINT_PREFIX}` sizes a stage, so it must precede a FROM; this one \
+                    "`# {HINT_PREFIX}` is about a stage, so it must precede a FROM; this one \
                      precedes {}",
                     keyword_of(other)
                 ),
@@ -186,7 +205,7 @@ pub fn parse(src: &str) -> Result<Dockerfile> {
         instructions.push(instr);
     }
     if !trailing.is_empty() {
-        bail!("`# {HINT_PREFIX}` at the end of the file sizes no stage");
+        bail!("`# {HINT_PREFIX}` at the end of the file is about no stage");
     }
     Ok(Dockerfile { instructions })
 }
@@ -238,6 +257,20 @@ fn parse_guest_hints(lines: &[String]) -> Result<GuestHint> {
                     })?;
                     hint.cpus = Some(n);
                 }
+                ALLOW_IP | ALLOW_NAME => {
+                    let egress = hint.egress.get_or_insert_with(StageEgress::default);
+                    let list = if key == ALLOW_IP {
+                        &mut egress.ips
+                    } else {
+                        &mut egress.names
+                    };
+                    list.extend(
+                        value
+                            .split(',')
+                            .filter(|v| !v.is_empty())
+                            .map(str::to_string),
+                    );
+                }
                 key if WINDOWS_HINTS.contains(&key) => {
                     if hint.windows.iter().any(|(k, _)| k == key) {
                         bail!("`# {HINT_PREFIX}`: {key} given twice");
@@ -245,11 +278,21 @@ fn parse_guest_hints(lines: &[String]) -> Result<GuestHint> {
                     hint.windows.push((key.to_string(), value.to_string()));
                 }
                 _ => bail!(
-                    "`# {HINT_PREFIX}`: unknown key {key:?} (want mem, cpus, or for Windows {})",
+                    "`# {HINT_PREFIX}`: unknown key {key:?} (want mem, cpus, {ALLOW_IP}, \
+                     {ALLOW_NAME}, or for Windows {})",
                     WINDOWS_HINTS.join(", ")
                 ),
             }
         }
+    }
+    // Checked as the flags are, so a bad entry fails the plan rather than the stage's boot.
+    if let Some(egress) = &hint.egress {
+        crate::switch::check_allowlist(
+            &egress.ips,
+            &egress.names,
+            &format!("`# {HINT_PREFIX} {ALLOW_IP}`"),
+            &format!("`# {HINT_PREFIX} {ALLOW_NAME}`"),
+        )?;
     }
     Ok(hint)
 }
@@ -813,6 +856,7 @@ mod tests {
                 mem: Some("8G".into()),
                 cpus: Some(16),
                 windows: Vec::new(),
+                egress: None,
             }
         );
         // One key per line reads better for a stage that sets both; they fold together.
@@ -830,7 +874,7 @@ mod tests {
         // which is the failure this whole hint exists to avoid.
         let err = |src: &str| parse(src).unwrap_err().to_string();
         assert!(err("# vk: mem=8G\nRUN a\n").contains("must precede a FROM"),);
-        assert!(err("FROM alpine\n# vk: mem=8G\n").contains("sizes no stage"));
+        assert!(err("FROM alpine\n# vk: mem=8G\n").contains("about no stage"));
         assert!(err("# vk: ram=8G\nFROM alpine\n").contains("unknown key"));
         assert!(err("# vk: mem\nFROM alpine\n").contains("expected key=value"));
         assert!(err("# vk: mem=lots\nFROM alpine\n").contains("expected a size"));
@@ -841,6 +885,40 @@ mod tests {
         // buildkit skips as part of the instruction being joined.
         assert!(parse("# vklike: mem=8G\nFROM alpine\n").is_ok());
         assert!(parse("RUN a \\\n  # vk: mem=8G\n  && b\nFROM alpine\n").is_ok());
+    }
+
+    #[test]
+    fn a_stage_declares_the_egress_its_steps_need() {
+        let df = parse(
+            "FROM alpine AS offline\n\
+             # vk: allow-name=cache.nixos.org,github.com mem=2G\n\
+             # vk: allow-ip=10.0.0.0/8:443 allow-name=codeload.github.com\n\
+             FROM alpine AS online\n\
+             # vk: allow-name=\n\
+             FROM alpine AS sealed\n",
+        )
+        .unwrap();
+        let egress = |i: usize| match &df.instructions[i] {
+            Instruction::From(f) => f.guest.egress.clone(),
+            other => panic!("expected FROM, got {other:?}"),
+        };
+        assert_eq!(egress(0), None);
+        assert_eq!(
+            egress(1),
+            Some(StageEgress {
+                ips: vec!["10.0.0.0/8:443".into()],
+                names: vec![
+                    "cache.nixos.org".into(),
+                    "github.com".into(),
+                    "codeload.github.com".into()
+                ],
+            })
+        );
+        // Declared, and empty: no network at all.
+        assert_eq!(egress(2), Some(StageEgress::default()));
+        let err = |src: &str| format!("{:#}", parse(src).unwrap_err());
+        assert!(err("# vk: allow-name=https://x.org\nFROM a\n").contains("allow-name"));
+        assert!(err("# vk: allow-ip=nope\nFROM a\n").contains("allow-ip"));
     }
 
     #[test]

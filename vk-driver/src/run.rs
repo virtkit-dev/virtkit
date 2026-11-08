@@ -2185,6 +2185,7 @@ async fn build_and_boot(
             None,
             egress.restrict,
             None,
+            None,
             egress.file,
             crate::prio::Prio::Normal,
         )
@@ -3852,6 +3853,7 @@ async fn compose_up(
         None,
         egress.restrict,
         None,
+        None,
         egress.file,
         crate::prio::Prio::Normal,
     )
@@ -5398,6 +5400,8 @@ pub(crate) async fn spawn_vm_switch(
     restrict: bool,
     // A CI job's build stage: the node's `[egress.build]` cap, checked before the lists above.
     cap: Option<&crate::switch::Cap>,
+    // A build stage's own layer, what its Dockerfile declares, checked after the lists above.
+    declared: Option<&crate::switch::Cap>,
     // Follow this `EgressFile` for the default policy instead of the lists above.
     egress_file: Option<&Path>,
     // Whether the VM this switch serves is a build stage (its downloads are the build's).
@@ -5450,6 +5454,7 @@ pub(crate) async fn spawn_vm_switch(
         // A CI job's build stage checks its node's cap and its own filter apart; dev `vk run`
         // has no cap. A placed job's names the service whose image it builds.
         cap: cap.cloned(),
+        declared: declared.cloned(),
         vm_names,
         // A placed job's build stage enforces the hub's build-phase layer too.
         hub: record.and_then(|r| r.hub.clone()),
@@ -5558,6 +5563,8 @@ pub(crate) async fn boot_session(
     agent: &Path,
     image: &Path,
     net: &crate::build::BuildNet,
+    // The stage's own layer on top of `net` (see `BuildNet::declared`).
+    declared: Option<&crate::switch::Cap>,
     cpus: u32,
     mem: &str,
     boot_timeout_secs: u64,
@@ -5735,6 +5742,7 @@ pub(crate) async fn boot_session(
             record,
             restrict,
             net.cap(),
+            declared,
             None,
             crate::prio::Prio::Build,
         )
@@ -8249,6 +8257,7 @@ mod tests {
                 &agent,
                 &root,
                 &crate::build::BuildNet::None,
+                None,
                 1,
                 "1G",
                 120,

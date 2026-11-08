@@ -644,6 +644,10 @@ pub struct MicroVm {
     timings: Arc<Timings>,
     /// egress policy for the stage guests (no network / unrestricted / allowlist).
     net: crate::build::BuildNet,
+    /// The current stage's own layer on top of `net`: what it declares, or a deny-all under
+    /// `--build-net declared` where it declares nothing (`BuildNet::declared`). Set for every
+    /// stage by `set_stage_guest`.
+    declared: Option<crate::switch::Cap>,
     /// audit mode (`--build-audit-egress`): the shared channel every stage switch appends the
     /// external domains its RUNs resolve to, drained into the post-build summary. `None` =
     /// off, unless a placed job records its build (`record`). All workers share this one path.
@@ -1294,6 +1298,7 @@ impl MicroVm {
             uncacheable_keys: std::collections::HashSet::new(),
             parent_digest: None,
             timings,
+            declared: net.declared(None),
             net,
             audit_log,
             bytes_log,
@@ -1424,6 +1429,7 @@ impl MicroVm {
             stage_last_digest: Arc::clone(&self.stage_last_digest),
             timings: Arc::clone(&self.timings),
             net: self.net.clone(),
+            declared: self.net.declared(None),
             audit_log: self.audit_log.clone(),
             bytes_log: self.bytes_log.clone(),
             record: self.record.clone(),
@@ -1598,6 +1604,7 @@ impl MicroVm {
             &self.agent,
             &ext4,
             &self.net,
+            self.declared.as_ref(),
             self.cpus,
             &self.mem,
             self.boot_timeout_secs,
@@ -2255,6 +2262,7 @@ impl Executor for MicroVm {
         // A shared budget settles at admission; until then, size as if alone.
         self.cpus = hint.cpus.unwrap_or_else(|| self.build_cpus.for_active(1));
         self.cpus_pinned = hint.cpus.is_some();
+        self.declared = self.net.declared(hint.egress.as_ref());
     }
     fn stage_admitted(&mut self, active: usize) {
         if !self.cpus_pinned {

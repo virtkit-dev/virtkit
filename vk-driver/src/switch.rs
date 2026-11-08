@@ -744,6 +744,10 @@ struct EgressGuard {
     /// attributed to (see [`EgressGuard::layer`]). `None` where there is none to check nor
     /// layers to tell apart (dev `vk run`).
     cap: Option<Arc<Egress>>,
+    /// A build stage's own layer, what its Dockerfile declares, checked after the default
+    /// policy for every source and attributed to the job, whose Dockerfile it is. `None` where
+    /// the stage declares nothing.
+    declared: Option<Arc<Egress>>,
     /// The services' VMs, by each of their addresses, which a record names its source by; an
     /// address not here is the job's own VM.
     vm_names: HashMap<Ipv4Addr, String>,
@@ -784,6 +788,7 @@ impl EgressGuard {
             dns_denials: RateLimiter::new(DNS_LOG_WINDOW, DNS_DENIALS_PER_WINDOW),
             dns_denied: Mutex::new(HashMap::new()),
             cap: None,
+            declared: None,
             vm_names: HashMap::new(),
             hub: None,
             hub_dry_run: Vec::new(),
@@ -823,6 +828,11 @@ impl EgressGuard {
     /// See the `cap` field.
     fn with_cap(mut self, cap: Option<Egress>) -> Self {
         self.cap = cap.map(Arc::new);
+        self
+    }
+    /// See the `declared` field.
+    fn with_declared(mut self, declared: Option<Egress>) -> Self {
+        self.declared = declared.map(Arc::new);
         self
     }
     /// See the `vm_names` field.
@@ -908,7 +918,8 @@ impl EgressGuard {
             EgressLayer::NodeCap
         } else if !hub_allows {
             EgressLayer::HubRule
-        } else if refuses(&self.default_policy()) {
+        } else if refuses(&self.default_policy()) || self.declared.as_deref().is_some_and(&refuses)
+        {
             EgressLayer::Job
         } else if src.is_some_and(|s| self.per_source.contains_key(&s)) {
             EgressLayer::Service
@@ -1280,6 +1291,7 @@ impl EgressGuard {
     fn restricted(&self) -> bool {
         self.cap.as_deref().is_some_and(Egress::restricts)
             || self.default_policy().restricts()
+            || self.declared.is_some()
             || !self.per_source.is_empty()
             || self.hub.is_some()
     }
@@ -1299,10 +1311,10 @@ impl EgressGuard {
         self.policy.read().unwrap().clone()
     }
     /// The node's layers that hold `src`, given the job's policy `job`, in the order they are
-    /// checked: the node's cap, the job's, then the service's own where `src` has one. Each is
-    /// checked alone, and dry-run softens them all; the hub's layer is apart. `src` is
-    /// authenticated by `handle_frame` against the address bound to its port, so a guest
-    /// cannot forge a sibling's source to select its layers.
+    /// checked: the node's cap, the job's, a build stage's declared one, then the service's
+    /// own where `src` has one. Each is checked alone, and dry-run softens them all; the hub's
+    /// layer is apart. `src` is authenticated by `handle_frame` against the address bound to
+    /// its port, so a guest cannot forge a sibling's source to select its layers.
     fn node_layers<'a>(
         &'a self,
         job: &'a Egress,
@@ -1312,6 +1324,7 @@ impl EgressGuard {
             .as_deref()
             .into_iter()
             .chain(std::iter::once(job))
+            .chain(self.declared.as_deref())
             .chain(self.per_source.get(&src).map(|p| &**p))
     }
     /// Replace the default policy and remove disallowed names from the DNS pins, revoking
@@ -1835,6 +1848,9 @@ pub struct Spawn {
     /// denial is attributed to first (see vk_hub_proto::egress). `None` = no cap, nor layers to
     /// tell apart (dev `vk run`).
     pub cap: Option<Cap>,
+    /// A build stage's own layer, what its Dockerfile declares, checked for every source after
+    /// the default policy. `None` = no such layer.
+    pub declared: Option<Cap>,
     /// The service each VM address belongs to, which records name their source by; an address
     /// not listed is the job's own VM.
     pub vm_names: Vec<(Ipv4Addr, String)>,
@@ -2066,6 +2082,10 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
         }
         None => {}
     }
+    if let Some(Cap::Allow { ips, names }) = &opts.declared {
+        cmd.arg("--egress-declared")
+            .arg(format!("{};{}", ips.join(","), names.join(",")));
+    }
     for (ip, name) in &opts.vm_names {
         cmd.arg("--vm-name").arg(format!("{ip}={name}"));
     }
@@ -2161,8 +2181,10 @@ pub async fn run(
     audit_log: Option<PathBuf>,
     bytes_log: Option<PathBuf>,
     dry_run: bool,
-    // The node's cap, and each service VM's name by address (see `Spawn`).
+    // The node's cap, a build stage's declared layer, and each service VM's name by address
+    // (see `Spawn`).
     cap: Option<Egress>,
+    declared: Option<Egress>,
     vm_names: HashMap<Ipv4Addr, String>,
     // The hub's layer for this phase (see `Spawn::hub`).
     hub: Option<HubLayer>,
@@ -2200,6 +2222,7 @@ pub async fn run(
             .with_bytes_log(bytes_log)
             .with_dry_run(dry_run)
             .with_cap(cap)
+            .with_declared(declared)
             .with_vm_names(vm_names)
             .with_hub(hub, hub_dry_run)
             .with_record_limit(record_limit),
@@ -8188,6 +8211,36 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_layer_holds_every_source_on_top_of_the_policy_and_cap() {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let src = Ipv4Addr::new(192, 168, 231, 2);
+        let g = EgressGuard::new(Egress::AllowAll, gw)
+            .with_cap(Some(
+                Egress::restricted(&[], &["github.com".into(), "nixos.org".into()]).unwrap(),
+            ))
+            .with_declared(Some(
+                Egress::restricted(&[], &["cache.nixos.org".into(), "example.org".into()]).unwrap(),
+            ));
+        assert!(g.restricted());
+        // Only what both allow: the cap refuses example.org, the declaration github.com.
+        assert!(g.name_allowed(src, "cache.nixos.org"));
+        assert!(!g.name_allowed(src, "example.org"));
+        assert!(!g.name_allowed(src, "github.com"));
+        let ip = [Ipv4Addr::new(151, 101, 1, 91)];
+        assert!(g.record_if_allowed(src, "cache.nixos.org", &ip, 300));
+        assert!(g.allows(src, "151.101.1.91:443".parse().unwrap()));
+        assert!(!g.allows(src, "140.82.121.4:443".parse().unwrap()));
+        // A refusal is the cap's where it refuses, else the job's, whose Dockerfile declared it.
+        assert_eq!(g.name_layer(src, "example.org", true), EgressLayer::NodeCap);
+        assert_eq!(g.name_layer(src, "github.com", true), EgressLayer::Job);
+        // A declaration of nothing denies everything.
+        let sealed = EgressGuard::new(Egress::AllowAll, gw)
+            .with_declared(Some(Egress::restricted(&[], &[]).unwrap()));
+        assert!(!sealed.name_allowed(src, "cache.nixos.org"));
+        assert!(!sealed.allows(src, "151.101.1.91:443".parse().unwrap()));
+    }
+
+    #[test]
     fn a_replaced_policy_decides_the_next_flow_and_revokes_the_old_pins() {
         let gw = Ipv4Addr::new(192, 168, 231, 1);
         let src = Ipv4Addr::new(192, 168, 231, 2);
@@ -9376,6 +9429,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
                 None,
                 HashMap::new(),
                 None,

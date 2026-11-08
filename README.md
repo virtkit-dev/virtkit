@@ -197,6 +197,21 @@ The resource hint is a comment and does not enter the instruction cache key. Whe
 stage asks for more memory than the host can allocate to one guest, virtkit clamps the
 request and emits a warning explaining the effective size and OOM risk.
 
+A stage can also declare the network its `RUN` steps need, as `--build-allow-name` and
+`--build-allow-ip` lists:
+
+```dockerfile
+# vk: allow-name=cache.nixos.org,github.com allow-ip=10.0.0.0/8:443
+FROM nixos/nix AS build
+```
+
+Its steps then reach only that, on top of whatever the build allows: with `--build-allow-*`
+they reach what both allow, and `--build-net none` still gives them nothing. `allow-name=`
+alone declares no network at all. `--build-net declared` gives each stage only what it
+declares, so a stage that declares nothing has no network. A stage restored from the
+instruction cache is not rebuilt to check its declaration, which, like the size, is not part
+of the cache key.
+
 Builds report each stage's peak guest memory as the stage finishes and in a block under
 the final timing breakdown:
 

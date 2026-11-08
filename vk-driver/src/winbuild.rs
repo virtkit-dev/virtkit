@@ -497,6 +497,9 @@ fn build_with(opts: &Options) -> Result<Vec<crate::cachelock::Guard>> {
 /// Refuse what `stage` asks for that a Windows build does not do, before anything boots.
 fn check_stage(stage: &Stage, context: &Path, no_network: bool) -> Result<()> {
     let from = &stage.from;
+    if from.guest.egress.is_some() {
+        bail!("`# vk: allow-ip` and `allow-name` do not apply to a Windows build yet");
+    }
     let winiso =
         crate::winiso::Source::of_stage(&from.image, &from.extra_flags, context)?.is_some();
     for (key, value) in &from.guest.windows {
@@ -665,6 +668,9 @@ fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> R
     let (opts, cache) = (b.opts, b.cache);
     let stage = &stages[index];
     let label = stage.label(index);
+    if matches!(opts.net, crate::build::BuildNet::Declared { .. }) {
+        bail!("--build-net declared does not apply to a Windows build yet");
+    }
     check_stage(
         stage,
         &opts.context,
@@ -1633,6 +1639,7 @@ fn make_step(
             None,
             restrict,
             steps.net.cap(),
+            None,
             None,
             crate::prio::Prio::Normal,
         );

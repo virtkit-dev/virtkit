@@ -36,6 +36,11 @@ All notable changes to virtkit will be documented in this file.
   area's `--grant` takes `guests` for them, within what the node itself is granted; such jobs
   then reach the registry at `registry.vk` with that access only, never the node's own. Jobs the
   hub places keep their own token alone. Nothing is granted unless an area says so.
+- **`vk build` stages can declare the network their `RUN` steps need.** A `# vk:
+  allow-name=… allow-ip=…` line above a stage's `FROM` holds its steps to those hosts, on top of
+  whatever the build allows; `--build-net declared` gives a stage that declares nothing no
+  network at all. CI job builds honor it too. A build that was refused any host ends by
+  listing them.
 
 ## [0.107.1] - 2026-11-08
 

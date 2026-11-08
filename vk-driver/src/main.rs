@@ -1160,11 +1160,15 @@ enum Cmd {
             help_heading = "What to build"
         )]
         build_arg: Vec<String>,
-        /// network for the build's RUN steps: `all` (unrestricted) or `none`
+        /// network for the build's RUN steps: `all` (unrestricted), `declared` or `none`
+        ///
+        /// A stage may declare the egress its RUN steps need with a `# vk: allow-ip=CIDR,…
+        /// allow-name=SUFFIX,…` line above its FROM; they then reach only that, under any
+        /// setting but `none`. `declared` gives a stage that declares nothing no network.
         #[arg(
             long = "build-net",
             default_value = "all",
-            value_name = "all|none",
+            value_name = "all|declared|none",
             help_heading = "Network (RUN steps)"
         )]
         build_net: String,
@@ -1195,6 +1199,11 @@ enum Cmd {
         /// restrict egress.
         #[arg(long = "build-audit-egress", help_heading = "Network (RUN steps)")]
         build_audit_egress: bool,
+        /// keep what the RUN steps contacted and were refused in this directory
+        ///
+        /// Set internally by a fleet node's CI tools build, which reads it afterwards.
+        #[arg(long = "egress-record", value_name = "DIR", hide = true)]
+        egress_record: Option<PathBuf>,
         /// restores from the instruction cache are allowed, but nothing may build
         ///
         /// A cache miss aborts with exit code 3, so scripts can branch cached-vs-cold without
@@ -1717,6 +1726,12 @@ enum Cmd {
         /// gitlab executor.
         #[arg(long = "egress-cap", value_name = "all|CIDRS;NAMES")]
         egress_cap: Option<String>,
+        /// a build stage's declared egress, checked for every source after the allowlists
+        ///
+        /// `<cidr,cidr>;<name,name>`, an empty field denying. Set internally by a build for a
+        /// stage whose Dockerfile declares its egress.
+        #[arg(long = "egress-declared", value_name = "CIDRS;NAMES")]
+        egress_declared: Option<String>,
         /// the service VM an address belongs to, `<ip>=<name>` (repeatable)
         ///
         /// Recorded denials and contacts name their source by it. Set internally by the gitlab
@@ -1840,13 +1855,15 @@ enum Cmd {
             help_heading = "Build (with -f or --compose)"
         )]
         build_arg: Vec<String>,
-        /// network for the --file build's RUN steps: `all` (unrestricted) or `none`
+        /// network for the --file build's RUN steps: `all` (unrestricted), `declared` or `none`
         ///
-        /// It is independent of --net, which governs the booted guest.
+        /// It is independent of --net, which governs the booted guest. As for `vk build`, a
+        /// stage's `# vk: allow-ip=… allow-name=…` holds its RUN steps to what it declares, and
+        /// `declared` gives a stage that declares nothing no network.
         #[arg(
             long = "build-net",
             default_value = "all",
-            value_name = "all|none",
+            value_name = "all|declared|none",
             help_heading = "Build (with -f or --compose)"
         )]
         build_net: String,
@@ -4173,6 +4190,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         build_allow_ip,
         build_allow_name,
         build_audit_egress,
+        egress_record,
         require_cached,
         build_jobs,
         stage_mem,
@@ -4305,7 +4323,11 @@ async fn cli_main(cli: Cli) -> ExitCode {
             build_args,
             net,
             audit: *build_audit_egress,
-            record: None,
+            record: egress_record.clone().map(|dir| build::EgressRecord {
+                dir,
+                source: None,
+                hub: None,
+            }),
             require_cached: *require_cached,
             build_jobs: build_jobs.or(b.jobs),
             debug: *debug,
@@ -4586,6 +4608,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         egress_dry_run,
         source_egress,
         egress_cap,
+        egress_declared,
         vm_name,
         hub_egress,
         record_limit,
@@ -4685,6 +4708,10 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Ok(c) => c,
             Err(e) => return fail(&e, 2),
         };
+        let declared = match egress_declared.as_deref().map(parse_egress_cap).transpose() {
+            Ok(d) => d,
+            Err(e) => return fail(&e, 2),
+        };
         let vm_names = match parse_vm_names(vm_name) {
             Ok(m) => m,
             Err(e) => return fail(&e, 2),
@@ -4715,6 +4742,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             net_bytes.clone(),
             *egress_dry_run,
             cap,
+            declared,
             vm_names,
             hub,
             *record_limit,
@@ -5496,6 +5524,7 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
         build_allow_ip,
         build_allow_name,
         build_audit_egress,
+        egress_record,
         require_cached,
         build_jobs,
         stage_mem,
@@ -5524,6 +5553,7 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
         (*build_tmp_tmpfs, "--build-tmp-tmpfs"),
         (!build_arg.is_empty(), "--build-arg"),
         (*build_audit_egress, "--build-audit-egress"),
+        (egress_record.is_some(), "--egress-record"),
         (*require_cached, "--require-cached"),
         (build_jobs.is_some(), "--build-jobs"),
         (!stage_mem.is_empty(), "--stage-mem"),

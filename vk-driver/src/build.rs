@@ -486,35 +486,67 @@ pub enum BuildNet {
         cap: crate::switch::Cap,
         job: crate::switch::Cap,
     },
+    /// `--build-net declared`: only what each stage declares (`# vk: allow-ip=… allow-name=…`)
+    /// and no network for a stage that declares nothing, held to `cap` (`--build-allow-*`)
+    /// as well.
+    Declared { cap: crate::switch::Cap },
 }
 
 impl BuildNet {
     /// Map the `--build-net` / `--build-allow-*` flags to a policy: allow flags
     /// restrict egress (and contradict `--build-net none`); with none of them,
     /// `--build-net` picks unrestricted (`all`, the default) or no network (`none`).
+    /// `declared` gives each stage only the egress it declares, still held to the allow flags.
     /// Allowlist syntax is validated here so a bad flag fails before any build work.
     pub fn from_flags(net: &str, ips: &[String], names: &[String]) -> Result<BuildNet> {
         let restricted = !ips.is_empty() || !names.is_empty();
+        if restricted && net != "none" {
+            // The checks `vk run --allow-*` makes, named after these flags.
+            crate::switch::check_allowlist(ips, names, "--build-allow-ip", "--build-allow-name")?;
+        }
+        let allow = || crate::switch::Cap::Allow {
+            ips: ips.to_vec(),
+            names: names.to_vec(),
+        };
         match net {
             "none" if restricted => {
                 bail!("--build-net none contradicts --build-allow-ip/--build-allow-name")
             }
             "none" => Ok(BuildNet::None),
-            "all" if restricted => {
-                // The checks `vk run --allow-*` makes, named after these flags.
-                crate::switch::check_allowlist(
-                    ips,
-                    names,
-                    "--build-allow-ip",
-                    "--build-allow-name",
-                )?;
-                Ok(BuildNet::Allow {
-                    ips: ips.to_vec(),
-                    names: names.to_vec(),
-                })
-            }
+            "all" if restricted => Ok(BuildNet::Allow {
+                ips: ips.to_vec(),
+                names: names.to_vec(),
+            }),
             "all" => Ok(BuildNet::All),
-            other => bail!("--build-net {other:?} (want all or none)"),
+            "declared" => Ok(BuildNet::Declared {
+                cap: if restricted {
+                    allow()
+                } else {
+                    crate::switch::Cap::Unrestricted
+                },
+            }),
+            other => bail!("--build-net {other:?} (want all, declared or none)"),
+        }
+    }
+
+    /// The layer a stage's switch holds its RUN steps to on top of this policy, from what the
+    /// stage declares: the declaration itself; under [`BuildNet::Declared`] a deny-all where
+    /// it declares nothing; nothing where the build has no network at all.
+    pub fn declared(&self, stage: Option<&parser::StageEgress>) -> Option<crate::switch::Cap> {
+        let allow = |e: &parser::StageEgress| crate::switch::Cap::Allow {
+            ips: e.ips.clone(),
+            names: e.names.clone(),
+        };
+        match self {
+            BuildNet::None => None,
+            BuildNet::Declared { .. } => Some(stage.map_or(
+                crate::switch::Cap::Allow {
+                    ips: Vec::new(),
+                    names: Vec::new(),
+                },
+                allow,
+            )),
+            _ => stage.map(allow),
         }
     }
 
@@ -529,15 +561,19 @@ impl BuildNet {
                 job: crate::switch::Cap::Allow { ips, names },
                 ..
             } => (ips, names, true),
-            BuildNet::All | BuildNet::None | BuildNet::Filtered { .. } => (&[], &[], false),
+            BuildNet::All
+            | BuildNet::None
+            | BuildNet::Filtered { .. }
+            | BuildNet::Declared { .. } => (&[], &[], false),
         }
     }
 
-    /// The node's cap a CI job's stage switch checks before [`Self::switch_policy`]'s; `None`
-    /// for any other build, which has no layers to tell apart.
+    /// The node's cap a CI job's stage switch checks before [`Self::switch_policy`]'s, or the
+    /// `--build-allow-*` flags under `--build-net declared`; `None` for any other build, which
+    /// has no layers to tell apart.
     pub fn cap(&self) -> Option<&crate::switch::Cap> {
         match self {
-            BuildNet::Filtered { cap, .. } => Some(cap),
+            BuildNet::Filtered { cap, .. } | BuildNet::Declared { cap } => Some(cap),
             _ => None,
         }
     }
@@ -893,12 +929,13 @@ fn make_microvm(
     let cache = opts.cache.registry()?;
     let cpus = exec::resolve_build_cpus(configured_build_cpus(), exec::host_cpus());
     let mem = exec::resolve_build_mem(configured_build_mem().as_deref());
-    // A placed job records its build's denials, attributed, and its contacts whatever audit
-    // says; the audit summary stays an audit feature.
-    let record = opts.record.as_ref().map(|r| crate::run::StageRecord {
+    // Every build records its denials, for the summary of what it was refused, and its
+    // contacts whatever audit says; a placed job's are attributed, and kept for its report.
+    // The audit summary stays an audit feature.
+    let record = Some(crate::run::StageRecord {
         denied_log: crate::jobctx::JobCtx::egress_denied_log_in(channels),
-        source: r.source.clone(),
-        hub: r.hub.clone(),
+        source: opts.record.as_ref().and_then(|r| r.source.clone()),
+        hub: opts.record.as_ref().and_then(|r| r.hub.clone()),
     });
     Ok(MicroVm::new(
         kernel.to_path_buf(),
@@ -912,7 +949,7 @@ fn make_microvm(
         !opts.tmp_tmpfs,
         // Channels shared across the build's parallel stage switches; the summaries are
         // drained once the build finishes.
-        (opts.audit || record.is_some()).then(|| channels.join(crate::run::AUDIT_LOG)),
+        Some(channels.join(crate::run::AUDIT_LOG)),
         channels.join(crate::run::NET_BYTES),
         record,
         Arc::clone(timings),
@@ -939,11 +976,31 @@ fn egress_channels(opts: &Options, scratch: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// `--build-audit-egress`: the domains and the IPs the build's RUN steps contacted, from its
+/// What the build's RUN steps were refused, from its `channels`, whatever audit says: a step
+/// that failed for want of a host it did not declare says so here.
+fn print_refusals(channels: &Path) {
+    let denied = crate::jobctx::JobCtx::egress_denied_log_in(channels);
+    let (denials, _) = crate::egress_report::read_records_since(&denied, 0);
+    let denials: Vec<_> = denials.into_iter().map(|(d, _)| d).collect();
+    let lines = crate::egress_report::denial_lines(&denials);
+    if lines.is_empty() {
+        return;
+    }
+    eprintln!("virtkit: network access refused during the build:");
+    for line in lines {
+        eprintln!("  {line}");
+    }
+}
+
+/// What the build's RUN steps were refused ([`print_refusals`]) unless a placed job reports it,
+/// then under `--build-audit-egress` the domains and the IPs they contacted, from its
 /// `channels` (read before the scratch, which may hold them, is removed). "during the build"
 /// distinguishes them from a `vk run` guest summary. Gated on audit rather than on the channel,
-/// which a placed job's build keeps either way.
+/// which every build keeps.
 fn print_audit_summaries(opts: &Options, channels: &Path) {
+    if opts.record.is_none() {
+        print_refusals(channels);
+    }
     if !opts.audit {
         return;
     }
@@ -6568,6 +6625,53 @@ mod tests {
     }
 
     #[test]
+    fn a_stage_is_held_to_the_egress_it_declares() {
+        use crate::switch::Cap;
+        let declared = parser::StageEgress {
+            ips: vec!["10.0.0.0/8".into()],
+            names: vec!["github.com".into()],
+        };
+        let as_cap = Cap::Allow {
+            ips: declared.ips.clone(),
+            names: declared.names.clone(),
+        };
+        let deny = Cap::Allow {
+            ips: Vec::new(),
+            names: Vec::new(),
+        };
+        let names = vec!["crates.io".to_string()];
+        let allow = BuildNet::from_flags("all", &[], &names).unwrap();
+        let declared_only = BuildNet::from_flags("declared", &[], &[]).unwrap();
+        let capped = BuildNet::from_flags("declared", &[], &names).unwrap();
+        // A declaration is a layer of its own on top of whatever the build allows; a stage that
+        // declares nothing keeps the build's policy, except under `declared`, which denies it.
+        for net in [&BuildNet::All, &allow, &declared_only, &capped] {
+            assert_eq!(
+                net.declared(Some(&declared)),
+                Some(as_cap.clone()),
+                "{net:?}"
+            );
+        }
+        assert_eq!(BuildNet::All.declared(None), None);
+        assert_eq!(allow.declared(None), None);
+        assert_eq!(declared_only.declared(None), Some(deny.clone()));
+        // `none` has no network to declare anything on.
+        assert_eq!(BuildNet::None.declared(Some(&declared)), None);
+        // Under `declared` the allow flags are the cap, checked first; the policy itself is
+        // open, the declaration doing the restricting.
+        assert_eq!(declared_only.cap(), Some(&Cap::Unrestricted));
+        assert_eq!(
+            capped.cap(),
+            Some(&Cap::Allow {
+                ips: Vec::new(),
+                names
+            })
+        );
+        assert!(!capped.switch_policy().2);
+        assert!(BuildNet::from_flags("declared", &["nope".into()], &[]).is_err());
+    }
+
+    #[test]
     fn cross_file_build_uses_each_files_context() {
         // Two files, two contexts: the merged build hashes each stage's COPY against
         // its own file's context, and editing one context busts only that stage's key
@@ -7750,6 +7854,7 @@ RUN ship
                 mem: Some("8G".into()),
                 cpus: None,
                 windows: Vec::new(),
+                egress: None,
             },
         )]);
         let mut matched = HashSet::new();

@@ -1462,7 +1462,9 @@ rust-job:
   job-visible error.
 
 The same applies to the build phase via `MICROVM_BUILD_EGRESS_ALLOW_IP` /
-`_ALLOW_NAME`.
+`_ALLOW_NAME`. A stage of the job's Dockerfile that declares its egress (`# vk: allow-name=…
+allow-ip=…` above its `FROM`, see the [README](../README.md#build-a-dockerfile)) is held to that
+too, as one more layer of the job's own.
 
 ### The hub's rules
 
