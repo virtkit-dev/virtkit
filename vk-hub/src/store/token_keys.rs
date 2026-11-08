@@ -1,11 +1,12 @@
 //! The keys the hub signs registry tokens with: which exist, which one signs, and since when
 //! the others no longer do. The private keys are files in the hub's `token-keys` directory;
-//! a row names its file and carries the public half registries get.
+//! a row names its file and carries the public half registries get. Beside them, the token
+//! subjects revoked, as removed nodes', which registries refuse.
 
 use anyhow::{Context, Result};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use vk_hub_proto::token::TokenKey;
+use vk_hub_proto::token::{MAX_TTL_SECS, SKEW_SECS, TokenKey};
 
 use std::collections::BTreeMap;
 
@@ -16,6 +17,24 @@ use super::{Db, append_audit, decode, encode};
 
 /// Key: the key's ID. Value: JSON [`TokenKeyRow`].
 pub(super) const TOKEN_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("token_keys");
+
+/// Key: a revoked token subject, as `node:<id>`. Value: when it was revoked.
+pub(super) const REVOKED_SUBJECTS: TableDefinition<&str, u64> =
+    TableDefinition::new("revoked_subjects");
+
+/// How long a subject stays revoked: past it, no token signed before the revocation is live,
+/// however long it was made to last.
+const REVOCATION_KEPT_SECS: u64 = MAX_TTL_SECS + SKEW_SECS;
+
+/// Revoke `subject` as of `now` in `txn`, the write that removes what it names.
+pub(super) fn revoke_subject_in(
+    txn: &redb::WriteTransaction,
+    subject: &str,
+    now: u64,
+) -> Result<()> {
+    txn.open_table(REVOKED_SUBJECTS)?.insert(subject, now)?;
+    Ok(())
+}
 
 /// A token-signing key as stored.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +123,45 @@ impl Db {
             bound,
             untokened,
         })
+    }
+
+    /// The subjects revoked at `now`, sorted: those revoked less than
+    /// [`REVOCATION_KEPT_SECS`] ago.
+    pub fn revoked_subjects(&self, now: u64) -> Result<Vec<String>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let mut out = Vec::new();
+        for entry in txn.open_table(REVOKED_SUBJECTS)?.iter()? {
+            let (subject, at) = entry?;
+            if now <= at.value().saturating_add(REVOCATION_KEPT_SECS) {
+                out.push(subject.value().to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Forget the subjects revoked longer than [`REVOCATION_KEPT_SECS`] before `now`.
+    pub fn prune_revoked_subjects(&self, now: u64) -> Result<()> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        let pruned = {
+            let mut table = txn.open_table(REVOKED_SUBJECTS)?;
+            let mut past = Vec::new();
+            for entry in table.iter()? {
+                let (subject, at) = entry?;
+                if now > at.value().saturating_add(REVOCATION_KEPT_SECS) {
+                    past.push(subject.value().to_string());
+                }
+            }
+            for subject in &past {
+                table.remove(subject.as_str())?;
+            }
+            !past.is_empty()
+        };
+        if !pruned {
+            txn.abort().context("dropping a write")?;
+            return Ok(());
+        }
+        txn.commit().context("forgetting revoked token subjects")?;
+        Ok(())
     }
 
     /// Every token-signing key, oldest first.

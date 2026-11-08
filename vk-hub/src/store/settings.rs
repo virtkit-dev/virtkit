@@ -10,7 +10,8 @@ use anyhow::{Context, Result, bail};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use vk_hub_proto::settings::{GUEST_CREDENTIAL, Kind};
+use vk_hub_proto::REGISTRY_ACCESS;
+use vk_hub_proto::settings::{GUEST_CREDENTIAL, GUEST_CREDENTIAL_JOB_OR_NODE, Kind};
 use vk_hub_proto::{DesiredState, STEERING};
 
 use super::namespaces::{CI_PIPELINE, NAMESPACES, NamespaceRow, ns_range};
@@ -159,7 +160,8 @@ impl Expanded {
 
     /// What node `id`, whose row is `row`, is sent: nothing unless it takes the hub's settings,
     /// and no registry while the one named has no URL bound, a node would refuse its table, or
-    /// it is gone.
+    /// it is gone. A node that takes its own registry access is told to lend its runner's guests
+    /// theirs ([`GUEST_CREDENTIAL_JOB_OR_NODE`]).
     fn wanted(&self, id: &str, row: &NodeRow) -> BTreeMap<String, Value> {
         if !takes(row) {
             return BTreeMap::new();
@@ -168,7 +170,16 @@ impl Expanded {
         if let Some(named) = wanted.remove("registry")
             && let Some(Some(table)) = named.as_str().and_then(|r| self.registries.get(r))
         {
-            wanted.insert("registry".to_string(), table.clone());
+            let mut table = table.clone();
+            if row.protocol.is_some_and(|v| v >= REGISTRY_ACCESS)
+                && let Value::Object(t) = &mut table
+            {
+                t.insert(
+                    "guest_credential".into(),
+                    Value::from(GUEST_CREDENTIAL_JOB_OR_NODE),
+                );
+            }
+            wanted.insert("registry".to_string(), table);
         }
         wanted
     }
@@ -520,6 +531,7 @@ mod tests {
             alias: None,
             isolate: Vec::new(),
             grants: vec![NsGrant::parse("r:*").unwrap()],
+            node_grants: Vec::new(),
             created_at: 0,
             created_by: "u".into(),
         };
@@ -542,6 +554,14 @@ mod tests {
             desired(&db, &id).settings["registry"],
             json!({"repo": "reg.example", "ca_pem": ca, "pipeline_root": "pipes",
                    "guest_credential": "job"})
+        );
+        // A node that takes its own registry access lends its runner's guests theirs.
+        db.record_session(&id, &"c".repeat(32), REGISTRY_ACCESS, 8, || true)
+            .unwrap();
+        assert_eq!(db.steer_settings(8).unwrap(), std::slice::from_ref(&id));
+        assert_eq!(
+            desired(&db, &id).settings["registry"]["guest_credential"],
+            json!("job-or-node")
         );
         // Unbound or gone, the registry is no longer sent; the setting stays.
         db.set_registry_url(&reg, None, None, "u", 8).unwrap();

@@ -41,12 +41,15 @@ pub fn set(
 }
 
 /// Send every node the settings the hub's make now, after a change they name but do not hold:
-/// a registry's URL, CA or namespaces. A failure is logged; the hub's next start sends them.
+/// a registry's URL, CA or namespaces, and have every session look at the node's own registry
+/// access again. A failure is logged; the hub's next start sends them.
 pub fn steer(hub: &Hub) {
     match hub.db.steer_settings(crate::now_secs()) {
         Ok(steered) => sent(hub, &steered),
         Err(e) => eprintln!("vk-hub: sending the nodes the hub's settings: {e:#}"),
     }
+    // What nodes' own registry tokens are bound to and grant moves with the same changes.
+    hub.token_keys.node_access_changed();
 }
 
 /// Send `nodes` the desired state the store just steered them to.

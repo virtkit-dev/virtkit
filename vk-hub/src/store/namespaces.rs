@@ -1,6 +1,7 @@
 //! Registry namespaces: per registry, a path prefix, who may read, write or lock under it, and
 //! how long its idle tags are kept. A job's registry token carries what the namespaces that
-//! select it grant ([`resolve`]); the registry enforces the token and never sees this policy.
+//! select it grant ([`resolve`]), a node's what they grant nodes ([`resolve_node`]); the
+//! registry enforces the token and never sees this policy.
 //!
 //! A path is a template: `{gitlab}` (the hub's name for the job's GitLab instance),
 //! `{project_id}`, `{pipeline_id}`, `{protection}` (`protected` or `unprotected`) and
@@ -16,7 +17,7 @@ use vk_hub_proto::job::RefType;
 use vk_hub_proto::registry::PrefixRetention;
 use vk_hub_proto::token::{
     ALIAS_ROOT, Grant, MAX_PREFIX_COMPONENTS, MAX_PREFIX_LEN, RESERVED_COMPONENTS, servable_prefix,
-    valid_component,
+    under, valid_component,
 };
 
 use super::registries::REGISTRIES;
@@ -83,7 +84,12 @@ pub struct NamespaceRow {
     /// every job.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub isolate: Vec<String>,
+    /// The grant lines selecting jobs; always written, even empty, as older hubs require it.
     pub grants: Vec<NsGrant>,
+    /// The grant lines selecting nodes, kept apart from [`NamespaceRow::grants`] so that a
+    /// hub that does not know them ignores them rather than reading them as job grants.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_grants: Vec<NodeGrant>,
     pub created_at: u64,
     pub created_by: String,
 }
@@ -100,37 +106,142 @@ pub struct NsGrant {
     pub subject: Subject,
 }
 
+/// A grant line's rights and subject text: `<rights>:<subject>`, rights a non-empty subset of
+/// `rwl`, as `(read, write, lock)`.
+fn split_line(line: &str) -> Result<((bool, bool, bool), &str), String> {
+    let (rights, subject) = line
+        .split_once(':')
+        .ok_or_else(|| format!("{line:?}: expected <rights>:<subject>, as rw:own project"))?;
+    let rights = rights.trim();
+    if rights.is_empty() || !rights.chars().all(|c| matches!(c, 'r' | 'w' | 'l')) {
+        return Err(format!("{rights:?}: rights are some of r, w and l"));
+    }
+    Ok((
+        (
+            rights.contains('r'),
+            rights.contains('w'),
+            rights.contains('l'),
+        ),
+        subject.trim(),
+    ))
+}
+
+fn rights_text(read: bool, write: bool, lock: bool) -> String {
+    [(read, 'r'), (write, 'w'), (lock, 'l')]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, c)| *c)
+        .collect()
+}
+
 impl NsGrant {
     /// `<rights>:<subject>`, rights a non-empty subset of `rwl`: `rw:own project`.
     pub fn parse(line: &str) -> Result<Self, String> {
-        let (rights, subject) = line
-            .split_once(':')
-            .ok_or_else(|| format!("{line:?}: expected <rights>:<subject>, as rw:own project"))?;
-        let rights = rights.trim();
-        if rights.is_empty() || !rights.chars().all(|c| matches!(c, 'r' | 'w' | 'l')) {
-            return Err(format!("{rights:?}: rights are some of r, w and l"));
-        }
+        let ((read, write, lock), subject) = split_line(line)?;
         Ok(NsGrant {
-            read: rights.contains('r'),
-            write: rights.contains('w'),
-            lock: rights.contains('l'),
-            subject: Subject::parse(subject.trim())?,
+            read,
+            write,
+            lock,
+            subject: Subject::parse(subject)?,
         })
-    }
-
-    fn rights(&self) -> String {
-        [(self.read, 'r'), (self.write, 'w'), (self.lock, 'l')]
-            .iter()
-            .filter(|(on, _)| *on)
-            .map(|(_, c)| *c)
-            .collect()
     }
 }
 
 impl std::fmt::Display for NsGrant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.rights(), self.subject)
+        let rights = rights_text(self.read, self.write, self.lock);
+        write!(f, "{rights}:{}", self.subject)
     }
+}
+
+/// The nodes a node grant selects, or the guests of the jobs nodes run for their own runners.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Nodes {
+    /// `nodes`: every node.
+    All,
+    /// `node <id>`: the node enrolled under that ID.
+    One(String),
+    /// `guests`: the guests of jobs no hub placed, which nodes run for a gitlab-runner of their
+    /// own, within what their node is granted ([`resolve_guest`]). Selects no node.
+    Guests,
+}
+
+impl Nodes {
+    /// `nodes`, `node <id>` or `guests`; `None` for any other subject, which may be a job's.
+    fn parse(text: &str) -> Option<Result<Self, String>> {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        match words.as_slice() {
+            ["nodes"] => Some(Ok(Nodes::All)),
+            ["guests"] => Some(Ok(Nodes::Guests)),
+            ["node", id] if vk_hub_proto::valid_id(id) => Some(Ok(Nodes::One((*id).to_string()))),
+            ["node", id] => Some(Err(format!(
+                "{id:?} is not a node's ID: 32 lowercase hex digits, as `vk-hub nodes` lists them"
+            ))),
+            ["node" | "nodes" | "guests", ..] => Some(Err(format!(
+                "{text:?}: a node subject is `nodes`, `node <id>` or `guests`, alone"
+            ))),
+            _ => None,
+        }
+    }
+
+    /// Whether it selects node `id`.
+    pub fn matches(&self, id: &str) -> bool {
+        match self {
+            Nodes::All => true,
+            Nodes::One(one) => one == id,
+            Nodes::Guests => false,
+        }
+    }
+}
+
+impl std::fmt::Display for Nodes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Nodes::All => f.write_str("nodes"),
+            Nodes::One(id) => write!(f, "node {id}"),
+            Nodes::Guests => f.write_str("guests"),
+        }
+    }
+}
+
+/// A grant line for nodes: rights, and the nodes that get them in their own tokens.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeGrant {
+    #[serde(default)]
+    pub read: bool,
+    #[serde(default)]
+    pub write: bool,
+    #[serde(default)]
+    pub lock: bool,
+    pub nodes: Nodes,
+}
+
+impl std::fmt::Display for NodeGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let rights = rights_text(self.read, self.write, self.lock);
+        write!(f, "{rights}:{}", self.nodes)
+    }
+}
+
+/// Grant lines as `vk-hub namespaces add --grant` takes them, `<rights>:<subject>`, split into
+/// those selecting jobs and those selecting nodes (`nodes`, `node <id>`).
+pub fn parse_grants<S: AsRef<str>>(lines: &[S]) -> Result<(Vec<NsGrant>, Vec<NodeGrant>), String> {
+    let (mut jobs, mut nodes) = (Vec::new(), Vec::new());
+    for line in lines {
+        let line = line.as_ref();
+        let ((read, write, lock), subject) = split_line(line)?;
+        match Nodes::parse(subject) {
+            Some(n) => nodes.push(NodeGrant {
+                read,
+                write,
+                lock,
+                nodes: n?,
+            }),
+            None => jobs.push(NsGrant::parse(line)?),
+        }
+    }
+    Ok((jobs, nodes))
 }
 
 impl NamespaceRow {
@@ -206,8 +317,16 @@ impl NamespaceRow {
             }
             _ => {}
         }
-        if self.grants.is_empty() || self.grants.len() > MAX_GRANTS {
+        let lines = self.grants.len().saturating_add(self.node_grants.len());
+        if lines == 0 || lines > MAX_GRANTS {
             return Err(format!("a namespace has 1 to {MAX_GRANTS} grant lines"));
+        }
+        if !self.node_grants.is_empty() && !self.literal() {
+            return Err(format!(
+                "{:?}: nodes are granted only paths without placeholders: a node has no \
+                 project, pipeline, protection or scope to fill one with",
+                self.path
+            ));
         }
         if self.name == CI_BUILD {
             self.check_ci_build()?;
@@ -242,6 +361,12 @@ impl NamespaceRow {
                 CI_BUILD_PLACEHOLDERS.join(", ")
             ));
         }
+        if let Some(g) = self.node_grants.first() {
+            return Err(format!(
+                "{g}: {CI_BUILD} grants only to `own project`, so no job reaches another's \
+                 build cache"
+            ));
+        }
         let own = Subject {
             projects: Projects::Own,
             ..Subject::default()
@@ -253,6 +378,11 @@ impl NamespaceRow {
             ));
         }
         Ok(())
+    }
+
+    /// Whether the path has no placeholder, the only kind of path nodes are granted.
+    fn literal(&self) -> bool {
+        !self.path.contains(['{', '}'])
     }
 
     /// Whether the path holds `{scope}`.
@@ -540,6 +670,95 @@ pub fn resolve(ns: &[NamespaceRow], c: &JobClaims) -> Resolved {
     out
 }
 
+/// The grants the namespaces `ns` give node `node` in its own token: per namespace with a
+/// literal path, the rights of every node grant line selecting it, merged by prefix. A path
+/// reaching a root another namespace reserves for its scopes, which the hub refuses to store
+/// beside node grants, gives nothing all the same: nodes never reach jobs' scopes.
+pub fn resolve_node(ns: &[NamespaceRow], node: &str) -> Vec<Grant> {
+    resolve_lines(ns, |n| n.matches(node))
+}
+
+/// The grants the namespaces `ns` give the guests of node `node`'s own runner's jobs, in the
+/// token it lends them: what lines for `guests` grant, within what node `node` is granted.
+/// Where one grant's prefix lies under the other's, the deeper prefix gets the rights both
+/// hold. None unless namespaces grant guests.
+pub fn resolve_guest(ns: &[NamespaceRow], node: &str) -> Vec<Grant> {
+    let guests = resolve_lines(ns, |n| *n == Nodes::Guests);
+    if guests.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Grant> = Vec::new();
+    for host in resolve_node(ns, node) {
+        for guest in &guests {
+            let prefix = if under(&host.prefix, &guest.prefix) {
+                &guest.prefix
+            } else if under(&guest.prefix, &host.prefix) {
+                &host.prefix
+            } else {
+                continue;
+            };
+            let grant = Grant {
+                prefix: prefix.clone(),
+                read: host.read && guest.read,
+                write: host.write && guest.write,
+                lock: host.lock && guest.lock,
+            };
+            merge(&mut out, grant);
+        }
+    }
+    out
+}
+
+/// Add `grant` to `out`, merging its rights into a grant of the same prefix; nothing for a
+/// grant of no rights.
+fn merge(out: &mut Vec<Grant>, grant: Grant) {
+    if !(grant.read || grant.write || grant.lock) {
+        return;
+    }
+    match out.iter_mut().find(|g| g.prefix == grant.prefix) {
+        Some(g) => {
+            g.read |= grant.read;
+            g.write |= grant.write;
+            g.lock |= grant.lock;
+        }
+        None => out.push(grant),
+    }
+}
+
+/// The grants of the node grant lines in `ns` whose subject `select` takes, as
+/// [`resolve_node`] gathers them.
+fn resolve_lines(ns: &[NamespaceRow], select: impl Fn(&Nodes) -> bool) -> Vec<Grant> {
+    let mut out: Vec<Grant> = Vec::new();
+    for (i, n) in ns.iter().enumerate() {
+        if !n.literal() || !servable_prefix(&n.path) {
+            continue;
+        }
+        let mut grant = Grant {
+            prefix: n.path.clone(),
+            ..Grant::default()
+        };
+        for g in n.node_grants.iter().filter(|g| select(&g.nodes)) {
+            grant.read |= g.read;
+            grant.write |= g.write;
+            grant.lock |= g.lock;
+        }
+        if !(grant.read || grant.write || grant.lock) {
+            continue;
+        }
+        let others: Vec<NamespaceRow> = ns
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, o)| o.clone())
+            .collect();
+        if check_reserved_root(n, &others).is_some() {
+            continue;
+        }
+        merge(&mut out, grant);
+    }
+    out
+}
+
 /// The retention windows `ns` set, by static prefix: the longest where several share one.
 pub fn prefix_retention(ns: &[NamespaceRow]) -> Vec<PrefixRetention> {
     let mut out: Vec<PrefixRetention> = Vec::new();
@@ -571,6 +790,7 @@ pub fn defaults(now: u64) -> Vec<NamespaceRow> {
             alias: None,
             isolate: Vec::new(),
             grants: vec![grant("rw:own project")],
+            node_grants: Vec::new(),
             created_at: now,
             created_by: "hub".into(),
         },
@@ -581,6 +801,7 @@ pub fn defaults(now: u64) -> Vec<NamespaceRow> {
             alias: None,
             isolate: Vec::new(),
             grants: vec![grant("rwl:own project, own pipeline")],
+            node_grants: Vec::new(),
             created_at: now,
             created_by: "hub".into(),
         },
@@ -591,6 +812,7 @@ pub fn defaults(now: u64) -> Vec<NamespaceRow> {
             alias: None,
             isolate: Vec::new(),
             grants: vec![grant("rwl:own project")],
+            node_grants: Vec::new(),
             created_at: now,
             created_by: "hub".into(),
         },
@@ -682,7 +904,12 @@ impl Db {
             table.insert(key.as_str(), encode(&ns)?.as_slice())?;
             old.is_some()
         };
-        let grants: Vec<String> = ns.grants.iter().map(ToString::to_string).collect();
+        let grants: Vec<String> = ns
+            .grants
+            .iter()
+            .map(ToString::to_string)
+            .chain(ns.node_grants.iter().map(ToString::to_string))
+            .collect();
         let event = format!(
             "{actor} {} namespace {} at {}{}{}{} granting {}",
             if replaced { "replaced" } else { "added" },
@@ -812,13 +1039,15 @@ mod tests {
     }
 
     fn ns(name: &str, path: &str, grants: &[&str], retention_days: Option<u64>) -> NamespaceRow {
+        let (grants, node_grants) = parse_grants(grants).unwrap();
         NamespaceRow {
             name: name.into(),
             path: path.into(),
             retention_days,
             alias: None,
             isolate: Vec::new(),
-            grants: grants.iter().map(|g| NsGrant::parse(g).unwrap()).collect(),
+            grants,
+            node_grants,
             created_at: 0,
             created_by: "t".into(),
         }
@@ -1035,6 +1264,232 @@ mod tests {
             got,
             vec![("images".into(), "r".into()), ("wab".into(), "r".into())]
         );
+    }
+
+    const NODE: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn grant_lines_split_into_jobs_and_nodes() {
+        let lines = [
+            "r:*",
+            "rwl:nodes",
+            &format!("r:node {NODE}"),
+            "r:guests",
+            "w:gitlab gl, projects wab/**, protected",
+        ];
+        let (jobs, nodes) = parse_grants(&lines).unwrap();
+        let jobs: Vec<String> = jobs.iter().map(ToString::to_string).collect();
+        let nodes: Vec<String> = nodes.iter().map(ToString::to_string).collect();
+        assert_eq!(jobs, ["r:*", "w:gitlab gl, projects wab/**, protected"]);
+        assert_eq!(
+            nodes,
+            [
+                "rwl:nodes".to_string(),
+                format!("r:node {NODE}"),
+                "r:guests".to_string()
+            ]
+        );
+        // `*` keeps selecting every job, never a node.
+        let (jobs, nodes) = parse_grants(&["r:*"]).unwrap();
+        assert_eq!(jobs[0].subject, Subject::default());
+        assert!(nodes.is_empty());
+        for bad in [
+            "r:node",
+            "r:node 0123",
+            &format!("r:node {}", NODE.to_uppercase()),
+            &format!("r:node {NODE} x"),
+            "r:nodes, protected",
+            "r:nodes x",
+            "r:guests x",
+            "r:guests, protected",
+            ":nodes",
+            "x:nodes",
+        ] {
+            assert!(parse_grants(&[bad]).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn nodes_are_granted_literal_paths_only() {
+        ns("images", "images/base", &["r:nodes"], Some(30))
+            .check()
+            .unwrap();
+        ns(
+            "mixed",
+            "images",
+            &["r:*", &format!("rwl:node {NODE}")],
+            None,
+        )
+        .check()
+        .unwrap();
+        for path in [
+            "p/{gitlab}/{project_id}",
+            "ci-pipeline/{gitlab}/{project_id}/{pipeline_id}",
+            "c/{protection}",
+            "c/{scope}",
+        ] {
+            let err = ns("x", path, &["r:nodes"], None).check().unwrap_err();
+            assert!(
+                err.contains("only paths without placeholders"),
+                "{path}: {err}"
+            );
+        }
+        let ci_build = defaults(0)
+            .into_iter()
+            .find(|n| n.name == CI_BUILD)
+            .unwrap();
+        let (_, node_grants) = parse_grants(&["r:nodes"]).unwrap();
+        assert!(
+            NamespaceRow {
+                node_grants,
+                ..ci_build
+            }
+            .check()
+            .is_err()
+        );
+        // Job and node lines count together.
+        let many: Vec<String> = (0..MAX_GRANTS).map(|_| "r:*".to_string()).collect();
+        let mut over = many.clone();
+        over.push("r:nodes".into());
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let over: Vec<&str> = over.iter().map(String::as_str).collect();
+        ns("x", "p", &many, None).check().unwrap();
+        assert!(ns("x", "p", &over, None).check().is_err());
+    }
+
+    #[test]
+    fn a_node_gets_what_node_grants_select() {
+        let other = "f".repeat(32);
+        let all = [
+            ns("images", "images", &["r:*", "r:nodes"], None),
+            ns("cache", "build-cache", &[&format!("rwl:node {NODE}")], None),
+            ns("cache-ro", "build-cache", &["r:nodes"], None),
+            ns("other", "other", &[&format!("r:node {other}")], None),
+            ns("jobs-only", "jobs-only", &["rwl:*"], None),
+            ns(
+                "project",
+                "p/{gitlab}/{project_id}",
+                &["rw:own project"],
+                None,
+            ),
+        ];
+        let got = |node: &str| -> Vec<(String, String)> {
+            resolve_node(&all, node)
+                .iter()
+                .map(|g| (g.prefix.clone(), g.rights()))
+                .collect()
+        };
+        assert_eq!(
+            got(NODE),
+            [
+                ("images".to_string(), "r".to_string()),
+                ("build-cache".to_string(), "rwl".to_string())
+            ]
+        );
+        assert_eq!(
+            got(&"e".repeat(32)),
+            [
+                ("images".to_string(), "r".to_string()),
+                ("build-cache".to_string(), "r".to_string())
+            ]
+        );
+        // Node grants give a job nothing, and none means no access.
+        let job = resolve(&all, &claims(true, 7));
+        assert!(job.grants.iter().all(|g| g.prefix != "build-cache"));
+        assert!(resolve_node(&defaults(0), NODE).is_empty());
+    }
+
+    /// Guests get what lines for `guests` grant within their node's grants, the deeper prefix
+    /// where one lies under the other; a guest line alone gives a node nothing.
+    #[test]
+    fn guests_get_their_nodes_grants_narrowed() {
+        let all = [
+            ns("images", "images", &["r:nodes", "rw:guests"], None),
+            ns(
+                "cache",
+                "build-cache",
+                &[&format!("rwl:node {NODE}"), "rw:guests"],
+                None,
+            ),
+            ns("tools", "tools", &["rwl:nodes"], None),
+            ns("guests-only", "guests-only", &["rwl:guests"], None),
+        ];
+        let got = |grants: Vec<Grant>| -> Vec<(String, String)> {
+            grants
+                .iter()
+                .map(|g| (g.prefix.clone(), g.rights()))
+                .collect()
+        };
+        assert_eq!(
+            got(resolve_guest(&all, NODE)),
+            [
+                ("images".to_string(), "r".to_string()),
+                ("build-cache".to_string(), "rw".to_string())
+            ]
+        );
+        // Another node, granted no cache, lends its guests none.
+        assert_eq!(
+            got(resolve_guest(&all, &"e".repeat(32))),
+            [("images".to_string(), "r".to_string())]
+        );
+        // `guests` selects no node.
+        assert!(
+            resolve_node(&all, NODE)
+                .iter()
+                .all(|g| g.prefix != "guests-only")
+        );
+        // A guest line under a node's grant narrows to its own prefix.
+        let nested = [
+            ns("images", "images", &["rw:nodes"], None),
+            ns("base", "images/base", &["rwl:guests"], None),
+        ];
+        assert_eq!(
+            got(resolve_guest(&nested, NODE)),
+            [("images/base".to_string(), "rw".to_string())]
+        );
+        // None without lines for guests.
+        let none = [ns("images", "images", &["rwl:nodes"], None)];
+        assert!(resolve_guest(&none, NODE).is_empty());
+    }
+
+    /// A namespace granting nodes is held to the scoped roots as any other is; one reaching a
+    /// root anyway, as stored before, gives nodes nothing there.
+    #[test]
+    fn node_grants_never_reach_a_reserved_root() {
+        use crate::store::{RegistryEnrollment, TokenKind};
+        let db = Db::open_memory().unwrap();
+        let ttl = std::time::Duration::from_secs(60);
+        let (token, _) = db
+            .create_token_for(TokenKind::Registry, ttl, None, "u", 1)
+            .unwrap();
+        let RegistryEnrollment::Enrolled { id } =
+            db.enroll_registry(&token, "aa", "reg", "p", 1).unwrap()
+        else {
+            panic!("not enrolled");
+        };
+        let scoped = ns(
+            "tc",
+            "tc/{gitlab}/{project_id}/{scope}",
+            &["rwl:own project"],
+            None,
+        );
+        db.put_namespace(&id, &scoped, "u", 1).unwrap();
+        let err = db
+            .put_namespace(&id, &ns("n", "tc/gl", &["r:nodes"], None), "u", 2)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("which namespace tc reserves"), "{err}");
+        let legacy = ns("n", "tc/gl", &["r:nodes"], None);
+        assert!(resolve_node(&[scoped, legacy], NODE).is_empty());
+        // Stored and read back, node grants keep their place; an older reader sees the job
+        // grants alone.
+        let images = ns("images", "images", &["r:*", "r:nodes"], None);
+        db.put_namespace(&id, &images, "u", 3).unwrap();
+        let back = db.namespaces(&id).unwrap();
+        assert!(back.contains(&images));
+        let json = serde_json::to_value(&images).unwrap();
+        assert_eq!(json["grants"].as_array().unwrap().len(), 1);
+        assert_eq!(json["node_grants"][0]["nodes"], "all");
     }
 
     #[test]

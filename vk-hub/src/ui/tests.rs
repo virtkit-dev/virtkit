@@ -9172,6 +9172,7 @@ async fn a_registry_page_shows_its_job_access_and_settings_in_tabs() {
             NsGrant::parse("rwl:gitlab gl, projects wab/**, protected").unwrap(),
             NsGrant::parse("r:gitlab gl, projects wab/**").unwrap(),
         ],
+        node_grants: Vec::new(),
         created_at: 0,
         created_by: "uid 0".into(),
     };

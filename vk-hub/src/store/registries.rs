@@ -82,6 +82,11 @@ impl RegistryRow {
         self.inventory.as_ref().is_some_and(|i| i.tokens)
     }
 
+    /// Whether it says it refuses the tokens of the subjects the hub revokes.
+    pub fn revokes_subjects(&self) -> bool {
+        self.inventory.as_ref().is_some_and(|i| i.revokes_subjects)
+    }
+
     /// The generation it last reported applying.
     pub fn applied(&self) -> u64 {
         self.report.as_ref().and_then(|r| r.applied).unwrap_or(0)
@@ -518,14 +523,16 @@ impl Db {
         Ok(changed)
     }
 
-    /// Have registry `id`'s desired state carry the token-signing `keys` and the namespaces'
-    /// `retention`, recording in which generation each key was first sent. Only for a
-    /// registry that takes tokens; the new state when it changed.
+    /// Have registry `id`'s desired state carry the token-signing `keys`, the namespaces'
+    /// `retention` and the `revoked` token subjects, recording in which generation each key was
+    /// first sent. Only for a registry that takes tokens, and the subjects only for one that
+    /// refuses them; the new state when it changed.
     pub fn sync_registry_tokens(
         &self,
         id: &str,
         keys: &[TokenKey],
         retention: &[PrefixRetention],
+        revoked: &[String],
         now: u64,
     ) -> Result<Option<DesiredState>> {
         self.update_registry(now, id, Durability::Immediate, |row| {
@@ -546,6 +553,9 @@ impl Db {
                         .any(|a| a == vk_hub_proto::registry::ALLOW_GC)
                 })
                 .then(|| retention.to_vec());
+            // Always a list, even empty, to a registry that takes one: none would keep the
+            // subjects it was sent before.
+            desired.revoked_subjects = row.revokes_subjects().then(|| revoked.to_vec());
             if desired == before {
                 return Ok((None, Vec::new()));
             }
@@ -559,8 +569,12 @@ impl Db {
             }
             row.desired = Some(desired.clone());
             let kids: Vec<&str> = keys.iter().map(|k| k.kid.as_str()).collect();
+            let revoked = match &desired.revoked_subjects {
+                Some(r) => format!(", {} revoked subject(s)", r.len()),
+                None => String::new(),
+            };
             let event = format!(
-                "token keys {} and {} retention window(s) sent (generation {})",
+                "token keys {} and {} retention window(s){revoked} sent (generation {})",
                 kids.join(", "),
                 retention.len(),
                 desired.generation

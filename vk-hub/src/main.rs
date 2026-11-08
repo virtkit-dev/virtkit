@@ -238,7 +238,10 @@ enum Cmd {
     /// {protection}; a grant is <rights>:<subject>, rights some of r, w and l, the subject
     /// comma-separated terms among *, own project, own pipeline, gitlab <name>,
     /// projects <glob>, project-id <n>, ref <glob>, protected and unprotected. Projects and
-    /// project IDs go with gitlab <name>: they repeat across GitLab instances.
+    /// project IDs go with gitlab <name>: they repeat across GitLab instances. The subject
+    /// nodes (every node) or node <id> grants nodes instead, outside jobs, only on a path
+    /// without placeholders; guests grants the jobs nodes run for their own gitlab-runner, within
+    /// what their node is granted; * selects jobs the hub places only.
     Namespaces {
         #[command(flatten)]
         config: ConfigArg,
@@ -831,7 +834,8 @@ enum NamespacesCmd {
         /// 'release/*'; repeat for several. The path must hold {scope}
         #[arg(long = "isolate", value_name = "GLOB")]
         isolate: Vec<String>,
-        /// A grant line, <rights>:<subject>, as 'rw:own project' or 'r:*'; repeat for several
+        /// A grant line, <rights>:<subject>, as 'rw:own project', 'r:*', 'r:nodes' or 'r:guests';
+        /// repeat for several
         #[arg(long = "grant", value_name = "LINE", required = true)]
         grants: Vec<String>,
     },
@@ -2944,6 +2948,9 @@ fn namespaces_blocking(client: &admin::Client, cmd: NamespacesCmd) -> Result<()>
             out.push_str(&format!("  isolate {}\n", ns.isolate.join(" ")));
         }
         for g in &ns.grants {
+            out.push_str(&format!("  {g}\n"));
+        }
+        for g in &ns.node_grants {
             out.push_str(&format!("  {g}\n"));
         }
         out

@@ -3,7 +3,8 @@
 //! From version [`STEERING`], also send desired state and commands; from version [`JOBS`],
 //! reservations and jobs ([`crate::jobs`]); from version [`vk_hub_proto::TOOLS`], tools builds;
 //! from version [`vk_hub_proto::RUNNER_NONE`], reports of nodes that run no gitlab-runner; from
-//! version [`LIVE_EGRESS`], running jobs' egress reports.
+//! version [`LIVE_EGRESS`], running jobs' egress reports; from version [`REGISTRY_ACCESS`], the
+//! node's own registry token, renewed before it expires.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -22,7 +23,8 @@ use tokio_tungstenite::tungstenite::Message;
 use vk_hub_proto::dispatch::NodeJobMsg;
 use vk_hub_proto::{
     CHALLENGE_LEN, Channel, Heartbeat, HubMsg, Inventory, JOBS, LIVE_EGRESS, NodeMsg,
-    PUBLIC_KEY_LEN, RefusalCode, Report, SIGNATURE_LEN, STEERING, VersionRange, from_hex_lower,
+    PUBLIC_KEY_LEN, REGISTRY_ACCESS, RefusalCode, Report, SIGNATURE_LEN, STEERING, VersionRange,
+    from_hex_lower,
 };
 
 use crate::server::{Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub};
@@ -39,12 +41,24 @@ pub(crate) const HANDSHAKE_STEP: Duration = crate::server::PRE_AUTH_TIMEOUT;
 pub(crate) const HANDSHAKE_STEP: Duration = Duration::from_secs(1);
 
 /// The protocol versions this hub speaks: [`vk_hub_proto::PROTOCOL`]'s, [`JOBS`],
-/// [`vk_hub_proto::TOOLS`], [`vk_hub_proto::RUNNER_NONE`] and [`LIVE_EGRESS`]. A node offering
-/// less negotiates the highest version both speak.
+/// [`vk_hub_proto::TOOLS`], [`vk_hub_proto::RUNNER_NONE`], [`LIVE_EGRESS`] and
+/// [`REGISTRY_ACCESS`]. A node offering less negotiates the highest version both speak.
 pub const PROTOCOL: VersionRange = VersionRange {
     min: vk_hub_proto::PROTOCOL.min,
-    max: LIVE_EGRESS,
+    max: REGISTRY_ACCESS,
 };
+
+/// When a node's own registry token is renewed: this far into its life, give or take
+/// [`RENEW_JITTER`], so that nodes connected together do not all renew together.
+const RENEW_AFTER: Duration = Duration::from_secs(45 * 60);
+const RENEW_JITTER: Duration = Duration::from_secs(5 * 60);
+
+/// How soon access the hub could not mint, or that waits on a registry, is looked at again.
+const ACCESS_RETRY: Duration = Duration::from_secs(60);
+
+/// How often a node's access is looked at again with nothing said to have changed: a registry
+/// that stopped taking nodes' tokens tells no session.
+const ACCESS_RECHECK: Duration = Duration::from_secs(5 * 60);
 
 /// The versions of a relay's session over HTTP/1.1: every one but
 /// [`CONNECTION`](vk_hub_proto::gitlab::CONNECTION), which only HTTP/2 carries.
@@ -392,7 +406,10 @@ async fn serve(
     let mut deadline = tokio::time::Instant::now() + quiet;
     let mut pace = Pace::default();
     let mut steer = Steer::default();
+    let mut access = Access::new(node.version);
+    let mut access_changed = hub.token_keys.subscribe_node_access();
     loop {
+        let access_due = access.due;
         tokio::select! {
             () = ending.notify.notified() => {
                 let (code, reason, why) = if ending.revoked.load(Ordering::Relaxed) {
@@ -415,6 +432,8 @@ async fn serve(
                 return Ok(why);
             }
             () = ending.kick.notified() => steer.sync(ws, hub, node).await?,
+            () = sleep_until_some(access_due) => access.sync(ws, hub, node).await?,
+            Ok(()) = access_changed.changed() => access.sync(ws, hub, node).await?,
             Some(msg) = next_job(&mut jobs) => send(ws, &HubMsg::Job(msg)).await?,
             _ = ping.tick() => {
                 tokio::time::timeout(HEARTBEAT, ws.send(Message::Ping(Default::default())))
@@ -463,10 +482,12 @@ async fn serve(
                     .context("the node sent a message this hub does not understand")?;
                 let now = Instant::now();
                 let mut report = false;
+                let mut names_registry = false;
                 let write = match msg {
                     NodeMsg::Inventory(inventory) => {
                         // What it enforces may move the Fallback in its desired state.
                         report = true;
+                        names_registry = true;
                         Some(Write::Inventory(inventory, pace.inventory_durable(now)))
                     }
                     NodeMsg::Heartbeat(heartbeat) => pace.heartbeat(heartbeat, now).map(|h| Write::Heartbeat(h, now)),
@@ -527,6 +548,11 @@ async fn serve(
                 if report {
                     steer.sync(ws, hub, node).await?;
                 }
+                // An inventory names the registry the node uses.
+                if names_registry {
+                    access.known = true;
+                    access.sync(ws, hub, node).await?;
+                }
             }
         }
     }
@@ -585,6 +611,189 @@ impl Steer {
             }
         }
         Ok(())
+    }
+}
+
+/// A fraction from 0 to 1 drawn at random; one half when no randomness can be had.
+fn jitter() -> f64 {
+    let mut b = [0u8; 2];
+    match vk_peer::fill_random(&mut b) {
+        Ok(()) => f64::from(u16::from_le_bytes(b)) / f64::from(u16::MAX),
+        Err(_) => 0.5,
+    }
+}
+
+/// Until `at`, or never with `None`.
+async fn sleep_until_some(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The node's own registry access, in a session from [`REGISTRY_ACCESS`]: what this session
+/// sent it, and when to look again. Nothing is sent before the session's first inventory, which
+/// names the registry the node uses; then access or an explicit clear, so that a node holding
+/// access from before learns whether it still may. Minted again when its binding changes or it
+/// is due for renewal; a failure to mint leaves what the node holds, and is retried.
+struct Access {
+    /// Whether the session carries it at all.
+    on: bool,
+    /// Whether an inventory arrived in this session.
+    known: bool,
+    sent: Option<Sent>,
+    /// When the access sent is to be renewed.
+    renew_at: Option<Instant>,
+    /// When to look again; `None` until the session carries it and knows the registry.
+    due: Option<Instant>,
+}
+
+/// What a session last sent of a node's access.
+#[derive(Debug, PartialEq, Eq)]
+enum Sent {
+    Cleared,
+    Granted(crate::tokens::NodeBinding),
+}
+
+/// What [`Access::plan`] decides.
+#[derive(Debug, PartialEq, Eq)]
+enum Plan {
+    Nothing,
+    Mint(crate::tokens::NodeBinding),
+    Clear(&'static str),
+}
+
+impl Access {
+    fn new(version: u32) -> Self {
+        Access {
+            on: version >= REGISTRY_ACCESS,
+            known: false,
+            sent: None,
+            renew_at: None,
+            due: None,
+        }
+    }
+
+    /// What to do at `now` for `target`, the next look scheduled for nothing sent.
+    fn plan(&mut self, target: crate::tokens::NodeTarget, now: Instant) -> Plan {
+        use crate::tokens::NodeTarget;
+        self.due = Some(now + ACCESS_RECHECK);
+        match target {
+            NodeTarget::Grant(binding) => {
+                let current = self.sent.as_ref() == Some(&Sent::Granted(binding.clone()));
+                if current && self.renew_at.is_some_and(|at| now < at) {
+                    self.due = self.renew_at.map(|at| at.min(now + ACCESS_RECHECK));
+                    Plan::Nothing
+                } else {
+                    Plan::Mint(binding)
+                }
+            }
+            NodeTarget::Clear(_) if self.sent == Some(Sent::Cleared) => Plan::Nothing,
+            NodeTarget::Clear(why) => Plan::Clear(why),
+            NodeTarget::Wait(_) => {
+                self.due = Some(now + ACCESS_RETRY);
+                Plan::Nothing
+            }
+        }
+    }
+
+    /// `binding` was sent at `now`; it renews after [`RENEW_AFTER`] shifted by `jitter`, from
+    /// 0 to 1 across [`RENEW_JITTER`] either way.
+    fn minted(&mut self, binding: crate::tokens::NodeBinding, now: Instant, jitter: f64) {
+        let renew = RENEW_AFTER - RENEW_JITTER + (RENEW_JITTER * 2).mul_f64(jitter.clamp(0.0, 1.0));
+        self.sent = Some(Sent::Granted(binding));
+        self.renew_at = Some(now + renew);
+        self.due = self.renew_at.map(|at| at.min(now + ACCESS_RECHECK));
+    }
+
+    fn cleared(&mut self) {
+        self.sent = Some(Sent::Cleared);
+        self.renew_at = None;
+    }
+
+    /// Minting failed at `now`: retried soon, the node keeping what it holds meanwhile.
+    fn failed(&mut self, now: Instant) {
+        self.due = Some(now + ACCESS_RETRY);
+    }
+
+    /// Look at the node's access and send what changed.
+    async fn sync(&mut self, ws: &mut Ws, hub: &Hub, node: &Peer) -> Result<()> {
+        if !self.on || !self.known {
+            return Ok(());
+        }
+        let (db, keys) = (hub.db.clone(), hub.token_keys.clone());
+        let id = node.id.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let ctx = crate::tokens::MintCtx::read(&db, &keys)?;
+            let target = db
+                .node(&id)?
+                .map(|row| crate::tokens::node_target(&ctx, &id, &row));
+            anyhow::Ok((ctx, target))
+        })
+        .await?;
+        let now = Instant::now();
+        let (ctx, target) = match read {
+            Ok((ctx, Some(target))) => (ctx, target),
+            // Removed: its session is being revoked.
+            Ok((_, None)) => return Ok(()),
+            Err(e) => {
+                eprintln!(
+                    "vk-hub: node {}: reading its registry access: {e:#}",
+                    node.id
+                );
+                self.failed(now);
+                return Ok(());
+            }
+        };
+        match self.plan(target, now) {
+            Plan::Nothing => Ok(()),
+            Plan::Clear(why) => {
+                send(ws, &HubMsg::RegistryAccess { access: None }).await?;
+                // Audited when it takes away what this session granted, not on every connect.
+                if let Some(Sent::Granted(was)) = &self.sent {
+                    let (db, registry, id) =
+                        (hub.db.clone(), was.registry.clone(), node.id.clone());
+                    let audited = tokio::task::spawn_blocking(move || {
+                        crate::tokens::cleared_node(&db, &registry, &id, why)
+                    })
+                    .await?;
+                    if let Err(e) = audited {
+                        eprintln!(
+                            "vk-hub: node {}: auditing its registry access: {e:#}",
+                            node.id
+                        );
+                    }
+                }
+                self.cleared();
+                Ok(())
+            }
+            Plan::Mint(binding) => {
+                let (db, keys) = (hub.db.clone(), hub.token_keys.clone());
+                let (id, bound) = (node.id.clone(), binding.clone());
+                let renewal = self.sent.as_ref() == Some(&Sent::Granted(binding.clone()));
+                let minted = tokio::task::spawn_blocking(move || {
+                    crate::tokens::for_node(&db, &keys, &ctx, &id, &bound, renewal)
+                })
+                .await?;
+                match minted {
+                    Ok(access) => {
+                        send(
+                            ws,
+                            &HubMsg::RegistryAccess {
+                                access: Some(access),
+                            },
+                        )
+                        .await?;
+                        self.minted(binding, now, jitter());
+                    }
+                    Err(e) => {
+                        eprintln!("vk-hub: node {}: no registry token: {e:#}", node.id);
+                        self.failed(now);
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -840,6 +1049,52 @@ mod tests {
         assert_eq!(pace.held(t + HEARTBEAT), None);
         assert_eq!(pace.held_report(t + HEARTBEAT), Some(report(2)));
         assert_eq!(pace.held_report(t + HEARTBEAT), None);
+    }
+
+    fn binding(registry: &str) -> crate::tokens::NodeBinding {
+        crate::tokens::NodeBinding {
+            registry: registry.into(),
+            origin: "https://reg.example.com".into(),
+            ca_sha256: None,
+            grants: Vec::new(),
+            guest_grants: Vec::new(),
+        }
+    }
+
+    /// A node's access is minted once, renewed when due and not before, minted again when its
+    /// binding changes, cleared once, and left alone while it waits on its registry.
+    #[test]
+    fn a_node_s_access_is_renewed_when_due_and_sent_again_only_when_it_changes() {
+        use crate::tokens::NodeTarget;
+        let mut access = Access::new(REGISTRY_ACCESS);
+        let t = Instant::now();
+        let grant = |r: &str| NodeTarget::Grant(binding(r));
+        assert_eq!(access.plan(grant("a"), t), Plan::Mint(binding("a")));
+        access.minted(binding("a"), t, 0.0);
+        let renew = t + RENEW_AFTER - RENEW_JITTER;
+        assert_eq!(access.renew_at, Some(renew));
+        // Looked at again within the recheck, and not renewed before it is due.
+        assert_eq!(access.due, Some(t + ACCESS_RECHECK));
+        assert_eq!(access.plan(grant("a"), t + ACCESS_RECHECK), Plan::Nothing);
+        assert!(access.due.is_some_and(|d| d <= renew));
+        assert_eq!(access.plan(grant("a"), renew), Plan::Mint(binding("a")));
+        // The latest jitter renews the latest.
+        access.minted(binding("a"), t, 1.0);
+        assert_eq!(access.renew_at, Some(t + RENEW_AFTER + RENEW_JITTER));
+        // Another binding is minted at once.
+        assert_eq!(access.plan(grant("b"), t), Plan::Mint(binding("b")));
+        // Waiting keeps what the node holds, and looks again soon.
+        assert_eq!(access.plan(NodeTarget::Wait("w"), t), Plan::Nothing);
+        assert_eq!(access.due, Some(t + ACCESS_RETRY));
+        assert_eq!(access.plan(NodeTarget::Clear("c"), t), Plan::Clear("c"));
+        access.cleared();
+        assert_eq!(access.plan(NodeTarget::Clear("c"), t), Plan::Nothing);
+        assert_eq!(access.renew_at, None);
+        // A failed mint is retried soon.
+        assert_eq!(access.plan(grant("a"), t), Plan::Mint(binding("a")));
+        access.failed(t);
+        assert_eq!(access.due, Some(t + ACCESS_RETRY));
+        assert!(!Access::new(LIVE_EGRESS).on);
     }
 
     #[test]

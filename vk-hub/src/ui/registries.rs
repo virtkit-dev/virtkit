@@ -242,19 +242,30 @@ pub(super) async fn detail(
     let tab = Tab::of(query);
     let hub = ui.hub.clone();
     let wanted = id.to_string();
-    let Some((view, commands, namespaces, keys, instances, releases)) = blocking(move || {
-        let Some((view, commands)) = ops::detail(&hub, &wanted)? else {
-            return Ok(None);
-        };
-        let namespaces = hub.db.namespaces(&wanted)?;
-        let keys = hub.db.token_keys()?;
-        let instances = hub.db.gitlab_instances()?;
-        let releases = hub.db.releases()?;
-        Ok::<_, anyhow::Error>(Some((
-            view, commands, namespaces, keys, instances, releases,
-        )))
-    })
-    .await?
+    let Some((view, commands, namespaces, keys, instances, releases, nodes)) =
+        blocking(move || {
+            let Some((view, commands)) = ops::detail(&hub, &wanted)? else {
+                return Ok(None);
+            };
+            let namespaces = hub.db.namespaces(&wanted)?;
+            let keys = hub.db.token_keys()?;
+            let instances = hub.db.gitlab_instances()?;
+            let releases = hub.db.releases()?;
+            // Only rules naming one node need its hostname.
+            let nodes = if namespaces
+                .iter()
+                .flat_map(|n| &n.node_grants)
+                .any(|g| matches!(g.nodes, crate::store::Nodes::One(_)))
+            {
+                hub.db.node_names()?
+            } else {
+                Vec::new()
+            };
+            Ok::<_, anyhow::Error>(Some((
+                view, commands, namespaces, keys, instances, releases, nodes,
+            )))
+        })
+        .await?
     else {
         return Ok(message(StatusCode::NOT_FOUND, "There is no such registry."));
     };
@@ -285,7 +296,7 @@ pub(super) async fn detail(
             usage(&mut main, &view);
             commands_table(&mut main, &view, &commands, now);
         }
-        Tab::Access => access(&mut main, &view, &namespaces, instances.as_deref()),
+        Tab::Access => access(&mut main, &view, &namespaces, instances.as_deref(), &nodes),
         Tab::Settings => settings(&mut main, &view, &namespaces, &keys, now),
     }
     let here = format!("{DETAIL_PREFIX}{id}");
@@ -299,8 +310,15 @@ pub(super) async fn detail(
 
 /// The Job access tab: the registry's storage areas, those the hub keeps for CI folded away,
 /// and what keeps jobs from getting access, when something does; access rules name their GitLab
-/// instance by the hub's `instances` ([`super::access::who`]).
-fn access(h: &mut Html, v: &RegistryView, namespaces: &[NamespaceRow], instances: Instances<&str>) {
+/// instance by the hub's `instances` ([`super::access::who`]) and their nodes by `nodes`, (ID,
+/// hostname).
+fn access(
+    h: &mut Html,
+    v: &RegistryView,
+    namespaces: &[NamespaceRow],
+    instances: Instances<&str>,
+    nodes: &[(String, String)],
+) {
     if !v.row.takes_tokens() {
         h.raw("<p class=\"callout\">Jobs get no access here, because the registry does not take ")
             .raw("the hub's tokens. To turn access on, set <code>[hub] tokens = true</code> in ")
@@ -331,11 +349,11 @@ fn access(h: &mut Html, v: &RegistryView, namespaces: &[NamespaceRow], instances
     }
     let areas: Vec<_> = namespaces
         .iter()
-        .map(|ns| super::access::area(ns, instances))
+        .map(|ns| super::access::area(ns, instances, nodes))
         .collect();
     let (managed, own): (Vec<_>, Vec<_>) = areas.iter().partition(|a| a.managed);
     h.raw("<section><h2>Storage areas</h2><p class=\"sub\">Each is a part of the registry. ")
-        .raw("Jobs get access only where an access rule allows it.</p>");
+        .raw("Jobs and nodes get access only where an access rule allows it.</p>");
     if own.is_empty() {
         h.raw("<p class=\"empty\">None besides the ones kept for CI. ")
             .raw("<code>vk-hub namespaces add</code> declares one.</p>");

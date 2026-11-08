@@ -1,5 +1,6 @@
 //! Registry tokens: the keys the hub signs them with, what it sends registries to check them,
-//! and minting one for a placed job ([`for_job`]) or for an operator ([`mint`]).
+//! and minting one for a placed job ([`for_job`]), for a node's own use ([`for_node`]) or for
+//! an operator ([`mint`]).
 //!
 //! The keys live in `<data_dir>/token-keys/`, one file each, created on first need. A
 //! registry that takes tokens gets the public halves in its desired state, with its
@@ -46,6 +47,12 @@ pub struct Keys {
     /// Held across a sync, a rotation and a sweep, so that a key list computed before a
     /// rotation is never written after it.
     sync: Mutex<()>,
+    /// Held across minting a node's token and removing a node, so that no token is minted for
+    /// a node once its removal commits.
+    nodes: Mutex<()>,
+    /// Bumped when what nodes' tokens are minted from may have changed: a registry's URL, CA
+    /// or namespaces.
+    node_access: tokio::sync::watch::Sender<u64>,
 }
 
 impl Keys {
@@ -56,7 +63,20 @@ impl Keys {
             max_token,
             loaded: Mutex::new(BTreeMap::new()),
             sync: Mutex::new(()),
+            nodes: Mutex::new(()),
+            node_access: tokio::sync::watch::Sender::new(0),
         }
+    }
+
+    /// Note that what nodes' tokens are minted from may have changed, for every session to
+    /// look again.
+    pub(crate) fn node_access_changed(&self) {
+        self.node_access.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Wake on the next [`Keys::node_access_changed`].
+    pub(crate) fn subscribe_node_access(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.node_access.subscribe()
     }
 
     /// The key directory, refusing one other users may read or enter.
@@ -195,6 +215,7 @@ fn published(hub: &Hub) -> Result<Vec<TokenKey>> {
     for gone in hub.db.retire_token_keys(before, now)? {
         hub.token_keys.remove(&gone);
     }
+    hub.db.prune_revoked_subjects(now)?;
     let mut rows = hub.db.token_keys()?;
     if rows.is_empty() {
         rows.push(create(hub, "hub")?);
@@ -203,7 +224,8 @@ fn published(hub: &Hub) -> Result<Vec<TokenKey>> {
 }
 
 /// Bring registry `id`'s token state up to date: its default namespaces the first time it
-/// takes tokens, then the keys and retention windows in its desired state. Sends the change.
+/// takes tokens, then the keys, retention windows and revoked subjects in its desired state.
+/// Sends the change.
 pub fn sync_registry(hub: &Hub, id: &str) -> Result<()> {
     let _sync = hub
         .token_keys
@@ -224,9 +246,10 @@ fn sync_locked(hub: &Hub, id: &str) -> Result<()> {
     hub.db.seed_namespaces(id, now)?;
     let keys = published(hub)?;
     let retention = crate::store::prefix_retention(&hub.db.namespaces(id)?);
+    let revoked = hub.db.revoked_subjects(now)?;
     if hub
         .db
-        .sync_registry_tokens(id, &keys, &retention, now)?
+        .sync_registry_tokens(id, &keys, &retention, &revoked, now)?
         .is_some()
     {
         hub.kick(id);
@@ -462,6 +485,181 @@ fn mint_for_job(
         token: signer.sign(claims)?,
     };
     Ok((access, (Some(registry), event), jti))
+}
+
+/// How long a node's own token lives.
+pub const NODE_TOKEN_TTL: u64 = 3600;
+
+/// What a node is to hold of its own registry access, as the hub stands now
+/// ([`node_target`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeTarget {
+    /// Access bound to this: the node uses the registry, which may get its tokens, and its
+    /// namespaces grant the node something.
+    Grant(NodeBinding),
+    /// None, for the reason given: the node is to drop what it holds.
+    Clear(&'static str),
+    /// None yet, for the reason given, which passes without anything changing on the node:
+    /// what it holds stays until then.
+    Wait(&'static str),
+}
+
+/// What a node's access is minted for: the registry, where and how the node reaches it, and
+/// the grants it carries. Minted again whenever it changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeBinding {
+    pub registry: String,
+    pub origin: String,
+    /// [`vk_hub_proto::NodeRegistryAccess::ca_sha256`].
+    pub ca_sha256: Option<String>,
+    pub grants: Vec<Grant>,
+    /// What the token the node lends its own runner's guests carries; none minted when empty.
+    pub guest_grants: Vec<Grant>,
+}
+
+/// What node `id`, whose row is `row`, is to hold of its own access to the registry it uses,
+/// read from `ctx`: the registry its inventory names, bound and taking tokens, refusing a
+/// removed node's, with a signing key it applied and namespaces granting the node something.
+pub fn node_target(ctx: &MintCtx, id: &str, row: &NodeRow) -> NodeTarget {
+    let Some(url) = row.inventory.as_ref().and_then(|i| i.registry.as_ref()) else {
+        return NodeTarget::Clear("the node names no registry");
+    };
+    let Some((registry, reg, namespaces)) = ctx.registry_at(url) else {
+        return NodeTarget::Clear("the node's registry takes no tokens of this hub");
+    };
+    if !reg.revokes_subjects() {
+        return NodeTarget::Clear("the node's registry does not refuse a removed node's tokens");
+    }
+    let grants = crate::store::resolve_node(namespaces, id);
+    if grants.is_empty() {
+        return NodeTarget::Clear("no namespace grants the node anything");
+    }
+    if signing_key(&ctx.keys, reg).is_none() {
+        return NodeTarget::Wait("the registry has not applied a token-signing key yet");
+    }
+    let Some(origin) = reg.url.clone() else {
+        return NodeTarget::Clear("the node's registry has no URL bound");
+    };
+    let ca_sha256 = reg.ca_pem.as_deref().map(|pem| {
+        use sha2::Digest;
+        vk_hub_proto::to_hex(&sha2::Sha256::digest(pem.as_bytes()))
+    });
+    NodeTarget::Grant(NodeBinding {
+        registry: registry.clone(),
+        origin,
+        ca_sha256,
+        grants,
+        guest_grants: crate::store::resolve_guest(namespaces, id),
+    })
+}
+
+/// Mint node `id`'s own access as `binding` says, from `ctx`: a token whose subject is the
+/// node's ([`vk_hub_proto::token::node_subject`]), living [`NODE_TOKEN_TTL`], and beside it,
+/// when `binding` grants guests anything, the guest token, same subject and lifetime with its
+/// own jti, which removing the node revokes with the other. Refused for a
+/// node no longer enrolled, which [`remove_node`] makes certain of: none is minted once its
+/// removal commits. Each issue is logged by jti; a renewal (`renewal`) is not audited, which
+/// would add a line per node every hour.
+pub fn for_node(
+    db: &Db,
+    keys: &Keys,
+    ctx: &MintCtx,
+    id: &str,
+    binding: &NodeBinding,
+    renewal: bool,
+) -> Result<vk_hub_proto::NodeRegistryAccess> {
+    let Some((registry, reg, _)) = ctx
+        .registries
+        .iter()
+        .find(|(r, _, _)| *r == binding.registry)
+    else {
+        bail!("registry {} takes no tokens", binding.registry);
+    };
+    let Some(key) = signing_key(&ctx.keys, reg) else {
+        bail!("registry {registry} has not applied a token-signing key yet");
+    };
+    let Some(signer) = ctx.signers.get(&key.public.kid) else {
+        bail!("token-signing key {} is not loaded", key.public.kid);
+    };
+    let _nodes = keys.nodes.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(row) = db.node(id)? else {
+        return Err(crate::store::NotEnrolled(id.to_string()).into());
+    };
+    let now = crate::now_secs();
+    let claims = Claims {
+        kid: signer.public().kid.clone(),
+        aud: registry.clone(),
+        sub: vk_hub_proto::token::node_subject(id),
+        jti: vk_peer::token::new_jti()?,
+        pipeline: None,
+        iat: now,
+        exp: now.saturating_add(NODE_TOKEN_TTL),
+        grants: binding.grants.clone(),
+    };
+    let guest = (!binding.guest_grants.is_empty())
+        .then(|| -> Result<Claims> {
+            Ok(Claims {
+                jti: vk_peer::token::new_jti()?,
+                grants: binding.guest_grants.clone(),
+                ..claims.clone()
+            })
+        })
+        .transpose()?;
+    let mut event = format!(
+        "issued registry token {} for node {id}: {}",
+        claims.jti,
+        grants_text(&claims.grants)
+    );
+    if let Some(guest) = &guest {
+        event.push_str(&format!(
+            "; token {} for its runner's guests: {}",
+            guest.jti,
+            grants_text(&guest.grants)
+        ));
+    }
+    eprintln!("vk-hub: registry {registry}: {event}");
+    if !renewal {
+        db.audit_node(Some(registry), HUB, &event, now)?;
+    }
+    let (guest_token, guest_grants) = match guest {
+        Some(guest) => {
+            let grants = guest.grants.clone();
+            (Some(signer.sign(guest)?), grants)
+        }
+        None => (None, Vec::new()),
+    };
+    Ok(vk_hub_proto::NodeRegistryAccess {
+        registry_id: registry.clone(),
+        origin: binding.origin.clone(),
+        ca_sha256: binding.ca_sha256.clone(),
+        generation: row.desired.map_or(0, |d| d.generation),
+        issued_at: claims.iat,
+        expires_at: claims.exp,
+        grants: claims.grants.clone(),
+        token: signer.sign(claims)?,
+        guest_token,
+        guest_grants,
+    })
+}
+
+/// The actor of what the hub audits on its own.
+const HUB: &str = "hub";
+
+/// Audit that node `id` was told to drop the access it was granted to `registry`, for `why`.
+pub fn cleared_node(db: &Db, registry: &str, id: &str, why: &str) -> Result<()> {
+    let event = format!("withdrew node {id}'s registry access: {why}");
+    eprintln!("vk-hub: registry {registry}: {event}");
+    db.audit_node(Some(registry), HUB, &event, crate::now_secs())
+}
+
+/// Remove node `id` as `actor`, serialized with [`for_node`]; whether there was one.
+pub fn remove_node(hub: &Hub, id: &str, actor: &str) -> Result<bool> {
+    let _nodes = hub
+        .token_keys
+        .nodes
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    hub.db.remove_node(id, actor, crate::now_secs())
 }
 
 /// Grants as the audit log and the CLI print them: `prefix=rwl`, comma-separated.

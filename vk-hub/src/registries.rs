@@ -216,6 +216,8 @@ async fn serve(
                             registry.id
                         );
                     }
+                    // Whether it takes nodes' tokens may have changed.
+                    hub.token_keys.node_access_changed();
                     steer.sync(ws, hub, registry).await?;
                 }
                 if let Some(first) = report {

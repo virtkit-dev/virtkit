@@ -85,7 +85,8 @@ pub use keys::{
     MAX_NAME, PrincipalKind, Scope, envelope_text, valid_name,
 };
 pub use namespaces::{
-    CI_BUILD, CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant, PLACEHOLDERS, prefix_retention, resolve,
+    CI_BUILD, CI_CACHE, CI_PIPELINE, NamespaceRow, Nodes, NsGrant, PLACEHOLDERS, parse_grants,
+    prefix_retention, resolve, resolve_guest, resolve_node,
 };
 pub use observed::{
     Coverages, MAX_OBSERVED_CONTACTS, ObservedFilter, ObservedSubject, ObservedUse, UNREPORTED,
@@ -1064,6 +1065,8 @@ impl Db {
             .context("opening the namespaces table")?;
         txn.open_table(token_keys::TOKEN_KEYS)
             .context("opening the token keys table")?;
+        txn.open_table(token_keys::REVOKED_SUBJECTS)
+            .context("opening the revoked token subjects table")?;
         txn.open_table(egress_rules::EGRESS_RULES)
             .context("opening the egress rules table")?;
         txn.open_table(egress_rules::EGRESS_RULES_META)
@@ -1298,7 +1301,8 @@ impl Db {
     }
 
     /// Remove a node, audited as `actor`'s: its key is no longer pinned, a session it opens is
-    /// refused, and its commands go. `Ok(false)` when there was no such node.
+    /// refused, its commands go, and its registry tokens' subject is revoked in the same write.
+    /// `Ok(false)` when there was no such node.
     pub fn remove_node(&self, id: &str, actor: &str, now: u64) -> Result<bool> {
         let txn = self.db.begin_write().context("starting a write")?;
         let removed = txn.open_table(NODES)?.remove(id)?.is_some();
@@ -1313,6 +1317,7 @@ impl Db {
             txn.open_table(WORKLOADS)?.remove(id)?;
             txn.open_table(WORKLOAD_MEM)?.remove(id)?;
             settings::remove_node_in(&txn, id)?;
+            token_keys::revoke_subject_in(&txn, &vk_hub_proto::token::node_subject(id), now)?;
             let (start, end) = command_range(id);
             txn.open_table(COMMANDS)?
                 .retain_in(start.as_str()..end.as_str(), |_, _| false)?;

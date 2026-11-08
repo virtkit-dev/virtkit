@@ -501,6 +501,7 @@ fn retention_goes_only_to_a_registry_allowing_gc_and_follows_namespaces() {
         alias: None,
         isolate: Vec::new(),
         grants: vec![crate::store::NsGrant::parse("r:*").unwrap()],
+        node_grants: Vec::new(),
         created_at: 1,
         created_by: "u".into(),
     };
@@ -550,6 +551,7 @@ fn a_removed_registry_takes_its_namespaces() {
         alias: None,
         isolate: Vec::new(),
         grants: vec![crate::store::NsGrant::parse("r:*").unwrap()],
+        node_grants: Vec::new(),
         created_at: 1,
         created_by: "u".into(),
     };
@@ -625,4 +627,349 @@ fn only_relays_of_approved_servers_have_their_jobs_minted_for() {
     let bound = db.mint_snapshot().unwrap().bound;
     assert_eq!(bound.len(), 1);
     assert_eq!(bound.get(&approved).map(String::as_str), Some("gl"));
+}
+
+/// Removing a node revokes its tokens' subject in the same write, and the registries that
+/// refuse revoked subjects get it at once; one that does not is sent none. The subject goes
+/// once no token for it can be live.
+#[test]
+fn a_removed_node_s_subject_is_revoked_on_registries_that_take_it() {
+    let hub = hub_with_keys("revoked");
+    let capable = token_registry(&hub, REGISTRY_URL, "aa");
+    let older = token_registry(&hub, "https://older.example.com", "bb");
+    let inventory = RegistryInventory {
+        hostname: "reg-1".into(),
+        tokens: true,
+        revokes_subjects: true,
+        ..RegistryInventory::default()
+    };
+    hub.db
+        .record_registry(&capable, RegistryWrite::Inventory(inventory), now_secs())
+        .unwrap();
+    crate::tokens::sync_registry(&hub, &capable).unwrap();
+    let revoked = |id: &str| {
+        let row = hub.db.registry(id).unwrap().unwrap();
+        assert!(row.takes_tokens());
+        row.desired.unwrap().revoked_subjects
+    };
+    assert_eq!(revoked(&capable), Some(Vec::new()));
+    assert_eq!(revoked(&older), None);
+
+    let node = enroll_as(&hub, "n1");
+    let kept = enroll_as(&hub, "n2");
+    let remove = |id: &str| {
+        let body = serde_json::json!({"v": 1, "call": {"op": "remove-node", "id": id}});
+        crate::admin::dispatch(&serde_json::to_vec(&body).unwrap(), &hub, 0).unwrap()
+    };
+    assert_eq!(remove(&node), serde_json::json!(true));
+    let subject = vk_hub_proto::token::node_subject(&node);
+    assert_eq!(revoked(&capable), Some(vec![subject.clone()]));
+    assert_eq!(revoked(&older), None);
+    assert!(hub.db.node(&kept).unwrap().is_some());
+    // No node, nothing revoked.
+    assert_eq!(remove(&"0".repeat(32)), serde_json::json!(false));
+    assert_eq!(hub.db.revoked_subjects(now_secs()).unwrap(), [subject]);
+
+    // Past any token's life, it is pruned and the registry sent an empty list.
+    let later = now_secs() + vk_hub_proto::token::MAX_TTL_SECS + vk_hub_proto::token::SKEW_SECS + 1;
+    assert!(hub.db.revoked_subjects(later).unwrap().is_empty());
+    hub.db.prune_revoked_subjects(later).unwrap();
+    assert!(hub.db.revoked_subjects(now_secs()).unwrap().is_empty());
+    crate::tokens::sync_registry(&hub, &capable).unwrap();
+    assert_eq!(revoked(&capable), Some(Vec::new()));
+}
+
+/// Node `id` reporting `registry` as the one its `[registry]` names.
+fn uses_registry(hub: &Hub, id: &str, registry: Option<&str>) {
+    let inventory = vk_hub_proto::Inventory {
+        hostname: "n".into(),
+        registry: registry.map(String::from),
+        ..vk_hub_proto::Inventory::default()
+    };
+    hub.db
+        .record_inventory(id, inventory, true, now_secs())
+        .unwrap();
+}
+
+/// Registry `id` announcing that it refuses revoked subjects.
+fn revokes(hub: &Hub, id: &str) {
+    let inventory = RegistryInventory {
+        hostname: "reg-1".into(),
+        tokens: true,
+        revokes_subjects: true,
+        ..RegistryInventory::default()
+    };
+    hub.db
+        .record_registry(id, RegistryWrite::Inventory(inventory), now_secs())
+        .unwrap();
+    crate::tokens::sync_registry(hub, id).unwrap();
+}
+
+/// Namespace `name` at literal `path` on registry `id`, with grant lines `grants`.
+fn grant(hub: &Hub, id: &str, name: &str, path: &str, grants: &[&str]) {
+    let (grants, node_grants) = crate::store::parse_grants(grants).unwrap();
+    let ns = crate::store::NamespaceRow {
+        name: name.into(),
+        path: path.into(),
+        retention_days: None,
+        alias: None,
+        isolate: Vec::new(),
+        grants,
+        node_grants,
+        created_at: 1,
+        created_by: "u".into(),
+    };
+    crate::registries::put_namespace(hub, "u", id, &ns).unwrap();
+}
+
+fn target(hub: &Hub, node: &str) -> crate::tokens::NodeTarget {
+    let ctx = crate::tokens::MintCtx::read(&hub.db, &hub.token_keys).unwrap();
+    let row = hub.db.node(node).unwrap().unwrap();
+    crate::tokens::node_target(&ctx, node, &row)
+}
+
+/// A node's own access needs, in turn: a registry named, bound and taking tokens, refusing a
+/// removed node's, granting the node something, and a key it applied; what it is minted with.
+#[test]
+fn a_node_gets_access_where_its_registry_takes_and_grants_it() {
+    use crate::tokens::NodeTarget;
+    let hub = hub_with_keys("node-access");
+    let id = token_registry(&hub, REGISTRY_URL, "aa");
+    let node = enroll_as(&hub, "n1");
+    let clear = |hub: &Hub| matches!(target(hub, &node), NodeTarget::Clear(_));
+    assert!(clear(&hub));
+    uses_registry(&hub, &node, Some("https://elsewhere.example.com"));
+    assert!(clear(&hub));
+    uses_registry(&hub, &node, Some(REGISTRY_URL));
+    // A registry that would accept a removed node's token gets none.
+    grant(&hub, &id, "images", "images", &["r:nodes"]);
+    assert_eq!(
+        target(&hub, &node),
+        NodeTarget::Clear("the node's registry does not refuse a removed node's tokens")
+    );
+    revokes(&hub, &id);
+    apply(&hub, &id);
+    let NodeTarget::Grant(binding) = target(&hub, &node) else {
+        panic!("expected a grant, got {:?}", target(&hub, &node));
+    };
+    assert_eq!(binding.registry, id);
+    assert_eq!(binding.origin, REGISTRY_URL);
+    assert_eq!(binding.ca_sha256, None);
+    assert_eq!(crate::tokens::grants_text(&binding.grants), "images=r");
+    // Job grant lines give nodes nothing.
+    grant(&hub, &id, "images", "images", &["r:*"]);
+    assert_eq!(
+        target(&hub, &node),
+        NodeTarget::Clear("no namespace grants the node anything")
+    );
+    grant(&hub, &id, "images", "images", &[&format!("rw:node {node}")]);
+    let NodeTarget::Grant(binding) = target(&hub, &node) else {
+        panic!("expected a grant");
+    };
+    assert_eq!(crate::tokens::grants_text(&binding.grants), "images=rw");
+
+    let ctx = crate::tokens::MintCtx::read(&hub.db, &hub.token_keys).unwrap();
+    let access =
+        crate::tokens::for_node(&hub.db, &hub.token_keys, &ctx, &node, &binding, false).unwrap();
+    assert_eq!(
+        (access.registry_id.as_str(), access.origin.as_str()),
+        (id.as_str(), REGISTRY_URL)
+    );
+    assert_eq!(
+        access.expires_at - access.issued_at,
+        crate::tokens::NODE_TOKEN_TTL
+    );
+    assert_eq!(access.guest_token, None);
+    let claims = vk_hub_proto::token::parse(&access.token).unwrap().claims;
+    assert_eq!(claims.sub, vk_hub_proto::token::node_subject(&node));
+    assert_eq!(claims.aud, id);
+    assert_eq!(claims.pipeline, None);
+    assert_eq!(
+        (claims.iat, claims.exp),
+        (access.issued_at, access.expires_at)
+    );
+    assert_eq!(claims.grants, binding.grants);
+    // Audited under the registry by jti, never the token; a renewal is not.
+    let issued = |hub: &Hub| {
+        hub.db
+            .audits(Some(&id), 50)
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.event.contains(&format!("for node {node}")))
+            .inspect(|a| assert!(!a.event.contains("vkt_")))
+            .count()
+    };
+    assert_eq!(issued(&hub), 1);
+    crate::tokens::for_node(&hub.db, &hub.token_keys, &ctx, &node, &binding, true).unwrap();
+    assert_eq!(issued(&hub), 1);
+
+    // Removed, it gets none: removal and minting are serialized, the row read under the lock.
+    assert!(crate::tokens::remove_node(&hub, &node, "uid 0").unwrap());
+    let e = crate::tokens::for_node(&hub.db, &hub.token_keys, &ctx, &node, &binding, false)
+        .unwrap_err();
+    assert!(e.is::<crate::store::NotEnrolled>(), "{e:#}");
+}
+
+/// Namespaces granting guests give a node a second token for its runner's guests: its own jti,
+/// the same subject and lifetime, its node's grants narrowed to the guests'; none without.
+#[test]
+fn a_node_s_guests_get_a_narrower_token_of_their_own() {
+    use crate::tokens::NodeTarget;
+    let hub = hub_with_keys("node-guest-access");
+    let id = token_registry(&hub, REGISTRY_URL, "aa");
+    revokes(&hub, &id);
+    apply(&hub, &id);
+    let node = enroll_as(&hub, "n1");
+    uses_registry(&hub, &node, Some(REGISTRY_URL));
+    grant(&hub, &id, "images", "images", &["r:nodes"]);
+    grant(
+        &hub,
+        &id,
+        "cache",
+        "build-cache",
+        &["rwl:nodes", "rw:guests"],
+    );
+    let NodeTarget::Grant(binding) = target(&hub, &node) else {
+        panic!("expected a grant");
+    };
+    assert_eq!(
+        crate::tokens::grants_text(&binding.guest_grants),
+        "build-cache=rw"
+    );
+    let ctx = crate::tokens::MintCtx::read(&hub.db, &hub.token_keys).unwrap();
+    let access =
+        crate::tokens::for_node(&hub.db, &hub.token_keys, &ctx, &node, &binding, false).unwrap();
+    let host = vk_hub_proto::token::parse(&access.token).unwrap().claims;
+    let guest = vk_hub_proto::token::parse(access.guest_token.as_deref().unwrap())
+        .unwrap()
+        .claims;
+    assert_eq!(guest.grants, binding.guest_grants);
+    assert_eq!(access.guest_grants, binding.guest_grants);
+    assert_eq!(
+        (guest.sub.as_str(), guest.aud.as_str(), guest.exp),
+        (host.sub.as_str(), host.aud.as_str(), host.exp)
+    );
+    assert_ne!(guest.jti, host.jti);
+    let audited = hub.db.audits(Some(&id), 50).unwrap();
+    assert!(audited.iter().any(|a| a.event.contains(&guest.jti)));
+    // Without lines for guests, none.
+    grant(&hub, &id, "cache", "build-cache", &["rwl:nodes"]);
+    let NodeTarget::Grant(binding) = target(&hub, &node) else {
+        panic!("expected a grant");
+    };
+    assert!(binding.guest_grants.is_empty());
+    let access =
+        crate::tokens::for_node(&hub.db, &hub.token_keys, &ctx, &node, &binding, false).unwrap();
+    assert_eq!(access.guest_token, None);
+}
+
+/// Until its registry applies a signing key, a node's access waits rather than clears; the CA
+/// the hub names the registry with binds it.
+#[test]
+fn a_node_s_access_waits_for_an_applied_key() {
+    use crate::tokens::NodeTarget;
+    let hub = hub_with_keys("node-access-wait");
+    let id = url_registry(&hub, REGISTRY_URL, "aa");
+    revokes(&hub, &id);
+    grant(&hub, &id, "images", "images", &["r:nodes"]);
+    let node = enroll_as(&hub, "n1");
+    uses_registry(&hub, &node, Some(REGISTRY_URL));
+    assert!(matches!(target(&hub, &node), NodeTarget::Wait(_)));
+    apply(&hub, &id);
+    let NodeTarget::Grant(binding) = target(&hub, &node) else {
+        panic!("expected a grant");
+    };
+    assert_eq!(binding.ca_sha256, None);
+    let ca = String::from_utf8(super::TLS_CA.to_vec()).unwrap();
+    crate::registries::set_url(&hub, "u", &id, Some(REGISTRY_URL), Some(&ca)).unwrap();
+    let NodeTarget::Grant(bound) = target(&hub, &node) else {
+        panic!("expected a grant");
+    };
+    use sha2::Digest;
+    assert_eq!(
+        bound.ca_sha256,
+        Some(vk_hub_proto::to_hex(&sha2::Sha256::digest(ca.as_bytes())))
+    );
+}
+
+/// Over a session: a node speaking [`vk_hub_proto::REGISTRY_ACCESS`] gets its access once its
+/// inventory names the registry, and a clear once nothing grants it; an older one gets
+/// neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_delivers_and_clears_a_node_s_access() {
+    let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hub = Arc::new(hub_with_keys("node-access-session"));
+    tokio::spawn(crate::server::serve(listener, None, hub.clone()));
+    let id = token_registry(&hub, REGISTRY_URL, "aa");
+    revokes(&hub, &id);
+    apply(&hub, &id);
+    grant(&hub, &id, "images", "images", &["r:nodes"]);
+
+    let key = keypair();
+    let node = enrolled(addr, &hub, &key).await;
+    let inventory = NodeMsg::Inventory(vk_hub_proto::Inventory {
+        hostname: "n".into(),
+        registry: Some(REGISTRY_URL.into()),
+        ..vk_hub_proto::Inventory::default()
+    });
+
+    // Version 6: nothing of it, while the session carries on.
+    let v6 = VersionRange {
+        min: 1,
+        max: vk_hub_proto::LIVE_EGRESS,
+    };
+    let mut ws = dial(addr).await;
+    let twist = Twist {
+        versions: Some(v6),
+        ..Twist::default()
+    };
+    assert!(matches!(
+        open_with(&mut ws, &node, &"31".repeat(16), &key, twist).await,
+        HubMsg::Welcome { .. }
+    ));
+    send(&mut ws, &inventory).await;
+    send(&mut ws, &NodeMsg::Report(vk_hub_proto::Report::default())).await;
+    let quiet = tokio::time::timeout(Duration::from_millis(500), receive(&mut ws)).await;
+    assert!(
+        !matches!(quiet, Ok(HubMsg::RegistryAccess { .. })),
+        "{quiet:?}"
+    );
+
+    let v7 = VersionRange {
+        min: 1,
+        max: vk_hub_proto::REGISTRY_ACCESS,
+    };
+    let mut ws = dial(addr).await;
+    let twist = Twist {
+        versions: Some(v7),
+        ..Twist::default()
+    };
+    assert!(matches!(
+        open_with(&mut ws, &node, &"32".repeat(16), &key, twist).await,
+        HubMsg::Welcome { .. }
+    ));
+    send(&mut ws, &inventory).await;
+    let HubMsg::RegistryAccess {
+        access: Some(access),
+    } = receive(&mut ws).await
+    else {
+        panic!("expected access");
+    };
+    assert_eq!(access.registry_id, id);
+    let claims = vk_hub_proto::token::parse(&access.token).unwrap().claims;
+    assert_eq!(claims.sub, vk_hub_proto::token::node_subject(&node));
+
+    // No longer granted: cleared at once.
+    grant(&hub, &id, "images", "images", &["r:*"]);
+    assert_eq!(
+        receive(&mut ws).await,
+        HubMsg::RegistryAccess { access: None }
+    );
+    // Granted again: minted again.
+    grant(&hub, &id, "images", "images", &["r:nodes"]);
+    assert!(matches!(
+        receive(&mut ws).await,
+        HubMsg::RegistryAccess { access: Some(_) }
+    ));
 }

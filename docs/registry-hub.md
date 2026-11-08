@@ -149,19 +149,22 @@ token flow: `oci-client`, `docker`, `podman`, `skopeo` and `crane` follow it as 
 vk's own clients do not: the raw-HTTP requests in `vk-driver/src/registry.rs` (among them
 `push_blob_zstd`, `detect_transparent_zstd`'s `/v2/` probe, `exists_batch`), the lock client
 (`vk-registry/src/client.rs`) and the guest credential proxy (`vk-driver/src/regproxy.rs`)
-send a static Basic or bearer credential and must learn to fetch and renew a token, and a
-node signing its token request is new code on both sides.
+send a static Basic or bearer credential and must learn to fetch and renew a token. Jobs and
+nodes need none of that: the hub hands them their tokens over the session they already hold,
+and they present them as that static bearer ([4a](#4a-tokens-for-placed-jobs),
+[4d](#4d-node-tokens)).
 
 | Client | Presents to the hub | Gets |
 |---|---|---|
 | a placed job | nothing: its node gets the job's token with the job; the guest reaches the registry through the credential proxy, which injects that token, never the node's own | the job's namespaces, until the job's timeout plus a margin (see [step 4](#step-4-namespaces-and-job-tokens)) |
-| a node outside a job (`vk build` warm-up, image pulls) | its node identity, signing the request | the node's scopes, 1 hour |
+| a node outside a job (`vk build` and its tools, image pulls and relays, `vk registry pull`, jobs gitlab-runner gives it) | nothing: the hub pushes the node its token over the node's session, and renews it (see [4d](#4d-node-tokens)) | what the registry's namespaces grant nodes, none by default, 1 hour |
 | automation (task-rs outside the fleet, release scripts) | a hub API key, as Basic | the key's scopes, 15 minutes |
 | a person's CLI (`docker login`, `vk registry push`) | a hub session token (`vk hub login`, proposed in `fleet-design.md`) | the person's scopes, 15 minutes |
 
 The registry checks each token locally: signature against the pinned keys, `aud` is its own
-registry ID, `exp` with a small skew, `jti` not in the revocation list, and the requested
-action against the scopes. No request waits on the hub.
+registry ID, `exp` with a small skew, `jti` not in the revocation list, `sub` not among the
+revoked subjects (a removed node, [4d](#4d-node-tokens)), and the requested action against the
+scopes. No request waits on the hub.
 
 ### Keys presented directly
 
@@ -264,13 +267,16 @@ The hub becomes a dependency of registry *authentication*, not of registry *serv
 
 - tokens already issued work until they expire: a placed job's until its timeout plus a
   margin, at most `max_job_token_secs`, so a running job survives a partition as it does
-  today; a node's own after an hour; others after 15 minutes;
+  today; a node's own after an hour, also across a restart of the node; others after 15
+  minutes;
 - API keys presented directly keep working from the cached key table;
 - browser sessions already open keep working until they expire or the registry restarts;
 - new tokens and new sign-ins wait for the hub.
 
-A node renews its own token at half-life, so a hub outage under 30 minutes costs `vk build`
-nothing; a longer one stops builds that use tokens for the build cache until the hub is back.
+A node's token is renewed about 15 minutes before it expires, so a hub outage under 15
+minutes costs the node nothing; a longer one stops what the node does with its own token once
+that expires — image pulls, builds, the build cache — until its session is back, and the node
+then says its registry credential expired rather than trying anonymously.
 
 ## Security
 
@@ -301,7 +307,7 @@ alone. Client changes are listed below.
 | 1. Registration and monitoring | `vk-hub token create --kind registry`, then `vk-registry join` on the registry host | nothing: same URL, same mode, same keys, same UI | `vk-registry leave`, then restart `serve`; the registry runs as before. `vk-hub registries remove <id>` drops it from the hub |
 | 2. Steering | list `read-only` and `gc` in `[hub] allow`; set a gc schedule on the hub, and drop `vk-registry gc` from cron | nothing, unless the hub makes the registry read-only | drop them from `[hub] allow`, restart `serve`, and put the cron entry back; what the hub asked is no longer applied |
 | 3. Updates | list `update` in `[hub] allow` and keys in `[hub] release_keys`; run `serve` under a supervisor that restarts it, from a binary in a directory the service user can write (either of `install-service`'s units: the `--system` one lets its account write the binary's directory when it owns it); sign `vk-registry` releases (`vk release-key sign --program vk-registry`) and add them to the hub | the registry hands over to the new version, refusing no connection; under `install-service`'s units the transfers open finish first (`[hub] update_drain_minutes`), elsewhere they are cut | drop `update` from `[hub] allow` and restart `serve`. A release that fails its trial is rolled back on its own; to go back after one succeeded, reinstall the previous binary, kept as `<root>/hub/releases/<sha256>` until the next update or `leave` |
-| 4. Hub tokens | define namespaces on the hub; `[hub] tokens = true` on the registry, `gc` in its `[hub] allow` for the hub's per-prefix windows, and `[[gc.prefix]] path = "ci-pipeline", retention_days = 2`, a window below `min_retention_days` the hub cannot set; `[registry] guest_credential = "job"` on nodes | jobs reach the registry with tokens scoped to their namespaces, guests through `registry.vk` including locks and files; other clients and their credentials keep working | `tokens = false`; nodes back to `guest_credential = "node"` |
+| 4. Hub tokens | define namespaces on the hub; `[hub] tokens = true` on the registry, `gc` in its `[hub] allow` for the hub's per-prefix windows, and `[[gc.prefix]] path = "ci-pipeline", retention_days = 2`, a window below `min_retention_days` the hub cannot set; `[registry] guest_credential = "job"` on nodes; for nodes ([4d](#4d-node-tokens)): grant nodes the prefixes they use (`--grant r:nodes`), and their own runner's jobs what they need (`--grant r:guests`), then name the registry to nodes from the hub and drop their local `[registry]` and its credential | jobs reach the registry with tokens scoped to their namespaces, guests through `registry.vk` including locks and files; nodes the hub names the registry to, with tokens of their own; other clients and their credentials keep working | `tokens = false`; nodes back to `guest_credential = "node"`, and to a local `[registry]` with a credential |
 | 5. Managed mode | `vk-hub registries import`, then `mode = "managed"` | people sign in through the hub; imported `vkr_` keys keep working, and new keys come from the hub | restore `mode = "accounts"`: `accounts.db` is archived, not deleted, but holds nothing created on the hub since the import |
 | 6. Locks on the hub | to be designed | — | — |
 
@@ -446,9 +452,10 @@ reports the update rolled back.
 
 ## Step 4: namespaces and job tokens
 
-Status: 4a and 4b are implemented (see *Step 4: reference*); 4c is proposed. This step covers
-GitLab jobs, and tokens an admin mints for automation and tests. Node tokens, tokens for API keys and people's tokens come later on
-the same keys, format and checks.
+Status: 4a and 4b are implemented (see *Step 4: reference*), 4d on the hub's side; 4c is
+proposed. This step covers GitLab jobs, tokens an admin mints for automation and tests, and
+nodes' own tokens (4d). Tokens for API keys and people's tokens come later on the same keys,
+format and checks.
 
 ### Namespaces
 
@@ -589,9 +596,10 @@ though within them it can claim protection.
   - its `kid` is known and its signature verifies;
   - `aud` is the registry's own ID;
   - `exp` has not passed, allowing 60 seconds of skew;
+  - its `sub` is not a revoked subject, as a removed node's ([4d](#4d-node-tokens));
   - the request falls under a grant.
 
-  A revocation list comes later; until then a token is valid until it expires.
+  A revocation list by `jti` comes later; until then a job's token is valid until it expires.
 - **Opting in.** The registry turns tokens on with `[hub] tokens = true` and announces it in
   its inventory; the hub mints tokens only for registries that do. The registry takes a
   `vkt_` token as a bearer or as a Basic password. In `accounts` mode it is checked as a
@@ -646,7 +654,8 @@ though within them it can claim protection.
   pulls, relays and locks; this includes nodes using the registry their hub names
   ([fleet design](fleet-design.md#hub-settings)). Pulling a job's image with a read token for
   its namespace (`images` for most) is
-  the next step, as `fleet-design.md` intends.
+  the next step, as `fleet-design.md` intends. Nodes' own tokens
+  ([4d](#4d-node-tokens)) cover these outside a job, and after a job's token expired.
 
 ### 4b: registry access from inside a job
 
@@ -761,6 +770,105 @@ though within them it can claim protection.
   identity, and the resolver rules that keep a job inside its pipeline, are in
   [the disk images design](disk-images-design.md) (§3).
 
+### 4d: node tokens
+
+Status: implemented on the hub's side (see *Step 4: reference*): node and guest grants,
+revoked subjects, the hub's delivery and renewal of node and guest tokens; nodes keeping them,
+the requests `vk` makes of the registry carrying them, and the guest proxy lending the guest
+token are proposed. A node using the registry its hub names holds no credential of its own
+([fleet design](fleet-design.md#hub-settings)), so outside a placed job it reaches the
+registry as nobody: `vk build` and its tools build, `vk registry pull`, `virtkit/` bundles,
+the Docker relay, a job gitlab-runner gives it, and a pull after a job's token expired. This
+step gives each such node a token of its own, so that `[registry] token_file` and its shared
+secret can go.
+
+- **Grants.** Namespaces grant nodes as they grant jobs, with two subjects of their own:
+  `nodes`, every node, and `node <id>`, one node by the ID it enrolled under. `*` keeps
+  selecting every *job*, never a node.
+  - A node grant goes only on a namespace whose path is literal, without placeholders, and
+    that reaches no root a namespace reserves for its scopes: a node has no project, pipeline
+    or protection to fill one with.
+  - A node's grants are the union of every namespace granting it, as a job's are.
+  - None by default. Naming a registry to a node says where it is and which CA to trust, not
+    what the node may read there; the operator grants each prefix nodes use:
+
+    ```sh
+    vk-hub namespaces add REG images --path images --grant r:nodes
+    vk-hub namespaces add REG docker --path docker.io --grant r:nodes
+    vk-hub namespaces add REG warm-cache --path build-cache --grant rwl:nodes
+    ```
+
+    A relay's prefix (`docker.io`) and wherever bundles live are granted like any other.
+    Write and lock on a shared cache trust every node granted them to fill it.
+- **The token.** Same format, keys and checks as a job's: `sub` is `node:<id>`, `aud` the
+  registry, `exp` an hour after `iat`, a fresh `jti`, the node's grants, and no `pipeline`.
+  The `sub` prefix tells node from job: no new claim, which older registries would refuse.
+  With `lock` a node takes, renews and releases locks; without a pipeline it records no
+  failure memo, and does not try to.
+- **Delivery.** The hub pushes the token over the node's session, in a message of its own,
+  to a node whose protocol version takes it: the registry's ID and URL, what the token is
+  bound to, its expiry, and the token, or an explicit clear when the node is to hold none.
+  It is not a hub setting: settings are kept, reported and shown, and a token must be none
+  of those. The hub mints one when the node connects, once it knows which registry the node
+  uses and that registry has applied a signing key; renews it about 45 minutes in, with
+  jitter; and mints again when the registry the node uses, its URL or the node's grants
+  change.
+- **Removal.** Removing a node records, in the same write, its subject `node:<id>` as
+  revoked in the desired state of every registry taking tokens, and the hub sends it. A
+  registry refuses every token of a revoked subject, keeps the revocation with the rest of
+  its applied state across a restart, and drops it once no token for that subject can be
+  live: after the longest any token lives (a week) and the skew. Minting for a node and removing it are serialized, so
+  no token is minted after the removal commits. A registry cut off from the hub honors the
+  removal only once it gets it: until then a token taken before stays valid until it
+  expires, an hour at most. The hub mints node tokens only for a registry announcing it
+  honors revoked subjects.
+- **On the node.** The node keeps its token in `<state_dir>/node/registry-access.json`
+  (`0600`, written whole by rename), bound to its enrollment, the registry's ID and URL and
+  the CA it trusts there, so a restarted node, or a `vk` command run on it, uses it while
+  it is valid, the hub unreachable or not. Once it expires the node says so and refuses,
+  rather than reaching the registry anonymously. It goes on removal, a new `join`, or a
+  change of registry; a renewed token reaches commands, relays and locks already running.
+  Which credential a request carries:
+
+  | Request | Credential |
+  |---|---|
+  | anything outside a placed job | the node's own `[registry]` credential if it has one; else its token |
+  | an ordinary image pull for a placed job, the node holding no credential of its own | the job's token; the node's once the job's expired |
+  | the job's pipeline content, CI cache and build cache | the job's token only; expired, it is an error |
+  | a placed job's guest | the job's token only; none or expired, refused |
+  | a guest of a job gitlab-runner gives the node | a guest token, below |
+
+  A job token's refusal (403) is never retried with the node's token: only expiry falls back,
+  and only for ordinary image pulls.
+- **Guests of gitlab-runner jobs.** A credential proxy grants its guest everything the
+  credential it injects may do, so it never injects the node's token. The hub mints a second
+  token beside it, same `sub`, its own `jti`, whose grants are the node's narrowed to what
+  namespaces grant guests, with a third subject, `guests` (`--grant r:guests`), none by
+  default: where a guest grant's prefix and a node grant's lie one under the other, the deeper
+  prefix gets the rights both hold. It is shared runner access, not a project's: nothing a
+  guest controls fills it. The hub sends it with the node's token, renewed with it, and none
+  when namespaces grant guests nothing. The node lends it with `guest_credential =
+  "job-or-node"`, which the hub names to every node taking tokens of its own (`"job"` to older
+  ones): a placed job's guest gets the job's token only, none or expired refused; a
+  gitlab-runner job's guest gets the guest token through `registry.vk`, on the paths a job's
+  token reaches (`/v2/`, `/lock/`, `/dav/files/`), read again for each request so a renewal
+  reaches a running job, and a proxy refusing everything while the node holds none. `"job"`
+  keeps refusing a job without a token. Removing the node revokes both.
+
+  ```sh
+  vk-hub namespaces add REG warm-cache --path build-cache --grant rwl:nodes --grant rw:guests
+  ```
+- **Compatibility.** A hub sends node tokens only to nodes that take them, and mints them
+  only for registries that honor revoked subjects; an older registry keeps serving jobs' and
+  its own credentials. A node with an older hub keeps today's behavior, and uses a token it
+  still holds until it expires. No fallback to a shared secret.
+
+The steps, each its own change: node grants on namespaces; revoked subjects in registries'
+desired state; delivery and renewal on the hub; the node keeping its token; one resolver
+choosing the credential for each kind of request, with renewal reaching long-lived clients;
+build and image paths carrying it; the guest token for gitlab-runner jobs; and end-to-end
+tests in `tests/fleet-registry-e2e.sh`.
+
 ### Retention by prefix
 
 A gc window on a prefix is the registry's own setting first, so it works with or without a
@@ -846,11 +954,16 @@ namespace whose path could, at some filling, lie above, at or under it, since gr
 and would reach the scopes there. A namespace stored before keeps its place; only a new or
 changed one is refused, naming the conflict. Tokens are not revoked, so one minted before the
 change keeps its grants until it expires; `namespaces add` says so. Rights are some of `r`,
-`w`, `l`. A subject is comma-separated terms that must all hold:
+`w`, `l`. A subject selects nodes or jobs. `nodes` selects every node, `node <id>` the node
+enrolled under that ID, and `guests` the jobs nodes run for their own gitlab-runner, within
+what their node is granted ([4d](#4d-node-tokens)): these go only on a path without
+placeholders, none by default, and a hub that does not know them ignores them, never taking
+them for grants to jobs. Any other subject selects jobs, comma-separated terms that must all
+hold:
 
 | Term | Selects |
 |---|---|
-| `*` | any job |
+| `*` | any job, never a node |
 | `own project`, `own pipeline` | any job, the path naming its own through `{gitlab}` and `{project_id}` or `{pipeline_id}`, which the hub checks |
 | `gitlab <name>` | jobs from that instance |
 | `projects <glob>`, `project-id <n>` | that project, beside `gitlab <name>`: `*` stays within a path component, `**` crosses them |
@@ -900,6 +1013,25 @@ the registry by jti, job and node, never the token, which the hub stores nowhere
 registries token <id> --grant <prefix>=<rights> [--grant …] [--pipeline <gitlab>/<id>] [--ttl
 1h]` mints one for automation and tests, audited the same way.
 
+**Revoked subjects.** Removing a node (`vk-hub nodes remove`) records `node:<id>` as revoked
+in the same write, and sends the hub's revoked subjects to every registry that takes tokens
+and announces it refuses them, in its desired state; the registry keeps them with the rest of
+its applied state. The hub drops a subject a week and the skew after revoking it, the longest
+any token lives, and sends the shorter list.
+
+**Node tokens.** In a session at protocol version 7, once the node's inventory names a
+registry URL the hub binds, the hub sends the node its own access: the registry's ID and URL,
+the SHA-256 of the CA it names the registry with, and a token with `sub` `node:<id>`, the
+node's grants from that registry's namespaces, no `pipeline`, living an hour. It mints one only
+for a registry that takes tokens, announces it refuses revoked subjects and has applied a
+signing key, and when something grants the node; otherwise it sends an explicit clear, except
+while the registry has yet to apply a key, when the node keeps what it holds. It renews the
+token 40 to 50 minutes after minting it, mints again when the registry's URL or CA or the
+node's grants change, and looks again every 5 minutes. Minting reads the node's row under the
+lock its removal takes, so none is minted once the removal commits. Each issue is logged by
+jti, never the token, and audited under the registry unless it renews the same access; so is
+a clear withdrawing access the session granted.
+
 **Web UI.** `/registries` lists each registry's name, bound address, connection status, free
 storage and job access: *off* (no `[hub] tokens`), *Setup needed* (no bound address or applied
 signing key), *Updating signing keys* (a newer key exists; the applied key still signs), or
@@ -909,7 +1041,8 @@ and ID are on the registry's page.
 A registry's page has three tabs. *Overview* (`/registry/<id>`) is what it reports and what
 the hub asks of it. *Job access* (`?tab=access`) lists its storage areas, each with who may
 read and who may publish there in plain words ("Projects under wab/ [gl], protected branches and
-tags only · can coordinate builds"). The instance is omitted while it is the hub's only one;
+tags only · can coordinate builds"), rules for nodes after those for jobs ("Every node",
+"Node build-01"). The instance is omitted while it is the hub's only one;
 rules bound to none show `[every server]` while it has several. The two areas kept for CI, `ci-cache`
 and `ci-pipeline`, are folded under *Managed by CI*. It says when cleanup after inactivity
 does not apply, because the registry's `[hub] allow` lacks `gc` or the registry refused a

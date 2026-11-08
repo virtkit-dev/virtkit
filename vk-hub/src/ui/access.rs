@@ -5,7 +5,7 @@
 use vk_hub_proto::token::Grant;
 
 use crate::egress::blocked::{Instances, instance_tag};
-use crate::store::{CI_BUILD, CI_CACHE, CI_PIPELINE, NamespaceRow, NsGrant, PLACEHOLDERS};
+use crate::store::{CI_BUILD, CI_CACHE, CI_PIPELINE, NamespaceRow, Nodes, NsGrant, PLACEHOLDERS};
 use crate::subject::{Projects, Subject};
 
 /// Rights in plain words: `Read, Publish, Coordinate builds`, or `No access`.
@@ -56,6 +56,20 @@ pub(super) fn who(s: &Subject, instances: Instances<&str>) -> String {
     text
 }
 
+/// The nodes a node grant selects, in plain words, a node named by its hostname from `names`
+/// (ID, hostname): `Every node`, `Node build-01`, the start of an ID no node holds, or the
+/// guests of jobs from nodes' own runners.
+pub(super) fn which_nodes(n: &Nodes, names: &[(String, String)]) -> String {
+    match n {
+        Nodes::All => "Every node".to_string(),
+        Nodes::One(id) => match names.iter().find(|(i, _)| i == id) {
+            Some((_, hostname)) => format!("Node {hostname}"),
+            None => format!("Node {}…, not enrolled", id.get(..8).unwrap_or(id)),
+        },
+        Nodes::Guests => "Jobs from nodes' own runners, within their node's access".to_string(),
+    }
+}
+
 /// A storage area as a page lists it.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Area {
@@ -86,25 +100,42 @@ pub(super) fn label(name: &str) -> String {
 }
 
 /// Namespace `ns` as a storage area, its rules' instance named by the hub's `instances`
-/// ([`who`]).
-pub(super) fn area(ns: &NamespaceRow, instances: Instances<&str>) -> Area {
+/// ([`who`]) and their nodes by `nodes`, (ID, hostname) ([`which_nodes`]); rules for jobs come
+/// first.
+pub(super) fn area(
+    ns: &NamespaceRow,
+    instances: Instances<&str>,
+    nodes: &[(String, String)],
+) -> Area {
     let line = |g: &NsGrant| who(&g.subject, instances);
+    let rules = ns
+        .grants
+        .iter()
+        .map(|g| (line(g), g.read, g.write, g.lock))
+        .chain(
+            ns.node_grants
+                .iter()
+                .map(|g| (which_nodes(&g.nodes, nodes), g.read, g.write, g.lock)),
+        );
+    let (mut readers, mut publishers) = (Vec::new(), Vec::new());
+    for (who, read, write, lock) in rules {
+        if read {
+            readers.push(who.clone());
+        }
+        match (write, lock) {
+            (true, true) => publishers.push(format!("{who} · can coordinate builds")),
+            (true, false) => publishers.push(who),
+            (false, true) => publishers.push(format!("{who} · coordinate builds only")),
+            (false, false) => {}
+        }
+    }
     Area {
         name: ns.name.clone(),
         label: label(&ns.name),
         path: ns.path.clone(),
         isolated: ns.isolate.clone(),
-        readers: ns.grants.iter().filter(|g| g.read).map(line).collect(),
-        publishers: ns
-            .grants
-            .iter()
-            .filter(|g| g.write || g.lock)
-            .map(|g| match (g.write, g.lock) {
-                (true, true) => format!("{} · can coordinate builds", line(g)),
-                (true, false) => line(g),
-                _ => format!("{} · coordinate builds only", line(g)),
-            })
-            .collect(),
+        readers,
+        publishers,
         managed: [CI_CACHE, CI_PIPELINE, CI_BUILD].contains(&ns.name.as_str()),
     }
 }
@@ -241,13 +272,15 @@ mod tests {
     }
 
     fn ns(name: &str, path: &str, grants: &[&str]) -> NamespaceRow {
+        let (grants, node_grants) = crate::store::parse_grants(grants).unwrap();
         NamespaceRow {
             name: name.into(),
             path: path.into(),
             retention_days: None,
             alias: None,
             isolate: Vec::new(),
-            grants: grants.iter().map(|g| NsGrant::parse(g).unwrap()).collect(),
+            grants,
+            node_grants,
             created_at: 0,
             created_by: "uid 0".into(),
         }
@@ -264,7 +297,7 @@ mod tests {
                 "l:gitlab gl, project-id 7",
             ],
         );
-        let a = area(&wab, Instances::Several);
+        let a = area(&wab, Instances::Several, &[]);
         assert_eq!(a.label, "wab");
         assert!(!a.managed);
         assert_eq!(
@@ -283,7 +316,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            area(&wab, Instances::Sole("gl")).readers[1],
+            area(&wab, Instances::Sole("gl"), &[]).readers[1],
             "Projects under wab/"
         );
         let cache = area(
@@ -293,9 +326,45 @@ mod tests {
                 &["rw:own project"],
             ),
             Instances::Several,
+            &[],
         );
         assert_eq!(cache.label, "CI caches");
         assert!(cache.managed);
+    }
+
+    /// Rules for nodes follow those for jobs, a node named by its hostname while enrolled.
+    #[test]
+    fn node_rules_read_as_the_nodes_they_select() {
+        let (one, gone) = ("1".repeat(32), "2".repeat(32));
+        let images = ns(
+            "images",
+            "images",
+            &[
+                &format!("rwl:node {one}"),
+                "r:nodes",
+                "r:gitlab gl, projects wab/**",
+                &format!("l:node {gone}"),
+                "r:guests",
+            ],
+        );
+        let names = [(one.clone(), "build-01".to_string())];
+        let a = area(&images, Instances::Sole("gl"), &names);
+        assert_eq!(
+            a.readers,
+            [
+                "Projects under wab/",
+                "Node build-01",
+                "Every node",
+                "Jobs from nodes' own runners, within their node's access"
+            ]
+        );
+        assert_eq!(
+            a.publishers,
+            [
+                "Node build-01 · can coordinate builds",
+                "Node 22222222…, not enrolled · coordinate builds only"
+            ]
+        );
     }
 
     #[test]

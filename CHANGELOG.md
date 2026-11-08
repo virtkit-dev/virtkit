@@ -4,6 +4,19 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Registry storage areas can grant fleet nodes access.** `vk-hub namespaces add --grant`
+  takes `nodes`, every node, or `node <id>`, one node, beside the job rules, on areas whose
+  path has no placeholders; `*` still means every job only. Nodes get no access unless granted.
+  The registry's access tab lists these rules by node.
+- **Removing a fleet node revokes its registry access.** Registries managed by the hub refuse
+  the removed node's tokens as soon as they hear of the removal, also after they restart.
+- **vk-hub issues fleet nodes their own registry access.** A node granted access to the
+  hub-managed registry it uses gets a token for it when it connects, renewed before it expires
+  and replaced when the registry or the node's grants change; one no longer granted anything
+  is told to drop it.
+
 ## [0.107.1] - 2026-11-08
 
 ### Fixed

@@ -806,11 +806,8 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             isolate,
             grants,
         } => {
-            let grants = grants
-                .iter()
-                .map(|g| crate::store::NsGrant::parse(g))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| anyhow!(e))?;
+            let (grants, node_grants) =
+                crate::store::parse_grants(&grants).map_err(|e| anyhow!(e))?;
             let keep_isolate = isolate.is_none();
             let ns = crate::store::NamespaceRow {
                 name,
@@ -819,6 +816,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
                 alias,
                 isolate: isolate.unwrap_or_default(),
                 grants,
+                node_grants,
                 created_at: crate::now_secs(),
                 created_by: actor.clone(),
             };
@@ -1150,10 +1148,17 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             serde_json::to_value(detail)?
         }
         Call::RemoveNode { id } => {
-            let removed = hub.db.remove_node(&id, &actor, crate::now_secs())?;
+            let removed = crate::tokens::remove_node(hub, &id, &actor)?;
             if removed {
                 hub.revoke(&id);
                 hub.touch();
+                // The revocation is recorded; the hourly sync sends it if this fails.
+                if let Err(e) = crate::tokens::sync_all(hub) {
+                    eprintln!(
+                        "vk-hub: sending node {}'s revocation to registries: {e:#}",
+                        vk_hub_proto::display_safe(&id)
+                    );
+                }
             }
             eprintln!(
                 "vk-hub: admin: uid {uid} removed node {} ({})",

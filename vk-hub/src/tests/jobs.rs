@@ -5875,6 +5875,7 @@ async fn a_relay_s_approved_job_gets_a_token_for_its_node_s_registry() {
         alias: Some("task-cache".into()),
         isolate: Vec::new(),
         grants: vec![crate::store::NsGrant::parse("rwl:own project").unwrap()],
+        node_grants: Vec::new(),
         created_at: 0,
         created_by: "t".into(),
     };
