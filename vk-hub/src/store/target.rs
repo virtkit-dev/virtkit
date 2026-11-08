@@ -28,7 +28,8 @@ fn target_in(txn: &redb::WriteTransaction) -> Result<Option<TargetRow>> {
         .transpose()
 }
 
-/// Whether `id` has a command still to finish that updates it, whatever the release.
+/// Whether `id` has a command still to finish that updates it, whatever the release, or that
+/// builds its CI tools, which an update cannot run beside.
 fn updating(
     commands: &impl ReadableTable<&'static str, &'static [u8]>,
     id: &str,
@@ -37,7 +38,12 @@ fn updating(
     let (start, end) = command_range(id);
     for entry in commands.range(start.as_str()..end.as_str())? {
         let c = decode::<CommandRow>(entry?.1.value())?;
-        if c.live(now) && matches!(c.command.op, Operation::Update { .. }) {
+        if c.live(now)
+            && matches!(
+                c.command.op,
+                Operation::Update { .. } | Operation::Tools { .. }
+            )
+        {
             return Ok(true);
         }
     }

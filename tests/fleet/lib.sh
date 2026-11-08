@@ -18,7 +18,9 @@
 # picks which one hub_start and hub run); VK_NEXT, a vk mounted in the primary as
 # /usr/local/share/vk-next, for the hub to hold as a release; IMAGE, the node services' base
 # image (tests/fleet/node/Dockerfile otherwise); HUB_TOML, lines appended to the hub's
-# hub.toml; E2E_REQUIRE_KVM=1 fails, rather than skips, on a host without KVM or nesting.
+# hub.toml; FLEET_TOOLS=1 leaves the hub's `tools` setting at its default, which has every
+# node build the hub's built-in CI tools, rather than `none`; E2E_REQUIRE_KVM=1 fails, rather
+# than skips, on a host without KVM or nesting.
 # Needs: KVM with nesting, openssl, and a registry to pull alpine.
 
 FLEET_LIB=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -148,6 +150,9 @@ EOF
     --detach --inactivity-timeout 0 >"$FLEET/run.log" 2>&1) ||
     { cat "$FLEET/run.log"; fail "the fleet did not boot"; }
   hub_start
+  # The hub builds its own CI tools on every node it can reach: a build of minutes, which needs
+  # network and holds back an update or a settings reload. Off unless a test asks for it.
+  [ "${FLEET_TOOLS:-}" = 1 ] || hub settings set tools none >/dev/null 2>&1 || true
   fleet_publish hub 8443 HUB_PORT
   [ "${HUB_UI:-}" != 1 ] || fleet_publish ui 8444 UI_PORT
 }

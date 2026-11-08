@@ -8,9 +8,12 @@ use vk_hub_proto::settings::Kind;
 
 use crate::server::Hub;
 
-/// Parse operator input `text` for `key`: a registry ID or a value of the key's kind.
-/// The store rechecks it and verifies the registry exists.
+/// Parse operator input `text` for `key`: a registry ID, the tools to keep nodes on, or a value
+/// of the key's kind. The store rechecks it and verifies the registry or the tools exist.
 pub fn parse(key: &str, text: &str) -> Result<Value> {
+    if key == crate::deploy::KEY {
+        return Ok(Value::from(text.trim()));
+    }
     let kind = vk_hub_proto::settings::kind(key)
         .ok_or_else(|| anyhow!("{key} is not a setting the hub may set"))?;
     match kind {

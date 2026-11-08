@@ -337,11 +337,13 @@ enum Call {
     RemoveTools {
         tools: String,
     },
-    /// Have a node build a tools definition, named by its sha256 or a prefix of it; `None`
-    /// for every node that can and needs to.
+    /// Have a node build a tools definition, named by its sha256 or a prefix of it, or
+    /// `builtin`; `None` for every node that can and needs to. No definition: the one the
+    /// hub's `tools` setting keeps each node on.
     NodeTools {
         id: Option<String>,
-        tools: String,
+        #[serde(default)]
+        tools: Option<String>,
     },
     CreateRollout {
         plan: ops::RolloutPlan,
@@ -1026,13 +1028,13 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             id: Some(id),
             tools,
         } => serde_json::to_value(vec![ops::ToolsIssued {
-            command: Some(ops::tools(hub, &actor, &id, &tools)?.id),
+            command: Some(ops::tools(hub, &actor, &id, tools.as_deref())?.id),
             hostname: hub.db.node(&id)?.map(|n| n.hostname).unwrap_or_default(),
             skipped: None,
             id,
         }])?,
         Call::NodeTools { id: None, tools } => {
-            serde_json::to_value(ops::tools_all(hub, &actor, &tools)?)?
+            serde_json::to_value(ops::tools_all(hub, &actor, tools.as_deref())?)?
         }
         Call::CreateRollout { plan } => {
             serde_json::to_value(ops::create_rollout(hub, &actor, &plan)?)?
@@ -1691,11 +1693,16 @@ impl Client {
         })
     }
 
-    /// Have node `id`, or with `None` every node that can and needs to, build `tools`.
-    pub fn node_tools(&self, id: Option<&str>, tools: &str) -> Result<Vec<ops::ToolsIssued>> {
+    /// Have node `id`, or with `None` every node that can and needs to, build `tools`, or
+    /// with `None` those the hub's `tools` setting keeps each on.
+    pub fn node_tools(
+        &self,
+        id: Option<&str>,
+        tools: Option<&str>,
+    ) -> Result<Vec<ops::ToolsIssued>> {
         self.call(Call::NodeTools {
             id: id.map(str::to_string),
-            tools: tools.to_string(),
+            tools: tools.map(str::to_string),
         })
     }
 

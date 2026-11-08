@@ -358,7 +358,8 @@ true` — and refused if it would be. `registry` takes the ID of a registry the 
 `vk-hub registries` lists it, once it has a URL bound (`vk-hub registries set-url <id> <url>
 [--ca <file>]`, the CA given to nodes that do not trust its certificate otherwise). Each change
 is audited, and moves the generation of every node it changes, sent to the nodes that announce
-`hub_settings` only; a node's layer goes when it is removed.
+`hub_settings` only; a node's layer goes when it is removed. `tools` is the hub's own, never sent:
+the [CI tools](#ci-tools) it keeps the node on.
 
 `vk-hub nodes` shows what the hub asked beside what the node reports. STATE is the node's own,
 with how many commands are pending. ACQUIRE and CEILING are the hub's, with the node's in
@@ -841,15 +842,38 @@ hub's TLS key and database. Adding the same tree with the same label returns the
 definition and restores its tar if missing; a different label is refused. The tar is published by
 rename before its row is written, and the add and its sha256 are audited.
 
-`vk-hub nodes tools <id> --tools <sha256>` asks a node to build a definition and make the tools
-current; a prefix of at least 8 hex digits names a definition. `--all` asks every node but those
-whose latest session ran below protocol version 4, those whose inventory reports these tools
-current, and those building them already, and says which it skipped and why. The request is a
+The hub keeps every node on the tools its `tools` setting names, fleet-wide or for the node:
+`builtin`, the default, for the definition built into the running hub, which moves with the hub's
+version; `none` to leave the node's tools to the operator; or a definition the hub holds, by its
+sha256 or a prefix of at least 8 hex digits, kept as the full sha256. A definition a setting
+names, in any layer, cannot be removed, nor can the built-in one. The hub asks every node for
+those tools that is connected, speaks protocol version 4, has reported its inventory, is not
+quarantined, reports other tools current, and has no tools build, update or reset still to
+finish — all at once, as an ordinary tools command issued by `auto-deploy`, since a build drains
+nothing; a target release's automatic update waits for a node's build to end. A build that ends
+well is followed until the node's inventory reports the tools, which counts as failed five
+minutes on. A failed, refused or untaken build is audited and noted against the node, and asked
+for again after 5 minutes, then 30 minutes, 2 hours and 6 hours, each give or take a fifth so
+that nodes that failed together do not retry together: five attempts in all, a retry that falls
+due waiting, as a first build does, for the node to be reachable and free. After the fifth, it is
+not asked for again until an operator asks for those tools on the node, which counts the
+attempts afresh, as does the setting naming others. With the hub's built-in definition, a node
+therefore gets git with no step from anyone.
+
+`vk-hub nodes tools <id>` asks a node for the tools its setting names now, also after a failed
+build; `--tools` names a definition by sha256, a prefix of at least 8 hex digits or `builtin`, and
+is refused for other tools than the setting's unless it is `none`, and for tools the node is
+building already. A build of the setting's tools is followed as an automatic one. `--all` asks
+every node but those whose latest session ran below protocol version 4, those the setting keeps
+on other tools or leaves alone, those whose inventory reports these tools current, and those
+building them already, and says which it skipped and why. The request is a
 command, valid for a day and audited like any other. It needs protocol version 4: the hub
 refuses it for a node whose latest session ran below that, and sends none in such a session; a
 node that has not connected yet is asked on trust, and the command waits for a session that can
 carry it. Nothing drains and the node's state does not move. Builds are issued node by node, not
-by rollout: a failed build leaves the node on the tools it had.
+by rollout: a failed build leaves the node on the tools it had. `vk-hub nodes` notes a node
+without its setting's tools — building, installed and not yet reported, which attempt failed and
+why and when the next is due or that none is, or not asked yet and why.
 
 The definition is downloaded from the node listener at `GET /v1/tools/<sha256>`, with the node's
 ID, the time and its signature in the headers a release download carries, over the label `vk-fleet
@@ -930,7 +954,7 @@ times less with them. A cache keyed on file metadata would save it, but adds a r
 in step and trusts what can change without the metadata changing; the inventory's check, every
 minute, costs the same. It finds a change at rest, not one made between the check and
 the VM opening the directory, and the manifest is the node user's to rewrite as much as the
-tools. Tools installed by a
+tools: the hub's comparison across nodes is the check a node cannot rewrite. Tools installed by a
 `vk` that recorded no checksums are given unchecked. A `tools_dir` the operator names elsewhere is
 given as it is.
 
@@ -942,9 +966,17 @@ recorded, what the build contacted and was refused (up to 64 hosts of each), and
 are still as recorded — `intact`, `modified` with the entries that are not, or `unrecorded` — as
 checked each time the inventory is gathered, every minute. These are optional fields of protocol
 version 4: a hub that does not know them ignores them, and a hub reads a node that sends none as
-one that checks nothing. `vk-hub nodes` notes the build and the tools under its table, a node's
-page shows them under Versions and Steering, `/updates` lists the definitions held, and the
-audit log has each phase as the node reports it.
+one that checks nothing.
+
+The hub keeps them with the node's inventory and compares the files of every node reporting the
+same definition: a reproducible build gives each the same. It notes under `vk-hub nodes`, and
+audits as the node reports them, tools that changed since the node installed them — its jobs are
+not given them — and tools whose files differ from those other nodes built from the same
+definition, naming the nodes and entries; which side is right is not told. The hub's `tools`
+setting has a node whose tools changed, or were installed with nothing recorded, build them anew,
+as it would a node lacking them. `vk-hub nodes` notes all of it under its table, a node's page
+shows the tools and the build under Versions and Steering, `/updates` lists the definitions held,
+and the audit log has each phase as the node reports it.
 
 Whoever registers a definition can put any binary into every job VM of the nodes that build it: a
 job's PATH gets each tool its image lacks, and in the jobs of a gitlab-runner the node manages, the

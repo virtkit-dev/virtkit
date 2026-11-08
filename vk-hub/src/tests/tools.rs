@@ -97,7 +97,7 @@ async fn a_definition_is_served_only_to_a_node_building_it_that_signs_for_it() {
         403
     );
 
-    let command = ops::tools(&hub, "uid 0", &node_id, &sha[..8]).unwrap();
+    let command = ops::tools(&hub, "uid 0", &node_id, Some(&sha[..8])).unwrap();
     assert_eq!(
         command.op,
         Operation::Tools {
@@ -162,7 +162,7 @@ async fn a_tools_build_goes_only_to_a_node_speaking_version_4() {
     let key = keypair();
     let node_id = enrolled(addr, &hub, &key).await;
     // Issued on trust before the node's first session.
-    let command = ops::tools(&hub, "uid 0", &node_id, &sha).unwrap();
+    let command = ops::tools(&hub, "uid 0", &node_id, Some(&sha)).unwrap();
 
     let mut ws = dial(addr).await;
     let twist = Twist {
@@ -179,7 +179,7 @@ async fn a_tools_build_goes_only_to_a_node_speaking_version_4() {
             .await
             .is_err()
     );
-    let err = ops::tools(&hub, "uid 0", &node_id, &sha).unwrap_err();
+    let err = ops::tools(&hub, "uid 0", &node_id, Some(&sha)).unwrap_err();
     assert!(format!("{err:#}").contains("update its vk"), "{err:#}");
     ws.close(None).await.unwrap();
 
@@ -302,9 +302,9 @@ async fn a_tools_build_for_every_node_skips_those_that_cannot_or_need_not() {
     hub.db
         .record_inventory(&current, inventory, true, now_secs())
         .unwrap();
-    ops::tools(&hub, "uid 0", &building, &sha).unwrap();
+    ops::tools(&hub, "uid 0", &building, Some(&sha)).unwrap();
 
-    let issued = ops::tools_all(&hub, "uid 0", &sha[..8]).unwrap();
+    let issued = ops::tools_all(&hub, "uid 0", Some(&sha[..8])).unwrap();
     let got: Vec<(&str, Option<&str>)> = issued
         .iter()
         .map(|n| (n.hostname.as_str(), n.skipped.as_deref()))
@@ -406,4 +406,483 @@ fn tools_arguments_parse() {
     assert!(parse(&["nodes", "tools", "--all", "--tools", "12345678"]).is_ok());
     assert!(parse(&["nodes", "tools", "--tools", "12345678"]).is_err());
     assert!(parse(&["nodes", "tools", "abcdabcd", "--all", "--tools", "12345678"]).is_err());
+}
+
+/// The hub keeps every node it can reach on the tools its `tools` setting names: each one that
+/// lacks them is asked at once, a failed build is retried after a while, and an operator's
+/// build of other tools is refused unless the setting leaves the node alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn nodes_are_kept_on_the_tools_the_setting_names() {
+    let (dir, _, hub) = start_releases("tools-deploy", None).await;
+    let a = crate::tools::add(&hub, "uid 0", &context(&dir, "a", "a"), "2026.10")
+        .unwrap()
+        .sha256;
+    let b = crate::tools::add(&hub, "uid 0", &context(&dir, "b", "b"), "2026.11")
+        .unwrap()
+        .sha256;
+    let [old, alone, current, ready] =
+        ["a-old", "b-alone", "c-current", "d-ready"].map(|name| enroll_as(&hub, name));
+    let inventory = |id: &str, host: &str, tools: Option<&str>| {
+        let mut inventory = Inventory {
+            hostname: host.into(),
+            hub_settings: true,
+            ..Inventory::default()
+        };
+        inventory.versions.tools = tools.map(|sha| vk_hub_proto::ToolsInstalled {
+            sha256: sha.into(),
+            version: "x".into(),
+            tools: Default::default(),
+            in_use: true,
+            files: Default::default(),
+            egress: None,
+            check: None,
+        });
+        hub.db
+            .record_inventory(id, inventory, true, now_secs())
+            .unwrap();
+    };
+    for (id, host, version) in [
+        (&old, "a-old", vk_hub_proto::JOBS),
+        (&alone, "b-alone", TOOLS),
+        (&current, "c-current", TOOLS),
+        (&ready, "d-ready", TOOLS),
+    ] {
+        hub.db
+            .record_session(id, "inc", version, now_secs(), || true)
+            .unwrap();
+        inventory(id, host, (id == &current).then_some(a.as_str()));
+    }
+    let set = |node: Option<&str>, value: &str| {
+        crate::settings::set(
+            &hub,
+            "uid 0",
+            node,
+            "tools",
+            Some(crate::settings::parse("tools", value).unwrap()),
+        )
+    };
+    assert!(format!("{:#}", set(None, "zz").unwrap_err()).contains("builtin"));
+    assert!(format!("{:#}", set(None, "ffffffff").unwrap_err()).contains("no tools"));
+    set(None, &a[..8]).unwrap();
+    set(Some(&alone), "none").unwrap();
+    let layers = hub.db.settings_layers().unwrap();
+    assert_eq!(layers.fleet["tools"], serde_json::json!(a), "kept whole");
+    // The hub's own: never sent to a node.
+    let sent = hub.db.node(&ready).unwrap().unwrap().desired;
+    assert!(sent.is_none_or(|d| !d.settings.contains_key("tools")));
+
+    let builtin = crate::tools::builtin().packed.sha256.clone();
+    let advance_at = |now: u64| hub.db.advance_tools(now, &builtin, &|_| true).unwrap();
+    let advance = || advance_at(now_secs());
+    assert_eq!(advance(), (true, vec![ready.clone()]));
+    assert_eq!(advance(), (false, Vec::new()), "asked once");
+    let command = |id: &str| {
+        hub.db
+            .pending_commands(id, now_secs())
+            .unwrap()
+            .into_iter()
+            .find(|c| matches!(&c.op, Operation::Tools { sha256, .. } if *sha256 == a))
+            .unwrap()
+            .id
+    };
+    let first = command(&ready);
+    let note = |id: &str| {
+        ops::node_views(&hub)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.id == id)
+            .unwrap()
+            .tools_deploy
+    };
+    assert!(
+        note(&ready)
+            .unwrap()
+            .contains("building the CI tools 2026.10")
+    );
+    assert_eq!(note(&current), None);
+    assert_eq!(note(&alone), None);
+    assert!(note(&old).unwrap().contains("protocol version 3"));
+    let ack = |id: &str, command: &str, outcome| {
+        hub.db
+            .record_ack(
+                id,
+                &CommandAck {
+                    id: command.to_string(),
+                    outcome,
+                },
+                now_secs(),
+            )
+            .unwrap();
+    };
+    ack(
+        &ready,
+        &first,
+        Outcome::Failed {
+            message: "vk build failed".into(),
+        },
+    );
+    assert_eq!(advance(), (true, Vec::new()));
+    assert_eq!(advance(), (false, Vec::new()), "not tried again at once");
+    let shown = note(&ready).unwrap();
+    assert!(
+        shown.contains("attempt 1 of 5 to build the CI tools 2026.10")
+            && shown.contains("failed: vk build failed; the next is due after"),
+        "{shown}"
+    );
+    // A while later it is: its second attempt.
+    assert_eq!(
+        advance_at(now_secs() + crate::deploy::RETRY_DELAYS_SECS[0] * 6 / 5 + 1),
+        (true, vec![ready.clone()])
+    );
+    let second = command(&ready);
+    assert_ne!(second, first);
+    assert!(note(&ready).unwrap().contains("attempt 2 of 5"));
+    ack(
+        &ready,
+        &second,
+        Outcome::Refused {
+            reason: "busy".into(),
+        },
+    );
+    assert_eq!(advance(), (true, Vec::new()));
+    assert!(note(&ready).unwrap().contains("attempt 2 of 5"));
+
+    // Other tools than the setting's are refused; the node left alone takes any.
+    let err = ops::tools(&hub, "uid 0", &ready, Some(&b)).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("`tools` setting keeps it"),
+        "{err:#}"
+    );
+    ops::tools(&hub, "uid 0", &alone, Some(&b)).unwrap();
+    // Asked for again, by default the setting's: the failure is forgotten.
+    let again = ops::tools(&hub, "uid 0", &ready, None).unwrap();
+    assert!(matches!(&again.op, Operation::Tools { sha256, .. } if *sha256 == a));
+    let shown = note(&ready).unwrap();
+    assert!(
+        shown.contains("building the CI tools 2026.10") && !shown.contains("attempt"),
+        "counted afresh: {shown}"
+    );
+    assert_eq!(advance(), (false, Vec::new()), "its build is under way");
+    ack(&ready, &again.id, Outcome::Done);
+    // Followed as the hub's own, until the node reports the tools: never asked for twice.
+    assert_eq!(advance(), (true, Vec::new()));
+    assert_eq!(advance(), (false, Vec::new()));
+    inventory(&ready, "d-ready", Some(&a));
+    assert_eq!(advance(), (true, Vec::new()));
+    assert_eq!(note(&ready), None);
+
+    // A definition a setting names is kept.
+    let err = crate::tools::remove(&hub, "uid 0", &a).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("names it fleet-wide"),
+        "{err:#}"
+    );
+    // Naming others moves the nodes on; one whose automatic build ends is followed until it
+    // reports the tools.
+    set(None, &b).unwrap();
+    let (_, mut issued) = advance();
+    issued.sort();
+    let mut want = vec![current.clone(), ready.clone()];
+    want.sort();
+    assert_eq!(issued, want);
+    let built = hub
+        .db
+        .pending_commands(&current, now_secs())
+        .unwrap()
+        .into_iter()
+        .find(|c| matches!(&c.op, Operation::Tools { .. }))
+        .unwrap()
+        .id;
+    ack(&current, &built, Outcome::Done);
+    assert_eq!(advance(), (true, Vec::new()));
+    assert!(
+        note(&current)
+            .unwrap()
+            .contains("installed the CI tools 2026.11")
+    );
+    inventory(&current, "c-current", Some(&b));
+    assert_eq!(advance(), (true, Vec::new()));
+    assert!(!hub.db.tools_deploys().unwrap().contains_key(&current));
+    let events: Vec<String> = hub
+        .db
+        .audits(Some(&ready), 50)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.event)
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.starts_with("auto-deploy issued tools 2026.10")),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e.contains("failed: vk build failed")),
+        "{events:?}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An automatic build that keeps failing is retried, later each time, until its attempts are
+/// spent; then it waits for an operator, whose build starts the count afresh.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_build_is_retried_until_its_attempts_are_spent() {
+    let (dir, _, hub) = start_releases("tools-retry", None).await;
+    let a = crate::tools::add(&hub, "uid 0", &context(&dir, "a", "a"), "2026.10")
+        .unwrap()
+        .sha256;
+    let node = enroll_as(&hub, "n");
+    hub.db
+        .record_session(&node, "inc", TOOLS, now_secs(), || true)
+        .unwrap();
+    hub.db
+        .record_inventory(
+            &node,
+            Inventory {
+                hostname: "n".into(),
+                hub_settings: true,
+                ..Inventory::default()
+            },
+            true,
+            now_secs(),
+        )
+        .unwrap();
+    crate::settings::set(
+        &hub,
+        "uid 0",
+        None,
+        "tools",
+        Some(crate::settings::parse("tools", &a).unwrap()),
+    )
+    .unwrap();
+    let builtin = crate::tools::builtin().packed.sha256.clone();
+    let advance = |now: u64| hub.db.advance_tools(now, &builtin, &|_| true).unwrap();
+    let fail = |now: u64| {
+        let command = hub
+            .db
+            .pending_commands(&node, now)
+            .unwrap()
+            .into_iter()
+            .find(|c| matches!(&c.op, Operation::Tools { .. }))
+            .unwrap()
+            .id;
+        hub.db
+            .record_ack(
+                &node,
+                &CommandAck {
+                    id: command,
+                    outcome: Outcome::Failed {
+                        message: "503".into(),
+                    },
+                },
+                now,
+            )
+            .unwrap();
+        advance(now);
+        match hub.db.tools_deploys().unwrap().remove(&node) {
+            Some(crate::deploy::Deploy::Failed {
+                attempt, retry_at, ..
+            }) => (attempt, retry_at),
+            other => panic!("{other:?}"),
+        }
+    };
+    let mut now = now_secs();
+    assert_eq!(advance(now), (true, vec![node.clone()]));
+    for (attempt, delay) in (1..).zip(crate::deploy::RETRY_DELAYS_SECS) {
+        let (failed, due) = fail(now);
+        assert_eq!(failed, attempt);
+        let due = due.unwrap();
+        assert!(due >= now + delay * 4 / 5 && due <= now + delay * 6 / 5);
+        assert_eq!(
+            advance(due - 1),
+            (false, Vec::new()),
+            "not before it is due"
+        );
+        // Due but not reachable: it waits, and spends no attempt.
+        assert_eq!(
+            hub.db.advance_tools(due, &builtin, &|_| false).unwrap(),
+            (false, Vec::new())
+        );
+        now = due;
+        assert_eq!(
+            advance(now),
+            (true, vec![node.clone()]),
+            "attempt {}",
+            attempt + 1
+        );
+    }
+    assert_eq!(fail(now), (crate::deploy::ATTEMPTS, None), "spent");
+    assert_eq!(advance(now + 30 * 86_400), (false, Vec::new()));
+    let shown = ops::node_views(&hub)
+        .unwrap()
+        .into_iter()
+        .find(|v| v.id == node)
+        .unwrap()
+        .tools_deploy
+        .unwrap();
+    assert!(
+        shown.contains("attempt 5 of 5") && shown.contains("no more are made automatically"),
+        "{shown}"
+    );
+    let events: Vec<String> = hub
+        .db
+        .audits(Some(&node), 50)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.event)
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.contains("attempt 1 of 5")
+                && e.contains("failed: 503; the next is due after")),
+        "{events:?}"
+    );
+    // An operator's build is the first attempt again, and a failure of it is retried.
+    ops::tools(&hub, "uid 0", &node, None).unwrap();
+    assert_eq!(fail(now_secs()).0, 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Nodes report each file of their tools: the hub notes and audits a node whose files differ
+/// from those other nodes built from the same definition, and one whose tools changed since it
+/// installed them, which it then asks to build them anew.
+#[tokio::test(flavor = "multi_thread")]
+async fn tools_that_differ_across_nodes_or_changed_are_noted_audited_and_rebuilt() {
+    use vk_hub_proto::{ToolsCheck, ToolsFile};
+    let (dir, _, hub) = start_releases("tools-outputs", None).await;
+    let a = crate::tools::add(&hub, "uid 0", &context(&dir, "a", "a"), "2026.10")
+        .unwrap()
+        .sha256;
+    crate::settings::set(
+        &hub,
+        "uid 0",
+        None,
+        "tools",
+        Some(crate::settings::parse("tools", &a).unwrap()),
+    )
+    .unwrap();
+    let [n1, n2, n3] = ["n1", "n2", "n3"].map(|name| enroll_as(&hub, name));
+    let files = |git: &str| {
+        std::collections::BTreeMap::from([
+            (
+                "git".to_string(),
+                ToolsFile::File {
+                    sha256: git.repeat(64),
+                    size: 10,
+                },
+            ),
+            (
+                "git-remote-https".to_string(),
+                ToolsFile::Link {
+                    target: "git-remote-http".into(),
+                },
+            ),
+        ])
+    };
+    let report = |id: &str, host: &str, git: &str, check: ToolsCheck| {
+        let mut inventory = Inventory {
+            hostname: host.into(),
+            ..Inventory::default()
+        };
+        inventory.versions.tools = Some(vk_hub_proto::ToolsInstalled {
+            sha256: a.clone(),
+            version: "2026.10".into(),
+            tools: Default::default(),
+            in_use: true,
+            files: files(git),
+            egress: None,
+            check: Some(check),
+        });
+        hub.db
+            .record_inventory(id, inventory, true, now_secs())
+            .unwrap();
+    };
+    for (id, host, git) in [(&n1, "n1", "1"), (&n2, "n2", "1"), (&n3, "n3", "2")] {
+        hub.db
+            .record_session(id, "inc", TOOLS, now_secs(), || true)
+            .unwrap();
+        hub.db
+            .record_report(id, vk_hub_proto::Report::default(), now_secs())
+            .unwrap();
+        report(id, host, git, ToolsCheck::Intact);
+    }
+    let views = ops::node_views(&hub).unwrap();
+    let peers = |id: &str| {
+        views
+            .iter()
+            .find(|v| v.id == id)
+            .unwrap()
+            .tools_peers
+            .clone()
+            .unwrap()
+    };
+    assert_eq!((peers(&n1).same, peers(&n1).differ.len()), (1, 1));
+    let differ: Vec<(String, Vec<String>)> = peers(&n3)
+        .differ
+        .into_iter()
+        .map(|d| (d.hostname, d.entries))
+        .collect();
+    let git = vec!["git".to_string()];
+    assert_eq!(differ, [("n1".into(), git.clone()), ("n2".into(), git)]);
+    let outputs = ops::tools_outputs(&hub.db.nodes().unwrap());
+    let mut nodes = vec![n1.clone(), n2.clone()];
+    nodes.sort();
+    assert_eq!(outputs[&a].outputs.len(), 2);
+    assert_eq!(outputs[&a].outputs[0].nodes, nodes);
+    let shown = render_nodes(&views, now_secs());
+    let want = format!(
+        "n3: tools 2026.10 ({}) hold other files than n1, n2 built from the same definition \
+         (git); 0 other nodes hold the same",
+        &a[..12]
+    );
+    assert!(shown.contains(&want), "{want}\n{shown}");
+    let audited = |id: &str, what: &str| {
+        hub.db
+            .audits(Some(id), 50)
+            .unwrap()
+            .iter()
+            .any(|r| r.event.contains(what))
+    };
+    assert!(audited(
+        &n3,
+        "hold other files than n1, n2 built from the same definition (git)"
+    ));
+    assert!(
+        !audited(&n1, "hold other files"),
+        "the first to report had nothing to differ from"
+    );
+
+    // Nothing is asked of nodes that have their tools.
+    let builtin = crate::tools::builtin().packed.sha256.clone();
+    let advance = || {
+        hub.db
+            .advance_tools(now_secs(), &builtin, &|_| true)
+            .unwrap()
+    };
+    assert_eq!(advance(), (false, Vec::new()));
+
+    // n2's tools changed since it installed them: noted, audited, and built anew.
+    report(
+        &n2,
+        "n2",
+        "1",
+        ToolsCheck::Modified {
+            entries: vec!["git".into()],
+        },
+    );
+    let shown = render_nodes(&ops::node_views(&hub).unwrap(), now_secs());
+    assert!(
+        shown.contains("n2: tools 2026.10")
+            && shown.contains(
+                "have changed since it installed them (git): its jobs are not given them"
+            ),
+        "{shown}"
+    );
+    assert!(audited(&n2, "have changed since it installed them (git)"));
+    assert_eq!(advance(), (true, vec![n2.clone()]));
+    // Installed with nothing recorded: built anew too.
+    report(&n1, "n1", "1", ToolsCheck::Unrecorded);
+    assert_eq!(advance(), (true, vec![n1.clone()]));
+    std::fs::remove_dir_all(&dir).unwrap();
 }

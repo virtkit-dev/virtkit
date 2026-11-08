@@ -86,6 +86,14 @@ pub struct NodeView {
     /// say: behind it, being updated, failed, or left alone and why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_update: Option<String>,
+    /// Where it stands against the CI tools the hub's `tools` setting keeps it on, in words,
+    /// when it does not have them: being built, failed, or not asked for yet and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_deploy: Option<String>,
+    /// How the files of its CI tools compare with those other nodes installed from the same
+    /// definition; `None` when it reports none, or no other node does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_peers: Option<crate::outputs::Peers>,
 }
 
 impl NodeView {
@@ -98,19 +106,56 @@ impl NodeView {
 /// Every enrolled node, as `vk-hub nodes` shows it, ordered by hostname.
 pub fn node_views(hub: &Hub) -> Result<Vec<NodeView>> {
     let target = hub.db.target()?;
-    let mut views: Vec<NodeView> = hub
-        .db
-        .nodes()?
-        .into_iter()
-        .map(|(id, row)| node_view(hub, id, &row, target.as_ref()))
+    let nodes = hub.db.nodes()?;
+    let outputs = tools_outputs(&nodes);
+    let mut views: Vec<NodeView> = nodes
+        .iter()
+        .map(|(id, row)| node_view_among(hub, id.clone(), row, target.as_ref(), &nodes, &outputs))
         .collect();
     views.sort_by(|a, b| (&a.hostname, &a.id).cmp(&(&b.hostname, &b.id)));
     Ok(views)
 }
 
+/// What every node of `nodes` installed, by definition ([`crate::outputs`]).
+pub fn tools_outputs(
+    nodes: &[(String, NodeRow)],
+) -> std::collections::BTreeMap<String, crate::outputs::DefinitionOutputs> {
+    crate::outputs::by_definition(nodes.iter().filter_map(|(id, row)| {
+        Some((
+            id.as_str(),
+            row.inventory.as_ref()?.versions.tools.as_ref()?,
+        ))
+    }))
+}
+
 /// Node `id`'s row as `vk-hub nodes` shows it, against the hub's `target` release if one is set.
 pub fn node_view(hub: &Hub, id: String, row: &NodeRow, target: Option<&TargetRow>) -> NodeView {
+    // Without the other nodes, nothing to compare its tools with, rather than no view.
+    let nodes = hub.db.nodes().unwrap_or_default();
+    let outputs = tools_outputs(&nodes);
+    node_view_among(hub, id, row, target, &nodes, &outputs)
+}
+
+/// [`node_view`], its tools compared with what the `nodes` installed, `outputs`.
+fn node_view_among(
+    hub: &Hub,
+    id: String,
+    row: &NodeRow,
+    target: Option<&TargetRow>,
+    nodes: &[(String, NodeRow)],
+    outputs: &std::collections::BTreeMap<String, crate::outputs::DefinitionOutputs>,
+) -> NodeView {
     let inventory = row.inventory.as_ref();
+    let tools_peers = inventory
+        .and_then(|i| i.versions.tools.as_ref())
+        .and_then(|t| {
+            crate::outputs::peers(&id, t, outputs, |n| {
+                nodes
+                    .iter()
+                    .find(|(id, _)| id == n)
+                    .map_or_else(|| n.to_string(), |(_, row)| row.hostname.clone())
+            })
+        });
     let admission = row.heartbeat.as_ref().and_then(|h| h.admission.as_ref());
     NodeView {
         connected: hub.reach(&id) == Reach::Connected,
@@ -144,8 +189,34 @@ pub fn node_view(hub: &Hub, id: String, row: &NodeRow, target: Option<&TargetRow
         without_job_build_cache: crate::jobs::accepting(hub).is_ok()
             && !crate::jobs::caches_builds_as_required(hub, row),
         auto_update: target.and_then(|t| crate::target::standing(t, &id, row).note(t)),
+        // A note that cannot be read is left out rather than failing the listing.
+        tools_deploy: tools_note(hub, &id, row).ok().flatten(),
+        tools_peers,
         id,
     }
+}
+
+/// [`NodeView::tools_deploy`] for node `id` of row `row`.
+fn tools_note(hub: &Hub, id: &str, row: &NodeRow) -> Result<Option<String>> {
+    let builtin = &crate::tools::builtin().packed.sha256;
+    let named =
+        crate::deploy::Named::of(hub.db.settings_layers()?.merged(id).get(crate::deploy::KEY));
+    let wanted = hub.db.tools_wanted(id, builtin)?;
+    let wanted = match &wanted {
+        None => return Ok(None),
+        Some(Ok((sha, row))) => Ok((sha.as_str(), row.version.as_str())),
+        Some(Err(why)) => Err(why.as_str()),
+    };
+    let deploys = hub.db.tools_deploys()?;
+    let connected = hub.reach(id) == Reach::Connected;
+    Ok(crate::deploy::note(
+        &named,
+        wanted,
+        deploys.get(id),
+        row,
+        connected,
+        crate::now_secs(),
+    ))
 }
 
 /// Replace node `id`'s pools as `actor`. Notify the hub's watchers only on change.
@@ -220,14 +291,75 @@ pub fn command(hub: &Hub, actor: &str, id: &str, operation: Operation) -> Result
     }
 }
 
-/// Have node `id` build the tools definition whose sha256 starts with `tools` and make the
-/// tools current, as `actor`. A node whose latest session ran below
-/// [`vk_hub_proto::TOOLS`] is refused.
-pub fn tools(hub: &Hub, actor: &str, id: &str, tools: &str) -> Result<Command> {
+/// The definition `name` names: `builtin`, or a sha256 or a prefix of at least 8 hex digits.
+fn resolve_tools(hub: &Hub, name: &str) -> Result<Tools> {
+    if name != crate::deploy::BUILTIN {
+        return hub.db.resolve_tools(name);
+    }
+    let sha256 = crate::tools::builtin().packed.sha256.clone();
+    match hub.db.tools(&sha256)? {
+        Some(row) => Ok(Tools { sha256, row }),
+        None => bail!("the hub does not hold its built-in tools; its log says why"),
+    }
+}
+
+/// The tools node `id` is to build, as an operator asked for `tools` (or, with `None`, those
+/// the hub's `tools` setting keeps it on), and whether they are the setting's: refused when
+/// the setting keeps it on others.
+fn tools_for(hub: &Hub, id: &str, tools: Option<&Tools>) -> Result<(Tools, bool)> {
+    let builtin = &crate::tools::builtin().packed.sha256;
+    let wanted = hub.db.tools_wanted(id, builtin)?;
+    match (tools, wanted) {
+        (Some(t), Some(Ok((sha, row)))) if t.sha256 != sha => bail!(
+            "the hub's `tools` setting keeps it on the CI tools {} ({}); `vk-hub settings set \
+             tools <sha256> --node {id}` names others",
+            row.version,
+            crate::store::short(&sha)
+        ),
+        (Some(t), Some(Ok(_))) => Ok((t.clone(), true)),
+        (Some(t), _) => Ok((t.clone(), false)),
+        (None, Some(Ok((sha256, row)))) => Ok((Tools { sha256, row }, true)),
+        (None, Some(Err(why))) => bail!("{why}"),
+        (None, None) => {
+            bail!("the hub's `tools` setting leaves its CI tools alone; name the tools to build")
+        }
+    }
+}
+
+/// Issue node `id` the build of `tools`, as `actor`; followed as an automatic one when they
+/// are what its `tools` setting names (`kept`).
+fn issue_tools(hub: &Hub, actor: &str, id: &str, tools: &Tools, kept: bool) -> Result<Command> {
+    let command = issue(hub, actor, id, tools_operation(tools))?;
+    if kept {
+        hub.db
+            .follow_tools(id, &tools.sha256, &command.id, actor, crate::now_secs())?;
+    }
+    Ok(command)
+}
+
+/// Have node `id` build the tools definition `tools` names ([`resolve_tools`]), or with `None`
+/// those the hub's `tools` setting keeps it on, and make the tools current, as `actor`. Tools
+/// other than the setting's are refused unless it is `none`; the setting's are followed as an
+/// automatic build, a failed one of them forgotten. A node whose latest session ran below [`vk_hub_proto::TOOLS`] is refused, as
+/// is one building them already.
+pub fn tools(hub: &Hub, actor: &str, id: &str, tools: Option<&str>) -> Result<Command> {
     // Held from the lookup to the command, so the definition cannot be removed between them.
     let _held = hub.tools_lock();
-    let tools = hub.db.resolve_tools(tools)?;
-    issue(hub, actor, id, tools_operation(&tools))
+    let named = tools.map(|t| resolve_tools(hub, t)).transpose()?;
+    let (tools, kept) = tools_for(hub, id, named.as_ref())?;
+    // One that cannot take a build at all hears why from the issue.
+    let takes = hub
+        .db
+        .node(id)?
+        .is_some_and(|n| n.protocol.is_none_or(|v| v >= vk_hub_proto::TOOLS));
+    if takes
+        && hub
+            .db
+            .building_tools(id, &tools.sha256, crate::now_secs())?
+    {
+        bail!("it is building these tools already");
+    }
+    issue_tools(hub, actor, id, &tools, kept)
 }
 
 /// What became of one node in [`tools_all`]: the command issued to it, or why it was skipped.
@@ -242,22 +374,32 @@ pub struct ToolsIssued {
 }
 
 /// [`tools`] for every node, as `actor`, but those that cannot take it or have no need to:
-/// a node monitored only or whose latest session ran below [`vk_hub_proto::TOOLS`], one that
-/// has the tools current already, and one with a build of them still under way. Ordered by
+/// a node monitored only or whose latest session ran below [`vk_hub_proto::TOOLS`], one the
+/// hub's `tools` setting keeps on other tools (or, without `tools`, leaves alone), one that has
+/// the tools current already, and one with a build of them still under way. Ordered by
 /// hostname. Any other error ends it, leaving the commands already issued.
-pub fn tools_all(hub: &Hub, actor: &str, tools: &str) -> Result<Vec<ToolsIssued>> {
+pub fn tools_all(hub: &Hub, actor: &str, tools: Option<&str>) -> Result<Vec<ToolsIssued>> {
     let _held = hub.tools_lock();
-    let tools = hub.db.resolve_tools(tools)?;
+    let named = tools.map(|t| resolve_tools(hub, t)).transpose()?;
     let mut nodes = hub.db.nodes()?;
     nodes.sort_by(|a, b| (&a.1.hostname, &a.0).cmp(&(&b.1.hostname, &b.0)));
     let now = crate::now_secs();
     let mut out = Vec::new();
     for (id, row) in nodes {
-        let has = row
-            .inventory
-            .as_ref()
-            .and_then(|i| i.versions.tools.as_ref())
-            .is_some_and(|t| t.sha256 == tools.sha256);
+        let skipped = |why: String| ToolsIssued {
+            id: id.clone(),
+            hostname: row.hostname.clone(),
+            command: None,
+            skipped: Some(why),
+        };
+        let (tools, kept) = match tools_for(hub, &id, named.as_ref()) {
+            Ok(t) => t,
+            Err(e) => {
+                out.push(skipped(format!("{e:#}")));
+                continue;
+            }
+        };
+        let has = crate::deploy::current(&row) == Some(tools.sha256.as_str());
         let skip = match row.protocol {
             Some(v) if v < vk_hub_proto::TOOLS => Some(format!(
                 "speaks protocol version {v}, and tools take version {}: update its vk",
@@ -269,21 +411,22 @@ pub fn tools_all(hub: &Hub, actor: &str, tools: &str) -> Result<Vec<ToolsIssued>
             }
             _ => None,
         };
-        let (command, skipped) = match skip {
-            Some(why) => (None, Some(why)),
-            // The node may have changed since the lookup. Skip the same refusals at issue
-            // time; any other error ends the run.
-            None => match issue(hub, actor, &id, tools_operation(&tools)) {
-                Ok(c) => (Some(c.id), None),
-                Err(e)
-                    if e.is::<MonitoringOnly>()
-                        || e.is::<ToolsUnsupported>()
-                        || e.is::<NotEnrolled>() =>
-                {
-                    (None, Some(format!("{e:#}")))
-                }
-                Err(e) => return Err(e),
-            },
+        if let Some(why) = skip {
+            out.push(skipped(why));
+            continue;
+        }
+        // The node may have changed since the lookup. Skip the same refusals at issue
+        // time; any other error ends the run.
+        let (command, skipped) = match issue_tools(hub, actor, &id, &tools, kept) {
+            Ok(c) => (Some(c.id), None),
+            Err(e)
+                if e.is::<MonitoringOnly>()
+                    || e.is::<ToolsUnsupported>()
+                    || e.is::<NotEnrolled>() =>
+            {
+                (None, Some(format!("{e:#}")))
+            }
+            Err(e) => return Err(e),
         };
         out.push(ToolsIssued {
             id,

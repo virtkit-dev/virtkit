@@ -135,6 +135,9 @@ impl Db {
                     );
                 }
             }
+            if let Some(why) = super::deploy::keeps(&txn, sha256)? {
+                bail!("tools {} are kept: {why}", short(sha256));
+            }
             let removed = txn.open_table(TOOLS)?.remove(sha256)?.is_some();
             if removed {
                 let event = format!("{actor} removed tools {}", short(sha256));

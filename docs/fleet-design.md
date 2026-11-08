@@ -485,7 +485,8 @@ not binaries: its `tools` stage holds the tools, and a reproducible tar's sha256
 the definition. Each node builds it with `vk build` in microVMs, without reusing or leaving
 instruction-cache layers, checks the result, and switches `<state_dir>/tools/current`.
 The hub holds a definition of its own, a static git and git-lfs built with Nix
-from pinned inputs.
+from pinned inputs, and keeps each node on the definition its `tools` setting names — its own
+by default — building it wherever a node lacks it, so a node needs no step to give its jobs git.
 See the implemented [CI tools](fleet-prototype.md#ci-tools).
 
 - No drain: a job resolves `tools_dir` as it boots and keeps that directory, so a switch only
@@ -499,11 +500,18 @@ See the implemented [CI tools](fleet-prototype.md#ci-tools).
   was refused, and reports it with the tools.
 - Integrity: the node records each file it installed by sha256 and checks the tools against
   that before every job that would get them, failing the job rather than giving it changed
-  tools, and in every inventory.
+  tools, and in every inventory. The hub compares the files nodes report for the same
+  definition, which a reproducible build makes identical, flags those that differ and those a
+  node found changed, and has the latter built anew. A node's own record guards against change
+  at rest only: the comparison across nodes is the check one node cannot rewrite.
 - Trust: tools run in every job VM that lacks its own, with the job's token, so registering them
   is an admin operation. They run on a node's host only where the node already takes unsigned
   releases from its hub. Proposed: a signature on the definition, checked against node-pinned
   keys as releases are, and the version probe run in a VM so every node can report versions.
+- A failed build is tried again, later each time, a few times over hours, then not until an
+  operator asks: it downloads from the internet, where a failure is often over in minutes, but
+  one that fails for want of network fails again. Unlike a failed automatic update, which waits
+  for an operator, a build drains nothing.
 - Proposed: rollouts of a definition by wave and canary, with the release rollouts' gates.
 
 ## Resets

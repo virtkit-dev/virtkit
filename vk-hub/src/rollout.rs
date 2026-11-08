@@ -716,7 +716,8 @@ pub fn short_id(id: &str) -> &str {
 const TICK: Duration = Duration::from_secs(5);
 
 /// Drive every active rollout, then the target's automatic updates
-/// ([`crate::target`]), for as long as the hub runs: at start — so a restarted hub carries on —
+/// ([`crate::target`]), then the automatic CI tools builds ([`crate::deploy`]), for as long as
+/// the hub runs: at start — so a restarted hub carries on —
 /// whenever a node reports or an operator acts, and every [`TICK`] regardless, for the
 /// timeouts. Its nodes get [`GIVE_UP_GRACE_SECS`] from the start to reconnect before
 /// any window is judged.
@@ -756,6 +757,15 @@ pub async fn drive(hub: Arc<Hub>) {
                     issued.extend(node);
                 }
                 Err(e) => eprintln!("vk-hub: advancing the target's updates: {e:#}"),
+            }
+            // After the target's, which a tools build would hold back.
+            let builtin = &crate::tools::builtin().packed.sha256;
+            match db.advance_tools(crate::now_secs(), builtin, &connected) {
+                Ok((changed, nodes)) => {
+                    any |= changed;
+                    issued.extend(nodes);
+                }
+                Err(e) => eprintln!("vk-hub: advancing the CI tools builds: {e:#}"),
             }
             anyhow::Ok((any, issued))
         })

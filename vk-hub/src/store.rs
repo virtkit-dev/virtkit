@@ -45,6 +45,7 @@ mod admissions;
 mod approvals;
 mod audit;
 mod clients;
+mod deploy;
 mod egress;
 mod egress_rules;
 mod gitlabs;
@@ -99,7 +100,8 @@ pub use registries::{
 pub use relay_commands::{RelayCommandRow, relay_operation_name};
 pub use relays::{PendingGitlab, RelayEnrollment, RelayRow, RelayWrite};
 pub use settings::{
-    Layer as SettingsLayer, Layers as SettingsLayers, registry_table, shown as setting_shown,
+    Layer as SettingsLayer, Layers as SettingsLayers, keys as setting_keys, registry_table,
+    shown as setting_shown,
 };
 pub use token_keys::{TokenKeyRow, signing_key};
 pub use tools::{Tools, ToolsRow};
@@ -1037,6 +1039,8 @@ impl Db {
             .context("opening the jobs-by-admission table")?;
         txn.open_table(tools::TOOLS)
             .context("opening the tools table")?;
+        txn.open_table(deploy::DEPLOY)
+            .context("opening the tools builds table")?;
         txn.open_table(jobs::JOB_SPECS)
             .context("opening the job specs table")?;
         txn.open_table(jobs::REQUESTS)
@@ -1337,15 +1341,27 @@ impl Db {
         now: u64,
     ) -> Result<bool> {
         let inventory = display_safe_inventory(inventory);
-        self.update_txn(now, id, |row, txn| {
+        let tools = inventory.versions.tools.clone();
+        let (renamed, new_files) = self.update_txn(now, id, |row, txn| {
             let changed = row.inventory.as_ref() != Some(&inventory);
             let renamed = !inventory.hostname.is_empty() && row.hostname != inventory.hostname;
             if renamed {
                 row.hostname = inventory.hostname.clone();
             }
+            let before = row
+                .inventory
+                .as_ref()
+                .and_then(|i| i.versions.tools.as_ref());
+            let mut events = Vec::new();
+            if let Some(event) = tools_check_event(before, tools.as_ref()) {
+                events.push(("node".to_string(), event));
+            }
+            let new_files = tools.as_ref().is_some_and(|t| {
+                !t.files.is_empty()
+                    && before.is_none_or(|b| (&b.sha256, &b.files) != (&t.sha256, &t.files))
+            });
             row.inventory = Some(inventory);
             row.last_seen = Some(now);
-            let mut events = Vec::new();
             if changed {
                 if let Some(generation) = steer_fallback(row, self.fallback_in(txn)?.as_ref()) {
                     events.push(("hub".to_string(), fallback_event(row, generation)));
@@ -1361,8 +1377,17 @@ impl Db {
             } else {
                 Durability::None
             };
-            Ok((renamed, events, durability))
-        })
+            Ok(((renamed, new_files), events, durability))
+        })?;
+        if new_files && let Some(tools) = &tools {
+            // Read after the write: two nodes reporting at once may both be told, or neither,
+            // until one reports again; what `vk-hub nodes` derives is always current.
+            let nodes = self.nodes()?;
+            if let Some(event) = tools_output_event(id, tools, &nodes) {
+                self.audit_node(Some(id), "hub", &event, now)?;
+            }
+        }
+        Ok(renamed)
     }
 
     pub fn record_heartbeat(&self, id: &str, heartbeat: Heartbeat, now: u64) -> Result<()> {
@@ -3100,6 +3125,56 @@ fn append_audit(
     Ok(())
 }
 
+/// The audit line for a node now reporting its CI tools `now`, before `before`, changed since
+/// it installed them: `None` unless that is new.
+fn tools_check_event(
+    before: Option<&vk_hub_proto::ToolsInstalled>,
+    now: Option<&vk_hub_proto::ToolsInstalled>,
+) -> Option<String> {
+    use vk_hub_proto::ToolsCheck;
+    let now = now?;
+    let Some(ToolsCheck::Modified { entries }) = &now.check else {
+        return None;
+    };
+    if before.is_some_and(|b| b.sha256 == now.sha256 && b.check == now.check) {
+        return None;
+    }
+    Some(format!(
+        "its CI tools {} ({}) have changed since it installed them ({}): its jobs are not \
+         given them",
+        now.version,
+        short(&now.sha256),
+        entries.join(", ")
+    ))
+}
+
+/// The audit line for node `id` newly reporting the files of its CI tools `tools`, when they
+/// differ from those other nodes of `nodes` installed from the same definition.
+fn tools_output_event(
+    id: &str,
+    tools: &vk_hub_proto::ToolsInstalled,
+    nodes: &[(String, NodeRow)],
+) -> Option<String> {
+    let outputs = crate::ops::tools_outputs(nodes);
+    let hostname = |n: &str| {
+        nodes
+            .iter()
+            .find(|(id, _)| id == n)
+            .map_or_else(|| n.to_string(), |(_, row)| row.hostname.clone())
+    };
+    let peers = crate::outputs::peers(id, tools, &outputs, hostname)?;
+    if peers.differ.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "its CI tools {} ({}) hold other files than {} built from the same definition ({})",
+        tools.version,
+        short(&tools.sha256),
+        peers.hosts().join(", "),
+        peers.differing().join(", ")
+    ))
+}
+
 /// Audit changes in state, applied generation, update phase, what the node cannot carry out,
 /// and concurrency errors.
 fn report_events(previous: Option<&Report>, report: &Report) -> Vec<String> {
@@ -3337,6 +3412,32 @@ fn display_safe_inventory(mut inventory: Inventory) -> Inventory {
                 .take(MAX_INVENTORY_ITEMS)
                 .map(|(name, version)| (safe(&name), safe(&version)))
                 .collect();
+            // Names and digests identify what is compared across nodes: one that is not plain
+            // is dropped rather than altered.
+            t.files = t
+                .files
+                .into_iter()
+                .filter(|(name, file)| {
+                    safe(name) == *name
+                        && match file {
+                            vk_hub_proto::ToolsFile::File { sha256, .. } => {
+                                vk_hub_proto::valid_sha256(sha256)
+                            }
+                            vk_hub_proto::ToolsFile::Link { target } => safe(target) == *target,
+                        }
+                })
+                .take(vk_hub_proto::MAX_TOOLS_FILES)
+                .collect();
+            if let Some(egress) = t.egress.as_mut() {
+                for hosts in [&mut egress.contacted, &mut egress.refused] {
+                    hosts.truncate(vk_hub_proto::MAX_TOOLS_EGRESS_HOSTS);
+                    hosts.iter_mut().for_each(clean);
+                }
+            }
+            if let Some(vk_hub_proto::ToolsCheck::Modified { entries }) = t.check.as_mut() {
+                entries.truncate(vk_hub_proto::MAX_TOOLS_FILES);
+                entries.iter_mut().for_each(clean);
+            }
             t
         });
     if let Some(runner) = inventory.runner.as_mut() {

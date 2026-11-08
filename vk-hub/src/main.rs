@@ -31,11 +31,13 @@ mod admin;
 mod client;
 mod clients;
 mod config;
+mod deploy;
 mod egress;
 mod fetch;
 mod jobs;
 mod local;
 mod ops;
+mod outputs;
 mod policy;
 mod registries;
 mod relays;
@@ -589,7 +591,8 @@ enum SettingsCmd {
     Set {
         /// A key `vk-hub settings` lists, e.g. executor.vm.max_cpus
         key: String,
-        /// Its value: a size such as 8G, a number, true or false, or a registry's ID
+        /// Its value: a size such as 8G, a number, true or false, a registry's ID, or for
+        /// `tools` builtin, none or a tools definition's sha256
         value: String,
         /// Only this node: its ID, as `vk-hub nodes` lists it
         #[arg(long, value_name = "ID")]
@@ -1085,7 +1088,10 @@ enum NodesCmd {
     /// The node builds it with `vk build` in microVMs, apart from its build cache, checks
     /// that the `tools` stage holds a static git, and switches
     /// `<state_dir>/tools/current` to them: jobs that start from then on get them, running
-    /// ones keep theirs. Nothing drains. Needs protocol version 4 on the node.
+    /// ones keep theirs. Nothing drains. Needs protocol version 4 on the node. The hub
+    /// keeps each node on the tools its `tools` setting names, and builds them on its own:
+    /// this asks for them now, also after a failed build, and asks for others only where
+    /// the setting is `none`.
     Tools {
         /// The node's ID; omitted with --all
         #[arg(required_unless_present = "all", conflicts_with = "all")]
@@ -1093,9 +1099,10 @@ enum NodesCmd {
         /// Every node that speaks version 4 and has not these tools current or building
         #[arg(long)]
         all: bool,
-        /// The definition's sha256, or at least its first 8 hex digits
+        /// The definition's sha256, at least its first 8 hex digits, or `builtin`; by
+        /// default, those the `tools` setting names for the node
         #[arg(long)]
-        tools: String,
+        tools: Option<String>,
     },
     /// Ask the node to replace its vk with a release the hub holds
     Update {
@@ -1374,7 +1381,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 Some(NodesCmd::Tools { id, all: _, tools }) => {
                     let issued = tokio::task::spawn_blocking(move || {
-                        client.node_tools(id.as_deref(), &tools)
+                        client.node_tools(id.as_deref(), tools.as_deref())
                     })
                     .await??;
                     for n in issued {
@@ -1771,8 +1778,8 @@ async fn tools_cmd(client: admin::Client, cmd: ToolsCmd) -> Result<()> {
             // The sha256 alone on stdout, so `$(vk-hub tools add …)` captures it.
             println!("{}", added.sha256);
             eprintln!(
-                "vk-hub: holding tools {} ({} files, {} bytes packed); `vk-hub nodes tools <id> \
-                 --tools {}` has a node build them",
+                "vk-hub: holding tools {} ({} files, {} bytes packed); `vk-hub settings set \
+                 tools {}` keeps the nodes on them",
                 added.row.version,
                 added.row.files,
                 added.row.size,
@@ -3648,6 +3655,9 @@ fn node_notes(n: &ops::NodeView) -> Vec<String> {
     if let Some(note) = &n.auto_update {
         placement.push(format!("{}: {note}", n.hostname));
     }
+    if let Some(note) = &n.tools_deploy {
+        placement.push(format!("{}: {note}", n.hostname));
+    }
     let Some(report) = &n.report else {
         return placement;
     };
@@ -3724,6 +3734,32 @@ fn tools_notes(n: &ops::NodeView) -> Vec<String> {
                 "; not in use: [executor] tools_dir names another directory"
             }
         ));
+        let shown = format!("{} ({})", t.version, store::short(&t.sha256));
+        match &t.check {
+            Some(vk_hub_proto::ToolsCheck::Modified { entries }) => notes.push(format!(
+                "{}: tools {shown} have changed since it installed them ({}): its jobs are not \
+                 given them until they are installed again",
+                n.hostname,
+                entries.join(", ")
+            )),
+            Some(vk_hub_proto::ToolsCheck::Unrecorded) => notes.push(format!(
+                "{}: tools {shown} cannot be checked: an older vk installed them without \
+                 recording their checksums; installing them again records them",
+                n.hostname
+            )),
+            Some(vk_hub_proto::ToolsCheck::Intact) | None => {}
+        }
+        if let Some(p) = n.tools_peers.as_ref().filter(|p| !p.differ.is_empty()) {
+            notes.push(format!(
+                "{}: tools {shown} hold other files than {} built from the same definition \
+                 ({}); {} other node{} the same",
+                n.hostname,
+                p.hosts().join(", "),
+                p.differing().join(", "),
+                p.same,
+                if p.same == 1 { " holds" } else { "s hold" }
+            ));
+        }
     }
     let Some(b) = n.report.as_ref().and_then(|r| r.tools.as_ref()) else {
         return notes;
@@ -3887,6 +3923,11 @@ fn render_settings(
     for (key, kind) in vk_hub_proto::settings::KEYS {
         out.push_str(&format!("  {key}: {}\n", kind.describe()));
     }
+    out.push_str(&format!(
+        "  {}: the CI tools the hub builds on the nodes, {}\n",
+        deploy::KEY,
+        deploy::DESCRIBE
+    ));
     out
 }
 

@@ -43,6 +43,12 @@ All notable changes to virtkit will be documented in this file.
   own gitlab-runner adds a definition that includes it. `./update-ci-tools.sh` re-pins it.
 - **Fleet nodes give their jobs the CI tools the hub installed.** A node whose config names no
   tools directory hands its jobs the tools it last built for the hub, once it has built any.
+- **vk-hub keeps its nodes on the CI tools it names.** The new `tools` setting, fleet-wide
+  or per node, names the tools nodes should have: the hub's own by default, a definition it
+  holds, or `none`. The hub has every node that lacks them build them, so a new node's jobs get
+  git with no operator step. A failed build is shown on the node and tried again after 5
+  minutes, then 30 minutes, 2 hours and 6 hours; after that it waits for `vk-hub nodes tools`,
+  which now asks for the setting's tools by default.
 - **`vk build` stages can declare the network their `RUN` steps need.** A `# vk:
   allow-name=… allow-ip=…` line above a stage's `FROM` holds its steps to those hosts, on top of
   whatever the build allows; `--build-net declared` gives a stage that declares nothing no
@@ -56,7 +62,9 @@ All notable changes to virtkit will be documented in this file.
   records a checksum of every file of the tools it installs and checks them before each job
   that would get them; a job whose tools changed fails before it starts. The node reports the
   checksums, whether its tools are still intact, and what their build contacted and was
-  refused.
+  refused. `vk-hub nodes` and the audit log flag a node whose tools changed, which the hub has
+  build them anew, and one whose tools hold other files than other nodes built from the same
+  definition. Tools installed by an earlier `vk` are rebuilt to record their checksums.
 
 ## [0.107.1] - 2026-11-08
 

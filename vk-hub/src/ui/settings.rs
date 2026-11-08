@@ -1,4 +1,5 @@
-//! `/settings`: fleet-wide and per-node settings, visible to every viewer. Operators set
+//! `/settings`: fleet-wide and per-node settings, the hub's own `tools` among them, visible to
+//! every viewer. Operators set
 //! and unset them through the admin socket's operation ([`crate::settings::set`]), with
 //! `vk-hub settings` validation and auditing as the session's principal.
 
@@ -125,7 +126,7 @@ fn set_form(h: &mut Html, auth: &Auth, names: &[(String, String)]) {
     csrf_field(h, auth);
     h.raw("<input type=\"hidden\" name=\"op\" value=\"set\">")
         .raw("<select name=\"key\" aria-label=\"Setting\">");
-    for (key, _) in vk_hub_proto::settings::KEYS {
+    for key in crate::store::setting_keys() {
         h.raw("<option>").text(key).raw("</option>");
     }
     h.raw("</select><input type=\"text\" name=\"value\" aria-label=\"Value\" required ")
@@ -157,6 +158,14 @@ fn keys_section(h: &mut Html) {
             .text(what)
             .raw("</td></tr>");
     }
+    h.raw("<tr><th><code>")
+        .text(crate::deploy::KEY)
+        .raw("</code></th><td>")
+        .text(format!(
+            "the CI tools the hub builds on the nodes: {}",
+            crate::deploy::DESCRIBE
+        ))
+        .raw("</td></tr>");
     h.raw("</tbody></table></section>");
 }
 

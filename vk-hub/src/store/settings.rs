@@ -16,6 +16,7 @@ use vk_hub_proto::{DesiredState, STEERING};
 
 use super::namespaces::{CI_PIPELINE, NAMESPACES, NamespaceRow, ns_range};
 use super::registries::{REGISTRIES, RegistryRow};
+use super::tools::TOOLS;
 use super::{Db, NODES, NodeRow, NotEnrolled, append_audit, decode, encode, steer};
 
 /// Key: [`FLEET`], or [`NODE_PREFIX`] and a node's ID. Value: JSON [`Layer`].
@@ -50,7 +51,7 @@ impl Layers {
 }
 
 /// The layers in `table`.
-fn layers_in(table: &impl ReadableTable<&'static str, &'static [u8]>) -> Result<Layers> {
+pub(super) fn layers_in(table: &impl ReadableTable<&'static str, &'static [u8]>) -> Result<Layers> {
     let mut layers = Layers::default();
     for entry in table.iter()? {
         let (key, value) = entry?;
@@ -167,6 +168,8 @@ impl Expanded {
             return BTreeMap::new();
         }
         let mut wanted = self.layers.merged(id);
+        // The hub's own: what it builds on the node, never a setting of the node's.
+        wanted.remove(crate::deploy::KEY);
         if let Some(named) = wanted.remove("registry")
             && let Some(Some(table)) = named.as_str().and_then(|r| self.registries.get(r))
         {
@@ -223,6 +226,48 @@ pub fn shown(value: &Value) -> String {
     }
 }
 
+/// Every key the hub may set: those it sends its nodes, then its own.
+pub fn keys() -> impl Iterator<Item = &'static str> {
+    vk_hub_proto::settings::KEYS
+        .iter()
+        .map(|(k, _)| *k)
+        .chain([crate::deploy::KEY])
+}
+
+/// `value` for the hub's own `tools`, as kept: `builtin`, `none`, or the full sha256 of the
+/// one definition in `tools` it names, by a prefix of at least 8 hex digits.
+fn tools_value(
+    value: &Value,
+    tools: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<Value> {
+    use crate::deploy::{BUILTIN, NONE};
+    let Some(text) = value.as_str().map(str::trim) else {
+        bail!("tools: expected {}", crate::deploy::DESCRIBE);
+    };
+    if text == BUILTIN || text == NONE {
+        return Ok(Value::from(text));
+    }
+    if text.len() < 8
+        || text.len() > 64
+        || !text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        bail!("tools: expected {}", crate::deploy::DESCRIBE);
+    }
+    let mut found = Vec::new();
+    for entry in tools.range(text..)? {
+        let key = entry?.0.value().to_string();
+        if !key.starts_with(text) {
+            break;
+        }
+        found.push(key);
+    }
+    match found.as_slice() {
+        [sha] => Ok(Value::from(sha.as_str())),
+        [] => bail!("there are no tools {text}"),
+        _ => bail!("{text} names more than one tools definition; give more digits"),
+    }
+}
+
 /// Check that the hub may set `key` and that `value` is of its kind and within its bounds; for
 /// `registry`, require a registry the hub manages with a bound URL, whose table a node would
 /// take. A node may still refuse an entry its own config leaves unloadable.
@@ -235,11 +280,7 @@ fn check(
     let Some(kind) = vk_hub_proto::settings::kind(key) else {
         bail!(
             "{key} is not a setting the hub may set; it may set {}",
-            vk_hub_proto::settings::KEYS
-                .iter()
-                .map(|(k, _)| *k)
-                .collect::<Vec<_>>()
-                .join(", ")
+            keys().collect::<Vec<_>>().join(", ")
         );
     };
     if kind != Kind::Registry {
@@ -282,16 +323,22 @@ impl Db {
         now: u64,
     ) -> Result<(bool, Vec<String>)> {
         let txn = self.db.begin_write().context("starting a write")?;
-        if let Some(value) = &value {
-            check(
-                key,
-                value,
-                &txn.open_table(REGISTRIES)?,
-                &txn.open_table(NAMESPACES)?,
-            )?;
-        } else if vk_hub_proto::settings::kind(key).is_none() {
-            bail!("{key} is not a setting the hub may set");
-        }
+        let value = match value {
+            Some(value) if key == crate::deploy::KEY => {
+                Some(tools_value(&value, &txn.open_table(TOOLS)?)?)
+            }
+            Some(value) => {
+                check(
+                    key,
+                    &value,
+                    &txn.open_table(REGISTRIES)?,
+                    &txn.open_table(NAMESPACES)?,
+                )?;
+                Some(value)
+            }
+            None if keys().all(|k| k != key) => bail!("{key} is not a setting the hub may set"),
+            None => None,
+        };
         if let Some(id) = node
             && txn.open_table(NODES)?.get(id)?.is_none()
         {
