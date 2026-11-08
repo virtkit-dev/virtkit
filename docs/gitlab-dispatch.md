@@ -668,7 +668,10 @@ mint the token for it.
 Under `guest_credential = "job"` the guest's registry proxy (`registry.vk`) runs for every
 job and injects the job's token, never the node's credential. A job with no token gets a
 proxy that refuses everything; so does every job a local gitlab-runner gives the node, which
-under `"job"` reaches the registry only by its own means.
+under `"job"` reaches the registry only by its own means. Under `"job-or-node"`, which a hub
+names to nodes taking tokens of their own, placed jobs are treated as under `"job"`, and a
+local gitlab-runner's job gets the node's guest token instead
+([registry hub, 4d](registry-hub.md#4d-node-tokens)).
 
 With a token, the proxy forwards the lock API (`/lock/`) and plain files (`/dav/files/`) as
 well as `/v2/`; the registry enforces the token's grants. Under `/dav/files/` only GET,

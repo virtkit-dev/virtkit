@@ -272,6 +272,9 @@ pub struct RunArgs {
     /// restore instead of rebuilding. Keep the destination, transport, and credentials together
     /// so each build path receives all three.
     pub cache: crate::build::CacheOpts,
+    /// The config's `[registry]`, whose base images every build of this run asks for with its
+    /// credential ([`crate::build::Options::base_registry`]); `None`: anonymously.
+    pub base_registry: Option<crate::config::Registry>,
     /// `--build-arg NAME=VALUE` overrides for the Dockerfile build.
     pub build_args: Vec<(String, String)>,
     /// host dir shared read-write into the guest (at WORKDIR_MOUNT); the command runs
@@ -489,6 +492,7 @@ impl Default for RunArgs {
             contexts: Vec::new(),
             build_contexts: Vec::new(),
             cache: Default::default(),
+            base_registry: None,
             build_args: Vec::new(),
             workdir: None,
             workdir_cache: crate::vmm::ShareCache::Auto,
@@ -3945,6 +3949,7 @@ fn manager_build_opts(args: &RunArgs, kernel: &Path, agent: &Path) -> crate::uni
         net: args.build_net.clone(),
         audit: args.build_audit_egress,
         record: None,
+        base_registry: args.base_registry.clone(),
     }
 }
 
@@ -3969,6 +3974,7 @@ pub(crate) fn service_build_options(
         kernel: Some(kernel.to_path_buf()),
         agent: Some(agent.to_path_buf()),
         cache: crate::build::CacheDest::Configured(args.cache.clone()),
+        base_registry: args.base_registry.clone(),
         build_cache: crate::build::BuildCache::default(),
         journal: false,
         // Run roots boot read-only under an overlay; qcow2 keeps the backing file compact.
@@ -6540,6 +6546,7 @@ mod tests {
                 net: crate::build::BuildNet::All,
                 audit: false,
                 record: None,
+                base_registry: None,
             },
             crate::manager::ManagerDirs {
                 cache: PathBuf::from("/cache"),
@@ -6908,6 +6915,37 @@ mod tests {
             o.cache.configured().registry.as_deref(),
             o.cache.configured().insecure,
             &o.cache.configured().auth,
+        );
+    }
+
+    /// Every build a run launches asks for base images on the config's registry with its
+    /// credential.
+    #[test]
+    fn every_build_a_run_launches_asks_the_registry_for_its_bases() {
+        let mut args = bare_args();
+        let cfg: crate::config::Config =
+            toml::from_str("[registry]\nrepo = \"reg.example/t\"\n").unwrap();
+        args.base_registry = cfg.registry;
+        let (kernel, agent) = (Path::new("/vmlinux"), Path::new("/vk-agent"));
+        let repo = |rg: Option<&crate::config::Registry>| rg.map(|r| r.repo.clone());
+        let want = Some("reg.example/t".to_string());
+        let o = dockerfile_build_options(&args, kernel, agent, PathBuf::from("/root.ext4"), None);
+        assert_eq!(repo(o.base_registry.as_ref()), want);
+        assert_eq!(
+            repo(
+                manager_build_opts(&args, kernel, agent)
+                    .base_registry
+                    .as_ref()
+            ),
+            want
+        );
+        assert_eq!(
+            repo(
+                service_build_options(&args, kernel, agent)
+                    .base_registry
+                    .as_ref()
+            ),
+            want
         );
     }
 

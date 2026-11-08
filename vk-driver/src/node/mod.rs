@@ -20,7 +20,8 @@
 //! `runner.pid` (a managed runner's pid and start time, for a restarted node to find), `ca.pem`
 //! (the CA the hub is verified against, copied at `join` when one was given), `settings.json`
 //! and `registry-ca-*.pem` (the hub's settings and the CAs of the registries they name, see
-//! [`hub_settings`]), `releases/` (a release being installed, and the binary it replaces)
+//! [`hub_settings`]), `registry-access.json` (the node's own token for that registry, see
+//! [`registry_access`]), `releases/` (a release being installed, and the binary it replaces)
 //! and `lock`, which one `vk node` process at a time holds. A `join` whose answer was lost
 //! keeps the key it made and joins again with a new token: the hub answers a key it already
 //! pinned with the node it pinned it to.
@@ -44,6 +45,7 @@ mod core;
 pub(crate) mod hub_settings;
 mod inventory;
 pub mod jobs;
+pub(crate) mod registry_access;
 mod reset;
 mod runner;
 pub mod service;
@@ -352,6 +354,7 @@ async fn enroll_here(
         }
         // Settings, like generations, count for one hub and one enrollment.
         hub_settings::remove(&dir)?;
+        registry_access::clear(&dir)?;
         let enrollment = Enrollment {
             hub: hub.to_string(),
             node_id: node_id.clone(),

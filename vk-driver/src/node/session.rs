@@ -51,11 +51,12 @@ const MISSED_HEARTBEATS: u32 = 3;
 /// How long a stopping node waits for the hub to take its close.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The protocol versions this node speaks: placed jobs, tools builds and `[node] runner =
-/// "none"` on top of what every peer shares.
+/// The protocol versions this node speaks: placed jobs, tools builds, `[node] runner =
+/// "none"`, running jobs' egress reports and its own registry access on top of what every peer
+/// shares.
 pub const NODE_PROTOCOL: VersionRange = VersionRange {
     min: PROTOCOL.min,
-    max: vk_hub_proto::LIVE_EGRESS,
+    max: vk_hub_proto::REGISTRY_ACCESS,
 };
 
 /// How often the node looks at its placed jobs for news: output, stages, results, leases.
@@ -484,8 +485,13 @@ async fn handle(msg: HubMsg, node: &Node, version: u32) -> Result<Option<Command
         HubMsg::Desired(_) | HubMsg::Command(_) | HubMsg::Recorded(_) if version < STEERING => {
             bail!("the hub sent {} in a version-{version} session", kind(&msg))
         }
-        HubMsg::Job(_) | HubMsg::RegistryAccess { .. } => {
+        HubMsg::Job(_) => bail!("the hub sent {} in a version-{version} session", kind(&msg)),
+        HubMsg::RegistryAccess { .. } if version < vk_hub_proto::REGISTRY_ACCESS => {
             bail!("the hub sent {} in a version-{version} session", kind(&msg))
+        }
+        HubMsg::RegistryAccess { access } => {
+            keep_access(node, access).await?;
+            Ok(None)
         }
         HubMsg::Desired(desired) => {
             let generation = desired.generation;
@@ -512,6 +518,31 @@ async fn handle(msg: HubMsg, node: &Node, version: u32) -> Result<Option<Command
     }
 }
 
+/// Keep the registry access the hub sent, or drop what the node holds for `None`.
+async fn keep_access(node: &Node, access: Option<vk_hub_proto::NodeRegistryAccess>) -> Result<()> {
+    let dir = node.dir.clone();
+    let issuer = super::state::Issuer {
+        hub: node.enrollment.hub.clone(),
+        node_id: node.enrollment.node_id.clone(),
+    };
+    let said = match &access {
+        Some(a) => format!(
+            "got registry access to {} until {} (seconds since the epoch)",
+            vk_hub_proto::display_safe(&a.origin),
+            a.expires_at
+        ),
+        None => "the hub withdrew this node's registry access".to_string(),
+    };
+    tokio::task::spawn_blocking(move || match &access {
+        Some(a) => super::registry_access::store(&dir, &issuer, a),
+        None => super::registry_access::clear(&dir),
+    })
+    .await
+    .context("keeping the registry access")??;
+    say!("{said}");
+    Ok(())
+}
+
 /// Run `f` on the core off the runtime: it writes the node's state file.
 async fn persist<T: Send + 'static>(
     core: &Arc<Core>,
@@ -525,7 +556,7 @@ async fn persist<T: Send + 'static>(
 
 /// A refusal from the hub as an error: [`Permanent`] when its code says so, [`Superseded`]
 /// when another session of this node took over. `dir` is the node's, which a node the hub
-/// has forgotten must be enrolled again without.
+/// has forgotten must be enrolled again without, and whose registry access goes with it.
 fn refusal(code: vk_hub_proto::RefusalCode, reason: &str, dir: &Path) -> anyhow::Error {
     use vk_hub_proto::RefusalCode;
     let mut message = format!(
@@ -538,6 +569,10 @@ fn refusal(code: vk_hub_proto::RefusalCode, reason: &str, dir: &Path) -> anyhow:
         _ => None,
     };
     if let Some(gone) = gone {
+        // Its registry access goes with its enrollment.
+        if let Err(e) = super::registry_access::clear(dir) {
+            say!("{e:#}");
+        }
         message.push_str(&format!(
             " — {gone}: remove {} and enroll again with `vk node join`",
             dir.display()
@@ -1202,6 +1237,77 @@ mod tests {
         ended.unwrap();
         assert!(node.core.persisted().tools.is_some());
     }
+
+    /// Wait for `cond` on the node's files, which the session writes after reading a message.
+    async fn until(mut cond: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("condition never held");
+    }
+
+    /// From version 7 the node keeps the registry access the hub sends and drops it on a clear;
+    /// below it, the message ends the session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_access_is_kept_and_cleared_from_version_7_only() {
+        let mut f = fixture("access").await;
+        let (node, gatherer, stopped, listener, stop) = f.parts();
+        let key = node.identity.public_key().to_vec();
+        let file = node.dir.join("registry-access.json");
+        let access = vk_hub_proto::NodeRegistryAccess {
+            registry_id: "ef".repeat(16),
+            origin: "https://reg.example.com".into(),
+            ca_sha256: None,
+            generation: 1,
+            issued_at: now_secs(),
+            expires_at: now_secs() + 3600,
+            grants: Vec::new(),
+            token: "vkt_node".into(),
+            guest_token: None,
+            guest_grants: Vec::new(),
+        };
+        let msg = HubMsg::RegistryAccess {
+            access: Some(access),
+        };
+        let v6 = VersionRange {
+            min: 1,
+            max: vk_hub_proto::LIVE_EGRESS,
+        };
+        let hub = async {
+            let mut ws = accept(listener).await;
+            assert!(challenge(&mut ws, &key, PROTOCOL_7, vk_hub_proto::REGISTRY_ACCESS).await);
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
+            hub_send(&mut ws, &msg).await;
+            until(|| file.exists()).await;
+            let text = std::fs::read_to_string(&file).unwrap();
+            assert!(text.contains("vkt_node"));
+            hub_send(&mut ws, &HubMsg::RegistryAccess { access: None }).await;
+            until(|| !file.exists()).await;
+            drop(ws);
+
+            let mut ws = accept(listener).await;
+            assert!(challenge(&mut ws, &key, v6, vk_hub_proto::LIVE_EGRESS).await);
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
+            hub_send(&mut ws, &msg).await;
+            while hub_receive(&mut ws).await.is_some() {}
+            stop.send(true).unwrap();
+        };
+        let node_side = async {
+            assert!(run(node, gatherer, stopped).await.is_err());
+            let e = run(node, gatherer, stopped).await.unwrap_err();
+            assert!(format!("{e:#}").contains("version-6 session"), "{e:#}");
+        };
+        tokio::join!(hub, node_side);
+        assert!(!file.exists());
+    }
+
+    const PROTOCOL_7: VersionRange = VersionRange {
+        min: 1,
+        max: vk_hub_proto::REGISTRY_ACCESS,
+    };
 
     /// With a managed runner, a drain stops it and is reported draining until the runner has
     /// exited, then drained, and its ack moves from accepted to done.

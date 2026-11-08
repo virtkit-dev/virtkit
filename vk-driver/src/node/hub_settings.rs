@@ -156,8 +156,18 @@ fn for_node(settings: &BTreeMap<String, Value>, dir: &Path) -> BTreeMap<String, 
 /// The name `pem` is pinned under in the node dir.
 fn ca_name(pem: &str) -> String {
     use sha2::Digest;
-    let hash = vk_hub_proto::to_hex(&sha2::Sha256::digest(pem.as_bytes()));
-    format!("{REGISTRY_CA}{}.pem", hash.get(..16).unwrap_or(&hash))
+    ca_name_of(&vk_hub_proto::to_hex(&sha2::Sha256::digest(pem.as_bytes())))
+}
+
+/// The name a CA whose SHA-256 is `hash`, hex, is pinned under in the node dir.
+fn ca_name_of(hash: &str) -> String {
+    format!("{REGISTRY_CA}{}.pem", hash.get(..16).unwrap_or(hash))
+}
+
+/// Where the node dir `dir` pins a CA whose SHA-256 is `hash`, hex: the `ca_file` of a
+/// `[registry]` the hub names with it.
+pub fn ca_file(dir: &Path, hash: &str) -> std::path::PathBuf {
+    dir.join(ca_name_of(hash))
 }
 
 /// The registry CA `settings` carry, as the hub sent it.
@@ -492,6 +502,12 @@ impl Held {
         if let Some(pem) = old.filter(|o| Some(*o) != new) {
             pin(pem)?;
         }
+        // The node's own access is bound to the registry the hub named: a new one is the hub's
+        // to send.
+        let registry = |s: Option<&Saved>| s.and_then(|s| s.settings.get("registry")).cloned();
+        if registry(self.saved.as_ref()) != registry(Some(&saved)) {
+            super::registry_access::clear(dir)?;
+        }
         let path = dir.join(FILE);
         if desired.settings.is_empty() {
             remove_file(&path)?;
@@ -763,6 +779,43 @@ mod tests {
     /// Taken settings are written whole with where they came from, kept while they do not
     /// change, and removed when the hub sends none; the node reloads only when what its config
     /// would take moves, masked entries aside.
+    #[test]
+    fn another_registry_drops_the_node_s_access() {
+        let dir = scratch("access");
+        let cfg = crate::config::from_table(toml::Table::new()).unwrap();
+        let mut held = Held::new(&cfg, &dir, &issuer());
+        let file = dir.join("registry-access.json");
+        let registry = |repo: &str| json!({"repo": repo, "guest_credential": "job"});
+        held.take(
+            &dir,
+            &issuer(),
+            &desired(1, &[("registry", registry("a.example"))]),
+        )
+        .unwrap();
+        std::fs::write(&file, "{}").unwrap();
+        // Other settings leave it.
+        held.take(
+            &dir,
+            &issuer(),
+            &desired(
+                2,
+                &[
+                    ("registry", registry("a.example")),
+                    ("executor.vm.cpus", json!(8)),
+                ],
+            ),
+        )
+        .unwrap();
+        assert!(file.exists());
+        held.take(
+            &dir,
+            &issuer(),
+            &desired(3, &[("registry", registry("b.example"))]),
+        )
+        .unwrap();
+        assert!(!file.exists());
+    }
+
     #[test]
     fn taken_settings_are_saved_and_tell_when_to_reload() {
         let dir = scratch("take");

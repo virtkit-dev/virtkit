@@ -381,13 +381,31 @@ fn render_cmd(cmd: &Cmdline) -> String {
 /// `--require-cached` keeps refusing and a ref-keyed entry an earlier outage left behind is
 /// taken as fresh. A loud, consistent miss beats a split cache. `BTreeMap` because
 /// `HashMap::new` is not `const`, so it cannot initialize a `static`.
+///
+/// An image asked for with a credential ([`base_creds`]) is memoized apart from the same image
+/// asked for anonymously, so a build that could not read it does not decide for one that can.
 static BASE_DIGESTS: Mutex<BTreeMap<String, Option<String>>> = Mutex::new(BTreeMap::new());
 
 /// The manifest digest for `image`, resolved once per process. `None` — including any resolve
 /// failure — means the caller keys by the bare image ref.
-fn base_digest(image: &str) -> Option<String> {
-    memoized_digest(image, || {
-        match block_on(crate::oci::resolve_digest(image)) {
+fn base_digest(registry: Option<&crate::config::Registry>, image: &str) -> Option<String> {
+    let creds = match base_creds(registry, image) {
+        Ok(creds) => creds,
+        Err(e) => {
+            eprintln!("virtkit: digest resolve failed for {image} ({e:#}) — keying by ref");
+            return None;
+        }
+    };
+    let memo = match creds.is_some() {
+        true => format!("{image} (authenticated)"),
+        false => image.to_string(),
+    };
+    memoized_digest(&memo, || {
+        let resolved = match &creds {
+            Some(creds) => block_on(crate::oci::resolve_digest_auth(image, creds)),
+            None => block_on(crate::oci::resolve_digest(image)),
+        };
+        match resolved {
             Ok(d) => Some(d),
             Err(e) => {
                 eprintln!("virtkit: digest resolve failed for {image} ({e:#}) — keying by ref");
@@ -395,6 +413,39 @@ fn base_digest(image: &str) -> Option<String> {
             }
         }
     })
+}
+
+/// The credential a `FROM` image is pulled with: `registry`'s, resolved now, when the image is
+/// on that registry's host; `None` for any other host, which is asked anonymously, so no
+/// credential leaves for a registry it was not given for.
+fn base_creds(
+    registry: Option<&crate::config::Registry>,
+    image: &str,
+) -> Result<Option<crate::oci::Creds>> {
+    let Some(rg) = registry else {
+        return Ok(None);
+    };
+    let Some((base, _)) = rg.base_url() else {
+        return Ok(None);
+    };
+    let authority = base.split_once("://").map_or(base.as_str(), |(_, a)| a);
+    let Ok(reference) = image.parse::<oci_client::Reference>() else {
+        return Ok(None);
+    };
+    if !reference.registry().eq_ignore_ascii_case(authority) {
+        return Ok(None);
+    }
+    crate::oci::Creds::from_registry(rg)
+        .map(Some)
+        .with_context(|| format!("the credential for {image}"))
+}
+
+/// [`base_creds`], or anonymous.
+fn pull_creds(
+    registry: Option<&crate::config::Registry>,
+    image: &str,
+) -> Result<crate::oci::Creds> {
+    Ok(base_creds(registry, image)?.unwrap_or_else(crate::oci::Creds::anonymous))
 }
 
 /// Fetch by the resolved digest, or by the original image ref if resolution failed.
@@ -440,11 +491,17 @@ fn memoized_digest(image: &str, resolve: impl FnOnce() -> Option<String>) -> Opt
 #[derive(Default)]
 pub struct Planner {
     configs: HashMap<String, crate::oci::ImageConfig>,
+    /// The registry whose images are asked for with its credential ([`base_creds`]).
+    registry: Option<crate::config::Registry>,
 }
 
 impl Planner {
-    pub fn new() -> Self {
-        Self::default()
+    /// A planner asking `registry` for the images on its host with its credential.
+    pub fn new(registry: Option<crate::config::Registry>) -> Self {
+        Planner {
+            configs: HashMap::new(),
+            registry,
+        }
     }
 }
 
@@ -452,7 +509,7 @@ impl Planner {
 // primitives are unreachable on this backend (it never builds), so they error.
 impl Executor for Planner {
     fn resolve_base_digest(&mut self, image: &str) -> Option<String> {
-        base_digest(image)
+        base_digest(self.registry.as_ref(), image)
     }
     fn base_config(&mut self, image: &str) -> Result<crate::oci::ImageConfig> {
         if let Some(c) = self.configs.get(image) {
@@ -461,7 +518,7 @@ impl Executor for Planner {
         let fetch = base_fetch_ref(image, self.resolve_base_digest(image).as_deref())?;
         let c = block_on(crate::oci::pull_config(
             &fetch,
-            &crate::oci::Creds::anonymous(),
+            &pull_creds(self.registry.as_ref(), image)?,
         ))?;
         self.configs.insert(image.to_string(), c.clone());
         Ok(c)
@@ -537,6 +594,9 @@ pub struct MicroVm {
     /// keyed by its chained content hash, and pulled back on a rebuild hit. The CDC
     /// chunk dedup makes successive snapshots share almost all blobs. `None` = no cache.
     cache: Option<crate::config::Registry>,
+    /// The registry whose `FROM` images are pulled with its credential ([`base_creds`]);
+    /// every other host anonymously.
+    base_registry: Option<crate::config::Registry>,
     /// stage label → its ext4 image path. Shared across concurrent stage workers
     /// (a fork / `COPY --from` reads a dep's committed image): the driver commits a
     /// stage before unblocking its dependents, so the write happens-before the read.
@@ -1223,6 +1283,7 @@ impl MicroVm {
             // overlay/push are hole-aware, so the unused capacity costs nothing on disk.
             free_blocks: 32u64 * 1024 * 1024 * 1024 / 4096,
             cache,
+            base_registry: None,
             images: Arc::new(Mutex::new(HashMap::new())),
             image_locks: Arc::new(Mutex::new(HashMap::new())),
             lease: Arc::default(),
@@ -1336,6 +1397,12 @@ impl MicroVm {
     /// per-stage guest and cache-push bookkeeping never alias across threads; those maps and
     /// the process-wide digest memo ([`base_digest`]) are the only synchronization points.
     /// Config (kernel/agent/net/…) is cheap to clone per worker.
+    /// Pull the `FROM` images on `registry`'s host with its credential ([`base_creds`]).
+    pub fn with_base_registry(mut self, registry: Option<crate::config::Registry>) -> MicroVm {
+        self.base_registry = registry;
+        self
+    }
+
     pub fn worker(&self) -> MicroVm {
         MicroVm {
             kernel: self.kernel.clone(),
@@ -1350,6 +1417,7 @@ impl MicroVm {
             debug: self.debug,
             free_blocks: self.free_blocks,
             cache: self.cache.clone(),
+            base_registry: self.base_registry.clone(),
             images: Arc::clone(&self.images),
             image_locks: Arc::clone(&self.image_locks),
             lease: Arc::clone(&self.lease),
@@ -1791,7 +1859,7 @@ impl MicroVm {
         // stage's FROM step, so the "pulling …"/"flattened …" notes are redundant here.
         block_on(crate::oci::pull_flatten(
             &fetch,
-            &crate::oci::Creds::anonymous(),
+            &pull_creds(self.base_registry.as_ref(), image)?,
             &tar,
             &|_| {},
         ))
@@ -2894,12 +2962,12 @@ impl Executor for MicroVm {
         let fetch = base_fetch_ref(image, self.resolve_base_digest(image).as_deref())?;
         block_on(crate::oci::pull_config(
             &fetch,
-            &crate::oci::Creds::anonymous(),
+            &pull_creds(self.base_registry.as_ref(), image)?,
         ))
     }
 
     fn resolve_base_digest(&mut self, image: &str) -> Option<String> {
-        base_digest(image)
+        base_digest(self.base_registry.as_ref(), image)
     }
 
     fn stage_sources(&mut self, sources: &[Rootfs], context: &Path) -> Result<()> {
@@ -3288,6 +3356,63 @@ mod tests {
     // Temp dirs are minted over in `build`'s tests, so the tags here share one namespace with
     // the tags there — keep any tag added here distinct from both.
     use crate::build::tests::tmpdir;
+
+    /// A base image on the registry's host is asked for with its credential, resolved at each
+    /// pull so a renewal is seen; an image anywhere else, anonymously.
+    #[test]
+    fn a_base_on_the_registrys_host_is_pulled_with_its_credential() {
+        let dir = tmpdir("base-creds");
+        let mut rg = crate::config::Registry::for_share(
+            "reg.example.com/ci".into(),
+            false,
+            None,
+            String::new(),
+            None,
+            None,
+            None,
+        );
+        rg.node_access = Some(crate::node::registry_access::tests::held(
+            &dir,
+            "vkt_node",
+            u64::MAX,
+        ));
+        let token = |image: &str| {
+            base_creds(Some(&rg), image)
+                .unwrap()
+                .map(|c| c.token.unwrap_or_default())
+        };
+        assert_eq!(
+            token("reg.example.com/images/base:1").as_deref(),
+            Some("vkt_node")
+        );
+        let pinned = format!("reg.example.com/images/base@sha256:{}", "0".repeat(64));
+        assert_eq!(token(&pinned).as_deref(), Some("vkt_node"));
+        assert_eq!(token("docker.io/library/alpine:3"), None);
+        assert_eq!(token("alpine"), None);
+        assert_eq!(token("reg.example.com:5000/images/base:1"), None);
+        crate::node::registry_access::tests::held(&dir, "vkt_renewed", u64::MAX);
+        assert_eq!(
+            token("reg.example.com/images/base:1").as_deref(),
+            Some("vkt_renewed")
+        );
+        assert!(
+            base_creds(None, "reg.example.com/images/base:1")
+                .unwrap()
+                .is_none()
+        );
+        // Expired: the pull fails saying so, rather than going anonymously.
+        crate::node::registry_access::tests::held(&dir, "vkt_late", vk_peer::now_secs());
+        assert!(base_creds(Some(&rg), "reg.example.com/images/base:1").is_err());
+        assert_eq!(token_free(&rg), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another host's image under an expired token: still anonymous, never an error.
+    fn token_free(rg: &crate::config::Registry) -> Option<String> {
+        base_creds(Some(rg), "ghcr.io/o/i:1")
+            .unwrap()
+            .and_then(|c| c.token)
+    }
 
     /// A restore through a worker adds to the build's one lease, which outlives the worker and
     /// goes with the last of the build's backends.

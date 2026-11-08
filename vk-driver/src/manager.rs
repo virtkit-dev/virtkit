@@ -1122,6 +1122,7 @@ mod tests {
                 net: crate::build::BuildNet::All,
                 audit: false,
                 record: None,
+                base_registry: None,
             },
             ManagerDirs {
                 cache: PathBuf::from("/cache"),

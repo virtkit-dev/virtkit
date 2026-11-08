@@ -190,6 +190,7 @@ fn freshness_of_recipe(r: &StaleRecipe) -> Freshness {
         &r.build_contexts,
         &r.build_args,
         r.target.as_deref(),
+        None,
     ) else {
         return Freshness::Unknown;
     };

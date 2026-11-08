@@ -187,6 +187,10 @@ pub struct Build {
     /// what a host commonly leaves an NVMe on, ignores it, so this is no substitute for
     /// `nice`.
     pub ionice: Option<IoNice>,
+    /// The node's own access to the registry its hub names, for a cache on that registry with
+    /// no credential of its own ([`crate::build::cache_registry`]). Never read from a config.
+    #[serde(skip)]
+    pub(crate) node_access: Option<crate::node::registry_access::Source>,
 }
 
 /// `[build] ionice`: the I/O priority class a build's work runs in.
@@ -1066,8 +1070,12 @@ pub struct Registry {
     /// proxied too; the proxy then runs for every job, and one without a token gets a proxy
     /// that refuses everything, never this section's credential. That includes every job a
     /// local gitlab-runner gives this node: under `"job"`, only jobs the hub placed reach the
-    /// registry through `registry.vk`. Either way the proxy needs `net.mode = "switch"`, the
-    /// only network that serves `registry.vk`.
+    /// registry through `registry.vk`. `"job-or-node"`: `"job"` for jobs the hub placed; a job
+    /// a local gitlab-runner gives this node gets the token the hub gives the node for its
+    /// runner's guests, scoped to what the hub's namespaces grant guests, and a proxy that
+    /// refuses everything while the node holds none. Never this section's own credential.
+    /// Either way the proxy needs `net.mode = "switch"`, the only network that serves
+    /// `registry.vk`.
     #[serde(default)]
     pub guest_credential: GuestCredential,
     /// The root of the `ci-pipeline` namespace's path on this registry, as the hub's config
@@ -1077,20 +1085,28 @@ pub struct Registry {
     #[serde(default)]
     pub pipeline_root: Option<String>,
     /// A runtime bearer token for reaching the registry on a job's behalf, overriding the
-    /// configured credential. Never read from a config. [`crate::registry::at_path`] sets it on
-    /// a copy used for publication, and a placed job's context on its own config when the node
-    /// has no credential of its own; the node's `[registry]` is unchanged.
-    /// [`crate::registry::cred`] supplies it to every request through that copy.
+    /// configured credential. Never read from a config. [`crate::registry::at_path`] sets it,
+    /// required, on a copy for the job's own content, and a placed job's context on its own
+    /// config when the node has no credential of its own; the node's `[registry]` is
+    /// unchanged. [`crate::registry::credential`] supplies it to every request through that copy.
     #[serde(skip)]
     pub(crate) job_token: Option<JobToken>,
+    /// Where the node's own token for this registry is read, on an enrolled host whose
+    /// `[registry]` the hub names ([`crate::node::registry_access`]). Never read from a config.
+    #[serde(skip)]
+    pub(crate) node_access: Option<crate::node::registry_access::Source>,
 }
 
-/// A job's registry token, kept out of `Debug`, and when it expires.
+/// A job's registry token, kept out of `Debug`, when it expires, and whether a request may go
+/// on without it once it has.
 #[derive(Clone)]
 pub(crate) struct JobToken {
     token: String,
     /// Seconds since the epoch.
     expires_at: u64,
+    /// Whether the request needs this token: the job's own content (its pipeline's images,
+    /// its build cache), which no other credential may reach in its place.
+    required: bool,
 }
 
 impl JobToken {
@@ -1098,6 +1114,7 @@ impl JobToken {
         JobToken {
             token: token.to_string(),
             expires_at,
+            required: false,
         }
     }
 
@@ -1106,8 +1123,22 @@ impl JobToken {
         JobToken::new(&registry.token, registry.expires_at)
     }
 
+    /// This token, needed by every request made with it: past its expiry they fail, rather
+    /// than go on with the node's own access ([`crate::registry::credential`]).
+    pub(crate) fn required(self) -> JobToken {
+        JobToken {
+            required: true,
+            ..self
+        }
+    }
+
+    /// Whether requests need this token ([`JobToken::required`]).
+    pub(crate) fn is_required(&self) -> bool {
+        self.required
+    }
+
     /// The token while it is live. From its expiry on, a registry refuses it, so a request
-    /// goes without it rather than fail on it.
+    /// does not send it.
     pub(crate) fn live(&self) -> Option<&str> {
         (vk_peer::now_secs() < self.expires_at).then_some(self.token.as_str())
     }
@@ -1132,6 +1163,8 @@ pub enum GuestCredential {
     #[default]
     Node,
     Job,
+    #[serde(rename = "job-or-node")]
+    JobOrNode,
 }
 
 impl Registry {
@@ -1172,16 +1205,16 @@ impl Registry {
         self.pipeline_root.as_deref().unwrap_or("ci-pipeline")
     }
 
-    /// Whether the guest's proxy lends this section's own credential: `proxy_guests` without
-    /// `guest_credential = "job"`.
+    /// Whether the guest's proxy lends this section's own credential: `proxy_guests` under
+    /// `guest_credential = "node"`.
     pub fn lends_node_credential(&self) -> bool {
-        self.proxy_guests && self.guest_credential != GuestCredential::Job
+        self.proxy_guests && self.guest_credential == GuestCredential::Node
     }
 
-    /// Whether the guest's proxy lends a job's token rather than this section's credential:
-    /// `guest_credential = "job"` on a remote registry.
+    /// Whether the guest's proxy lends a placed job's token rather than this section's
+    /// credential: `guest_credential = "job"` or `"job-or-node"` on a remote registry.
     pub fn lends_job_token(&self) -> bool {
-        self.guest_credential == GuestCredential::Job && self.local_root().is_none()
+        self.guest_credential != GuestCredential::Node && self.local_root().is_none()
     }
 
     /// Whether this section names a credential of the node's own: a `token_file`, or a
@@ -1190,9 +1223,14 @@ impl Registry {
         self.token_file.is_some() || !self.username.is_empty()
     }
 
-    /// [`Registry::job_token`] while it is live ([`JobToken::live`]).
-    pub(crate) fn live_job_token(&self) -> Option<&str> {
-        self.job_token.as_ref().and_then(JobToken::live)
+    /// The node's own token for this registry, read again whenever the hub renewed it: `None`
+    /// where it holds none for this registry; an error once the one it holds expired, rather
+    /// than reaching the registry anonymously.
+    pub(crate) fn node_token(&self) -> Result<Option<crate::node::registry_access::NodeToken>> {
+        match &self.node_access {
+            Some(source) => source.live(vk_peer::now_secs()),
+            None => Ok(None),
+        }
     }
 
     /// [`Registry::local_root`]'s test applied to a repo string that is not (yet) a
@@ -1229,6 +1267,7 @@ impl Registry {
             guest_credential: GuestCredential::Node,
             pipeline_root: None,
             job_token: None,
+            node_access: None,
         }
     }
 }
@@ -1351,6 +1390,15 @@ fn load_resolved(explicit: Option<PathBuf>, fallbacks: &[PathBuf]) -> Result<Con
             Ok(with_hub) => {
                 cfg = with_hub;
                 cfg.layers.hub = taken;
+                // The node's own access is for the registry the hub names, never one the file
+                // sets.
+                if cfg.layers.hub.contains_key("registry") {
+                    let source = crate::node::registry_access::source(&cfg);
+                    cfg.build.node_access.clone_from(&source);
+                    if let Some(registry) = cfg.registry.as_mut() {
+                        registry.node_access = source;
+                    }
+                }
             }
             Err(e) => eprintln!(
                 "virtkit: warning: ignoring the fleet hub's settings, which leave the \
@@ -1545,18 +1593,19 @@ fn refuse_conflicts(cfg: &Config) -> Result<()> {
 fn ineffective_settings(cfg: &Config) -> Vec<&'static str> {
     let mut found = Vec::new();
     if let Some(rg) = &cfg.registry
-        && rg.guest_credential == GuestCredential::Job
+        && rg.guest_credential != GuestCredential::Node
         && !rg.lends_job_token()
     {
         found.push(
-            "`[registry] guest_credential = \"job\"` needs a remote registry: on a local store, \
-             jobs get no registry proxy",
+            "`[registry] guest_credential = \"job\"` or `\"job-or-node\"` needs a remote \
+             registry: on a local store, jobs get no registry proxy",
         );
     }
     if cfg.registry.as_ref().is_some_and(Registry::lends_job_token) && cfg.net.mode != "switch" {
         found.push(
-            "`[registry] guest_credential = \"job\"` needs `[net] mode = \"switch\"`, the only \
-             network that serves registry.vk: under another, jobs get no registry proxy",
+            "`[registry] guest_credential = \"job\"` or `\"job-or-node\"` needs `[net] mode = \
+             \"switch\"`, the only network that serves registry.vk: under another, jobs get no \
+             registry proxy",
         );
     }
     found
@@ -1681,12 +1730,19 @@ mod tests {
         assert_eq!(registry("repo = \"https:///x\"\n").base_url(), None);
     }
 
-    /// Only a remote registry under `"job"` lends a job's token.
+    /// Only a remote registry under `"job"` or `"job-or-node"` lends a job's token; neither
+    /// lends the node's own credential.
     #[test]
     fn only_a_remote_registry_under_job_lends_the_token() {
         assert!(
             registry("repo = \"reg.example/t\"\nguest_credential = \"job\"\n").lends_job_token()
         );
+        let either = registry(
+            "repo = \"reg.example/t\"\nproxy_guests = true\nguest_credential = \"job-or-node\"\n",
+        );
+        assert_eq!(either.guest_credential, GuestCredential::JobOrNode);
+        assert!(either.lends_job_token());
+        assert!(!either.lends_node_credential());
         assert!(!registry("repo = \"reg.example/t\"\n").lends_job_token());
         assert!(!registry("repo = \"/srv/store\"\nguest_credential = \"job\"\n").lends_job_token());
     }
@@ -1786,6 +1842,68 @@ mod tests {
             (cfg.executor.vm.cpus, cfg.executor.vm.max_cpus),
             (4, online)
         );
+    }
+
+    /// The node's own registry access is read for a `[registry]` the hub names, never for one
+    /// the file sets; it is live until it expires, then an error.
+    #[test]
+    fn the_node_s_registry_access_reaches_a_registry_the_hub_names() {
+        let dir = Dir::new("node-access");
+        let state = dir.0.join("state");
+        let node = state.join("node");
+        std::fs::create_dir_all(&node).unwrap();
+        let node_id = "ab".repeat(16);
+        std::fs::write(
+            node.join("enrollment.json"),
+            format!(r#"{{"hub": "https://hub.example", "node_id": "{node_id}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            node.join("settings.json"),
+            format!(
+                r#"{{"hub": "https://hub.example", "node_id": "{node_id}", "generation": 3,
+                    "settings": {{"registry": {{"repo": "reg.example.com",
+                                                "guest_credential": "job"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let issuer = crate::node::registry_access::Issuer {
+            hub: "https://hub.example".into(),
+            node_id: node_id.clone(),
+        };
+        let now = vk_peer::now_secs();
+        let access = |expires_at: u64| vk_hub_proto::NodeRegistryAccess {
+            registry_id: "cd".repeat(16),
+            origin: "https://reg.example.com".into(),
+            ca_sha256: None,
+            generation: 3,
+            issued_at: expires_at - 3600,
+            expires_at,
+            grants: Vec::new(),
+            token: "vkt_node".into(),
+            guest_token: None,
+            guest_grants: Vec::new(),
+        };
+        crate::node::registry_access::store(&node, &issuer, &access(now + 600)).unwrap();
+        let hub_named = dir.file("c.toml", &format!("state_dir = {state:?}\n"));
+        let cfg = load_resolved(Some(hub_named.clone()), &[]).unwrap();
+        // A build cache on that registry reaches it the same way.
+        assert!(cfg.build.node_access.is_some());
+        let registry = cfg.registry.as_ref().unwrap();
+        assert!(!registry.has_credential());
+        assert_eq!(registry.node_token().unwrap().unwrap().token, "vkt_node");
+        assert!(!format!("{registry:?}").contains("vkt_"));
+        crate::node::registry_access::store(&node, &issuer, &access(now - 1)).unwrap();
+        assert!(registry.node_token().is_err());
+
+        let own = dir.file(
+            "own.toml",
+            &format!("state_dir = {state:?}\n[registry]\nrepo = \"reg.example.com\"\n"),
+        );
+        let cfg = load_resolved(Some(own), &[]).unwrap();
+        assert!(cfg.registry.as_ref().unwrap().node_access.is_none());
+        assert!(cfg.build.node_access.is_none());
+        assert_eq!(cfg.registry.unwrap().node_token().unwrap(), None);
     }
 
     /// An enrolled host with nothing set budgets its memory less a reserve, lets a job ask for

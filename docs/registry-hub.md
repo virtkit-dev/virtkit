@@ -452,10 +452,10 @@ reports the update rolled back.
 
 ## Step 4: namespaces and job tokens
 
-Status: 4a and 4b are implemented (see *Step 4: reference*), 4d on the hub's side; 4c is
-proposed. This step covers GitLab jobs, tokens an admin mints for automation and tests, and
-nodes' own tokens (4d). Tokens for API keys and people's tokens come later on the same keys,
-format and checks.
+Status: 4a, 4b and 4d are implemented (see *Step 4: reference*); 4c is proposed. This
+step covers GitLab jobs, tokens an admin mints for automation and tests, and nodes' own
+tokens (4d). Tokens for API keys and people's tokens come later on the same keys, format and
+checks.
 
 ### Namespaces
 
@@ -636,7 +636,9 @@ though within them it can claim protection.
     from the node stays valid until it expires.
 - **On the node.**
   - `[registry] guest_credential = "job" | "node"` chooses what the guest's credential
-    proxy injects. The default is `"node"`, which is today's behaviour.
+    proxy injects. The default is `"node"`, which is today's behaviour. `"job-or-node"`
+    ([4d](#4d-node-tokens)) is `"job"` for placed jobs and lends jobs a local gitlab-runner
+    gives the node its guest token.
   - With `"job"`, the guest proxy runs for every job, whatever `proxy_guests` says. A job
     that arrives without a token gets a proxy that answers every request with 403. It never
     falls back to the node's credential.
@@ -772,10 +774,10 @@ though within them it can claim protection.
 
 ### 4d: node tokens
 
-Status: implemented on the hub's side (see *Step 4: reference*): node and guest grants,
-revoked subjects, the hub's delivery and renewal of node and guest tokens; nodes keeping them,
-the requests `vk` makes of the registry carrying them, and the guest proxy lending the guest
-token are proposed. A node using the registry its hub names holds no credential of its own
+Status: implemented (see *Step 4: reference*): node and guest grants, revoked subjects, the
+hub's delivery and renewal of node and guest tokens, nodes keeping them, the requests `vk`
+makes of the registry carrying them, and the guest proxy lending the guest token. A node
+using the registry its hub names holds no credential of its own
 ([fleet design](fleet-design.md#hub-settings)), so outside a placed job it reaches the
 registry as nobody: `vk build` and its tools build, `vk registry pull`, `virtkit/` bundles,
 the Docker relay, a job gitlab-runner gives it, and a pull after a job's token expired. This
@@ -1031,6 +1033,27 @@ node's grants change, and looks again every 5 minutes. Minting reads the node's 
 lock its removal takes, so none is minted once the removal commits. Each issue is logged by
 jti, never the token, and audited under the registry unless it renews the same access; so is
 a clear withdrawing access the session granted.
+
+A node keeps what it was sent in `<state_dir>/node/registry-access.json` (`0600`, replaced by
+rename) with its hub and node ID, and drops it on a clear, a new `join`, a refusal saying it
+was removed, or a change of the registry the hub's settings name. A config whose `[registry]`
+comes from those settings, never one the file sets, reads it again whenever it changed, and
+only for that registry's URL and the CA the settings pin; once expired, it is an error, not
+an anonymous request.
+
+Each request `vk` makes of the registry — bundles, `vk registry pull`, the Docker relay, the
+CI cache, build locks and failure memos, and `vk build`'s base images on its host — picks its
+credential again: a job's token while
+live; past its expiry, an error for the job's own content (`pipeline/build/` images, its CI
+and build caches), the next one for anything else; then the section's own `token_file` or
+Basic pair; then the node's token. A refusal of the job's token is final. A lock held across a
+renewal is renewed and released with the new token; a memo is never recorded with the node's,
+which names no pipeline. The guest proxy `proxy_guests` runs lends the section's own credential
+only, never the node's token. A base image on another host, and a direct pull after the relay
+declined, go anonymously. A build cache (`[build] cache_registry`, `--cache-registry`) at the
+registry's origin naming no credential of its own takes the node's token and the registry's CA;
+its own credential, or any other destination, is left as configured. The tools build keeps its
+`--cache-registry none` and reads the node's token as any other `vk` on the host does.
 
 **Web UI.** `/registries` lists each registry's name, bound address, connection status, free
 storage and job access: *off* (no `[hub] tokens`), *Setup needed* (no bound address or applied

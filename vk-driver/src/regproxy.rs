@@ -27,7 +27,9 @@
 //! scoped to the job's namespaces (`[registry] guest_credential = "job"`), also reaches the
 //! lock API (`/lock/`) and plain files (`/dav/files/`): the registry enforces the token's
 //! grants on each. A job meant to have a token and given none gets a proxy that forwards
-//! nothing.
+//! nothing. A job no hub placed, under `guest_credential = "job-or-node"`, gets the token the
+//! hub gives the node for its runner's guests on the same paths, read again for each request so
+//! a renewal reaches a running job; while the node holds none, the proxy forwards nothing.
 //!
 //! A job's token may come with areas ([`Area`]): `job/<alias>` in an OCI or plain-file path, or
 //! before the `:` of a lock name, stands for the area's prefix, so a guest names a fixed path
@@ -108,6 +110,9 @@ pub struct ProxyCfg {
     /// The credential injected into every forwarded request, so the job stays
     /// credential-free — and the trust anchor `client` was built against.
     pub creds: Creds,
+    /// Where the token the node lends its runner's guests is read for each request, injected
+    /// in place of `creds`' ([`ProxyCfg::for_guests`]).
+    guests: Option<crate::node::registry_access::Source>,
     pub client: reqwest::Client,
 }
 
@@ -119,10 +124,11 @@ impl ProxyCfg {
     }
 
     /// Build from the runner's `[registry]` config (the executor path): the central
-    /// registry's base URL, and the credential every other `[registry]` client resolves —
-    /// a bearer token when one is configured, else the Basic pair.
+    /// registry's base URL, and the section's own credential — a bearer token when one is
+    /// configured, else the Basic pair. Never the node's token from its hub: a guest could
+    /// exercise everything it grants.
     pub fn from_registry(rg: &crate::config::Registry) -> Result<Self> {
-        Self::build(Self::upstream_of(rg)?, Creds::from_registry(rg)?)
+        Self::build(Self::upstream_of(rg)?, Creds::from_registry_own(rg)?)
     }
 
     fn upstream_of(rg: &crate::config::Registry) -> Result<String> {
@@ -150,6 +156,20 @@ impl ProxyCfg {
             Some(_) => Scope::Job,
             None => Scope::Deny,
         };
+        Ok(cfg)
+    }
+
+    /// Build for a job no hub placed under `[registry] guest_credential = "job-or-node"`: the
+    /// runner's `[registry]` as upstream and trust anchor, injecting the token the hub gives the
+    /// node for its runner's guests, as it stands at each request, and nothing of the section's
+    /// own credential nor the node's own token; for a registry the hub does not name, a proxy
+    /// that forwards nothing.
+    pub fn for_guests(rg: &crate::config::Registry) -> Result<Self> {
+        let mut cfg = Self::for_job(rg, None)?;
+        if let Some(source) = &rg.node_access {
+            cfg.scope = Scope::Job;
+            cfg.guests = Some(source.clone());
+        }
         Ok(cfg)
     }
 
@@ -203,6 +223,7 @@ impl ProxyCfg {
             scope: Scope::Oci,
             areas: Vec::new(),
             creds,
+            guests: None,
             client: b.build().context("building the registry proxy client")?,
         })
     }
@@ -548,6 +569,24 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
             Scope::Deny => b"registry proxy: this job has no registry credential",
         }));
     };
+    // The guests' token as it stands now, so a renewal reaches a job already running.
+    let guest_token = match &cfg.guests {
+        None => None,
+        Some(source) => match source.live_guest(vk_peer::now_secs()) {
+            Ok(Some(token)) => Some(token),
+            Ok(None) => {
+                return Ok(forbidden(
+                    b"registry proxy: this node holds no registry credential for its jobs",
+                ));
+            }
+            Err(e) => {
+                eprintln!("virtkit: registry proxy: {e:#}");
+                return Ok(forbidden(
+                    b"registry proxy: this node's registry credential has expired",
+                ));
+            }
+        },
+    };
     let method = req.method().clone();
     // Plain files take the verbs vk-registry serves there, and no MOVE or COPY, whose
     // `Destination` names the proxy rather than the registry.
@@ -603,7 +642,10 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
         for (k, v) in &headers {
             rb = rb.header(k, v);
         }
-        rb = cfg.creds.apply(rb);
+        rb = match &guest_token {
+            Some(token) => rb.bearer_auth(token),
+            None => cfg.creds.apply(rb),
+        };
         match body {
             Some(body) => rb.body(body),
             None => rb,
@@ -1188,6 +1230,49 @@ mod tests {
             .unwrap();
         let (auth, path) = seen.lock().unwrap().clone();
         (r.status().as_u16(), auth, path)
+    }
+
+    /// A job of the node's own runner gets the guests' token on the job token's paths, read
+    /// again for each request; while the node holds none, or once it expired, nothing is
+    /// forwarded, and neither the section's credential nor the node's own token ever is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runner_job_gets_the_guests_token_as_it_stands() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = fake_upstream();
+        let dir = std::env::temp_dir().join(format!("vk-regproxy-guests-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let origin = format!("http://{up_addr}");
+        let held = |guest: Option<&str>, expires_at: u64| {
+            crate::node::registry_access::tests::held_for_guests(&dir, &origin, guest, expires_at)
+        };
+        let far = vk_peer::now_secs() + 3600;
+        let mut rg = registry(up_addr);
+        // A registry the hub does not name: nothing.
+        let none = ProxyCfg::for_guests(&rg).unwrap();
+        assert_eq!(none.scope, Scope::Deny);
+        rg.node_access = Some(held(None, far));
+        let proxy = spawn_blocking(ProxyCfg::for_guests(&rg).unwrap()).unwrap();
+        let get = "/v2/build-cache/app/manifests/latest";
+        let (status, auth, _) = status_and_auth(proxy, "GET", get, &seen).await;
+        assert_eq!((status, auth.as_str()), (403, ""));
+        held(Some("vkt_guest_one"), far);
+        for (method, target) in [("GET", get), ("POST", "/lock/acquire?name=build-cache:k")] {
+            let (status, auth, _) = status_and_auth(proxy, method, target, &seen).await;
+            assert_eq!(
+                (status, auth.as_str()),
+                (200, "Bearer vkt_guest_one"),
+                "{method} {target}"
+            );
+        }
+        // Renewed while the job runs.
+        held(Some("vkt_guest_two"), far + 1);
+        let (_, auth, _) = status_and_auth(proxy, "GET", get, &seen).await;
+        assert_eq!(auth, "Bearer vkt_guest_two");
+        held(Some("vkt_guest_two"), 1);
+        let (status, auth, _) = status_and_auth(proxy, "GET", get, &seen).await;
+        assert_eq!((status, auth.as_str()), (403, ""));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A job's token reaches the lock API and plain files as well as `/v2/`, injected in

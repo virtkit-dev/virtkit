@@ -204,6 +204,9 @@ pub struct CacheAuth {
     pub username: String,
     pub password_file: Option<PathBuf>,
     pub token_file: Option<PathBuf>,
+    /// The node's own access to the registry its hub names: a cache there with none of the
+    /// credentials above is reached with it.
+    pub(crate) node_access: Option<crate::node::registry_access::Source>,
 }
 
 impl CacheAuth {
@@ -216,6 +219,7 @@ impl CacheAuth {
             username: b.cache_username.clone(),
             password_file: b.cache_password_file.clone(),
             token_file: b.cache_token_file.clone(),
+            node_access: b.node_access.clone(),
         }
     }
 }
@@ -288,9 +292,14 @@ impl CacheDest {
 
 /// The server or on-disk store for cached builds and plain files, with its credentials.
 /// `None` when caching is off.
+///
+/// A cache on the registry the node's hub names, at the same origin, given no credential of
+/// its own, is reached with the node's own access there, and trusted with that registry's CA
+/// when it names none. A credential the cache names wins, and the cache stays where it was
+/// asked to be: nothing here picks one.
 pub(crate) fn cache_registry(cache: &CacheOpts) -> Result<Option<crate::config::Registry>> {
     Ok(cache_repo(cache.registry.as_deref())?.map(|repo| {
-        crate::config::Registry::for_share(
+        let mut rg = crate::config::Registry::for_share(
             repo,
             cache.insecure,
             cache.auth.ca_file.clone(),
@@ -298,7 +307,19 @@ pub(crate) fn cache_registry(cache: &CacheOpts) -> Result<Option<crate::config::
             cache.auth.password_file.clone(),
             cache.auth.token_file.clone(),
             None,
-        )
+        );
+        if let Some(access) = &cache.auth.node_access
+            && !rg.has_credential()
+            && rg
+                .base_url()
+                .is_some_and(|(origin, _)| origin == access.origin())
+        {
+            if rg.ca_file.is_none() {
+                rg.ca_file = access.ca_file().map(Path::to_path_buf);
+            }
+            rg.node_access = Some(access.clone());
+        }
+        rg
     }))
 }
 
@@ -340,6 +361,10 @@ pub struct Options {
     pub agent: Option<PathBuf>,
     /// Where the instruction cache lives ([`CacheDest`]).
     pub cache: CacheDest,
+    /// The `[registry]` whose host's `FROM` images are pulled with its credential, as every
+    /// other request to it ([`crate::registry::credential`]); every other host is asked
+    /// anonymously.
+    pub base_registry: Option<crate::config::Registry>,
     /// how aggressively the instruction cache is populated (see [`BuildCache`]).
     pub build_cache: BuildCache,
     /// add an ext4 journal to the exported image (the build stays journal-less).
@@ -891,7 +916,8 @@ fn make_microvm(
         channels.join(crate::run::NET_BYTES),
         record,
         Arc::clone(timings),
-    ))
+    )
+    .with_base_registry(opts.base_registry.clone()))
 }
 
 /// Where a build's stage switches keep their channels: in a placed job's record, a dir of
@@ -1932,20 +1958,21 @@ fn resolve_stages(
 /// Resolve every stage's cache key (name or index → `stage_key`: the chain key after the
 /// stage's last instruction) without building — the exact identity virtkit's instruction
 /// cache stores a stage's snapshot under. Resolves base digests + base image config over
-/// the network (like a real build) so the keys match what a build would store. Backs the
-/// `docker-hash` subcommand.
+/// the network (like a real build, with `registry`'s credential for the images on its host)
+/// so the keys match what a build would store. Backs the `docker-hash` subcommand.
 pub fn stage_keys(
     dockerfiles: &[PathBuf],
     contexts: &[PathBuf],
     build_contexts: &[(String, PathBuf)],
     build_args: &[(String, String)],
+    registry: Option<&crate::config::Registry>,
 ) -> Result<Vec<(String, String)>> {
     let inputs = load_inputs(dockerfiles, contexts)?;
     let ba: Vars = build_args.iter().cloned().collect();
     let mut plan = Plan::from_dockerfiles(&inputs, &ba)?;
     plan.named_contexts = named_context_map(build_contexts)?;
     let order = plan.all_order()?;
-    let mut ex = exec::Planner::new();
+    let mut ex = exec::Planner::new(registry.cloned());
     // canonical keys: DOCKER_STAGE_HASH is excluded (its injected value never affects a
     // stage's identity), so `docker-hash` prints exactly the key a build would store.
     let resolved = resolve_stages(&plan, &order, &ba, &mut ex, None)?;
@@ -2014,13 +2041,15 @@ fn source_content_key(
 /// The cache key (`stage_key`) of one target stage in the merged Dockerfiles — the
 /// content identity a unit image is fingerprinted with. `None` targets the last
 /// stage, like a build. Resolves base digests/config over the network like a real
-/// build, pruned to the target's dependency subgraph.
+/// build, pruned to the target's dependency subgraph, with `registry`'s credential for the
+/// images on its host, as the build pulls them.
 pub fn target_stage_key(
     dockerfiles: &[PathBuf],
     contexts: &[PathBuf],
     build_contexts: &[(String, PathBuf)],
     build_args: &[(String, String)],
     target: Option<&str>,
+    registry: Option<&crate::config::Registry>,
 ) -> Result<String> {
     let inputs = load_inputs(dockerfiles, contexts)?;
     let ba: Vars = build_args.iter().cloned().collect();
@@ -2028,7 +2057,7 @@ pub fn target_stage_key(
     plan.named_contexts = named_context_map(build_contexts)?;
     let t = plan.resolve_target(target)?;
     let order = plan.build_order(t)?;
-    let mut ex = exec::Planner::new();
+    let mut ex = exec::Planner::new(registry.cloned());
     let resolved = resolve_stages(&plan, &order, &ba, &mut ex, None)?;
     Ok(resolved[&t].final_key.clone())
 }
@@ -5857,6 +5886,53 @@ mod tests {
         }
     }
 
+    /// A cache on the registry the node's hub names, at its origin and naming no credential,
+    /// is reached with the node's access there and that registry's CA; a credential the cache
+    /// names, another origin or plain HTTP gets none of it.
+    #[test]
+    fn a_cache_on_the_hubs_registry_takes_the_nodes_access() {
+        let dir = std::env::temp_dir().join(format!("vk-cache-node-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let access = crate::node::registry_access::tests::held(&dir, "vkt_node", u64::MAX);
+        let ca = dir.join("ca.pem");
+        let access = crate::node::registry_access::Source::new(
+            &dir,
+            crate::node::registry_access::tests::issuer("n1"),
+            access.origin().to_string(),
+            Some(ca.clone()),
+        );
+        let cache = |repo: &str, insecure: bool, token_file: Option<PathBuf>| {
+            cache_registry(&CacheOpts {
+                registry: Some(repo.into()),
+                insecure,
+                auth: CacheAuth {
+                    token_file,
+                    node_access: Some(access.clone()),
+                    ..CacheAuth::default()
+                },
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let same = cache("reg.example.com/build-cache", false, None);
+        assert!(same.node_access.is_some());
+        assert_eq!(same.ca_file.as_deref(), Some(ca.as_path()));
+        let own = cache("reg.example.com/build-cache", false, Some("/t".into()));
+        assert!(own.node_access.is_none());
+        assert!(
+            cache("cache.corp/build-cache", false, None)
+                .node_access
+                .is_none()
+        );
+        assert!(
+            cache("reg.example.com/build-cache", true, None)
+                .node_access
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn cache_repo_resolution() {
         assert_eq!(cache_repo(Some("none")).unwrap(), None);
@@ -6244,6 +6320,7 @@ mod tests {
                 &named,
                 &[],
                 None,
+                None,
             )
             .unwrap()
         };
@@ -6510,7 +6587,7 @@ mod tests {
         let files = [tmp.join("a/Dockerfile"), tmp.join("b/Dockerfile")];
 
         let keys = || {
-            let m: HashMap<String, String> = stage_keys(&files, &[], &[], &[])
+            let m: HashMap<String, String> = stage_keys(&files, &[], &[], &[], None)
                 .unwrap()
                 .into_iter()
                 .collect();
@@ -6869,6 +6946,7 @@ ENTRYPOINT run me
                 insecure: false,
                 auth: Default::default(),
             }),
+            base_registry: None,
             build_cache: BuildCache::default(),
             journal: false,
             out_format: ImageFormat::Raw,
@@ -6944,6 +7022,7 @@ ENTRYPOINT run me
                 insecure: false,
                 auth: Default::default(),
             }),
+            base_registry: None,
             build_cache: BuildCache::default(),
             journal: false,
             out_format: ImageFormat::Raw,
@@ -6996,6 +7075,7 @@ ENTRYPOINT run me
                 insecure: false,
                 auth: Default::default(),
             }),
+            base_registry: None,
             build_cache: BuildCache::default(),
             journal: false,
             out_format: ImageFormat::Raw,
@@ -7055,6 +7135,7 @@ ENTRYPOINT run me
                 insecure: false,
                 auth: Default::default(),
             }),
+            base_registry: None,
             build_cache: BuildCache::default(),
             journal: false,
             out_format: ImageFormat::Raw,
@@ -7070,7 +7151,7 @@ ENTRYPOINT run me
         })
         .unwrap();
         // The stamped UUID must equal fingerprint([the target's stage key]).
-        let key = target_stage_key(&dockerfiles, &[], &[], &[], None).unwrap();
+        let key = target_stage_key(&dockerfiles, &[], &[], &[], None, None).unwrap();
         let expected = crate::ensure::fingerprint(&[&key]);
         assert_eq!(
             crate::ext4::fs_uuid(&out).as_deref(),
@@ -7106,6 +7187,7 @@ ENTRYPOINT run me
                 insecure: false,
                 auth: Default::default(),
             }),
+            base_registry: None,
             build_cache: BuildCache::default(),
             journal: false,
             out_format: ImageFormat::Raw,
@@ -7164,6 +7246,7 @@ ENTRYPOINT run me
                 insecure: false,
                 auth: Default::default(),
             }),
+            base_registry: None,
             build_cache: BuildCache::default(),
             journal: false,
             tmp_tmpfs: false,
@@ -7239,6 +7322,7 @@ ENTRYPOINT run me
                 insecure: false,
                 auth: Default::default(),
             }),
+            base_registry: None,
             build_cache: BuildCache::default(),
             journal: true,
             out_format: ImageFormat::Raw,
@@ -7253,7 +7337,7 @@ ENTRYPOINT run me
             progress_sink: None,
         })
         .expect("a journaled export must not fail stamping its own UUID");
-        let key = target_stage_key(&[tmp.join("Dockerfile")], &[], &[], &[], None).unwrap();
+        let key = target_stage_key(&[tmp.join("Dockerfile")], &[], &[], &[], None, None).unwrap();
         let expected = crate::ensure::fingerprint(&[&key]);
         assert_eq!(
             crate::ext4::fs_uuid(&out).as_deref(),
@@ -8416,6 +8500,7 @@ RUN ship
                 insecure: false,
                 auth: Default::default(),
             }),
+            base_registry: None,
             build_cache: BuildCache::default(),
             journal: false,
             out_format: ImageFormat::Raw,

@@ -228,6 +228,7 @@ fn run_args(
         }
     }
     let mut args = crate::run::RunArgs {
+        base_registry: cfg.registry.clone(),
         workspace: Some(plan.workspace.clone()),
         state_dir: Some(plan.state_dir.clone()),
         // Egress, and for compose the LAN its services share.

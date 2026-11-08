@@ -138,8 +138,16 @@ impl Creds {
     }
 
     /// What `[build]`'s `cache_*` keys name, for the vk-registry a runner is handed as its
-    /// build cache — also the first server a job image that nothing routes is offered to.
+    /// build cache — also the first server a job image that nothing routes is offered to. A
+    /// cache on the registry the node's hub names, naming no credential, gets the node's own
+    /// access there, as [`crate::build::cache_registry`] gives it.
     pub fn from_build_cache(b: &Build) -> Result<Creds> {
+        let cache = crate::build::CacheOpts::from_config(b);
+        if let Some(rg) = crate::build::cache_registry(&cache)?
+            && rg.node_access.is_some()
+        {
+            return Creds::from_registry(&rg);
+        }
         Creds::from_files(CredFiles {
             section: "[build] cache_*",
             ca_file: b.cache_ca_file.as_deref(),
@@ -150,36 +158,44 @@ impl Creds {
         })
     }
 
-    /// What `[registry]` names — the same credential `registry::cred` resolves for the
-    /// bundle paths, a job's token first, in the shape the OCI client here takes.
+    /// What `[registry]` names — the credential [`crate::registry::credential`] gives the bundle
+    /// paths, in the shape the OCI client here takes. Resolved now: build it for each pull,
+    /// not once for a long-lived client, so a renewed node token is the one sent.
     pub fn from_registry(rg: &Registry) -> Result<Creds> {
-        if let Some(token) = rg.live_job_token() {
-            return Creds {
-                username: None,
-                password: None,
-                token: Some(token.to_string()),
-                ca_pem: None,
-                insecure: rg.insecure,
-            }
-            .with_ca_file(rg.ca_file.as_deref());
-        }
-        Creds::from_files(CredFiles {
-            section: "[registry]",
-            ca_file: rg.ca_file.as_deref(),
-            username: &rg.username,
-            password_file: rg.password_file.as_deref(),
-            token_file: rg.token_file.as_deref(),
-            insecure: rg.insecure,
-        })
+        Creds::of(crate::registry::cred(rg)?, rg)
     }
 
-    /// The shared body of the four `from_*` constructors.
+    /// `[registry]`'s own credential only, never a job's or the node's token: what a guest's
+    /// proxy lends under `proxy_guests`.
+    pub fn from_registry_own(rg: &Registry) -> Result<Creds> {
+        Creds::of(crate::registry::own_cred(rg)?, rg)
+    }
+
+    /// `cred`, over `rg`'s transport.
+    fn of(cred: crate::registry::Cred, rg: &Registry) -> Result<Creds> {
+        use crate::registry::Cred;
+        let (username, password, token) = match cred {
+            Cred::None => (None, None, None),
+            Cred::Basic { user, pass } => (Some(user), Some(pass), None),
+            Cred::Bearer { token } => (None, None, Some(token)),
+        };
+        Creds {
+            username,
+            password,
+            token,
+            ca_pem: None,
+            insecure: rg.insecure,
+        }
+        .with_ca_file(rg.ca_file.as_deref())
+    }
+
+    /// The shared body of the `from_*` constructors for the sections other than `[registry]`.
     ///
     /// The files are read here, once, rather than at each use: a pull that would fail for
     /// an unreadable 0600 file says so before the first request, naming the path. A
     /// `token_file` supersedes the Basic pair, so the password is not read at all when one
     /// is set — what [`Creds::auth`] would ignore, and what `vk check` skips validating.
-    /// The trimming rules are `registry::cred`'s, so one credential file behaves the same
+    /// The trimming rules are `registry::own_cred`'s, so one credential file behaves the same
     /// whichever path reads it: a token loses whitespace at both ends, while a password is
     /// `trim_end`ed only — it may legitimately begin with whitespace.
     fn from_files(f: CredFiles<'_>) -> Result<Creds> {

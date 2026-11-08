@@ -311,8 +311,9 @@ async fn inspect_async(rg: &Registry, name: &str, reference: &Reference) -> Resu
 }
 
 /// `rg` with its repository prefix replaced by `path`, an absolute path on the same registry,
-/// and `token`, when given, in place of its credential; without one, it keeps `rg`'s. `None`
-/// for a local store or a `repo` naming no host.
+/// and `token`, when given, in place of its credential (a job's own content takes it
+/// [`crate::config::JobToken::required`]); without one, it keeps `rg`'s. `None` for a local
+/// store or a `repo` naming no host.
 pub(crate) fn at_path(
     rg: &Registry,
     path: &str,
@@ -3355,7 +3356,7 @@ pub struct BuildLock {
 }
 
 struct BuildLockInner {
-    client: Arc<vk_registry::LockClient>,
+    locks: Arc<Locks>,
     held: vk_registry::Held,
     /// `(stopped, condvar)`: a Condvar (not a bare flag) so `Drop` wakes the heartbeat out
     /// of its wait at once instead of blocking a whole renew interval on `join`.
@@ -3363,17 +3364,39 @@ struct BuildLockInner {
     heartbeat: Option<std::thread::JoinHandle<()>>,
 }
 
+/// A registry's `/lock/` API, reached with the credential [`credential`] gives at each request,
+/// so a lease held across a renewal of the node's token is renewed and released with the new
+/// one.
+struct Locks {
+    rg: Registry,
+    base: String,
+    http: reqwest::Client,
+}
+
+impl Locks {
+    /// A client with the credential the registry takes now; `None` when there is none to be
+    /// had (the node's token expired, an unreadable credential file).
+    fn client(&self) -> Option<vk_registry::LockClient> {
+        let auth = cred(&self.rg).ok()?.client_auth();
+        Some(vk_registry::LockClient::new(
+            self.base.clone(),
+            auth,
+            self.http.clone(),
+        ))
+    }
+}
+
 /// One acquire attempt on `key`, long-polling up to `wait` for a holder to let go
 /// (`Duration::ZERO` does not wait for one, though a busy registry's 503 is still waited out
 /// for up to 30 s). `None` if the wait elapsed with the key still held, or on any transport
 /// error — the caller treats both as "not acquired".
 fn acquire_once(
-    client: &Arc<vk_registry::LockClient>,
+    locks: &Locks,
     key: &str,
     holder: &str,
     wait: Duration,
 ) -> Option<vk_registry::Held> {
-    let client = client.clone();
+    let client = locks.client()?;
     let key = key.to_string();
     let holder = holder.to_string();
     block_on(async move { client.acquire(&key, BUILD_LOCK_TTL, wait, &holder).await })
@@ -3402,22 +3425,26 @@ pub fn build_lock_waiting(
     wait: Duration,
     on_wait: &mut dyn FnMut(&str),
 ) -> Option<BuildLock> {
-    let base = lock_base(rg)?;
-    let http = http_client(rg).ok()?;
-    // Authenticate the lock API with the cache registry's own credentials — the /lock/
-    // endpoint is gated like every other path, so a tokenless client 401s against an
-    // auth-gated registry (no fleet-wide build-once serialization).
-    let auth = cred(rg).map(|c| c.client_auth()).unwrap_or_default();
-    let client = Arc::new(vk_registry::LockClient::new(base, auth, http));
+    // Authenticate the lock API with the cache registry's credentials — the /lock/ endpoint
+    // is gated like every other path, so a tokenless client 401s against an auth-gated
+    // registry (no fleet-wide build-once serialization).
+    let locks = Arc::new(Locks {
+        rg: rg.clone(),
+        base: lock_base(rg)?,
+        http: http_client(rg).ok()?,
+    });
     let identity = crate::jobctx::job_identity();
 
     // Try once without blocking; on contention, name the holder before we park on the wait.
-    let held = match acquire_once(&client, key, &identity, Duration::ZERO) {
+    let held = match acquire_once(&locks, key, &identity, Duration::ZERO) {
         Some(h) => h,
         None => {
-            let who = block_on(client.holder(key));
+            let who = match locks.client() {
+                Some(client) => block_on(async move { client.holder(key).await }),
+                None => None,
+            };
             on_wait(who.as_deref().unwrap_or("another runner"));
-            acquire_once(&client, key, &identity, wait)?
+            acquire_once(&locks, key, &identity, wait)?
         }
     };
 
@@ -3425,7 +3452,7 @@ pub fn build_lock_waiting(
     // is a Condvar so Drop wakes the wait immediately rather than blocking `join` for up to
     // a full renew interval.
     let stop = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-    let hb_client = client.clone();
+    let hb_locks = locks.clone();
     let hb_stop = stop.clone();
     let hb_held = vk_registry::Held {
         name: held.name.clone(),
@@ -3462,9 +3489,12 @@ pub fn build_lock_waiting(
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             };
+            let Some(client) = hb_locks.client() else {
+                continue;
+            };
             rt.block_on(async {
                 tokio::select! {
-                    _ = hb_client.renew(&hb_held, BUILD_LOCK_TTL) => {}
+                    _ = client.renew(&hb_held, BUILD_LOCK_TTL) => {}
                     () = stopping => {}
                 }
             });
@@ -3473,7 +3503,7 @@ pub fn build_lock_waiting(
 
     Some(BuildLock {
         inner: Some(BuildLockInner {
-            client,
+            locks,
             held,
             stop,
             heartbeat: Some(heartbeat),
@@ -3494,7 +3524,9 @@ impl Drop for BuildLock {
         if let Some(hb) = inner.heartbeat.take() {
             let _ = hb.join();
         }
-        let client = inner.client;
+        let Some(client) = inner.locks.client() else {
+            return;
+        };
         let held = inner.held;
         let _ = block_on(async move { client.release(&held).await });
     }
@@ -3507,13 +3539,15 @@ impl Drop for BuildLock {
 /// pipeline id always bypasses it regardless.
 const BUILD_FAIL_TTL: Duration = Duration::from_secs(6 * 3600);
 
-/// Failure-memo pipeline for the lock API: `Some(None)` uses the job token's pipeline.
-/// Without a job token, use the CI pipeline or return `None` to disable memos.
-fn memo_pipeline(rg: &Registry) -> Option<Option<String>> {
-    if rg.live_job_token().is_some() {
-        Some(None)
-    } else {
-        crate::jobctx::pipeline_identity().map(Some)
+/// Failure-memo pipeline for the lock API, by whose credential the memo goes with:
+/// `Some(None)` uses the job token's pipeline. The node's own token has none, and the registry
+/// refuses it memos, so it gets `None`, as does a request without a CI pipeline; any other
+/// names the CI pipeline.
+fn memo_pipeline(whose: Whose) -> Option<Option<String>> {
+    match whose {
+        Whose::Job => Some(None),
+        Whose::Node => None,
+        Whose::Own | Whose::Nobody => crate::jobctx::pipeline_identity().map(Some),
     }
 }
 
@@ -3527,15 +3561,19 @@ pub(crate) fn lock_name(rg: &Registry, repo: &str, tag: &str) -> String {
 }
 
 /// A lock client for `rg`'s failure-memo endpoints, or `None` when there is nothing to talk
-/// to: a local filesystem store (no lock server), or outside CI without a job token (no
-/// pipeline id — a local `vk build`/`vk run` always retries, never memoized). Shared setup for
+/// to: a local filesystem store (no lock server), outside CI without a job token (no
+/// pipeline id — a local `vk build`/`vk run` always retries, never memoized), with the node's
+/// own token, or with no credential to be had. Shared setup for
 /// [`check_build_failure`]/[`report_build_failure`].
 fn fail_client(rg: &Registry) -> Option<(vk_registry::LockClient, Option<String>)> {
-    let pipeline = memo_pipeline(rg)?;
     let base = lock_base(rg)?;
+    let (cred, whose) = credential(rg).ok()?;
+    let pipeline = memo_pipeline(whose)?;
     let http = http_client(rg).ok()?;
-    let auth = cred(rg).map(|c| c.client_auth()).unwrap_or_default();
-    Some((vk_registry::LockClient::new(base, auth, http), pipeline))
+    Some((
+        vk_registry::LockClient::new(base, cred.client_auth(), http),
+        pipeline,
+    ))
 }
 
 /// Did `key` (a stage's final content hash) already fail to build earlier in this same
@@ -3561,22 +3599,69 @@ pub fn report_build_failure(rg: &Registry, key: &str, reason: &str) {
     });
 }
 
-/// Client credentials resolved from the registry config: a static bearer token
-/// (`token_file`) takes precedence over Basic (`username` + `password_file`), else none.
-/// One resolver for every client path (oci_client, raw HTTP, the lock API) so the driver
-/// can authenticate to a registry gated by either Basic or a static bearer token.
+/// The credential a request to a `[registry]` carries. One resolver ([`credential`]) for every
+/// client path (oci_client, raw HTTP, the lock API, the OCI client of [`crate::oci`]) so they
+/// all present the same one.
 pub(crate) enum Cred {
     None,
     Basic { user: String, pass: String },
     Bearer { token: String },
 }
 
+/// Whose credential [`credential`] chose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Whose {
+    /// None: the request goes anonymously.
+    Nobody,
+    /// The section's own `token_file` or Basic pair.
+    Own,
+    /// A job's token.
+    Job,
+    /// The node's own token, which its hub issued.
+    Node,
+}
+
+/// [`credential`]'s choice alone.
 pub(crate) fn cred(rg: &Registry) -> Result<Cred> {
-    if let Some(token) = rg.live_job_token() {
-        return Ok(Cred::Bearer {
-            token: token.to_string(),
-        });
+    credential(rg).map(|(cred, _)| cred)
+}
+
+/// The credential a request to `rg` carries, and whose it is:
+///
+/// 1. a job's token, while live. Past its expiry, a token the request needs (the job's own
+///    content, [`crate::config::JobToken::required`]) is an error; any other request goes on
+///    below, as an ordinary pull of a placed job's image does once its token expired;
+/// 2. the section's own credential (`token_file`, else `username` and `password_file`);
+/// 3. the node's own token, from its hub ([`Registry::node_token`]): an error once expired,
+///    never a reason to go anonymous.
+///
+/// Only expiry moves on to the next: a request the job's token is refused is never tried
+/// again with another. Called for each request, or each short-lived client, so a renewed
+/// node token is what the next one sends.
+pub(crate) fn credential(rg: &Registry) -> Result<(Cred, Whose)> {
+    if let Some(job) = &rg.job_token {
+        if let Some(token) = job.live() {
+            let token = token.to_string();
+            return Ok((Cred::Bearer { token }, Whose::Job));
+        }
+        if job.is_required() {
+            bail!("the job's registry token has expired");
+        }
     }
+    match own_cred(rg)? {
+        Cred::None => {}
+        own => return Ok((own, Whose::Own)),
+    }
+    Ok(match rg.node_token()? {
+        Some(node) => (Cred::Bearer { token: node.token }, Whose::Node),
+        None => (Cred::None, Whose::Nobody),
+    })
+}
+
+/// The section's own credential, and nothing else: a static bearer token (`token_file`)
+/// takes precedence over Basic (`username` + `password_file`), else none. What a guest's
+/// proxy lends under `proxy_guests`, which must never be a job's or the node's token.
+pub(crate) fn own_cred(rg: &Registry) -> Result<Cred> {
     if let Some(tf) = &rg.token_file {
         // A bearer token carries no meaningful surrounding whitespace, so trim both ends
         // (unlike a password below, which may legitimately begin with whitespace and is
@@ -4664,7 +4749,83 @@ pub(crate) mod tests {
             None,
         );
         let scoped = at_path(&node, "ci-build/gl/42/protected/all", Some(live_token())).unwrap();
-        assert_eq!(memo_pipeline(&scoped), Some(None));
+        let (_, whose) = credential(&scoped).unwrap();
+        assert_eq!(memo_pipeline(whose), Some(None));
+        // The node's own token has no pipeline to name: no memo goes with it.
+        assert_eq!(memo_pipeline(Whose::Node), None);
+    }
+
+    /// The bearer token `rg`'s requests carry now, and whose it is.
+    fn bearer(rg: &Registry) -> (String, Whose) {
+        match credential(rg).unwrap() {
+            (Cred::Bearer { token }, whose) => (token, whose),
+            _ => panic!("expected a bearer token"),
+        }
+    }
+
+    /// Which credential each request carries: a live job token over everything; the
+    /// section's own over the node's token; the node's token renewed for a client that read
+    /// the one before, and an error once expired. A job's own content needs its token: past
+    /// its expiry, an error rather than the node's token.
+    #[test]
+    fn a_request_takes_the_credential_its_purpose_allows() {
+        let dir = std::env::temp_dir().join(format!("vk-cred-node-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = |token: &str, expires_at| {
+            crate::node::registry_access::tests::held(&dir, token, expires_at)
+        };
+        let mut rg = auth_registry("", None, None);
+        rg.repo = "reg.example.com/ci".into();
+        rg.node_access = Some(held("vkt_node", u64::MAX));
+        assert_eq!(bearer(&rg), ("vkt_node".into(), Whose::Node));
+        // Renewed: the next request sends the new one, through the same config and through a
+        // lock client made before.
+        // A client needs the process's crypto provider; another test may have installed it.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let locks = Locks {
+            rg: rg.clone(),
+            base: lock_base(&rg).unwrap(),
+            http: reqwest::Client::new(),
+        };
+        held("vkt_renewed", u64::MAX);
+        assert_eq!(bearer(&rg).0, "vkt_renewed");
+        assert_eq!(bearer(&locks.rg).0, "vkt_renewed");
+        assert!(locks.client().is_some());
+        // A guest's proxy never lends it.
+        assert!(matches!(own_cred(&rg).unwrap(), Cred::None));
+        assert_eq!(
+            crate::oci::Creds::from_registry_own(&rg).unwrap().token,
+            None
+        );
+
+        // A live job token wins, needed or not; the node's is never sent in its place.
+        let ordinary = at_path(&rg, "images", Some(live_token())).unwrap();
+        assert_eq!(bearer(&ordinary), ("vkt_x.y".into(), Whose::Job));
+        let expired = crate::config::JobToken::new("vkt_old", vk_peer::now_secs());
+        // An ordinary request past its expiry goes with the node's token...
+        let ordinary = at_path(&rg, "images", Some(expired.clone())).unwrap();
+        assert_eq!(bearer(&ordinary), ("vkt_renewed".into(), Whose::Node));
+        // ...one for the job's own content fails.
+        let scoped = at_path(&rg, "ci-pipeline/p/builds", Some(expired.required())).unwrap();
+        let e = credential(&scoped).err().unwrap();
+        assert!(format!("{e:#}").contains("job's registry token has expired"));
+
+        // The section's own credential wins over the node's token.
+        let token = dir.join("token");
+        std::fs::write(&token, "own").unwrap();
+        let mut own = rg.clone();
+        own.token_file = Some(token);
+        assert_eq!(bearer(&own), ("own".into(), Whose::Own));
+
+        // Expired: an error naming what to do, never anonymous, and no lock client.
+        held("vkt_late", vk_peer::now_secs());
+        let e = credential(&rg).err().unwrap();
+        assert!(format!("{e:#}").contains("reconnect the node"), "{e:#}");
+        assert!(crate::oci::Creds::from_registry(&rg).is_err());
+        assert!(locks.client().is_none());
+        assert!(fail_client(&rg).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// One request as the fake registry saw it.

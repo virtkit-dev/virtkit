@@ -176,11 +176,15 @@ fn resolve_build(
 }
 
 /// Pull from the pipeline's `builds/` with its job token, scoped by the hub to that pipeline,
-/// as [`publication`] does. The node's credential needs no read access to the pipeline
-/// namespace; it applies after token expiry ([`crate::config::Registry::live_job_token`]).
+/// as [`publication`] does. The token is required: past its expiry the pull fails, rather
+/// than reach the pipeline namespace with any of the node's own credentials.
 fn pull_registry(cfg: &Config, job: Option<&JobRegistry>) -> Result<crate::config::Registry> {
     let prefix = prefix(job)?;
-    builds(cfg, prefix, job.map(crate::config::JobToken::of))
+    builds(
+        cfg,
+        prefix,
+        job.map(|j| crate::config::JobToken::of(j).required()),
+    )
 }
 
 /// Refuse `image` when one of the node's credentials would pull it from a repository in the
@@ -338,7 +342,7 @@ fn publication(
     let prefix = prefix(job)?;
     let token = job
         .filter(|j| vk_peer::now_secs() < j.expires_at)
-        .map(crate::config::JobToken::of)
+        .map(|j| crate::config::JobToken::of(j).required())
         .context("the job's registry token has expired")?;
     builds(cfg, prefix, Some(token))
 }
@@ -847,8 +851,9 @@ mod tests {
     }
 
     /// Resolution uses the job's token, as publication does; the node's credential needs
-    /// no read access to the pipeline namespace. After token expiry, it uses the node's
-    /// credential. Separate state directories prevent resolutions from sharing cached images.
+    /// no read access to the pipeline namespace. After token expiry, it fails, even for a node
+    /// whose own credential could read it. Separate state directories prevent resolutions from
+    /// sharing cached images.
     #[test]
     fn resolution_sends_the_job_token() {
         let dir = tmpdir("job-token-pull");
@@ -866,7 +871,10 @@ mod tests {
             ..job(Some("ci-pipeline/gl/42/7"))
         };
         assert!(resolve_ref(&for_job, &dir.join("s3"), Some(&expired), &pinned).is_err());
-        resolve_ref(&for_node, &dir.join("s4"), Some(&expired), &pinned).unwrap();
+        let e = resolve_ref(&for_node, &dir.join("s4"), Some(&expired), &pinned)
+            .err()
+            .unwrap();
+        assert!(format!("{e:#}").contains("token has expired"), "{e:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

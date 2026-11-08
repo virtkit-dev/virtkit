@@ -499,7 +499,10 @@ fn unpack(tar: &Path, dest: &Path) -> Result<()> {
 }
 
 /// `vk build` of the context's `tools` stage, as a child process of this very binary, apart
-/// from the node's build cache.
+/// from the node's build cache. Only its cache and data dirs are its own: it loads this
+/// node's config, whose state dir holds the enrollment and the registry access the hub issued,
+/// so its base images on the hub's registry are pulled with the node's token, while
+/// `--cache-registry none` keeps it from caching anywhere.
 fn vk_build<'a>(
     cfg: &'a Config,
     context: &'a Path,

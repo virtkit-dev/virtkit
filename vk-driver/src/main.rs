@@ -3798,6 +3798,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             contexts: context.clone(),
             build_contexts,
             cache,
+            base_registry: cfg.registry.clone(),
             build_args,
             workdir: workdir.clone(),
             workdir_cache: *workdir_cache,
@@ -3890,7 +3891,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 (k.to_string(), v.to_string())
             })
             .collect();
-        return match dockerhash::run(dockerfile, context, &args, stages) {
+        return match dockerhash::run(dockerfile, context, &args, stages, cfg.registry.as_ref()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         };
@@ -4294,6 +4295,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             kernel: kernel.clone().or_else(|| b.kernel.clone()),
             agent: agent.clone().or_else(|| b.agent.clone()),
             cache: crate::build::CacheDest::Configured(cache),
+            base_registry: cfg.registry.clone(),
             build_cache,
             journal: journal_enabled(*no_journal, b.no_journal),
             // A `vk build --out` artifact stays a raw ext4: it is what gets mounted, packaged

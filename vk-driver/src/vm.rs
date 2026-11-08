@@ -898,6 +898,7 @@ pub(crate) fn build_image_sources(
         &build_contexts,
         &build_args,
         stage,
+        cfg.registry.as_ref(),
     )
     .context("computing the image's stage fingerprint")?;
     let (net, audit) = effective_build_egress(cfg, ctx)?;
@@ -914,6 +915,7 @@ pub(crate) fn build_image_sources(
         net,
         audit,
         record: build_record(ctx, service.as_deref())?,
+        base_registry: cfg.registry.clone(),
     };
     let (dir, guard) = crate::ensure::ensure_build_tier(
         cfg.state_dir(),
@@ -1530,6 +1532,7 @@ fn build_compose_unit(
         net,
         audit,
         record: build_record(ctx, Some(&unit.name))?,
+        base_registry: cfg.registry.clone(),
     };
     // The build reports the entry it materialized; addressing it separately would pin the
     // fingerprint computed here rather than the one the build settled on.
@@ -2899,21 +2902,30 @@ enum GuestProxy<'a> {
     /// The node's own `[registry]` credential (`proxy_guests`).
     Node,
     /// The job's token and areas, or nothing at all when it has none
-    /// (`guest_credential = "job"`).
+    /// (`guest_credential = "job"`, and `"job-or-node"` for a job a hub placed).
     Job(Option<&'a vk_hub_proto::dispatch::JobRegistry>),
+    /// The token the hub gives the node for its runner's guests, or nothing at all while it
+    /// holds none (`guest_credential = "job-or-node"`, for a job no hub placed).
+    Guests,
 }
 
-/// The proxy a job given `job` registry access gets under the node's `rg`. Under `"job"` the
-/// node's credential is never lent, whatever `proxy_guests` says, and a local store gets none.
+/// The proxy a job given `job` registry access, placed by a hub if `hub_placed`, gets under
+/// the node's `rg`. Under `"job"` and `"job-or-node"` the node's credential is never lent,
+/// whatever `proxy_guests` says, and a local store gets none; a placed job gets its own token
+/// only, never the guests', which go to the jobs of the node's own runner.
 fn guest_proxy<'a>(
     rg: Option<&crate::config::Registry>,
     job: Option<&'a vk_hub_proto::dispatch::JobRegistry>,
+    hub_placed: bool,
 ) -> GuestProxy<'a> {
     match rg {
-        Some(rg) if rg.guest_credential == GuestCredential::Job => match rg.lends_job_token() {
-            true => GuestProxy::Job(job),
-            false => GuestProxy::None,
-        },
+        Some(rg) if rg.guest_credential != GuestCredential::Node => {
+            match (rg.lends_job_token(), rg.guest_credential, hub_placed) {
+                (false, _, _) => GuestProxy::None,
+                (true, GuestCredential::JobOrNode, false) => GuestProxy::Guests,
+                (true, _, _) => GuestProxy::Job(job),
+            }
+        }
         Some(rg) if rg.proxy_guests => GuestProxy::Node,
         _ => GuestProxy::None,
     }
@@ -2973,14 +2985,20 @@ fn spawn_switch(
     // proxy; see regproxy.rs / switch.rs.
     // Under `guest_credential = "job"` the proxy lends the token the hub minted for this job
     // instead, and runs for every job: one without a token gets a proxy that refuses all.
+    // `"job-or-node"` lends a job no hub placed the token the hub gave the node for its guests.
     let proxy_cfg = match (
-        guest_proxy(cfg.registry.as_ref(), ctx.job_registry.as_ref()),
+        guest_proxy(
+            cfg.registry.as_ref(),
+            ctx.job_registry.as_ref(),
+            ctx.hub_placed,
+        ),
         &cfg.registry,
     ) {
         (GuestProxy::Job(job), Some(rg)) => Some(
             crate::regproxy::ProxyCfg::for_job(rg, job.map(|r| r.token.as_str()))?
                 .with_areas(job.map_or(&[], |r| r.areas.as_slice())),
         ),
+        (GuestProxy::Guests, Some(rg)) => Some(crate::regproxy::ProxyCfg::for_guests(rg)?),
         (GuestProxy::Node, Some(rg)) => Some(crate::regproxy::ProxyCfg::from_registry(rg)?),
         _ => None,
     };
@@ -5137,7 +5155,8 @@ mod tests {
     use crate::jobctx::JobCtx;
 
     /// Under `"job"` the guest gets the job's token or nothing, never the node's credential,
-    /// whatever `proxy_guests` says; under `"node"` it gets the node's only with `proxy_guests`.
+    /// whatever `proxy_guests` says; under `"node"` it gets the node's only with `proxy_guests`;
+    /// under `"job-or-node"` a job no hub placed gets the guests' token.
     #[test]
     fn the_guest_proxy_lends_the_job_token_or_nothing_under_job() {
         let rg = |toml: &str| -> crate::config::Registry {
@@ -5157,18 +5176,50 @@ mod tests {
         let remote_job =
             rg("repo = \"reg.example/t\"\nguest_credential = \"job\"\nproxy_guests = true\n");
         assert_eq!(
-            guest_proxy(Some(&remote_job), Some(&job)),
+            guest_proxy(Some(&remote_job), Some(&job), true),
             GuestProxy::Job(Some(&job))
         );
-        assert_eq!(guest_proxy(Some(&remote_job), None), GuestProxy::Job(None));
+        assert_eq!(
+            guest_proxy(Some(&remote_job), None, true),
+            GuestProxy::Job(None)
+        );
         let local_job =
             rg("repo = \"/srv/store\"\nguest_credential = \"job\"\nproxy_guests = true\n");
-        assert_eq!(guest_proxy(Some(&local_job), Some(&job)), GuestProxy::None);
+        assert_eq!(
+            guest_proxy(Some(&local_job), Some(&job), true),
+            GuestProxy::None
+        );
         let node = rg("repo = \"reg.example/t\"\nproxy_guests = true\n");
-        assert_eq!(guest_proxy(Some(&node), Some(&job)), GuestProxy::Node);
+        assert_eq!(guest_proxy(Some(&node), Some(&job), true), GuestProxy::Node);
         let plain = rg("repo = \"reg.example/t\"\n");
-        assert_eq!(guest_proxy(Some(&plain), Some(&job)), GuestProxy::None);
-        assert_eq!(guest_proxy(None, Some(&job)), GuestProxy::None);
+        assert_eq!(
+            guest_proxy(Some(&plain), Some(&job), true),
+            GuestProxy::None
+        );
+        assert_eq!(guest_proxy(None, Some(&job), true), GuestProxy::None);
+        // `"job"` refuses a job no hub placed; `"job-or-node"` lends it the guests' token, and
+        // a placed job its own token or nothing, never the guests'.
+        assert_eq!(
+            guest_proxy(Some(&remote_job), None, false),
+            GuestProxy::Job(None)
+        );
+        let either = rg(
+            "repo = \"reg.example/t\"\nguest_credential = \"job-or-node\"\nproxy_guests = true\n",
+        );
+        assert_eq!(guest_proxy(Some(&either), None, false), GuestProxy::Guests);
+        assert_eq!(
+            guest_proxy(Some(&either), Some(&job), true),
+            GuestProxy::Job(Some(&job))
+        );
+        assert_eq!(
+            guest_proxy(Some(&either), None, true),
+            GuestProxy::Job(None)
+        );
+        let local_either = rg("repo = \"/srv/store\"\nguest_credential = \"job-or-node\"\n");
+        assert_eq!(
+            guest_proxy(Some(&local_either), None, false),
+            GuestProxy::None
+        );
     }
 
     /// What a VM's `vk-agent exec --service` may ask of its host: an exec into one of its own

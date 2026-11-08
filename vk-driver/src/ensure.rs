@@ -79,6 +79,8 @@ pub struct BuildRecipe {
     pub audit: bool,
     /// A placed job's egress record, which the build's denials and contacts go to.
     pub record: Option<crate::build::EgressRecord>,
+    /// [`crate::build::Options::base_registry`].
+    pub base_registry: Option<crate::config::Registry>,
 }
 
 /// A unit image is fresh when its UUID is the expected fingerprint *and* its runtime
@@ -136,6 +138,7 @@ pub fn ensure_unit_build(
         net: recipe.net.clone(),
         audit: recipe.audit,
         record: recipe.record.clone(),
+        base_registry: recipe.base_registry.clone(),
         require_cached: false,
         build_jobs: None,
         debug: false,
@@ -327,6 +330,7 @@ mod tests {
             net: crate::build::BuildNet::All,
             audit: false,
             record: None,
+            base_registry: None,
         };
         let key = "deadbeef";
         let expected = fingerprint(&[key]);
@@ -367,6 +371,7 @@ mod tests {
             net: crate::build::BuildNet::All,
             audit: false,
             record: None,
+            base_registry: None,
         };
         let key = "will-fail";
         let result = ensure_build_tier(
@@ -428,6 +433,7 @@ mod tests {
             net: crate::build::BuildNet::All,
             audit: false,
             record: None,
+            base_registry: None,
         };
         let (got_dir, guard) = ensure_build_tier(
             &state_dir,

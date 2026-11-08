@@ -216,8 +216,9 @@ with the source `detected` where the host's size supplied or held down the value
   other entries apply. The node's page shows both.
 - **A registry.** With no `[registry]` in the local file, the node uses the one the hub names —
   a registry the hub manages, by URL, CA and pipeline root — with no credential of its own:
-  guests get the job's token (`guest_credential = "job"`, the only value the hub may send),
-  so only jobs the hub places reach it, and only on `[net] mode = "switch"`, the default. The hub sends the CA as PEM, `ca_pem`; the node checks it holds certificates
+  a placed job's guest gets the job's token (`guest_credential = "job"`, or `"job-or-node"` to
+  a node taking tokens of its own, the only values the hub may send, the latter lending the
+  guests of the node's own runner's jobs its guest token, below), and only on `[net] mode = "switch"`, the default. The hub sends the CA as PEM, `ca_pem`; the node checks it holds certificates
   and pins it by content as `<state_dir>/node/registry-ca-<hash>.pem`, written whole by rename
   before the settings that name it. A CA the hub no longer names is kept a week, the longest
   a job's registry token lives, for the jobs that started with it. A local `[registry]` is
@@ -237,12 +238,25 @@ with the source `detected` where the host's size supplied or held down the value
   with the job's token, as it does on any node lending guests the job's token with no
   credential of its own; so the hub's namespaces must grant jobs read where their images live,
   and a relay the token cannot read falls back to a direct pull. Past the token's expiry the
-  node sends it no more and pulls as nobody. Limits: outside a placed job (`vk build`,
-  `vk registry pull`, a job gitlab-runner gives the node) the node reaches the registry as nobody,
-  which a registry that takes no anonymous requests refuses, until nodes get tokens of their
-  own; Windows install media and layers go through `[build]`'s cache settings, not this
-  registry; and an image already in the node's cache by digest is served to any job without
-  asking the registry, as it is under a node credential.
+  node pulls them with its own token, below; `pipeline/build/` images and the job's caches
+  need the job's token, and fail once it expired.
+
+  Outside placed jobs the node uses a [token of its own](registry-hub.md#4d-node-tokens): the
+  hub pushes it over the node's session, an hour long and renewed before it expires, granting
+  what the registry's namespaces grant nodes (`nodes`, `node <id>`), none by default. It
+  carries `virtkit/` bundles, `vk registry pull`, the Docker relay, caches and build locks, and
+  the base images on the registry of `vk build`, the node's tools build and `vk run`'s builds
+  (compose services, `-f`) included; once expired, the
+  node says so rather than reach the registry as nobody. Removing a node revokes its tokens on
+  the registries. A job gitlab-runner gives the node reaches the registry from its guest
+  through `registry.vk` with the node's guest token (`guest_credential = "job-or-node"`),
+  granting what namespaces grant `guests` within the node's grants, none by default. Limits:
+  `vk status --stale` asks for base images as nobody, and reports a private one's VM as unknown;
+  Windows
+  install media and layers go through `[build]`'s cache settings, which take the node's token
+  only when they name this registry and no credential of their own; and an image already in
+  the node's cache by digest is served to any job without asking the registry, as it is under
+  a node credential.
 
 The node reports a hash of its effective configuration, hub settings included, and its node
 page shows it, so drift between nodes that should match is visible.

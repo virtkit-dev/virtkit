@@ -132,6 +132,8 @@ enum Relay<'a> {
 }
 
 impl Relay<'_> {
+    /// The credential the relay is asked with, resolved now: never sent anywhere but the
+    /// relay's own host, a direct pull going anonymously.
     fn creds(&self) -> Result<Creds> {
         match self {
             Relay::BuildCache(b) => Creds::from_build_cache(b),
@@ -537,6 +539,46 @@ fn name_of(reporel: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The relay is asked with the node's own access to the registry its hub names, whether
+    /// it is `[registry]` or a build cache at that origin naming no credential; a cache
+    /// anywhere else gets none of it.
+    #[test]
+    fn the_relay_is_asked_with_the_nodes_access_to_its_own_registry() {
+        let dir = std::env::temp_dir().join(format!("vk-relay-node-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let access = crate::node::registry_access::tests::held(&dir, "vkt_node", u64::MAX);
+        let cfg = |cache: &str| {
+            let mut registry = Registry::for_share(
+                "reg.example.com/ci".into(),
+                false,
+                None,
+                String::new(),
+                None,
+                None,
+                None,
+            );
+            registry.node_access = Some(access.clone());
+            Config {
+                build: crate::config::Build {
+                    cache_registry: Some(cache.into()),
+                    node_access: Some(access.clone()),
+                    ..crate::config::Build::default()
+                },
+                registry: Some(registry),
+                ..Config::default()
+            }
+        };
+        let token = |cfg: &Config| relay_target(cfg).unwrap().1.creds().unwrap().token;
+        assert_eq!(token(&cfg("none")).as_deref(), Some("vkt_node"));
+        assert_eq!(
+            token(&cfg("reg.example.com/build-cache")).as_deref(),
+            Some("vkt_node")
+        );
+        assert_eq!(token(&cfg("cache.corp/virtkit")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A `[docker]` with the given `repo` and optional Hub `mirror`, no auth — for `route`.
     fn dk(repo: Option<&str>, mirror: Option<&str>) -> Docker {

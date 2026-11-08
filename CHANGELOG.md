@@ -16,6 +16,26 @@ All notable changes to virtkit will be documented in this file.
   hub-managed registry it uses gets a token for it when it connects, renewed before it expires
   and replaced when the registry or the node's grants change; one no longer granted anything
   is told to drop it.
+- **Fleet nodes keep the registry access the hub issues them.** A restarted node, and any
+  `vk` run on it, has it while it is valid even with the hub unreachable; it goes when the hub
+  withdraws it, the node joins again or is removed, or the hub names another registry.
+- **Fleet nodes reach the hub-managed registry with the access the hub issues them.** A node
+  with no registry credential of its own uses it for `virtkit/` bundles, `vk registry pull`,
+  the Docker relay, caches and build locks, and for a placed job's image pulls once the job's
+  token has expired; access that has expired is reported rather than replaced by anonymous
+  requests. A job's pipeline images and caches still need the job's own token, and fail once it
+  has expired.
+- **`vk build` on a fleet node pulls private base images from the hub-managed registry.** Base
+  images on that registry are pulled with the node's access, or with a placed job's token for
+  the job's builds, and a build cache naming that registry without a credential of its own uses
+  it too; images on other registries are still pulled anonymously.
+- **`vk run` on a fleet node builds from private base images on the hub-managed registry.**
+  Compose service builds and `-f` boots pull such bases with the node's access, as `vk build`
+  does.
+- **Jobs from a fleet node's own gitlab-runner can reach the hub-managed registry.** A storage
+  area's `--grant` takes `guests` for them, within what the node itself is granted; such jobs
+  then reach the registry at `registry.vk` with that access only, never the node's own. Jobs the
+  hub places keep their own token alone. Nothing is granted unless an area says so.
 
 ## [0.107.1] - 2026-11-08
 

@@ -204,7 +204,7 @@ pub fn plan_save(c: &CacheSpec, succeeded: bool, job_name: &str, git_ref: &str) 
 
 struct Store {
     http: reqwest::Client,
-    cred: crate::registry::Cred,
+    cred: StoreCred,
     /// `<scheme>://<registry>/v2/<repository>`.
     base: String,
     /// Whether the repository is the hub's for the job's protection, so tags leave it out.
@@ -215,6 +215,15 @@ struct Store {
     /// away — retries spent: the stage's other requests are not made, so its other keys and
     /// caches are not waited for too.
     gave_up: std::sync::atomic::AtomicBool,
+}
+
+/// The credential a [`Store`]'s requests carry.
+enum StoreCred {
+    /// The job's token, for the hub's repository.
+    Job(crate::registry::Cred),
+    /// The node's `[registry]`, its credential resolved for each request, so a renewal of the
+    /// node's own token reaches a long transfer.
+    Node(crate::config::Registry),
 }
 
 /// Marks an attempt that ran into the client's total timeout: final, as that is the whole of
@@ -240,8 +249,13 @@ impl Store {
         }
     }
 
-    fn req(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
-        self.cred.apply(self.http.request(method, url))
+    /// A request with the credential the registry takes now.
+    fn req(&self, method: reqwest::Method, url: &str) -> Result<reqwest::RequestBuilder> {
+        let req = self.http.request(method, url);
+        Ok(match &self.cred {
+            StoreCred::Job(cred) => cred.apply(req),
+            StoreCred::Node(rg) => crate::registry::cred(rg)?.apply(req),
+        })
     }
 
     /// `<scheme>://<registry>`, for a relative `Location`.
@@ -284,7 +298,7 @@ fn access<'a>(
         }),
         None if rg.lends_job_token() => Err(
             "caches need a cache repository from the hub under [registry] guest_credential \
-             = \"job\"; skipping"
+             = \"job\" or \"job-or-node\"; skipping"
                 .to_string(),
         ),
         None => Ok(Access::Node),
@@ -336,10 +350,14 @@ fn store(ctx: &StageCtx<'_>) -> Option<Store> {
     let timeout = request_timeout(&ctx.vars.value("CACHE_REQUEST_TIMEOUT"));
     let made = (|| {
         let cred = match &access {
-            Access::Hub { token, .. } => crate::registry::Cred::Bearer {
+            Access::Hub { token, .. } => StoreCred::Job(crate::registry::Cred::Bearer {
                 token: token.to_string(),
-            },
-            Access::Node => crate::registry::cred(rg)?,
+            }),
+            Access::Node => {
+                // Said now rather than at the first request, when nothing would reach it.
+                crate::registry::cred(rg)?;
+                StoreCred::Node(rg.clone())
+            }
         };
         Ok::<_, anyhow::Error>(Store {
             http: crate::registry::http_client_builder(rg)?
@@ -462,7 +480,7 @@ async fn fetch(ctx: &StageCtx<'_>, store: &Store, tag: &str) -> Result<bool> {
     let body = store
         .retry("cache manifest", || async {
             let resp = store
-                .req(reqwest::Method::GET, &url)
+                .req(reqwest::Method::GET, &url)?
                 .header(reqwest::header::ACCEPT, MANIFEST_MEDIA_TYPE)
                 .send()
                 .await
@@ -521,7 +539,7 @@ async fn download(store: &Store, digest: &str, size: u64, dest: &Path) -> Result
 async fn download_once(store: &Store, digest: &str, size: u64, dest: &Path) -> Result<()> {
     let url = format!("{}/blobs/{digest}", store.base);
     let mut resp = store
-        .req(reqwest::Method::GET, &url)
+        .req(reqwest::Method::GET, &url)?
         .send()
         .await
         .and_then(turned_away)
@@ -603,7 +621,7 @@ async fn push(
     store
         .retry("cache manifest push", || async {
             let resp = store
-                .req(reqwest::Method::PUT, &url)
+                .req(reqwest::Method::PUT, &url)?
                 .header(reqwest::header::CONTENT_TYPE, MANIFEST_MEDIA_TYPE)
                 .body(manifest(digest, size, key))
                 .send()
@@ -698,7 +716,7 @@ async fn put_blob_once(store: &Store, digest: &str, body: &Body<'_>) -> Result<(
         .req(
             reqwest::Method::HEAD,
             &format!("{}/blobs/{digest}", store.base),
-        )
+        )?
         .send()
         .await
         .and_then(turned_away)
@@ -710,7 +728,7 @@ async fn put_blob_once(store: &Store, digest: &str, body: &Body<'_>) -> Result<(
         .req(
             reqwest::Method::POST,
             &format!("{}/blobs/uploads/", store.base),
-        )
+        )?
         .header(reqwest::header::CONTENT_LENGTH, "0")
         .send()
         .await
@@ -740,7 +758,7 @@ async fn put_blob_once(store: &Store, digest: &str, body: &Body<'_>) -> Result<(
         bail!("the registry sent the cache's upload to {location}, outside itself");
     }
     let req = store
-        .req(reqwest::Method::PUT, &location)
+        .req(reqwest::Method::PUT, &location)?
         .query(&[("digest", digest)])
         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
     let req = match body {
@@ -1074,7 +1092,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         Store {
             http: reqwest::Client::new(),
-            cred: crate::registry::Cred::None,
+            cred: StoreCred::Job(crate::registry::Cred::None),
             base: format!("{url}/v2/ci-cache/h/1"),
             hub_repo: false,
             timeout: Duration::from_secs(600),

@@ -126,15 +126,19 @@ pub struct BuildOpts {
     pub audit: bool,
     /// A placed job's egress record, which the unit build's denials and contacts go to.
     pub record: Option<crate::build::EgressRecord>,
+    /// [`crate::build::Options::base_registry`].
+    pub base_registry: Option<crate::config::Registry>,
 }
 
 /// The build recipe + target + stage key for a `build:` unit, shared by the ext4-path
-/// helper and the materialize path so both agree on the stage identity. Errors for an
-/// `image:` unit (callers dispatch on the source first).
+/// helper and the materialize path so both agree on the stage identity: base images on
+/// `registry` are asked for with its credential. Errors for an `image:` unit (callers dispatch
+/// on the source first).
 fn build_recipe(
     unit: &crate::compose::Unit,
     global_build_args: &[(String, String)],
     build: Option<&BuildOpts>,
+    registry: Option<&crate::config::Registry>,
 ) -> Result<(crate::ensure::BuildRecipe, Option<String>, String)> {
     let crate::compose::Source::Build {
         dockerfiles,
@@ -156,6 +160,7 @@ fn build_recipe(
         build_contexts,
         &build_args,
         target.as_deref(),
+        registry,
     )?;
     let recipe = crate::ensure::BuildRecipe {
         dockerfiles: dockerfiles.clone(),
@@ -174,6 +179,7 @@ fn build_recipe(
             .unwrap_or(crate::build::BuildNet::All),
         audit: build.is_some_and(|b| b.audit),
         record: build.and_then(|b| b.record.clone()),
+        base_registry: registry.cloned(),
     };
     Ok((recipe, target.clone(), key))
 }
@@ -181,13 +187,15 @@ fn build_recipe(
 /// The shared build-tier ext4 path a `build:` unit resolves to, without building it: a pure
 /// function of the stage fingerprint, so provisioning can address a unit before (or without)
 /// materializing it. `global_build_args` are the run-wide `--build-arg`s the manager also
-/// applies. Errors for an `image:` unit.
+/// applies; base images on `registry` are asked for with its credential. Errors for an
+/// `image:` unit.
 pub fn build_unit_ext4(
     state_dir: &Path,
     global_build_args: &[(String, String)],
     unit: &crate::compose::Unit,
+    registry: Option<&crate::config::Registry>,
 ) -> Result<PathBuf> {
-    let (_recipe, _target, key) = build_recipe(unit, global_build_args, None)?;
+    let (_recipe, _target, key) = build_recipe(unit, global_build_args, None, registry)?;
     // `vk run --compose`'s own units: no placed job, so the unscoped tier.
     Ok(crate::ensure::build_tier_dir(state_dir, None, &key).join(crate::ensure::UNIT_IMAGE))
 }
@@ -212,7 +220,7 @@ pub fn unit_image_id(
             rootfs
         }
         crate::compose::Source::Build { .. } => {
-            build_unit_ext4(state_dir, global_build_args, unit)?
+            build_unit_ext4(state_dir, global_build_args, unit, cfg.registry.as_ref())?
         }
         crate::compose::Source::Bundle { dir, .. } => dir.clone(),
     };
@@ -245,7 +253,12 @@ pub fn ensure_unit_build_sync(
             unit.name
         );
     }
-    let (recipe, target, key) = build_recipe(unit, &build.build_args, Some(build))?;
+    let (recipe, target, key) = build_recipe(
+        unit,
+        &build.build_args,
+        Some(build),
+        build.base_registry.as_ref(),
+    )?;
     let (dir, guard) = crate::ensure::ensure_build_tier(
         state_dir,
         idle,
@@ -287,7 +300,7 @@ pub fn provision(
             )
         }
         crate::compose::Source::Build { .. } => {
-            let ext4 = build_unit_ext4(state_dir, global_build_args, unit)?;
+            let ext4 = build_unit_ext4(state_dir, global_build_args, unit, cfg.registry.as_ref())?;
             (
                 ext4,
                 crate::compose::merged_config(&RunConfig::default(), unit),
@@ -916,6 +929,7 @@ mod tests {
             net: crate::build::BuildNet::All,
             audit: false,
             record: None,
+            base_registry: None,
         };
         let err = ensure_unit_build_sync(
             &unit,
@@ -955,9 +969,9 @@ mod tests {
         .pop()
         .unwrap();
 
-        let before = build_unit_ext4(Path::new("/state"), &[], &unit).unwrap();
+        let before = build_unit_ext4(Path::new("/state"), &[], &unit, None).unwrap();
         std::fs::write(tmp.join("payload"), "two").unwrap();
-        let after = build_unit_ext4(Path::new("/state"), &[], &unit).unwrap();
+        let after = build_unit_ext4(Path::new("/state"), &[], &unit, None).unwrap();
         assert_ne!(
             before, after,
             "editing the context must move the unit to another tier entry"
