@@ -888,12 +888,13 @@ mod tests {
     }
 
     /// The hub shows what a CI tools definition declares with its own reading of the hints;
-    /// it reads them as this parser does.
+    /// it reads them as this parser does, the hub's built-in definition included.
     #[test]
     fn the_hub_reads_declared_egress_as_the_build_does() {
         /// A stage's `AS` name, and its declared addresses and names.
         type Declared = (Option<String>, Option<(Vec<String>, Vec<String>)>);
-        for src in vk_hub_proto::definition::SAMPLES {
+        let builtin = include_str!("../../../vk-hub/ci-tools/Dockerfile");
+        for src in vk_hub_proto::definition::SAMPLES.iter().chain([&builtin]) {
             let ours: Vec<Declared> = parse(src)
                 .unwrap()
                 .instructions

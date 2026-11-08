@@ -36,6 +36,11 @@ All notable changes to virtkit will be documented in this file.
   area's `--grant` takes `guests` for them, within what the node itself is granted; such jobs
   then reach the registry at `registry.vk` with that access only, never the node's own. Jobs the
   hub places keep their own token alone. Nothing is granted unless an area says so.
+- **vk-hub comes with the CI tools nodes need.** The hub holds a reproducible definition of a
+  static git (with `git submodule`) and git-lfs of its own, labelled with their versions, which
+  nodes build to hand their jobs; it declares the hosts its build reaches, `cache.nixos.org` and
+  GitHub's. It has no gitlab-runner, which jobs the hub places never run: a fleet whose nodes run their
+  own gitlab-runner adds a definition that includes it. `./update-ci-tools.sh` re-pins it.
 - **Fleet nodes give their jobs the CI tools the hub installed.** A node whose config names no
   tools directory hands its jobs the tools it last built for the hub, once it has built any.
 - **`vk build` stages can declare the network their `RUN` steps need.** A `# vk:

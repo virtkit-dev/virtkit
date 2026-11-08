@@ -2035,6 +2035,19 @@ fn link_ci_tools(cmdline: &HashMap<String, String>) {
     crate::tools::record(&why);
 }
 
+/// Whether CI tool `name` is git or one of the programs it runs from PATH: its https helpers,
+/// `git submodule` with the scripts and helper it uses, and the commands a local or ssh fetch
+/// or push runs by name.
+fn of_git(name: &str) -> bool {
+    name == "git"
+        || name.starts_with("git-remote")
+        || name.starts_with("git-sh-")
+        || matches!(
+            name,
+            "git-submodule" | "git-upload-pack" | "git-receive-pack"
+        )
+}
+
 /// Jobs need gitlab-runner for artifact and cache transfers unless marked as a hub job
 /// by `VIRTKIT_NO_RUNNER=1`.
 fn needs_runner(cmdline: &HashMap<String, String>) -> bool {
@@ -2049,8 +2062,8 @@ fn link_ci_tools_from(tag: &str, mnt: &str, image_has_runner: bool) -> Result<To
     mount(tag, mnt, "virtiofs", 0).map_err(|e| format!("the share cannot be mounted: {e}"))?;
     let entries = std::fs::read_dir(mnt).map_err(|e| format!("the share cannot be read: {e}"))?;
     let _ = std::fs::create_dir_all("/usr/local/bin");
-    // `git` ships with its `git-remote-http(s)` helpers (https is not a builtin); the
-    // family is all-or-nothing, governed by whether the image already has git, so we
+    // `git` ships with its `git-remote-http(s)` helpers (https is not a builtin) and the
+    // programs git runs by name ([`of_git`]); the family is all-or-nothing, governed by whether the image already has git, so we
     // never mix our helpers with the image's git. Captured before we link anything.
     let image_has_git = which("git");
     let mut linked_git = false;
@@ -2073,7 +2086,7 @@ fn link_ci_tools_from(tag: &str, mnt: &str, image_has_runner: bool) -> Result<To
             continue; // is_file follows the symlink (git-remote-https -> git-remote-http)
         }
         // per-image opt-out: leave a tool to the image when it already provides it
-        let skip = if name == "git" || name.starts_with("git-remote") {
+        let skip = if of_git(name) {
             image_has_git
         } else if name == "gitlab-runner" {
             image_has_runner // only a runnable one: a stray file must not block the share's
@@ -2103,8 +2116,8 @@ fn link_ci_tools_from(tag: &str, mnt: &str, image_has_runner: bool) -> Result<To
             }
         }
     }
-    // The injected static git's compiled-in CA bundle is Alpine's /etc/ssl/cert.pem,
-    // absent in most job images. Point it at the image's own CA store so https clones
+    // The injected static git's compiled-in CA bundle is where its build environment kept
+    // one, absent in most job images. Point it at the image's own CA store so https clones
     // work; only when we linked our git and the job has not set its own.
     if linked_git && std::env::var_os("GIT_SSL_CAINFO").is_none() {
         const CA_CANDIDATES: &[&str] = &[
@@ -3520,6 +3533,24 @@ fn cstr(s: &str) -> CString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// git's helpers and scripts are left to an image with git; git-lfs is a tool of its own.
+    #[test]
+    fn git_family() {
+        for name in [
+            "git",
+            "git-remote-http",
+            "git-remote-https",
+            "git-submodule",
+        ] {
+            assert!(of_git(name), "{name}");
+        }
+        assert!(of_git("git-sh-setup") && of_git("git-sh-i18n") && of_git("git-sh-i18n--envsubst"));
+        assert!(of_git("git-upload-pack") && of_git("git-receive-pack"));
+        for name in ["git-lfs", "gitlab-runner", "git-crypt"] {
+            assert!(!of_git(name), "{name}");
+        }
+    }
 
     /// The agent's directory goes last on the PATH, after anything of the image's, and once.
     #[test]

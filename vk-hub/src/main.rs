@@ -150,7 +150,7 @@ enum Cmd {
     /// has nodes build one with `vk build` and install what the stage holds as
     /// `<state_dir>/tools/current`, the directory their `[executor] tools_dir` names. Those
     /// tools then run in every job VM: holding the admin socket is what registering them
-    /// takes.
+    /// takes. The hub holds one of its own, a static git and git-lfs.
     Tools {
         #[command(flatten)]
         config: ConfigArg,
@@ -2255,6 +2255,18 @@ async fn serve(mut cfg: HubConfig) -> Result<()> {
         Ok(Ok(())) => {}
         Ok(Err(e)) => eprintln!("vk-hub: syncing registry tokens: {e:#}"),
         Err(e) => eprintln!("vk-hub: syncing registry tokens: {e}"),
+    }
+    // The CI tools built into this hub, held for its nodes. A failure is logged: nodes keep
+    // the tools they have, and an operator can add the definition by hand.
+    let h = hub.clone();
+    match tokio::task::spawn_blocking(move || tools::add_builtin(&h, "hub")).await {
+        Ok(Ok(t)) => eprintln!(
+            "vk-hub: built-in CI tools: {} ({})",
+            t.row.version,
+            store::short(&t.sha256)
+        ),
+        Ok(Err(e)) => eprintln!("vk-hub: warning: holding the built-in CI tools: {e:#}"),
+        Err(e) => eprintln!("vk-hub: warning: holding the built-in CI tools: {e}"),
     }
     tokio::spawn(tokens::sweep(hub.clone()));
     tokio::spawn(jobs::drive(hub.clone()));

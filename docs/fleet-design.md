@@ -484,6 +484,8 @@ between hand-provisioned hosts just as its `vk` can. The hub distributes a build
 not binaries: its `tools` stage holds the tools, and a reproducible tar's sha256 identifies
 the definition. Each node builds it with `vk build` in microVMs, without reusing or leaving
 instruction-cache layers, checks the result, and switches `<state_dir>/tools/current`.
+The hub holds a definition of its own, a static git and git-lfs built with Nix
+from pinned inputs.
 See the implemented [CI tools](fleet-prototype.md#ci-tools).
 
 - No drain: a job resolves `tools_dir` as it boots and keeps that directory, so a switch only

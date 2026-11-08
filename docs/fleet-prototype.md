@@ -803,12 +803,35 @@ principal.
 
 ## CI tools
 
+`vk-hub serve` holds a definition of its own, built into the binary from `vk-hub/ci-tools/`: a
+static `git` (with `git-remote-http`, `git-remote-https` linking to it, `git submodule`'s
+scripts and helper, and `git-upload-pack` and `git-receive-pack` linking to `git`) and
+`git-lfs`. It has no `gitlab-runner`: jobs the hub places run none, and only a node running a
+gitlab-runner of its own needs one in its jobs, so a fleet with such nodes adds a definition that
+also builds it. At each start the hub adds its own unless that tree is held already, under any
+label; its label names the versions of the tools it builds, `git-<v>-lfs-<v>`, and its sha256
+tells two pins of the same versions apart. It is packed as `vk-hub tools add vk-hub/ci-tools`
+packs that directory, so the two are the same definition. A definition added by an earlier hub
+stays until `tools remove`. If it cannot be held, the hub logs why and serves on.
+
+The definition is reproducible as the build image is: a `nixos/nix` stage by manifest-list
+digest builds a flake pinned by its `flake.lock` (nixpkgs by commit, the build image's), `git`
+from source by `pkgsStatic` (musl, statically linked; shell `/bin/sh`; no templates; its scripts
+found on `PATH`), and upstream's static `git-lfs` release checked against its sha256; a `FROM
+scratch AS tools` stage holds them flat. The Dockerfile names each tool's version, which labels the definition,
+and fails the build when the lock builds another. Its build stage declares the only hosts it
+reaches: `cache.nixos.org` for the static toolchain, git's sources and nixpkgs, `github.com`
+for `git-lfs` (and nixpkgs where the cache lacks it), and `release-assets.githubusercontent.com`,
+where GitHub hands the release download; `git` and its libraries compile on the node, minutes of the build's hour.
+`./update-ci-tools.sh` re-pins the digest, the lock (`--latest` for the head of
+`nixos-unstable` rather than the build image's commit), the releases and the versions.
+
 `vk-hub tools add <dir> --version <label>` packs a build context into a definition stored in
 `<data_dir>/tools/` under its sha256 and prints that digest. `tools list` lists definitions;
 `tools remove` deletes one unless a node still has to build it. The context needs a
 `Dockerfile` at its root with a `tools` stage that holds the tools at its root: static `git`,
-`git-remote-http`, `git-remote-https`, `git-lfs` and `gitlab-runner`, typically a `FROM scratch AS
-tools` stage copying them from a build stage. The hub never builds or runs it. It packs it
+`git-remote-http`, `git-remote-https`, `git-lfs`, and `gitlab-runner` where nodes run their own,
+typically a `FROM scratch AS tools` stage copying them from a build stage. The hub never builds or runs it. It packs it
 reproducibly, so the same tree is the same definition: entries in byte order of their paths,
 each directory before its contents, owner 0, mtime 0, mode `0755` for a directory and for a file
 with any execute bit, `0644` for any other file. It takes only regular files and directories,

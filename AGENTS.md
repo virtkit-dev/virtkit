@@ -159,6 +159,7 @@ fast edit loop below is deliberately `vk`-only and never invokes Docker.
 ./sweep.sh [--time 15]              # cargo-sweep stale target/ artifacts (default --installed)
 ./update.sh                         # bump the pinned Rust toolchain + re-lock the flake
 ./update-kernel.sh [--lts|--stable] # bump the pinned guest kernel (defaults to LTS)
+./update-ci-tools.sh [--latest]     # re-pin vk-hub's built-in CI tools (vk-hub/ci-tools/)
 ```
 
 **When you need a runnable binary, use `./build.sh --fast`** (alias `--debug`). It builds the

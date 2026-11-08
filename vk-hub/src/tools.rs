@@ -62,19 +62,36 @@ pub fn pack(dir: &Path) -> Result<Packed> {
     let root = vk_fs::open_dir(dir).with_context(|| format!("opening {}", dir.display()))?;
     let mut entries = Vec::new();
     walk(root.as_fd(), Path::new(""), 0, &mut entries, &mut 0)?;
+    finish(&entries, &dir.display().to_string())
+}
+
+/// `entries`, in the order [`walk`] gives them, as a definition, refused without a
+/// [`DOCKERFILE`] at its root or past [`MAX_TOOLS_DEFINITION`] packed. `shown` names it.
+fn finish(entries: &[Entry], shown: &str) -> Result<Packed> {
     if !entries
         .iter()
         .any(|e| e.path.as_os_str() == DOCKERFILE && e.data.is_some())
     {
         bail!(
-            "{} has no {DOCKERFILE} at its root: a tools definition is a build context whose \
-             {DOCKERFILE} has a `tools` stage",
-            dir.display()
+            "{shown} has no {DOCKERFILE} at its root: a tools definition is a build context \
+             whose {DOCKERFILE} has a `tools` stage"
         );
     }
+    let packed = write_tar(entries)?;
+    if packed.tar.len() as u64 > MAX_TOOLS_DEFINITION {
+        bail!(
+            "{shown} packs to {} bytes, past the {MAX_TOOLS_DEFINITION} a tools definition may be",
+            packed.tar.len()
+        );
+    }
+    Ok(packed)
+}
+
+/// `entries`, in the order given, as a definition's tar.
+fn write_tar(entries: &[Entry]) -> Result<Packed> {
     let mut builder = tar::Builder::new(Vec::new());
     let mut files = 0u32;
-    for e in &entries {
+    for e in entries {
         let mut header = tar::Header::new_gnu();
         header.set_uid(0);
         header.set_gid(0);
@@ -100,15 +117,65 @@ pub fn pack(dir: &Path) -> Result<Packed> {
         }
     }
     let tar = builder.into_inner().context("finishing the tar")?;
-    if tar.len() as u64 > MAX_TOOLS_DEFINITION {
-        bail!(
-            "{} packs to {} bytes, past the {MAX_TOOLS_DEFINITION} a tools definition may be",
-            dir.display(),
-            tar.len()
-        );
-    }
     let sha256 = vk_hub_proto::to_hex(&Sha256::digest(&tar));
     Ok(Packed { tar, sha256, files })
+}
+
+/// The definition built into the hub, `vk-hub/ci-tools/`: its files, in byte order, as
+/// [`pack`] would find them there.
+const BUILTIN_FILES: [(&str, &[u8]); 3] = [
+    ("Dockerfile", include_bytes!("../ci-tools/Dockerfile")),
+    ("flake.lock", include_bytes!("../ci-tools/flake.lock")),
+    ("flake.nix", include_bytes!("../ci-tools/flake.nix")),
+];
+
+/// The tool versions the built-in definition's label names, by the `ARG` that holds each.
+const BUILTIN_VERSIONS: [(&str, &str); 2] = [("git", "GIT_VERSION"), ("lfs", "GIT_LFS_VERSION")];
+
+/// The definition built into the hub: packed as `vk-hub tools add vk-hub/ci-tools` packs it,
+/// and its label, the versions of the tools it builds.
+pub struct Builtin {
+    pub packed: Packed,
+    pub version: String,
+}
+
+/// The built-in definition, packed once.
+pub fn builtin() -> &'static Builtin {
+    static BUILTIN: std::sync::OnceLock<Builtin> = std::sync::OnceLock::new();
+    BUILTIN.get_or_init(|| {
+        let entries: Vec<Entry> = BUILTIN_FILES
+            .iter()
+            .map(|(name, data)| Entry {
+                path: PathBuf::from(name),
+                data: Some(data.to_vec()),
+                executable: false,
+            })
+            .collect();
+        // Both are checked by the tests: the files are the hub's own.
+        let packed = write_tar(&entries).expect("the built-in tools definition packs");
+        let dockerfile = std::str::from_utf8(BUILTIN_FILES[0].1).unwrap_or_default();
+        let version = builtin_version(dockerfile).expect("the built-in tools are labelled");
+        Builtin { packed, version }
+    })
+}
+
+/// The label of a definition whose Dockerfile is `dockerfile`: each tool of
+/// [`BUILTIN_VERSIONS`] and the version its `ARG` gives, e.g. `git-2.56.0-lfs-3.8.0`.
+fn builtin_version(dockerfile: &str) -> Result<String> {
+    let mut parts = Vec::new();
+    for (tool, arg) in BUILTIN_VERSIONS {
+        let prefix = format!("ARG {arg}=");
+        let Some(version) = dockerfile
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(&prefix))
+        else {
+            bail!("the Dockerfile has no {prefix}");
+        };
+        parts.push(format!("{tool}-{}", version.trim()));
+    }
+    let version = parts.join("-");
+    crate::releases::check_version(&version)?;
+    Ok(version)
 }
 
 /// One entry of a definition: a file with its contents, or a directory.
@@ -267,6 +334,19 @@ fn tools_dir(hub: &Hub) -> Result<&Path> {
 pub fn add(hub: &Hub, actor: &str, from: &Path, version: &str) -> Result<Tools> {
     crate::releases::check_version(version)?;
     let packed = pack(from)?;
+    hold(hub, actor, &packed, version, false)
+}
+
+/// Hold the definition built into the hub, as `actor`: added under its label unless already
+/// held, under whatever label it was given.
+pub fn add_builtin(hub: &Hub, actor: &str) -> Result<Tools> {
+    let builtin = builtin();
+    hold(hub, actor, &builtin.packed, &builtin.version, true)
+}
+
+/// Hold `packed` as definition `version`, as [`add`] does. One already held under another
+/// label is refused, unless `any_label`, which takes it as it is.
+fn hold(hub: &Hub, actor: &str, packed: &Packed, version: &str, any_label: bool) -> Result<Tools> {
     let dir = tools_dir(hub)?;
     let row = ToolsRow {
         version: version.to_string(),
@@ -280,7 +360,7 @@ pub fn add(hub: &Hub, actor: &str, from: &Path, version: &str) -> Result<Tools> 
     let dest = path(dir, &sha256);
     let existing = hub.db.tools(&sha256)?;
     if let Some(existing) = &existing {
-        if existing.version != row.version {
+        if existing.version != row.version && !any_label {
             bail!(
                 "tools {} are already held, as version {}",
                 crate::store::short(&sha256),
@@ -343,8 +423,15 @@ fn publish(dir: &Path, dest: &Path, tar: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Forget definition `sha256` and delete its tar. `Ok(false)` when there was none.
+/// Forget definition `sha256` and delete its tar, unless it is built into the hub. `Ok(false)`
+/// when there was none.
 pub fn remove(hub: &Hub, actor: &str, sha256: &str) -> Result<bool> {
+    if sha256 == builtin().packed.sha256 {
+        bail!(
+            "tools {} are built into this hub, which holds them again at its next start",
+            crate::store::short(sha256)
+        );
+    }
     let _held = hub.tools_lock();
     let removed = hub.db.remove_tools(sha256, actor, crate::now_secs())?;
     if removed {
@@ -435,6 +522,35 @@ mod tests {
         assert_ne!(pack(&b).unwrap().sha256, pa.sha256);
         let _ = std::fs::remove_dir_all(&a);
         let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn the_builtin_definition_is_the_directory_it_comes_from() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("ci-tools");
+        let on_disk = pack(&dir).unwrap();
+        let builtin = builtin();
+        assert_eq!(builtin.packed.sha256, on_disk.sha256);
+        assert_eq!(builtin.packed.tar, on_disk.tar);
+        assert_eq!(builtin.packed.files, on_disk.files);
+        let names: Vec<_> = BUILTIN_FILES.iter().map(|(n, _)| *n).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+        assert!(
+            builtin.version.starts_with("git-") && builtin.version.contains("-lfs-"),
+            "{}",
+            builtin.version
+        );
+    }
+
+    #[test]
+    fn a_label_names_each_tool_s_version() {
+        let dockerfile = "FROM x\nARG GIT_VERSION=2.56.0\n  ARG GIT_LFS_VERSION=3.8.0\n";
+        assert_eq!(builtin_version(dockerfile).unwrap(), "git-2.56.0-lfs-3.8.0");
+        let err = builtin_version("ARG GIT_VERSION=2\n").unwrap_err();
+        assert!(format!("{err:#}").contains("GIT_LFS_VERSION"), "{err:#}");
+        let bad = "ARG GIT_VERSION=2 3\nARG GIT_LFS_VERSION=3\n";
+        assert!(builtin_version(bad).is_err());
     }
 
     #[test]

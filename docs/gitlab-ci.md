@@ -71,16 +71,19 @@ job rather than booting a guest that cannot nest.
 
 `[executor] tools_dir` names a host directory of static tools — `git`, `git-remote-http(s)`,
 `git-lfs`, `gitlab-runner` — shared read-only into every job VM; the guest links each one its image
-lacks onto its PATH. On a host that runs a gitlab-runner of its own — one `vk node` manages, or one
-on systemd's `PATH` — `vk check --feature gitlab` fails without a `gitlab-runner` there: that
-runner's jobs transfer no artifacts, caches or dotenv reports without one. Jobs a hub places need
-only `git`. The directory is resolved at each job's start, so pointing a link at a new one changes
-the tools of the jobs that start after it.
+lacks onto its PATH, `git` with the helpers and scripts it runs only when the image has no `git`.
+On a host that runs a gitlab-runner of its own — one `vk node` manages, or one on systemd's `PATH`
+— `vk check --feature gitlab` fails without a `gitlab-runner` there: that runner's jobs transfer no
+artifacts, caches or dotenv reports without one. Jobs a hub places need only `git`. The directory
+is resolved at each job's start, so pointing a link at a new one changes the tools of the jobs
+that start after it.
 
-On a fleet node the hub can provision it: `vk-hub tools add` holds a build context whose `tools`
-stage holds the tools — a definition need only provide `git` — and `vk-hub nodes tools` has nodes
-build it and install the result as `<state_dir>/tools/current`
-([CI tools](fleet-prototype.md#ci-tools)). An enrolled node whose config sets no `tools_dir`
+On a fleet node the hub can provision it: the hub holds a definition of its own building `git`,
+its helpers and `git-lfs`, and `vk-hub tools add` holds others, build contexts whose `tools` stage
+holds the tools — a definition need only provide `git`. The hub's own has no `gitlab-runner`,
+which only a node running a gitlab-runner of its own needs: a fleet with such nodes adds a
+definition that also builds it. `vk-hub nodes tools` has nodes build one and install the
+result as `<state_dir>/tools/current` ([CI tools](fleet-prototype.md#ci-tools)). An enrolled node whose config sets no `tools_dir`
 gives its jobs those tools once its first build is done, as `vk-hub nodes` shows; before that
 its jobs get none. A node that sets one points it there to use them:
 
