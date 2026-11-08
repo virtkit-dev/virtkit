@@ -708,7 +708,12 @@ or as the password of a Basic pair, and is told apart by its `vkt_` prefix. The 
 checks it in memory against the keys the hub last sent in its desired state, kept in
 `<root>/hub/state.json` and taken again at start before the first connection: signed by a
 known key, for this registry's ID, not expired beyond a minute of skew. A desired state that
-sends no keys keeps the previous ones. A bad token is a 401 with the mode's challenge, and
+sends no keys keeps the previous ones. The desired state also lists revoked subjects, as
+`node:<id>` for a node the hub removed: a token whose `sub` is one is refused whatever it
+says, now and after a restart, until the hub drops it from the list once none of its tokens
+can be live; a desired state with no list keeps the previous one, as does one listing more than
+4096. The registry announces this in its inventory, and the hub sends such lists only to a
+registry that does. A bad token is a 401 with the mode's challenge, and
 its refusal is logged, a line a minute at most. With tokens on, a shared secret starting with
 `vkt_` is refused at start, since it would be taken for a token.
 

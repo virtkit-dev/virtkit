@@ -65,8 +65,14 @@ pub const MAX_RATIO: f64 = 64.0;
 /// The most a registry's `ca_pem` may hold.
 pub const MAX_CA_PEM: usize = 256 * 1024;
 
-/// The only `guest_credential` a registry the hub names may have: the job's token.
+/// The `guest_credential` a registry the hub names has by default: the job's token, and nothing
+/// for a job the hub did not place.
 pub const GUEST_CREDENTIAL: &str = "job";
+
+/// The `guest_credential` the hub names to a node from protocol version
+/// [`crate::REGISTRY_ACCESS`]: the job's token for a job it placed, as [`GUEST_CREDENTIAL`]; the
+/// token the hub gives the node for its runner's guests for any other.
+pub const GUEST_CREDENTIAL_JOB_OR_NODE: &str = "job-or-node";
 
 /// `key`'s kind; `None` for a key the hub may not set.
 pub fn kind(key: &str) -> Option<Kind> {
@@ -181,12 +187,15 @@ fn check_registry(value: &Value) -> Result<(), String> {
     if authority.split('/').next().is_none_or(str::is_empty) {
         return Err("`repo` names no registry host".to_string());
     }
-    if table
-        .get("guest_credential")
-        .is_some_and(|v| v.as_str() != Some(GUEST_CREDENTIAL))
-    {
+    if table.get("guest_credential").is_some_and(|v| {
+        !matches!(
+            v.as_str(),
+            Some(GUEST_CREDENTIAL | GUEST_CREDENTIAL_JOB_OR_NODE)
+        )
+    }) {
         return Err(format!(
-            "`guest_credential` may only be {GUEST_CREDENTIAL:?}: guests get the job's token"
+            "`guest_credential` may only be {GUEST_CREDENTIAL:?} or \
+             {GUEST_CREDENTIAL_JOB_OR_NODE:?}: guests never get the node's own credential"
         ));
     }
     for key in ["ca_pem", "pipeline_root"] {
@@ -292,6 +301,7 @@ mod tests {
         assert!(check(json!({"ca_pem": "x"})).is_err());
         assert!(check(json!({"repo": "r", "token_file": "/t"})).is_err());
         assert!(check(json!({"repo": "r", "guest_credential": "node"})).is_err());
+        check(json!({"repo": "r", "guest_credential": "job-or-node"})).unwrap();
         assert!(check(json!({"repo": "r", "insecure": "yes"})).is_err());
         assert!(check(json!("r")).is_err());
         for (registry, why) in [

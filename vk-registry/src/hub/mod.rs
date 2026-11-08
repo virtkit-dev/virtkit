@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use vk_hub_proto::registry::{
     ALLOW_GC, ALLOW_READ_ONLY, Command, DesiredState, GcPolicy, GcRun, Heartbeat, Inventory,
-    Operation, REFUSED_PREFIX_RETENTION, Report, Usage,
+    MAX_REVOKED_SUBJECTS, Operation, REFUSED_PREFIX_RETENTION, Report, Usage,
 };
 use vk_hub_proto::{CommandAck, EnrollRequest, Outcome};
 use vk_peer::identity::Identity;
@@ -343,8 +343,10 @@ fn restore_token_keys(dir: &Path, state: &ServerState, ctx: &Facts) {
         );
         return;
     };
-    let keys = applied.and_then(|d| d.token_keys).unwrap_or_default();
-    state.tokens.open(&enrollment.registry_id, keys);
+    let applied = applied.unwrap_or_default();
+    let revoked = applied.revoked_subjects.unwrap_or_default();
+    let keys = applied.token_keys.unwrap_or_default();
+    state.tokens.open(&enrollment.registry_id, keys, &revoked);
 }
 
 /// The retention windows under prefixes: the config's `[[gc.prefix]]`, lengthened by what
@@ -565,6 +567,7 @@ impl Link {
             self.state.tokens.open(
                 &self.enrollment.registry_id,
                 desired.token_keys.clone().unwrap_or_default(),
+                desired.revoked_subjects.as_deref().unwrap_or_default(),
             );
         }
     }
@@ -580,7 +583,23 @@ impl Link {
         }
         // No keys sent leaves the keys as they were: tokens already handed out stay good.
         if desired.token_keys.is_none() {
-            desired.token_keys = previous.and_then(|a| a.token_keys);
+            desired.token_keys = previous.as_ref().and_then(|a| a.token_keys.clone());
+        }
+        // Nor does a list of revoked subjects left out, or one too long to hold, end a
+        // revocation.
+        if desired
+            .revoked_subjects
+            .as_ref()
+            .is_some_and(|r| r.len() > MAX_REVOKED_SUBJECTS)
+        {
+            eprintln!(
+                "vk-registry: hub: more than {MAX_REVOKED_SUBJECTS} revoked subjects sent; \
+                 keeping those revoked before"
+            );
+            desired.revoked_subjects = None;
+        }
+        if desired.revoked_subjects.is_none() {
+            desired.revoked_subjects = previous.and_then(|a| a.revoked_subjects);
         }
         // Kept first, so what takes effect is what a restart applies again.
         self.update(|p| p.applied = Some(desired.clone()))?;
@@ -787,6 +806,7 @@ impl Link {
             allow: self.ctx.settings.allow.clone(),
             requires_signed: self.policy.required(),
             tokens: self.ctx.settings.tokens,
+            revokes_subjects: true,
         }
     }
 
@@ -957,6 +977,7 @@ mod tests {
             }),
             token_keys: None,
             prefix_retention: None,
+            revoked_subjects: None,
         }
     }
 
@@ -1040,6 +1061,7 @@ mod tests {
                 gc: None,
                 token_keys: None,
                 prefix_retention: None,
+                revoked_subjects: None,
             })
             .unwrap();
         assert!(first.state.store.read_only());
@@ -1079,6 +1101,7 @@ mod tests {
             gc: None,
             token_keys: None,
             prefix_retention: None,
+            revoked_subjects: None,
         };
         link.apply_desired(read_only(1, false)).unwrap();
         assert!(link.report().refused.is_empty());
@@ -1162,6 +1185,7 @@ mod tests {
                 gc: None,
                 token_keys: None,
                 prefix_retention: None,
+                revoked_subjects: None,
             })
             .unwrap();
         let state = server_state(&root);
@@ -1204,6 +1228,7 @@ mod tests {
             gc: None,
             token_keys: None,
             prefix_retention: None,
+            revoked_subjects: None,
         };
         assert!(link.apply_desired(desired).is_err());
         mode(0o700).unwrap();
@@ -1491,6 +1516,61 @@ mod tests {
             Some(Vec::new()),
             "no keys from another hub"
         );
+    }
+
+    /// The subjects the hub revokes are refused from the desired state that names them, kept
+    /// when a later one names none or too many, replaced by a new list, and refused again
+    /// after a restart.
+    #[test]
+    fn revoked_subjects_are_applied_kept_and_restored() {
+        let root = enrolled("revoked");
+        let settings = HubSettings {
+            tokens: true,
+            ..HubSettings::default()
+        };
+        let link = open_link(&root, settings.clone());
+        assert!(link.inventory().revokes_subjects);
+        let node = |n: u8| format!("node:{}", n.to_string().repeat(32));
+        link.apply_desired(DesiredState {
+            generation: 1,
+            revoked_subjects: Some(vec![node(1), node(2)]),
+            ..DesiredState::default()
+        })
+        .unwrap();
+        assert_eq!(link.state.tokens.revoked(), Some(vec![node(1), node(2)]));
+        link.apply_desired(DesiredState {
+            generation: 2,
+            read_only: Some(false),
+            ..DesiredState::default()
+        })
+        .unwrap();
+        assert_eq!(link.state.tokens.revoked(), Some(vec![node(1), node(2)]));
+        let too_many = (0..=MAX_REVOKED_SUBJECTS)
+            .map(|i| format!("node:{i}"))
+            .collect();
+        link.apply_desired(DesiredState {
+            generation: 3,
+            revoked_subjects: Some(too_many),
+            ..DesiredState::default()
+        })
+        .unwrap();
+        assert_eq!(link.state.tokens.revoked(), Some(vec![node(1), node(2)]));
+
+        let state = server_state(&root);
+        restore_token_keys(&dir(&root), &state, &facts(settings.clone(), Vec::new()));
+        assert_eq!(state.tokens.revoked(), Some(vec![node(1), node(2)]));
+
+        // The hub drops one once no token for it can be live.
+        link.apply_desired(DesiredState {
+            generation: 4,
+            revoked_subjects: Some(vec![node(2)]),
+            ..DesiredState::default()
+        })
+        .unwrap();
+        assert_eq!(link.state.tokens.revoked(), Some(vec![node(2)]));
+        let state = server_state(&root);
+        restore_token_keys(&dir(&root), &state, &facts(settings, Vec::new()));
+        assert_eq!(state.tokens.revoked(), Some(vec![node(2)]));
     }
 
     /// A hub that no longer knows the registry closes its tokens, now and across a restart,

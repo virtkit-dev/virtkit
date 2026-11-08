@@ -76,6 +76,9 @@ pub enum Refused {
     BadSignature,
     WrongAudience,
     Expired,
+    /// Its subject was revoked, as a removed node's is; checked by the registry, not by
+    /// [`verify`].
+    Revoked,
 }
 
 impl std::fmt::Display for Refused {
@@ -86,6 +89,7 @@ impl std::fmt::Display for Refused {
             Refused::BadSignature => "bad signature",
             Refused::WrongAudience => "for another registry",
             Refused::Expired => "expired",
+            Refused::Revoked => "of a revoked subject",
         })
     }
 }

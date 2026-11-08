@@ -123,6 +123,10 @@ pub struct Inventory {
     /// a registry that does.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tokens: bool,
+    /// Whether it refuses the tokens of [`DesiredState::revoked_subjects`]: the hub mints node
+    /// tokens only for a registry that does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub revokes_subjects: bool,
 }
 
 impl Inventory {
@@ -277,7 +281,15 @@ pub struct DesiredState {
     /// elsewhere. `None` leaves only the registry's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_retention: Option<Vec<PrefixRetention>>,
+    /// Token subjects to refuse whatever their tokens say, as `node:<id>` for a removed node,
+    /// each until no token for it can be live; `None` leaves the registry's list as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_subjects: Option<Vec<String>>,
 }
+
+/// The most subjects [`DesiredState::revoked_subjects`] holds: a registry refuses a longer
+/// list, keeping the one it has.
+pub const MAX_REVOKED_SUBJECTS: usize = 4096;
 
 /// A retention window on the tags under a prefix ([`crate::token::under`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -449,6 +461,7 @@ mod tests {
                 allow: vec![ALLOW_GC.into()],
                 requires_signed: true,
                 tokens: false,
+                revokes_subjects: false,
             }),
             r#"{"type":"inventory","hostname":"h","version":"0.89.0","sha256":"s","listen":"0.0.0.0:5000","tls":true,"mode":"accounts","webdav":false,"upstreams":["docker.io"],"store":"/srv","store_size_bytes":100,"config_hash":"c","allow":["gc"],"requires_signed":true}"#,
         );
@@ -464,6 +477,20 @@ mod tests {
                 ..Inventory::default()
             }),
             r#"{"type":"inventory","hostname":"h","version":"0.93.0","listen":"l","tls":false,"mode":"accounts","webdav":false,"store":"/srv","store_size_bytes":0,"config_hash":"c","requires_signed":false,"tokens":true}"#,
+        );
+        pinned(
+            &RegistryMsg::Inventory(Inventory {
+                hostname: "h".into(),
+                version: "0.108.0".into(),
+                listen: "l".into(),
+                mode: "accounts".into(),
+                store: "/srv".into(),
+                config_hash: "c".into(),
+                tokens: true,
+                revokes_subjects: true,
+                ..Inventory::default()
+            }),
+            r#"{"type":"inventory","hostname":"h","version":"0.108.0","listen":"l","tls":false,"mode":"accounts","webdav":false,"store":"/srv","store_size_bytes":0,"config_hash":"c","requires_signed":false,"tokens":true,"revokes_subjects":true}"#,
         );
         pinned(
             &RegistryMsg::Heartbeat(Heartbeat {
@@ -545,6 +572,7 @@ mod tests {
                 gc: None,
                 token_keys: None,
                 prefix_retention: None,
+                revoked_subjects: None,
             }),
             r#"{"type":"desired","generation":2,"read_only":false}"#,
         );
@@ -561,8 +589,9 @@ mod tests {
                     prefix: "team/a".into(),
                     retention_days: 90,
                 }]),
+                revoked_subjects: Some(vec!["node:n".into()]),
             }),
-            r#"{"type":"desired","generation":3,"token_keys":[{"kid":"k","public_key":"p"}],"prefix_retention":[{"prefix":"team/a","retention_days":90}]}"#,
+            r#"{"type":"desired","generation":3,"token_keys":[{"kid":"k","public_key":"p"}],"prefix_retention":[{"prefix":"team/a","retention_days":90}],"revoked_subjects":["node:n"]}"#,
         );
         pinned(
             &HubRegistryMsg::Command(Command {

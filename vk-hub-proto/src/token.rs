@@ -64,7 +64,8 @@ pub struct Claims {
     pub kid: String,
     /// The registry's ID: another registry refuses the token.
     pub aud: String,
-    /// Who the token is for: `job:<hub job id>` for a placed job.
+    /// Who the token is for: `job:<hub job id>` for a placed job, [`node_subject`] for a
+    /// node's own.
     pub sub: String,
     /// The token's own ID, for the audit log and revocation.
     pub jti: String,
@@ -76,6 +77,11 @@ pub struct Claims {
     pub exp: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub grants: Vec<Grant>,
+}
+
+/// The `sub` of node `id`'s own tokens, which removing the node revokes.
+pub fn node_subject(id: &str) -> String {
+    format!("node:{id}")
 }
 
 /// What a token may do under a prefix.

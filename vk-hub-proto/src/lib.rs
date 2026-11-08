@@ -72,6 +72,11 @@
 //! Version 6 ([`LIVE_EGRESS`]) adds [`dispatch::NodeJobMsg::Egress`], a running job's egress
 //! report. Below it a node sends the report with the job's result only.
 //!
+//! Version 7 ([`REGISTRY_ACCESS`]) adds [`HubMsg::RegistryAccess`], the node's own token for the
+//! registry its `[registry]` names, renewed or cleared by the hub, and the token it lends its own
+//! runner's guests. A hub sends none below it, nor `guest_credential = "job-or-node"` in the
+//! node's settings.
+//!
 //! **Steering.** From version 2 the node's [`Report`] also carries its observed state — the
 //! desired state it last applied, its [`NodeState`], whether its runner is taking jobs, its
 //! concurrency, drain and update progress — and the node acks every command whose
@@ -184,6 +189,9 @@ pub const RUNNER_NONE: u32 = 5;
 /// The first protocol version carrying [`dispatch::NodeJobMsg::Egress`]. Not in [`PROTOCOL`]
 /// either.
 pub const LIVE_EGRESS: u32 = 6;
+
+/// The first protocol version carrying [`HubMsg::RegistryAccess`]. Not in [`PROTOCOL`] either.
+pub const REGISTRY_ACCESS: u32 = 7;
 
 /// The largest tools definition — a build context packed as a tar — a hub holds and a node
 /// takes: a Dockerfile and the few files it copies, not the tools themselves.
@@ -683,6 +691,58 @@ pub enum HubMsg {
     Recorded(CommandAck),
     /// Reservations and jobs. From version [`JOBS`].
     Job(dispatch::HubJobMsg),
+    /// The node's own access to the registry its `[registry]` names, replacing any it holds;
+    /// `None` clears it. Sent once the hub knows which registry the node uses, again before it
+    /// expires, and whenever the registry or its grants change. From version
+    /// [`REGISTRY_ACCESS`].
+    RegistryAccess { access: Option<NodeRegistryAccess> },
+}
+
+/// A node's own access to a registry the hub manages ([`HubMsg::RegistryAccess`]): what it is
+/// bound to, and its token. Never part of the node's settings or reports; its `Debug` leaves
+/// the tokens out.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeRegistryAccess {
+    /// The registry's ID, the token's audience.
+    pub registry_id: String,
+    /// The registry's base URL as the hub binds it, `<scheme>://<host>[:<port>]`.
+    pub origin: String,
+    /// The SHA-256, lowercase hex, of the CA PEM the hub names the registry with in its
+    /// settings; `None` when it names none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_sha256: Option<String>,
+    /// The generation of the node's desired state the access was minted under.
+    pub generation: u64,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    /// What the token may do, as the registry checks it.
+    pub grants: Vec<token::Grant>,
+    /// The token for the node's own requests.
+    pub token: String,
+    /// The token a node lends the guests of jobs the hub did not place, under `[registry]
+    /// guest_credential = "job-or-node"`: same subject, its own ID, what namespaces grant
+    /// guests within [`NodeRegistryAccess::grants`], expiring with the node's token. `None`
+    /// when namespaces grant guests nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_token: Option<String>,
+    /// What [`NodeRegistryAccess::guest_token`] may do.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guest_grants: Vec<token::Grant>,
+}
+
+impl std::fmt::Debug for NodeRegistryAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeRegistryAccess")
+            .field("registry_id", &self.registry_id)
+            .field("origin", &self.origin)
+            .field("ca_sha256", &self.ca_sha256)
+            .field("generation", &self.generation)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .field("grants", &self.grants)
+            .field("guest_grants", &self.guest_grants)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Why a session was refused or ended, for the node to decide whether redialing can help.
@@ -2756,6 +2816,62 @@ mod tests {
             assert_eq!(r.clone().without_runner_none(), r);
             assert!(old(&r).is_ok());
         }
+    }
+
+    /// Version 7's message: the access, bound to its registry, or `null` to clear it; its
+    /// `Debug` never shows a token.
+    #[test]
+    fn version_7_keeps_its_wire_shape() {
+        assert_eq!(REGISTRY_ACCESS, 7);
+        let access = NodeRegistryAccess {
+            registry_id: "ab".repeat(16),
+            origin: "https://reg.example.com".into(),
+            ca_sha256: Some("cd".repeat(32)),
+            generation: 3,
+            issued_at: 1_800_000_000,
+            expires_at: 1_800_003_600,
+            grants: vec![token::Grant {
+                prefix: "images".into(),
+                read: true,
+                write: false,
+                lock: false,
+            }],
+            token: "vkt_secret".into(),
+            guest_token: None,
+            guest_grants: Vec::new(),
+        };
+        pinned(
+            &HubMsg::RegistryAccess {
+                access: Some(access.clone()),
+            },
+            json!({
+                "type": "registry_access",
+                "access": {
+                    "registry_id": "ab".repeat(16),
+                    "origin": "https://reg.example.com",
+                    "ca_sha256": "cd".repeat(32),
+                    "generation": 3,
+                    "issued_at": 1_800_000_000u64,
+                    "expires_at": 1_800_003_600u64,
+                    "grants": [serde_json::to_value(&access.grants[0]).unwrap()],
+                    "token": "vkt_secret",
+                },
+            }),
+        );
+        pinned(
+            &HubMsg::RegistryAccess { access: None },
+            json!({"type": "registry_access", "access": null}),
+        );
+        let shown = format!(
+            "{:?}",
+            HubMsg::RegistryAccess {
+                access: Some(NodeRegistryAccess {
+                    guest_token: Some("vkt_guest".into()),
+                    ..access
+                })
+            }
+        );
+        assert!(!shown.contains("vkt_"), "{shown}");
     }
 
     /// A report as 0.83.0 and 0.84.0 write it reads with every steering field absent, and goes

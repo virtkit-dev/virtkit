@@ -2,8 +2,10 @@
 //! (`vk_hub_proto::token`), checked here against the keys the hub sent, without asking it.
 //! A token is presented as a bearer, or as the password of a Basic pair, as docker-style
 //! clients send a registry credential; it is told apart from every other credential by its
-//! `vkt_` prefix.
+//! `vkt_` prefix. A token whose subject the hub revoked, as a removed node's, is refused
+//! whatever it says.
 
+use std::collections::HashSet;
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -33,14 +35,18 @@ struct Refusals {
 struct Gate {
     aud: String,
     keys: Vec<TokenKey>,
+    /// Subjects whose tokens are refused.
+    revoked: HashSet<String>,
 }
 
 impl TokenGate {
-    /// Take tokens for the registry `aud`, signed by one of `keys`.
-    pub fn open(&self, aud: &str, keys: Vec<TokenKey>) {
+    /// Take tokens for the registry `aud`, signed by one of `keys`, but none whose subject is
+    /// in `revoked`.
+    pub fn open(&self, aud: &str, keys: Vec<TokenKey>, revoked: &[String]) {
         *self.gate.write().unwrap_or_else(|e| e.into_inner()) = Some(Gate {
             aud: aud.to_string(),
             keys,
+            revoked: revoked.iter().cloned().collect(),
         });
     }
 
@@ -68,11 +74,33 @@ impl TokenGate {
             .map(|g| g.keys.clone())
     }
 
+    /// The subjects whose tokens are refused, sorted; `None` when tokens are not taken.
+    #[cfg(test)]
+    pub(crate) fn revoked(&self) -> Option<Vec<String>> {
+        self.gate
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|g| {
+                let mut r: Vec<String> = g.revoked.iter().cloned().collect();
+                r.sort();
+                r
+            })
+    }
+
     /// `token`'s claims, checked at `now`; `None` when tokens are not taken.
     pub(crate) fn check(&self, token: &str, now: u64) -> Option<Result<Claims, Refused>> {
         let gate = self.gate.read().unwrap_or_else(|e| e.into_inner());
         let gate = gate.as_ref()?;
-        Some(vk_peer::token::verify(token, &gate.keys, &gate.aud, now))
+        Some(
+            vk_peer::token::verify(token, &gate.keys, &gate.aud, now).and_then(|claims| {
+                if gate.revoked.contains(&claims.sub) {
+                    Err(Refused::Revoked)
+                } else {
+                    Ok(claims)
+                }
+            }),
+        )
     }
 
     /// Log that a token was refused for `why`, unless a refusal was logged less than
@@ -177,7 +205,7 @@ mod tests {
         let gate = TokenGate::default();
         assert_eq!(gate.keys(), None);
         assert!(gate.check("vkt_a.b", 0).is_none());
-        gate.open("9c2f4e1a7b3d5e60f1a2b3c4d5e6f708", Vec::new());
+        gate.open("9c2f4e1a7b3d5e60f1a2b3c4d5e6f708", Vec::new(), &[]);
         assert_eq!(gate.keys(), Some(Vec::new()));
         assert_eq!(gate.check("vkt_a.b", 0), Some(Err(Refused::Malformed)));
     }

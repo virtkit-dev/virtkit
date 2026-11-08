@@ -94,7 +94,7 @@ fn shared_with(
         handover: Default::default(),
     });
     if tokens {
-        state.tokens.open(AUD, vec![signer.public().clone()]);
+        state.tokens.open(AUD, vec![signer.public().clone()], &[]);
     }
     (state, signer)
 }
@@ -492,7 +492,7 @@ async fn accounts_mode_takes_a_token_and_keeps_it_off_the_pages() {
     });
     let state = Arc::new(cfg.into_state().unwrap());
     let signer = Signer::generate(&dir.join("token-key")).unwrap();
-    state.tokens.open(AUD, vec![signer.public().clone()]);
+    state.tokens.open(AUD, vec![signer.public().clone()], &[]);
     let url = spawn(state);
     let http = reqwest::Client::new();
     let token = signer.sign(claims(AUD, 600, None)).unwrap();
@@ -521,5 +521,44 @@ async fn accounts_mode_takes_a_token_and_keeps_it_off_the_pages() {
         assert_eq!(r.status(), 403, "{page}");
     }
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A token of a revoked subject, as a removed node's, is refused whatever it says; others of
+/// the same key go on working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_subject_s_token_is_refused() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("revoked");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (state, signer) = shared(&dir);
+    state.tokens.open(
+        AUD,
+        vec![signer.public().clone()],
+        &["node:0123456789abcdef0123456789abcdef".to_string()],
+    );
+    let url = spawn(state);
+    let http = reqwest::Client::new();
+    let token = |sub: &str| {
+        signer
+            .sign(Claims {
+                sub: sub.into(),
+                ..claims(AUD, 600, None)
+            })
+            .unwrap()
+    };
+    let status = |token: String| {
+        let req = http
+            .get(format!("{url}/v2/images/debian/manifests/v1"))
+            .bearer_auth(token);
+        async move { req.send().await.unwrap().status() }
+    };
+    let revoked = status(token("node:0123456789abcdef0123456789abcdef")).await;
+    assert_eq!(revoked, 401);
+    assert_eq!(
+        status(token("node:fedcba9876543210fedcba9876543210")).await,
+        404
+    );
+    assert_eq!(status(token("job:j1")).await, 404);
     let _ = std::fs::remove_dir_all(&dir);
 }

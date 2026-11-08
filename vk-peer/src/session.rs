@@ -547,6 +547,7 @@ pub fn kind(msg: &HubMsg) -> &'static str {
         HubMsg::Command(_) => "a command",
         HubMsg::Recorded(_) => "a record of an ack",
         HubMsg::Job(_) => "a job message",
+        HubMsg::RegistryAccess { .. } => "registry access",
     }
 }
 
