@@ -40,6 +40,13 @@
         inherit curl;
       }).overrideAttrs (old: {
         makeFlags = old.makeFlags ++ [ "SHELL_PATH=/bin/sh" "NO_CURL=" ];
+        # Without the sandbox (see the Dockerfile) Nix builds in a randomly named directory,
+        # not /build. Its path reaches the debug info, which the linker hashes into the build
+        # ID before the debug info is stripped, so each build's binaries differ. Name it /build
+        # to the compiler, as the sandbox would.
+        preConfigure = (old.preConfigure or "") + ''
+          export NIX_CFLAGS_COMPILE+=" -ffile-prefix-map=$NIX_BUILD_TOP=/build"
+        '';
         postPatch = (old.postPatch or "") + ''
           substituteInPlace setup.c \
             --replace-fail 'dir = system_path(DEFAULT_GIT_TEMPLATE_DIR);' 'dir = xstrdup("");'

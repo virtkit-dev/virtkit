@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **vk-hub's built-in CI tools build to the same bytes on every node.** Each build's git
+  binaries used to differ, so nodes building the same definition reported different checksums
+  for them.
+
 ## [0.108.0] - 2026-11-08
 
 ### Added
