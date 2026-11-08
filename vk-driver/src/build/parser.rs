@@ -887,6 +887,37 @@ mod tests {
         assert!(parse("RUN a \\\n  # vk: mem=8G\n  && b\nFROM alpine\n").is_ok());
     }
 
+    /// The hub shows what a CI tools definition declares with its own reading of the hints;
+    /// it reads them as this parser does.
+    #[test]
+    fn the_hub_reads_declared_egress_as_the_build_does() {
+        /// A stage's `AS` name, and its declared addresses and names.
+        type Declared = (Option<String>, Option<(Vec<String>, Vec<String>)>);
+        for src in vk_hub_proto::definition::SAMPLES {
+            let ours: Vec<Declared> = parse(src)
+                .unwrap()
+                .instructions
+                .into_iter()
+                .filter_map(|i| match i {
+                    Instruction::From(f) => {
+                        Some((f.as_name, f.guest.egress.map(|e| (e.ips, e.names))))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let hubs: Vec<Declared> = vk_hub_proto::definition::declared_egress(src)
+                .unwrap()
+                .into_iter()
+                .enumerate()
+                .map(|(n, s)| {
+                    let name = (s.name != n.to_string()).then_some(s.name);
+                    (name, s.egress.map(|e| (e.ips, e.names)))
+                })
+                .collect();
+            assert_eq!(ours, hubs, "{src}");
+        }
+    }
+
     #[test]
     fn a_stage_declares_the_egress_its_steps_need() {
         let df = parse(

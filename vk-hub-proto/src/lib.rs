@@ -63,7 +63,8 @@
 //! Version 4 ([`TOOLS`]) adds the CI tools a hub has its nodes build: [`Operation::Tools`],
 //! [`Report::tools`] and the tools download. A hub sends no such command in a session below
 //! it, and a node leaves the report's tools progress out there. [`Versions::tools`] is an
-//! optional inventory field, which a hub of any version reads or ignores.
+//! optional inventory field, which a hub of any version reads or ignores, as are its own
+//! optional [`ToolsInstalled::files`], [`ToolsInstalled::egress`] and [`ToolsInstalled::check`].
 //!
 //! Version 5 ([`RUNNER_NONE`]) adds [`RunnerMode::None`], a node that runs no gitlab-runner. In
 //! a session below it a node reports that mode as [`RunnerMode::External`], which an older hub
@@ -115,6 +116,7 @@ macro_rules! version_mark {
 }
 
 pub mod client;
+pub mod definition;
 pub mod dispatch;
 pub mod egress;
 pub mod gitlab;
@@ -928,6 +930,58 @@ pub struct ToolsInstalled {
     pub tools: BTreeMap<String, String>,
     /// Whether `[executor] tools_dir` names them: when not, jobs are given whatever it names.
     pub in_use: bool,
+    /// What the node installed, by file name, as it recorded it then: at most
+    /// [`MAX_TOOLS_FILES`]. Empty from a node that records none, or tools installed before it
+    /// did. A reproducible definition gives every node the same.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, ToolsFile>,
+    /// What the build that made them contacted and was refused; `None` from a node that says
+    /// nothing of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<ToolsEgress>,
+    /// Whether they are still what [`ToolsInstalled::files`] records, as the node found them when
+    /// it gathered this inventory; `None` from a node that does not check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<ToolsCheck>,
+}
+
+/// The most entries [`ToolsInstalled::files`] holds: a node installs no more.
+pub const MAX_TOOLS_FILES: usize = 64;
+
+/// The most hosts each of [`ToolsEgress`]'s lists holds in an inventory.
+pub const MAX_TOOLS_EGRESS_HOSTS: usize = 64;
+
+/// One entry of installed tools.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolsFile {
+    /// A regular file: its contents' sha256, lowercase hex ([`valid_sha256`]), and size.
+    File { sha256: String, size: u64 },
+    /// A symlink naming a file beside it.
+    Link { target: String },
+}
+
+/// What a tools build's RUN steps contacted — names they resolved and addresses they dialled
+/// without one — and the names and addresses they were refused, each sorted, once.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolsEgress {
+    #[serde(default)]
+    pub contacted: Vec<String>,
+    #[serde(default)]
+    pub refused: Vec<String>,
+}
+
+/// Installed tools against what the node recorded as it installed them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ToolsCheck {
+    /// Every entry is as recorded, and there is no other.
+    Intact,
+    /// Nothing was recorded to check them against: a `vk` that recorded nothing installed them.
+    Unrecorded,
+    /// These entries, sorted, are not as recorded: changed, missing, or added since. The node
+    /// gives them to no job.
+    Modified { entries: Vec<String> },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2751,19 +2805,65 @@ mod tests {
                     version: "2026.10".into(),
                     tools: BTreeMap::from([("git".into(), "git version 2.49.0".into())]),
                     in_use: true,
+                    files: BTreeMap::new(),
+                    egress: None,
+                    check: None,
                 }),
                 ..inventory().versions
             },
             versions,
         );
-        assert_eq!(
-            serde_json::from_value::<ToolsInstalled>(
-                json!({"sha256": sha, "version": "v", "in_use": false})
-            )
-            .unwrap()
-            .tools,
-            BTreeMap::new()
+        let old = serde_json::from_value::<ToolsInstalled>(
+            json!({"sha256": sha, "version": "v", "in_use": false}),
+        )
+        .unwrap();
+        assert_eq!(old.tools, BTreeMap::new());
+        assert_eq!((old.files.len(), old.egress, old.check), (0, None, None));
+
+        // What a node records of its tools, and found of them, are optional fields of version 4.
+        pinned(
+            &ToolsInstalled {
+                sha256: sha.clone(),
+                version: "v".into(),
+                tools: BTreeMap::new(),
+                in_use: true,
+                files: BTreeMap::from([
+                    (
+                        "git".into(),
+                        ToolsFile::File {
+                            sha256: sha.clone(),
+                            size: 7,
+                        },
+                    ),
+                    (
+                        "git-remote-https".into(),
+                        ToolsFile::Link {
+                            target: "git-remote-http".into(),
+                        },
+                    ),
+                ]),
+                egress: Some(ToolsEgress {
+                    contacted: vec!["cache.nixos.org".into()],
+                    refused: vec!["example.com".into()],
+                }),
+                check: Some(ToolsCheck::Modified {
+                    entries: vec!["git".into()],
+                }),
+            },
+            json!({
+                "sha256": sha,
+                "version": "v",
+                "in_use": true,
+                "files": {
+                    "git": {"file": {"sha256": sha, "size": 7}},
+                    "git-remote-https": {"link": {"target": "git-remote-http"}},
+                },
+                "egress": {"contacted": ["cache.nixos.org"], "refused": ["example.com"]},
+                "check": {"state": "modified", "entries": ["git"]},
+            }),
         );
+        pinned(&ToolsCheck::Intact, json!({"state": "intact"}));
+        pinned(&ToolsCheck::Unrecorded, json!({"state": "unrecorded"}));
     }
 
     /// Version 5 adds the `none` runner mode. Older hubs cannot read it, so reports sent to

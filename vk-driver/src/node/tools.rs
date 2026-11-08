@@ -125,6 +125,10 @@ pub fn installed(cfg: &Config) -> Option<ToolsInstalled> {
         version: manifest.version,
         tools: manifest.tools,
         in_use: in_use(cfg),
+        // Not recorded yet.
+        files: Default::default(),
+        egress: None,
+        check: None,
     })
 }
 

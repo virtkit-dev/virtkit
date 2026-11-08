@@ -295,6 +295,9 @@ async fn a_tools_build_for_every_node_skips_those_that_cannot_or_need_not() {
         version: "2026.10".into(),
         tools: Default::default(),
         in_use: true,
+        files: Default::default(),
+        egress: None,
+        check: None,
     });
     hub.db
         .record_inventory(&current, inventory, true, now_secs())
@@ -365,6 +368,9 @@ fn the_nodes_table_notes_the_tools_and_a_failed_build() {
             ]
             .into(),
             in_use: false,
+            files: Default::default(),
+            egress: None,
+            check: None,
         }),
         report: Some(vk_hub_proto::Report {
             tools: Some(vk_hub_proto::ToolsProgress {
