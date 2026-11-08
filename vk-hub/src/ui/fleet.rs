@@ -61,7 +61,7 @@ const TOKEN_TTLS: [(u64, &str); 4] = [
 pub(super) struct FleetSite {
     /// Pending confirmations, shared with the hub's update, which hands them over.
     pub(super) questions: Arc<actions::Questions>,
-    /// Whether a release is being uploaded.
+    /// Whether a release or CI tools are being uploaded.
     pub(super) uploading: operations::Uploading,
     nodes_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
     updates_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
@@ -295,6 +295,12 @@ pub(super) async fn get(
         let views = blocking(move || crate::ops::node_views(&hub)).await?;
         return Ok(Some(page(nodes(auth, &views, now))));
     }
+    if let Some(sha256) = super::tools::download_target(path) {
+        return Ok(Some(super::tools::download(auth, ui, sha256).await?));
+    }
+    if let Some(sha256) = super::tools::detail_target(path) {
+        return Ok(Some(super::tools::detail(auth, ui, sha256).await?));
+    }
     if path == UPDATES_PATH {
         let steer = auth.session.role >= Role::Operator;
         let parts = blocking(move || read_updates(&hub, steer, now)).await?;
@@ -490,7 +496,7 @@ fn updates_events(hub: &Arc<Hub>, steer: bool) -> sse::Events {
         (UPDATES_EVENT, first),
         (PEERS_EVENT, part(peers_part)),
         (NODES_EVENT, part(nodes_part)),
-        (TOOLS_EVENT, part(|hub, _, _, _| tools_part(hub))),
+        (TOOLS_EVENT, part(|hub, _, steer, _| tools_part(hub, steer))),
     ];
     if steer {
         events.push((
@@ -547,10 +553,13 @@ fn read_node(hub: &Hub, id: &str) -> Result<Option<NodeDetail>> {
     let mut commands = hub.db.node_commands(id)?;
     commands.reverse();
     commands.truncate(NODE_COMMANDS);
+    let view = crate::ops::node_view(hub, id.to_string(), &row, hub.db.target()?.as_ref());
+    let tools = super::tools::read_node(hub, id, &row, view.connected, view.tools_peers.clone())?;
     Ok(Some(NodeDetail {
-        view: crate::ops::node_view(hub, id.to_string(), &row, hub.db.target()?.as_ref()),
+        view,
         workloads,
         commands,
+        tools,
         row,
     }))
 }
@@ -563,6 +572,7 @@ struct NodeDetail {
     workloads: Option<crate::store::Workloads>,
     /// The latest, newest first.
     commands: Vec<CommandRow>,
+    tools: super::tools::NodeTools,
 }
 
 /// `/node/<id>/action`'s node, if `path` is that for a well-formed ID.
@@ -579,6 +589,18 @@ enum Steer {
     Command(Operation),
     /// The pools to put the node in, replacing those it is in.
     Pools(Vec<String>),
+    /// Build the CI tools of this sha256, those the settings keep the node on, now.
+    Tools(String),
+}
+
+/// Marks why a build of CI tools asked from a node's page was not issued.
+#[derive(Debug)]
+struct ToolsRefused;
+
+impl std::fmt::Display for ToolsRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the CI tools build was refused")
+    }
 }
 
 /// What `form` asks, or why it is no action.
@@ -607,6 +629,10 @@ fn steer(form: &[(String, String)]) -> Result<Steer, &'static str> {
             pools.dedup();
             Steer::Pools(pools)
         }
+        "tools" => match field(form, "tools").filter(|t| vk_hub_proto::valid_sha256(t)) {
+            Some(sha256) => Steer::Tools(sha256.to_string()),
+            None => return Err("Refused: name the CI tools by their sha256."),
+        },
         "stop" => Steer::Acquisition(Acquisition::Stop),
         "resume" => Steer::Acquisition(Acquisition::Run),
         "drain" => Steer::Command(Operation::Drain),
@@ -707,6 +733,17 @@ pub(super) async fn node_action(
                     format!("Now in pools {}.", pools.join(", "))
                 }
             }),
+            Steer::Tools(sha256) => match ops::tools(&hub, &principal, &node, Some(&sha256)) {
+                Ok(c) => Ok(format!(
+                    "Issued the build of the CI tools (command {}). The node's response shows \
+                     on this page.",
+                    c.id
+                )),
+                Err(e) if e.is::<NotEnrolled>() || e.is::<MonitoringOnly>() => Err(e),
+                // Why the build cannot be issued: the settings name other tools now, it is
+                // under way already, the node cannot take one.
+                Err(e) => Err(e.context(ToolsRefused)),
+            },
             Steer::Command(op) => ops::command(&hub, &principal, &node, op).map(|c| {
                 format!(
                     "Issued {} (command {}). The node's response shows on this page.",
@@ -738,6 +775,14 @@ pub(super) async fn node_action(
                 htmx,
                 StatusCode::NOT_FOUND,
                 "There is no such node.",
+            ));
+        }
+        Err(e) if e.is::<ToolsRefused>() => {
+            let why = format!("{:#}", e.root_cause());
+            return Ok(actions::refused(
+                htmx,
+                StatusCode::CONFLICT,
+                &format!("Refused: {why}."),
             ));
         }
         Err(e) => return Err(e),
@@ -1711,7 +1756,7 @@ fn pools_form(h: &mut Html, pools: &[String], path: &str, csrf: &str) {
 
 /// The opening of a steering form posting to `path`, by htmx or as a plain form, with the
 /// session's CSRF token `csrf`.
-fn form_open(h: &mut Html, path: &str, csrf: &str) {
+pub(super) fn form_open(h: &mut Html, path: &str, csrf: &str) {
     h.raw("<form class=\"act\" method=\"post\" action=\"")
         .text(path)
         .raw("\" hx-post=\"")
@@ -1855,6 +1900,7 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
         settings_section(&mut h, settings);
     }
     updates_section(&mut h, v);
+    super::tools::node_section(&mut h, &d.tools, &v.id, csrf, !v.monitoring_only(), now);
 
     let inventory = d.row.inventory.as_ref();
     section(&mut h, "Hardware");
@@ -1947,31 +1993,6 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
             inv.versions.guest_kernel.as_deref().unwrap_or("-"),
         );
         kv_node(&mut h, "Configuration hash", &inv.versions.config_hash);
-        match &inv.versions.tools {
-            None => kv(&mut h, "CI tools", "none from the hub"),
-            Some(t) => {
-                h.raw("<tr><th>CI tools</th><td>")
-                    .node(&t.version)
-                    .raw(" (<code title=\"")
-                    .node(&t.sha256)
-                    .raw("\">")
-                    .node(crate::store::short(&t.sha256))
-                    .raw("</code>)");
-                if !t.in_use {
-                    h.raw(", not in use: <code>[executor] tools_dir</code> names another ")
-                        .raw("directory");
-                }
-                h.raw("</td></tr>");
-                // Both the node's words: a tool's name is a file it found.
-                for (name, version) in &t.tools {
-                    h.raw("<tr><th>")
-                        .node(name)
-                        .raw("</th><td>")
-                        .node(version)
-                        .raw("</td></tr>");
-                }
-            }
-        }
         end_section(&mut h);
 
         section(&mut h, "Runner");
@@ -2357,7 +2378,7 @@ fn read_updates(hub: &Hub, steer: bool, now: u64) -> Result<UpdatesParts> {
         releases: releases_part(hub, &held.releases),
         peers: peers_part(hub, &held, steer, now)?,
         nodes: nodes_part(hub, &held, steer, now)?,
-        tools: tools_part(hub)?,
+        tools: tools_part(hub, steer)?,
         held,
         source: hub.fetches.source().map(|s| s.url().to_string()),
     })
@@ -2413,6 +2434,9 @@ fn updates_page(auth: &Auth, parts: &UpdatesParts) -> Html {
         .raw(ROLLOUTS_PATH)
         .raw("\">Rollout history</a></p></section>");
     swapped(&mut main, TOOLS_EVENT, &parts.tools);
+    if steer {
+        super::tools::upload_form(&mut main, auth);
+    }
     main.raw("</div>");
     layout("Updates", UPDATES_PATH, auth, &main)
 }
@@ -2705,25 +2729,64 @@ fn update_phase(node: &NodeView, version: &str) -> Option<String> {
     })
 }
 
-/// The CI tools definitions held, newest first.
-fn tools_part(hub: &Hub) -> Result<Html> {
+/// The CI tools definitions held, newest first: each linked to its page, with how many nodes
+/// the settings keep on it and have it, and its download for an operator (`steer`).
+fn tools_part(hub: &Hub, steer: bool) -> Result<Html> {
     let tools = hub.db.tools_list()?;
     let mut h = Html::new();
     h.raw("<section><h2>CI tools</h2>");
     if tools.is_empty() {
         h.raw("<p class=\"empty\">none. <code>vk-hub tools add</code> packs a build context ")
-            .raw("into the hub. <code>vk-hub nodes tools</code> then has nodes build it.</p>");
+            .raw("into the hub. The <code>tools</code> setting names the tools nodes are ")
+            .raw("kept on.</p>");
     } else {
-        h.raw("<table class=\"grid\"><thead><tr><th>sha256</th><th>version</th>")
-            .raw("<th>files</th><th>size</th><th>added</th><th>by</th></tr></thead><tbody>");
+        let builtin = &crate::tools::builtin().packed.sha256;
+        let layers = hub.db.settings_layers()?;
+        let nodes = hub.db.nodes()?;
+        let outputs = crate::ops::tools_outputs(&nodes);
+        let mut kept = std::collections::BTreeMap::<String, usize>::new();
+        let mut installed = std::collections::BTreeMap::<String, usize>::new();
+        for (id, row) in &nodes {
+            let named = crate::deploy::Named::of(layers.merged(id).get(crate::deploy::KEY));
+            if let Some(sha) = named.sha256(builtin) {
+                *kept.entry(sha.to_string()).or_default() += 1;
+            }
+            if let Some(t) = row
+                .inventory
+                .as_ref()
+                .and_then(|i| i.versions.tools.as_ref())
+            {
+                *installed.entry(t.sha256.clone()).or_default() += 1;
+            }
+        }
+        h.raw("<table class=\"grid\"><thead><tr><th>label</th><th>sha256</th>")
+            .raw("<th>kept on</th><th>installed on</th><th>files</th><th>size</th>")
+            .raw("<th>added</th><th>by</th>");
+        if steer {
+            h.raw("<th></th>");
+        }
+        h.raw("</tr></thead><tbody>");
         for t in &tools {
-            h.raw("<tr><td><code title=\"")
+            h.raw("<tr><td><a href=\"")
+                .text(super::tools::detail_path(&t.sha256))
+                .raw("\">")
+                .text(&t.row.version)
+                .raw("</a>");
+            if t.sha256 == *builtin {
+                h.raw(" <span class=\"sub\">built in</span>");
+            }
+            h.raw("</td><td><code title=\"")
                 .text(&t.sha256)
                 .raw("\">")
                 .text(crate::store::short(&t.sha256))
                 .raw("</code></td><td>")
-                .text(&t.row.version)
+                .text(kept.get(&t.sha256).copied().unwrap_or(0))
                 .raw("</td><td>")
+                .text(installed.get(&t.sha256).copied().unwrap_or(0));
+            if outputs.get(&t.sha256).is_some_and(|o| o.outputs.len() > 1) {
+                h.raw(" <span class=\"badge bad\">files differ</span>");
+            }
+            h.raw("</td><td>")
                 .text(t.row.files)
                 .raw("</td><td>")
                 .text(bytes(t.row.size))
@@ -2731,7 +2794,13 @@ fn tools_part(hub: &Hub) -> Result<Html> {
                 .html(&pages::at_html(t.row.added_at))
                 .raw("</td><td>")
                 .text(&t.row.added_by)
-                .raw("</td></tr>");
+                .raw("</td>");
+            if steer {
+                h.raw("<td class=\"actions\"><a href=\"")
+                    .text(super::tools::download_path(&t.sha256))
+                    .raw("\" download>Download</a></td>");
+            }
+            h.raw("</tr>");
         }
         h.raw("</tbody></table>");
     }

@@ -151,6 +151,13 @@ impl Db {
         deploys_in(&txn.open_table(DEPLOY)?)
     }
 
+    /// Whether node `id` has a tools build, an update or a reset still to finish: what an
+    /// automatic build waits for.
+    pub fn tools_busy(&self, id: &str, now: u64) -> Result<bool> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        busy(&txn.open_table(COMMANDS)?, id, now)
+    }
+
     /// The definition node `id` is kept on, `builtin` being the built-in one's sha256: `None`
     /// when its `tools` setting leaves it alone, `Err` with why it names none the hub holds.
     pub fn tools_wanted(

@@ -88,6 +88,7 @@ mod relays;
 mod settings;
 mod sse;
 mod target;
+mod tools;
 mod updates;
 mod users;
 
@@ -419,6 +420,8 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
             Site::Fleet(site) => {
                 if path == operations::UPLOAD_PATH {
                     operations::upload(req, ui, site).await
+                } else if path == tools::UPLOAD_PATH {
+                    tools::upload(req, ui, site).await
                 } else if path == operations::FETCH_PATH {
                     operations::fetch_action(req, ui).await
                 } else if path == users::PATH {
@@ -441,6 +444,8 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                     fleet::create_token(req, ui).await
                 } else if path == operations::ROLLOUT_PATH {
                     operations::create_rollout(req, ui, site).await
+                } else if let Some(sha256) = tools::remove_target(&path) {
+                    tools::remove(req, ui, site, sha256).await
                 } else if let Some(id) = fleet::action_node(&path) {
                     fleet::node_action(req, ui, site, id).await
                 } else if let Some(id) = fleet::action_rollout(&path) {

@@ -20,12 +20,15 @@ pub(super) const PATH: &str = "/settings";
 struct Shown {
     layers: SettingsLayers,
     names: Vec<(String, String)>,
+    /// The CI tools definitions held, to show a `tools` value by its label.
+    tools: Vec<crate::store::Tools>,
 }
 
 fn read(hub: &crate::server::Hub) -> Result<Shown> {
     Ok(Shown {
         layers: hub.db.settings_layers()?,
         names: hub.db.node_names()?,
+        tools: hub.db.tools_list()?,
     })
 }
 
@@ -57,7 +60,7 @@ fn layers_section(shown: &Shown, auth: Option<&Auth>, oob: bool) -> Html {
         h.raw(" hx-swap-oob=\"true\"");
     }
     h.raw("><h2>Fleet-wide</h2>");
-    layer_table(&mut h, &shown.layers.fleet, None, auth);
+    layer_table(&mut h, &shown.layers.fleet, None, auth, &shown.tools);
     for (id, layer) in &shown.layers.nodes {
         let name = shown
             .names
@@ -69,13 +72,19 @@ fn layers_section(shown: &Shown, auth: Option<&Auth>, oob: bool) -> Html {
             .raw("\">")
             .node(name)
             .raw("</a></h2>");
-        layer_table(&mut h, layer, Some(id), auth);
+        layer_table(&mut h, layer, Some(id), auth, &shown.tools);
     }
     h.raw("</section>");
     h
 }
 
-fn layer_table(h: &mut Html, layer: &SettingsLayer, node: Option<&str>, auth: Option<&Auth>) {
+fn layer_table(
+    h: &mut Html,
+    layer: &SettingsLayer,
+    node: Option<&str>,
+    auth: Option<&Auth>,
+    tools: &[crate::store::Tools],
+) {
     if layer.is_empty() {
         h.raw("<p class=\"empty\">none</p>");
         return;
@@ -86,11 +95,26 @@ fn layer_table(h: &mut Html, layer: &SettingsLayer, node: Option<&str>, auth: Op
     }
     h.raw("</tr></thead><tbody>");
     for (key, value) in layer {
-        h.raw("<tr><td><code>")
-            .text(key)
-            .raw("</code></td><td>")
-            .text(crate::store::setting_shown(value))
-            .raw("</td>");
+        h.raw("<tr><td><code>").text(key).raw("</code></td><td>");
+        // The tools a `tools` value names, by their label, linked to their page.
+        let named = (key == crate::deploy::KEY)
+            .then(|| value.as_str())
+            .flatten()
+            .and_then(|v| tools.iter().find(|t| t.sha256 == v));
+        match named {
+            Some(t) => h
+                .raw("<a href=\"")
+                .text(super::tools::detail_path(&t.sha256))
+                .raw("\">")
+                .text(&t.row.version)
+                .raw("</a> (<code title=\"")
+                .text(&t.sha256)
+                .raw("\">")
+                .text(crate::store::short(&t.sha256))
+                .raw("</code>)"),
+            None => h.text(crate::store::setting_shown(value)),
+        };
+        h.raw("</td>");
         if let Some(auth) = auth {
             h.raw("<td class=\"actions\">");
             form_open(h, auth);

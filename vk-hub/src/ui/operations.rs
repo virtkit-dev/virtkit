@@ -53,16 +53,16 @@ const FORM_OVERHEAD: u64 = 64 * 1024;
 
 /// The slowest an upload may arrive on average: 2 Mbit/s, so a gigabyte has a little over an
 /// hour and a release of a hundred megabytes under seven minutes.
-const MIN_RATE: u64 = 256 * 1024;
+pub(super) const MIN_RATE: u64 = 256 * 1024;
 
 /// What an upload has on top of its length at [`MIN_RATE`]: a slow start, a TLS handshake.
-const UPLOAD_GRACE: Duration = Duration::from_secs(60);
+pub(super) const UPLOAD_GRACE: Duration = Duration::from_secs(60);
 
 /// The longest an upload may go without a byte arriving.
 #[cfg(not(test))]
-const UPLOAD_IDLE: Duration = Duration::from_secs(30);
+pub(super) const UPLOAD_IDLE: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const UPLOAD_IDLE: Duration = Duration::from_secs(1);
+pub(super) const UPLOAD_IDLE: Duration = Duration::from_secs(1);
 
 /// The longest a field of the upload form may be: a signature, base64.
 const MAX_FIELD: usize = 4096;
@@ -76,7 +76,7 @@ impl Uploading {
     }
 
     /// The slot, if no upload holds it; given back when dropped.
-    fn take(&self) -> Option<UploadSlot<'_>> {
+    pub(super) fn take(&self) -> Option<UploadSlot<'_>> {
         self.0
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
@@ -84,7 +84,7 @@ impl Uploading {
     }
 }
 
-struct UploadSlot<'a>(&'a AtomicBool);
+pub(super) struct UploadSlot<'a>(&'a AtomicBool);
 
 impl Drop for UploadSlot<'_> {
     fn drop(&mut self) {
@@ -153,7 +153,7 @@ pub(super) async fn upload(
     let Some(_slot) = site.uploading.take() else {
         return refuse(
             StatusCode::CONFLICT,
-            "Refused: another release is being uploaded. Wait for that upload to end.",
+            "Refused: another upload is under way. Wait for it to end.",
         );
     };
     // Held until the release is: an update of the hub would cut the upload.

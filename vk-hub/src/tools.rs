@@ -87,6 +87,161 @@ fn finish(entries: &[Entry], shown: &str) -> Result<Packed> {
     Ok(packed)
 }
 
+/// Pack the build context `archive` holds, a tar or a gzipped tar as an operator uploads one,
+/// into a definition: by the rules and in the order of [`pack`], so a context packs the same
+/// whether added from a directory or uploaded. Its entries are regular files and directories at
+/// plain relative paths, each once, the directories a path implies taken as there; anything
+/// else is refused. A context whose root holds one directory alone, with the [`DOCKERFILE`] in
+/// it, is that directory's.
+pub fn pack_archive(archive: &[u8]) -> Result<Packed> {
+    // What a tar of the most a definition may hold can come to: its headers, padding and
+    // long names. Past it, a gzip is refused rather than inflated on.
+    const MAX_TAR: u64 = MAX_TOOLS_DEFINITION.saturating_mul(2);
+    let reader: Box<dyn Read + '_> = if archive.starts_with(&[0x1f, 0x8b]) {
+        Box::new(flate2::read::GzDecoder::new(archive))
+    } else {
+        Box::new(archive)
+    };
+    let mut limited = reader.take(MAX_TAR.saturating_add(1));
+    let mut tar = Vec::new();
+    limited
+        .read_to_end(&mut tar)
+        .context("reading the archive: it is neither a tar nor a gzipped tar")?;
+    if tar.len() as u64 > MAX_TAR {
+        bail!("the archive holds more than a tools definition may");
+    }
+    let mut files: std::collections::BTreeMap<Vec<OsString>, Entry> = Default::default();
+    let mut taken = 0u64;
+    let mut archive = tar::Archive::new(tar.as_slice());
+    for entry in archive.entries().context("reading the archive")? {
+        let mut entry = entry.context("reading the archive")?;
+        let kind = entry.header().entry_type();
+        let raw = entry
+            .path()
+            .context("reading a name in the archive")?
+            .into_owned();
+        let mut parts = Vec::new();
+        for c in raw.components() {
+            match c {
+                std::path::Component::Normal(n) => parts.push(n.to_os_string()),
+                std::path::Component::CurDir => {}
+                _ => bail!(
+                    "{} is not a plain relative path",
+                    vk_hub_proto::display_safe(&raw.display().to_string())
+                ),
+            }
+        }
+        let path: PathBuf = parts.iter().collect();
+        let shown = || vk_hub_proto::display_safe(&path.display().to_string());
+        if parts.len() > MAX_DEPTH.saturating_add(1) {
+            bail!("{} nests deeper than {MAX_DEPTH} directories", shown());
+        }
+        let found = match kind {
+            tar::EntryType::Regular | tar::EntryType::Continuous => {
+                let left = MAX_TOOLS_DEFINITION.saturating_sub(taken);
+                if entry.size() > left {
+                    bail!(
+                        "the context holds more than the {MAX_TOOLS_DEFINITION} bytes a \
+                         definition may"
+                    );
+                }
+                let mut data = Vec::new();
+                entry
+                    .read_to_end(&mut data)
+                    .with_context(|| format!("reading {}", shown()))?;
+                taken = taken.saturating_add(data.len() as u64);
+                let executable = entry.header().mode().is_ok_and(|m| m & 0o111 != 0);
+                Entry {
+                    path: path.clone(),
+                    data: Some(data),
+                    executable,
+                }
+            }
+            tar::EntryType::Directory => Entry {
+                path: path.clone(),
+                data: None,
+                executable: true,
+            },
+            // Metadata of the archive's own, not entries of the context.
+            tar::EntryType::XGlobalHeader | tar::EntryType::XHeader => continue,
+            tar::EntryType::Symlink | tar::EntryType::Link => bail!(
+                "{} is a link: a tools definition holds regular files and directories only",
+                shown()
+            ),
+            _ => bail!("{} is neither a regular file nor a directory", shown()),
+        };
+        if parts.is_empty() {
+            if found.data.is_some() {
+                bail!("the archive holds a file with no name");
+            }
+            continue;
+        }
+        if files.contains_key(&parts) {
+            bail!("{} is in the archive twice", shown());
+        }
+        files.insert(parts, found);
+        if files.len() > MAX_ENTRIES {
+            bail!("it holds more than {MAX_ENTRIES} entries");
+        }
+    }
+    // The directories the paths imply, and no file where a directory must be.
+    let mut implied = Vec::new();
+    for parts in files.keys() {
+        for depth in 1..parts.len() {
+            let dir = &parts[..depth];
+            match files.get(dir) {
+                Some(e) if e.data.is_some() => bail!(
+                    "{} is a file and a directory in the archive",
+                    vk_hub_proto::display_safe(
+                        &dir.iter().collect::<PathBuf>().display().to_string()
+                    )
+                ),
+                Some(_) => {}
+                None => implied.push(dir.to_vec()),
+            }
+        }
+    }
+    for parts in implied {
+        let path = parts.iter().collect();
+        files.entry(parts).or_insert(Entry {
+            path,
+            data: None,
+            executable: true,
+        });
+    }
+    if files.len() > MAX_ENTRIES {
+        bail!("it holds more than {MAX_ENTRIES} entries");
+    }
+    // One directory alone at the root, holding the Dockerfile: the context is in it.
+    let top: Vec<&Vec<OsString>> = files.keys().filter(|p| p.len() == 1).collect();
+    if let [only] = top.as_slice()
+        && files[*only].data.is_none()
+    {
+        let inner = vec![only[0].clone(), OsString::from(DOCKERFILE)];
+        if files.get(&inner).is_some_and(|e| e.data.is_some()) {
+            files = files
+                .into_iter()
+                .filter(|(p, _)| p.len() > 1)
+                .map(|(p, mut e)| {
+                    let parts = p[1..].to_vec();
+                    e.path = parts.iter().collect();
+                    (parts, e)
+                })
+                .collect();
+        }
+    }
+    // Ordered by component, byte by byte: each directory before what it holds, its entries in
+    // byte order, as `walk` lists a directory.
+    let mut entries: Vec<(Vec<OsString>, Entry)> = files.into_iter().collect();
+    entries.sort_by(|a, b| {
+        let a = a.0.iter().map(|c| c.as_bytes());
+        let b = b.0.iter().map(|c| c.as_bytes());
+        a.cmp(b)
+    });
+    let entries: Vec<Entry> = entries.into_iter().map(|(_, e)| e).collect();
+    finish(&entries, "the archive")
+}
+
 /// `entries`, in the order given, as a definition's tar.
 fn write_tar(entries: &[Entry]) -> Result<Packed> {
     let mut builder = tar::Builder::new(Vec::new());
@@ -337,6 +492,14 @@ pub fn add(hub: &Hub, actor: &str, from: &Path, version: &str) -> Result<Tools> 
     hold(hub, actor, &packed, version, false)
 }
 
+/// Hold the build context in `archive` ([`pack_archive`]) as definition `version`, audited as
+/// `actor`, as [`add`] holds one from a directory.
+pub fn add_archive(hub: &Hub, actor: &str, archive: &[u8], version: &str) -> Result<Tools> {
+    crate::releases::check_version(version)?;
+    let packed = pack_archive(archive)?;
+    hold(hub, actor, &packed, version, false)
+}
+
 /// Hold the definition built into the hub, as `actor`: added under its label unless already
 /// held, under whatever label it was given.
 pub fn add_builtin(hub: &Hub, actor: &str) -> Result<Tools> {
@@ -421,6 +584,29 @@ fn publish(dir: &Path, dest: &Path, tar: &[u8]) -> Result<()> {
         let _ = d.sync_all();
     }
     Ok(())
+}
+
+/// The largest Dockerfile [`dockerfile`] reads.
+const MAX_DOCKERFILE: u64 = 1 << 20;
+
+/// The Dockerfile of definition `sha256`, read from its tar in `dir`.
+pub fn dockerfile(dir: &Path, sha256: &str) -> Result<String> {
+    let file = path(dir, sha256);
+    let tar = std::fs::File::open(&file).with_context(|| format!("opening {}", file.display()))?;
+    let mut archive = tar::Archive::new(tar);
+    for entry in archive.entries()? {
+        let entry = entry?;
+        if entry.path()?.as_os_str() != DOCKERFILE {
+            continue;
+        }
+        let mut text = String::new();
+        entry
+            .take(MAX_DOCKERFILE)
+            .read_to_string(&mut text)
+            .context("reading its Dockerfile")?;
+        return Ok(text);
+    }
+    bail!("it holds no {DOCKERFILE}")
 }
 
 /// Forget definition `sha256` and delete its tar, unless it is built into the hub. `Ok(false)`
@@ -541,6 +727,101 @@ mod tests {
             "{}",
             builtin.version
         );
+    }
+
+    /// `dir`'s tree as `tar -czf` or `tar -cf` would archive it, with the given prefix and
+    /// in another order than a pack's.
+    fn archived(dir: &Path, prefix: &str, gzip: bool) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        builder.mode(tar::HeaderMode::Complete);
+        builder.append_dir_all(prefix, dir).unwrap();
+        let tar = builder.into_inner().unwrap();
+        if !gzip {
+            return tar;
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar).unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    fn an_uploaded_context_packs_as_its_directory_does() {
+        let dir = scratch("archive");
+        context(&dir, 0o022);
+        let packed = pack(&dir).unwrap();
+        for (prefix, gzip) in [(".", false), ("", true), ("ci-tools", true)] {
+            let got = pack_archive(&archived(&dir, prefix, gzip)).unwrap();
+            assert_eq!(got.sha256, packed.sha256, "{prefix:?}, gzip {gzip}");
+            assert_eq!(got.tar, packed.tar);
+        }
+        // A file named as a directory sorts by component, as a directory lists it.
+        std::fs::write(dir.join("sub.txt"), "x").unwrap();
+        assert_eq!(
+            pack_archive(&archived(&dir, "", false)).unwrap().sha256,
+            pack(&dir).unwrap().sha256
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_archive_of_anything_but_plain_files_and_directories_is_refused() {
+        let entry = |builder: &mut tar::Builder<Vec<u8>>, path: &str, kind, data: &[u8]| {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(0o644);
+            header.set_size(data.len() as u64);
+            // Set raw: `set_path` refuses `..`, which an archive may still hold.
+            let name = &mut header.as_old_mut().name;
+            name[..path.len()].copy_from_slice(path.as_bytes());
+            header.set_cksum();
+            builder.append(&header, data).unwrap();
+        };
+        let refused = |entries: &[(&str, tar::EntryType, &[u8])]| {
+            let mut builder = tar::Builder::new(Vec::new());
+            entry(
+                &mut builder,
+                "Dockerfile",
+                tar::EntryType::Regular,
+                b"FROM scratch AS tools\n",
+            );
+            for (path, kind, data) in entries {
+                entry(&mut builder, path, *kind, data);
+            }
+            format!(
+                "{:#}",
+                pack_archive(&builder.into_inner().unwrap()).unwrap_err()
+            )
+        };
+        assert!(refused(&[("link", tar::EntryType::Symlink, b"")]).contains("is a link"));
+        assert!(refused(&[("hard", tar::EntryType::Link, b"")]).contains("is a link"));
+        assert!(refused(&[("fifo", tar::EntryType::Fifo, b"")]).contains("neither"));
+        assert!(refused(&[("../x", tar::EntryType::Regular, b"")]).contains("plain relative"));
+        assert!(refused(&[("/etc/x", tar::EntryType::Regular, b"")]).contains("plain relative"));
+        assert!(refused(&[("./Dockerfile", tar::EntryType::Regular, b"")]).contains("twice"));
+        assert!(
+            refused(&[
+                ("a", tar::EntryType::Regular, b""),
+                ("a/b", tar::EntryType::Regular, b"")
+            ])
+            .contains("a file and a directory")
+        );
+        let err =
+            pack_archive(b"not an archive at all, but long enough to be read as one").unwrap_err();
+        assert!(!format!("{err:#}").is_empty());
+        // No Dockerfile at its root, nor in one directory alone there.
+        let mut builder = tar::Builder::new(Vec::new());
+        entry(&mut builder, "a/b/Dockerfile", tar::EntryType::Regular, b"");
+        let err = pack_archive(&builder.into_inner().unwrap()).unwrap_err();
+        assert!(format!("{err:#}").contains("no Dockerfile"), "{err:#}");
+        // A gzip that inflates past what a definition may hold.
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        let zeros = vec![0u8; 1 << 20];
+        for _ in 0..(2 * (MAX_TOOLS_DEFINITION >> 20) + 1) {
+            gz.write_all(&zeros).unwrap();
+        }
+        let bomb = gz.finish().unwrap();
+        let err = pack_archive(&bomb).unwrap_err();
+        assert!(format!("{err:#}").contains("more than"), "{err:#}");
     }
 
     #[test]

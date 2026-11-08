@@ -58,6 +58,10 @@ All notable changes to virtkit will be documented in this file.
   reaches the hosts its Dockerfile declares, within the node's `[egress.build]`, and nothing if
   it declares none. The node keeps what the build contacted and was refused, and a failed build
   names the hosts it was refused.
+- **Operators download and add CI tools from vk-hub's web UI.** The Updates page offers each
+  tools definition the hub holds, the built-in one included, as a download, and takes a new
+  one as an uploaded tar or gzipped tar of its build context, checked and labelled as
+  `vk-hub tools add` does.
 - **Fleet nodes never give jobs CI tools that changed after they were installed.** A node
   records a checksum of every file of the tools it installs and checks them before each job
   that would get them; a job whose tools changed fails before it starts. The node reports the
@@ -65,6 +69,12 @@ All notable changes to virtkit will be documented in this file.
   refused. `vk-hub nodes` and the audit log flag a node whose tools changed, which the hub has
   build them anew, and one whose tools hold other files than other nodes built from the same
   definition. Tools installed by an earlier `vk` are rebuilt to record their checksums.
+- **vk-hub's web UI shows CI tools in full.** Each tools definition has a page: the settings
+  and nodes that use it, the network each stage of its build declares, each node's build and
+  whether its tools are intact, what the build reached and was refused, and the files nodes
+  installed, with those that differ between nodes flagged. A node's page shows its tools, their
+  check and its automatic build with its next attempt; operators build a failed build's tools
+  again from there, and remove a definition no setting names, after confirming.
 
 ## [0.107.1] - 2026-11-08
 

@@ -505,7 +505,7 @@ See the implemented [CI tools](fleet-prototype.md#ci-tools).
   node found changed, and has the latter built anew. A node's own record guards against change
   at rest only: the comparison across nodes is the check one node cannot rewrite.
 - Trust: tools run in every job VM that lacks its own, with the job's token, so registering them
-  is an admin operation. They run on a node's host only where the node already takes unsigned
+  is an admin operation, or a web UI operator's, as uploading a release is. They run on a node's host only where the node already takes unsigned
   releases from its hub. Proposed: a signature on the definition, checked against node-pinned
   keys as releases are, and the version probe run in a VM so every node can report versions.
 - A failed build is tried again, later each time, a few times over hours, then not until an

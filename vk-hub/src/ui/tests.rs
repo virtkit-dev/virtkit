@@ -5730,8 +5730,11 @@ async fn the_rollout_form_follows_what_it_offers() {
     assert!(
         at("<div id=\"start-rollout\" sse-swap=\"start-rollout\">") < at("id=\"update-tools\"")
     );
+    // The CI tools' upload form last, outside their live part.
     assert!(
-        page.body.ends_with("</div></div></main></body></html>"),
+        page.body
+            .contains("</div><details class=\"upload\"><summary class=\"button\">Add CI tools")
+            && page.body.ends_with("</details></div></main></body></html>"),
         "{}",
         page.body
     );
@@ -7781,7 +7784,7 @@ async fn one_upload_at_a_time() {
     until_staged(&dir, true).await;
     let reply = post_upload(addr, &origin, &operator, &form, &[]).await;
     assert_eq!(reply.status, 409, "{}", reply.body);
-    assert!(reply.body.contains("another release"), "{}", reply.body);
+    assert!(reply.body.contains("another upload"), "{}", reply.body);
     file.abort();
     until_staged(&dir, false).await;
     let reply = post_upload(addr, &origin, &operator, &form, &[]).await;
@@ -13726,4 +13729,356 @@ async fn an_operator_sets_and_clears_the_target_from_the_updates_page() {
         reply.body
     );
     assert!(hub.db.target().unwrap().is_none());
+}
+
+/// An operator uploads a build context as CI tools from `/updates`, a gzipped tar with the
+/// context in a directory of its own: it is packed as `vk-hub tools add` packs that directory
+/// and held as the session's principal, and the same tree under another label is refused. An
+/// operator downloads any definition held as its tar; a viewer neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_uploads_and_downloads_ci_tools() {
+    use std::io::Write;
+    let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let origin = format!("http://{addr}");
+    let dir = std::env::temp_dir().join(format!(
+        "vk-hub-ui-tools-{}-{}",
+        std::process::id(),
+        crate::random_hex(4).unwrap()
+    ));
+    let hub = Arc::new(
+        Hub::new(Arc::new(Db::open_memory().unwrap()), Some(origin.clone()))
+            .with_tools(dir.join("tools")),
+    );
+    tokio::spawn(serve(
+        listener,
+        None,
+        Arc::new(Ui::new(hub.clone(), &origin)),
+    ));
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/updates", Some(&operator)).await;
+    assert!(
+        page.body
+            .contains("action=\"/tools/upload\" enctype=\"multipart/form-data\""),
+        "{}",
+        page.body
+    );
+    assert!(
+        !get(addr, "/updates", Some(&viewer))
+            .await
+            .body
+            .contains("/tools/upload")
+    );
+
+    let ctx = dir.join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        "FROM scratch AS tools\nCOPY git /git\n",
+    )
+    .unwrap();
+    std::fs::write(ctx.join("git"), "#!/bin/sh\n").unwrap();
+    let mut builder = tar::Builder::new(Vec::new());
+    builder.append_dir_all("ci-tools", &ctx).unwrap();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(&builder.into_inner().unwrap()).unwrap();
+    let archive = gz.finish().unwrap();
+    let upload = |cookie: String, fields: Vec<(&'static str, Vec<u8>)>| {
+        let origin = origin.clone();
+        async move {
+            let fields: Vec<(&str, &[u8])> =
+                fields.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+            let (content_type, body) = multipart_form(&fields);
+            let headers = [
+                format!("Cookie: {cookie}"),
+                format!("Origin: {origin}"),
+                format!("Content-Type: {content_type}"),
+            ];
+            let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+            request_bytes(addr, "POST", super::tools::UPLOAD_PATH, &headers, &body).await
+        }
+    };
+    let fields = |csrf: &str, version: &str| {
+        vec![
+            ("_csrf", csrf.as_bytes().to_vec()),
+            ("version", version.as_bytes().to_vec()),
+            ("file", archive.clone()),
+        ]
+    };
+    let reply = upload(viewer.clone(), fields(&viewer_csrf, "e2e-1")).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let reply = upload(operator.clone(), fields("nope", "e2e-1")).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let reply = upload(operator.clone(), fields(&csrf, "e2e-1")).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let held = hub.db.tools_list().unwrap();
+    assert_eq!(held.len(), 1);
+    let sha = held[0].sha256.clone();
+    assert_eq!(sha, crate::tools::pack(&ctx).unwrap().sha256);
+    assert_eq!(held[0].row.added_by, principal);
+    let reply = upload(operator.clone(), fields(&csrf, "e2e-2")).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(reply.body.contains("already held"), "{}", reply.body);
+    let reply = upload(
+        operator.clone(),
+        vec![
+            ("_csrf", csrf.as_bytes().to_vec()),
+            ("version", b"e2e-3".to_vec()),
+            ("file", b"not an archive".to_vec()),
+        ],
+    )
+    .await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+
+    let path = super::tools::download_path(&sha);
+    assert_eq!(get(addr, &path, Some(&viewer)).await.status, 403);
+    let reply = get(addr, &path, Some(&operator)).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.header("content-type"), Some("application/x-tar"));
+    assert_eq!(
+        reply.header("content-disposition"),
+        Some(format!("attachment; filename=\"ci-tools-e2e-1-{}.tar\"", &sha[..12]).as_str())
+    );
+    let tar = std::fs::read(crate::tools::path(&dir.join("tools"), &sha)).unwrap();
+    assert_eq!(reply.body.as_bytes(), tar.as_slice());
+    let page = get(addr, "/updates", Some(&operator)).await;
+    assert!(
+        page.body.contains(&format!("href=\"{path}\" download")),
+        "{}",
+        page.body
+    );
+    let missing = super::tools::download_path(&"ab".repeat(32));
+    assert_eq!(get(addr, &missing, Some(&operator)).await.status, 404);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A CI tools definition's page, for any viewer: the network its Dockerfile declares, the nodes
+/// kept on it or having it and the files they installed, those that differ flagged. The node's
+/// page and `/updates` link to it, `/settings` names it by its label. An operator removes a
+/// definition no setting names, confirmed first; one a setting names is refused, as is a viewer.
+/// A build asked from a node's page of other tools than its setting names is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ci_tools_definition_s_page_shows_its_nodes_files_and_network() {
+    use vk_hub_proto::{ToolsCheck, ToolsEgress, ToolsFile, ToolsInstalled};
+    let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let origin = format!("http://{addr}");
+    let dir = std::env::temp_dir().join(format!(
+        "vk-hub-ui-tools-page-{}-{}",
+        std::process::id(),
+        crate::random_hex(4).unwrap()
+    ));
+    let hub = Arc::new(
+        Hub::new(Arc::new(Db::open_memory().unwrap()), Some(origin.clone()))
+            .with_tools(dir.join("tools")),
+    );
+    tokio::spawn(serve(
+        listener,
+        None,
+        Arc::new(Ui::new(hub.clone(), &origin)),
+    ));
+    let add = |name: &str, dockerfile: &str| {
+        let ctx = dir.join(name);
+        std::fs::create_dir_all(&ctx).unwrap();
+        std::fs::write(ctx.join("Dockerfile"), dockerfile).unwrap();
+        crate::tools::add(&hub, "uid 0", &ctx, name).unwrap().sha256
+    };
+    let good = add(
+        "e2e-good",
+        "# vk: allow-name=cache.nixos.org,github.com\nFROM alpine AS fetch\nRUN true\n\
+         FROM scratch AS tools\nCOPY --from=fetch /x /x\n",
+    );
+    let spare = add("e2e-spare", "FROM scratch AS tools\n");
+    crate::settings::set(
+        &hub,
+        "uid 0",
+        None,
+        "tools",
+        Some(crate::settings::parse("tools", &good).unwrap()),
+    )
+    .unwrap();
+    let files = |git: &str| {
+        std::collections::BTreeMap::from([(
+            "git".to_string(),
+            ToolsFile::File {
+                sha256: git.repeat(64),
+                size: 4096,
+            },
+        )])
+    };
+    let mut ids = Vec::new();
+    for (host, key, git, check) in [
+        ("ci-1", "a1", "1", ToolsCheck::Intact),
+        ("ci-2", "a2", "1", ToolsCheck::Intact),
+        (
+            "ci-3",
+            "a3",
+            "2",
+            ToolsCheck::Modified {
+                entries: vec!["git".into()],
+            },
+        ),
+    ] {
+        let id = enrolled_as(&hub, host, key);
+        hub.db
+            .record_session(&id, "inc", vk_hub_proto::TOOLS, crate::now_secs(), || true)
+            .unwrap();
+        let mut inventory = vk_hub_proto::Inventory {
+            hostname: host.into(),
+            ..vk_hub_proto::Inventory::default()
+        };
+        inventory.versions.tools = Some(ToolsInstalled {
+            sha256: good.clone(),
+            version: "e2e-good".into(),
+            tools: Default::default(),
+            in_use: true,
+            files: files(git),
+            egress: Some(ToolsEgress {
+                contacted: vec!["cache.nixos.org".into()],
+                refused: vec!["example.org".into()],
+            }),
+            check: Some(check),
+        });
+        hub.db
+            .record_inventory(&id, inventory, true, crate::now_secs())
+            .unwrap();
+        ids.push(id);
+    }
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+
+    let path = super::tools::detail_path(&good);
+    let page = get(addr, &path, Some(&viewer)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    for want in [
+        "<h1>e2e-good</h1>",
+        "<tr><th>Named by the settings</th><td>fleet-wide</td></tr>",
+        "<tr><th>Kept on</th><td>3 node(s)</td></tr>",
+        "<tr><th>Installed on</th><td>3 node(s)</td></tr>",
+        "<td><code>fetch</code></td><td>cache.nixos.org, github.com</td><td>none</td>",
+        "<td><code>tools</code></td><td colspan=\"2\">none: its steps reach no network</td>",
+        "<span class=\"badge bad\">changed</span>",
+        "<td>cache.nixos.org; refused example.org</td>",
+        "Which are right cannot be told",
+    ] {
+        assert!(page.body.contains(want), "{want}\n{}", page.body);
+    }
+    assert_eq!(page.body.matches("<h3>Files <code>").count(), 2);
+    assert!(!page.body.contains("Download") && !page.body.contains("Remove"));
+    let page = get(addr, &path, Some(&operator)).await;
+    assert!(page.body.contains("download>Download</a>"), "{}", page.body);
+    // Named by the fleet-wide setting: not to be removed.
+    assert!(!page.body.contains("Remove"), "{}", page.body);
+    assert_eq!(
+        get(
+            addr,
+            &super::tools::detail_path(&"ab".repeat(32)),
+            Some(&viewer)
+        )
+        .await
+        .status,
+        404
+    );
+
+    let node = get(addr, &format!("/node/{}", ids[2]), Some(&viewer)).await;
+    for want in [
+        "<section><h2>CI tools</h2>",
+        &format!("<a href=\"{path}\">e2e-good</a>"),
+        "by the fleet-wide setting",
+        "<span class=\"badge bad\">other files</span> than <a href=\"/node/",
+        "<summary>Files as installed (1)</summary>",
+    ] {
+        assert!(node.body.contains(want), "{want}\n{}", node.body);
+    }
+    let updates = get(addr, "/updates", Some(&viewer)).await;
+    assert!(
+        updates
+            .body
+            .contains(&format!("<a href=\"{path}\">e2e-good</a>")),
+        "{}",
+        updates.body
+    );
+    assert!(
+        updates
+            .body
+            .contains("<span class=\"badge bad\">files differ</span>")
+    );
+    let settings = get(addr, "/settings", Some(&viewer)).await;
+    assert!(
+        settings
+            .body
+            .contains(&format!("<a href=\"{path}\">e2e-good</a> (<code")),
+        "{}",
+        settings.body
+    );
+
+    // Tools a setting names are not removed, even once confirmed.
+    let named = format!("/tools/{good}/remove");
+    let answer = ask(addr, &origin, &operator, &csrf, &named, "remove").await;
+    let reply = post_action(addr, &origin, &operator, &named, &answer, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(reply.body.contains("setting names it"), "{}", reply.body);
+    assert!(hub.db.tools(&good).unwrap().is_some());
+
+    // A build of other tools than the setting names is refused, and not issued.
+    let action = format!("/node/{}/action", ids[0]);
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        &action,
+        &format!("_csrf={csrf}&op=tools&tools={spare}"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(reply.body.contains("setting keeps it on"), "{}", reply.body);
+    let reply = post_action(
+        addr,
+        &origin,
+        &viewer,
+        &action,
+        &format!("_csrf={viewer_csrf}&op=tools&tools={good}"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        &action,
+        &format!("_csrf={csrf}&op=tools&tools={good}"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(reply.body.contains("Issued the build"), "{}", reply.body);
+
+    // Removal: refused to a viewer, confirmed for tools no setting names.
+    let remove = format!("/tools/{spare}/remove");
+    let reply = post_action(
+        addr,
+        &origin,
+        &viewer,
+        &remove,
+        &format!("_csrf={viewer_csrf}&op=remove"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let page = get(addr, &super::tools::detail_path(&spare), Some(&operator)).await;
+    assert!(page.body.contains("Remove"), "{}", page.body);
+    let answer = ask(addr, &origin, &operator, &csrf, &remove, "remove").await;
+    let reply = post_action(addr, &origin, &operator, &remove, &answer, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Removed the CI tools e2e-spare"),
+        "{}",
+        reply.body
+    );
+    assert!(hub.db.tools(&spare).unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
 }

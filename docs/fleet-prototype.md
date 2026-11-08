@@ -873,7 +873,8 @@ node that has not connected yet is asked on trust, and the command waits for a s
 carry it. Nothing drains and the node's state does not move. Builds are issued node by node, not
 by rollout: a failed build leaves the node on the tools it had. `vk-hub nodes` notes a node
 without its setting's tools — building, installed and not yet reported, which attempt failed and
-why and when the next is due or that none is, or not asked yet and why.
+why and when the next is due or that none is, or not asked yet and why — and its page shows the
+same under CI tools, where an operator builds a failed build's tools now.
 
 The definition is downloaded from the node listener at `GET /v1/tools/<sha256>`, with the node's
 ID, the time and its signature in the headers a release download carries, over the label `vk-fleet
@@ -974,14 +975,45 @@ audits as the node reports them, tools that changed since the node installed the
 not given them — and tools whose files differ from those other nodes built from the same
 definition, naming the nodes and entries; which side is right is not told. The hub's `tools`
 setting has a node whose tools changed, or were installed with nothing recorded, build them anew,
-as it would a node lacking them. `vk-hub nodes` notes all of it under its table, a node's page
-shows the tools and the build under Versions and Steering, `/updates` lists the definitions held,
-and the audit log has each phase as the node reports it.
+as it would a node lacking them. `vk-hub nodes` notes all of it under its table, and the audit
+log has each phase as the node reports it.
+
+**In the web UI**, `/updates` lists the definitions held, the hub's built-in one marked, each
+with how many nodes the settings keep on it and how many have it, flagged when their files
+differ, and links each to its page, `/tools/<sha256>`, which any viewer reads: its label,
+digest, build context and who added it; the settings that name it, fleet-wide or per node, apart
+from the nodes it ends up kept on; for each stage of its Dockerfile, the hosts and addresses it
+declares (a stage that declares none reaches no network; a Dockerfile that cannot be read says
+so); every node kept on it, having it or building it, with its check (`intact`, `changed` with
+the entries, `unchecked` for tools installed with nothing recorded), its automatic build, its
+latest build's phase, which files it installed and what its build contacted and was refused, as
+reported; and the files the nodes installed, a table for each set of files nodes reported, the
+entries in which the sets differ flagged, none taken for the right one. A node's page has a CI
+tools section: the tools its setting keeps it on and from which layer, the tools it has, their
+check, versions and what their build reached, how their files compare with other nodes' from
+the same definition, the files themselves, and its automatic build: building and which attempt,
+built and waiting for the node's report, or failed, why, and when the next attempt is due, that
+it waits and why, or that none is made. `/settings` shows a `tools` value by the label of the
+definition it names, linked to its page, and sets it fleet-wide or per node like any other
+setting.
+
+An operator downloads any definition held, from `/updates` or its page, as
+`GET /tools/<sha256>.tar`, the tar nodes build, named `ci-tools-<label>-<sha256 prefix>.tar`; a
+viewer cannot, since a build context may hold any file. An operator also adds one from
+`/updates` (*Add CI tools*, under [the web UI](#web-ui)), and removes one from its page, which
+asks first, posting to `/tools/<sha256>/remove`; it is refused as `tools remove` refuses it — built
+in, named by a setting, or still to be built by a node — and the page offers it only for one
+neither built in nor named. On a node page whose failed automatic build waits, the node being
+reachable and free, *Build now* asks the node for those tools at once, as
+`vk-hub nodes tools <id>` does, and counts the attempts afresh; it names the definition it
+showed, so one the setting no longer names is refused. Both post with the origin, CSRF and role
+checks of the other forms and run as the session's principal.
 
 Whoever registers a definition can put any binary into every job VM of the nodes that build it: a
 job's PATH gets each tool its image lacks, and in the jobs of a gitlab-runner the node manages, the
 definition's gitlab-runner handles the artifacts, caches and token. Registering and issuing tools is
-the admin socket's alone — the hub's user or root, audited as `uid <n>` — not the web UI's. The
+the admin socket's and the web UI operators' — the hub's user or root, audited as `uid <n>`,
+or an operator's session, audited as its principal. The
 definition itself is code each node builds in microVMs, with network, as any `vk build` is.
 
 Not built: rolling tools out by wave and canary, as [rollouts](#rollouts) do releases; pinning a
@@ -2060,7 +2092,8 @@ adapters and its registries, each with its version, whether its `[hub] allow` (t
 update — as it reports it, or the last command while it has not taken it or once it refused or
 failed it; then the nodes, each with its version and what the newest rollout to reach it did,
 the rollouts under way with their state, counts, current wave, and each node's status and
-profile by wave; then the CI tools definitions. `/updates/rollouts` lists every rollout the same way.
+profile by wave; then the CI tools definitions, each linking to its page (see
+[CI tools](#ci-tools)). `/updates/rollouts` lists every rollout the same way.
 Operators can pause, resume and abort active rollouts, and delete, once confirmed, an ended
 one that updated no node: every update it issued was refused or expired before it
 ran. These actions post to `/rollout/<id>/action` with the node actions' origin, CSRF and role
@@ -2070,10 +2103,11 @@ supplies its session's CSRF token through `hx-headers`, as JSON that htmx parses
 evaluating. The buttons require htmx; `vk-hub rollout pause|resume|abort|delete` works
 without it.
 
-An operator's `/updates` carries three forms, each with the same origin, CSRF and role
+An operator's `/updates` carries four forms, each with the same origin, CSRF and role
 checks, run as the session's principal; a viewer's carries none. Fetch sits above the
 releases and Upload is folded behind a button below them, both outside the live parts; Start
-a rollout sits under the nodes, a live part of its own.
+a rollout sits under the nodes, a live part of its own; Add CI tools is folded behind a button
+below the definitions.
 
 - **Upload** posts a binary, its program (`vk`, `vk-registry` or `vk-gitlab`), its version and
   an optional release key signature (the base64 `vk release-key sign` prints) to
@@ -2086,6 +2120,16 @@ a rollout sits under the nodes, a live part of its own.
   256 KiB/s — a little over an hour for 1 GiB, about seven and a half minutes for 100 MB —
   without pausing for 30 seconds. One upload runs at a time, starting when its fields pass
   their checks. The session must still belong to an operator once the file arrives.
+- **Add CI tools** is `vk-hub tools add` from a browser: it posts a label and a build context,
+  a tar or a gzipped tar, to `/tools/upload` as a plain `multipart/form-data` form, its CSRF
+  token and label checked before the archive is read. The archive may be 64 MiB and is read
+  into memory, under the release upload's deadlines and its one-at-a-time slot. Its entries
+  must be regular files and directories at plain relative paths, each once — a link, a device,
+  `..` or an absolute path refuses it — at most 4096 of them, 32 directories deep, 64 MiB of
+  contents; a context whose root holds one directory alone, with the Dockerfile in it, is that
+  directory's. It is packed as `tools add` packs a directory, so an archive of a directory and
+  the directory are one definition, and held the same way: the same tree under another label
+  is refused, and the add is audited.
 - **Fetch from GitHub** posts a program and a version, `latest` by default, to `/releases/fetch`
   and starts `release fetch` in the background; the releases show its progress and how it
   ended. The program defaults to all programs: each is fetched in turn from the same release,

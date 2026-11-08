@@ -36,6 +36,8 @@ sha2.workspace = true
 zstd.workspace = true
 # tools definitions packed reproducibly; already in the tree through vk-driver
 tar.workspace = true
+# tools definitions uploaded gzipped; already in the tree through vk-driver
+flate2.workspace = true
 # column widths in the CLI's tables
 unicode-width.workspace = true
 libc.workspace = true

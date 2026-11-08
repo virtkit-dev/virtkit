@@ -151,8 +151,9 @@ enum Cmd {
     /// holds static tools (git, git-lfs, gitlab-runner…) at its root. `vk-hub nodes tools`
     /// has nodes build one with `vk build` and install what the stage holds as
     /// `<state_dir>/tools/current`, the directory their `[executor] tools_dir` names. Those
-    /// tools then run in every job VM: holding the admin socket is what registering them
-    /// takes. The hub holds one of its own, a static git and git-lfs.
+    /// tools then run in every job VM: holding the admin socket, or an operator's session
+    /// of the web UI, is what registering them takes. The hub holds one of its own, a static
+    /// git and git-lfs.
     Tools {
         #[command(flatten)]
         config: ConfigArg,
