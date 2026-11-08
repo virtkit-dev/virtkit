@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.108.1] - 2026-11-09
+
 ### Fixed
 
 - **vk-hub's built-in CI tools build to the same bytes on every node.** Each build's git
@@ -5404,7 +5406,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.108.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.108.1...HEAD
+[0.108.1]: https://github.com/virtkit-dev/virtkit/compare/v0.108.0...v0.108.1
 [0.108.0]: https://github.com/virtkit-dev/virtkit/compare/v0.107.1...v0.108.0
 [0.107.1]: https://github.com/virtkit-dev/virtkit/compare/v0.107.0...v0.107.1
 [0.107.0]: https://github.com/virtkit-dev/virtkit/compare/v0.106.1...v0.107.0
