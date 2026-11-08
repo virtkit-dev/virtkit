@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.107.1] - 2026-11-08
+
 ### Fixed
 
 - **A VM on a tap can no longer pass checksum or segmentation offload requests to the host
@@ -5322,7 +5324,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.107.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.107.1...HEAD
+[0.107.1]: https://github.com/virtkit-dev/virtkit/compare/v0.107.0...v0.107.1
 [0.107.0]: https://github.com/virtkit-dev/virtkit/compare/v0.106.1...v0.107.0
 [0.106.1]: https://github.com/virtkit-dev/virtkit/compare/v0.106.0...v0.106.1
 [0.106.0]: https://github.com/virtkit-dev/virtkit/compare/v0.105.1...v0.106.0
