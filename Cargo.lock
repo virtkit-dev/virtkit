@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "fsbench"
-version = "0.108.1"
+version = "0.108.2"
 
 [[package]]
 name = "fuser"
@@ -4087,7 +4087,7 @@ checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 
 [[package]]
 name = "vk-agent"
-version = "0.108.1"
+version = "0.108.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -4108,7 +4108,7 @@ dependencies = [
 
 [[package]]
 name = "vk-core"
-version = "0.108.1"
+version = "0.108.2"
 dependencies = [
  "anyhow",
  "futures",
@@ -4128,7 +4128,7 @@ dependencies = [
 
 [[package]]
 name = "vk-driver"
-version = "0.108.1"
+version = "0.108.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4174,7 +4174,7 @@ dependencies = [
 
 [[package]]
 name = "vk-fs"
-version = "0.108.1"
+version = "0.108.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -4182,7 +4182,7 @@ dependencies = [
 
 [[package]]
 name = "vk-gitlab"
-version = "0.108.1"
+version = "0.108.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4212,7 +4212,7 @@ dependencies = [
 
 [[package]]
 name = "vk-hub"
-version = "0.108.1"
+version = "0.108.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4246,7 +4246,7 @@ dependencies = [
 
 [[package]]
 name = "vk-hub-proto"
-version = "0.108.1"
+version = "0.108.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -4254,7 +4254,7 @@ dependencies = [
 
 [[package]]
 name = "vk-oidc"
-version = "0.108.1"
+version = "0.108.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4272,7 +4272,7 @@ dependencies = [
 
 [[package]]
 name = "vk-peer"
-version = "0.108.1"
+version = "0.108.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4300,7 +4300,7 @@ dependencies = [
 
 [[package]]
 name = "vk-registry"
-version = "0.108.1"
+version = "0.108.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4334,7 +4334,7 @@ dependencies = [
 
 [[package]]
 name = "vk-runnerctl"
-version = "0.108.1"
+version = "0.108.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -4344,7 +4344,7 @@ dependencies = [
 
 [[package]]
 name = "vk-selfupdate"
-version = "0.108.1"
+version = "0.108.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4364,7 +4364,7 @@ dependencies = [
 
 [[package]]
 name = "vk-testkit"
-version = "0.108.1"
+version = "0.108.2"
 dependencies = [
  "anyhow",
  "flate2",
@@ -4374,7 +4374,7 @@ dependencies = [
 
 [[package]]
 name = "vk-tpm"
-version = "0.108.1"
+version = "0.108.2"
 dependencies = [
  "aes",
  "cfb-mode",
@@ -4393,7 +4393,7 @@ dependencies = [
 
 [[package]]
 name = "vk-uefi-vars"
-version = "0.108.1"
+version = "0.108.2"
 dependencies = [
  "crypto-bigint",
  "getrandom 0.4.3",
