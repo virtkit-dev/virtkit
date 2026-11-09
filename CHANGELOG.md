@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A fleet job larger than its reservation no longer starves on its node.** While it waits
+  for the rest of its size, the node turns down new reservations instead of letting smaller
+  jobs take the room it waits for.
+
 ## [0.108.1] - 2026-11-09
 
 ### Fixed

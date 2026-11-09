@@ -1083,32 +1083,33 @@ hub places work on it as before.
 **Reservations.** An offer is decided at once against the same admission ledger
 (`<state_dir>/admit/`) as executor jobs: memory against `[executor.schedule] mem_budget`, job-dir
 disk under `disk_admission`, vCPUs against `[executor.vm] max_cpus` (else `cpus`) per job and
-against the node's vCPU budget (`cpu_overcommit`) in all. An offer that would jump executor jobs
-still waiting is refused too, as `memory` (`cpus` without a memory budget, `disk` without
-either). A granted offer is a ledger entry `reservation-<id>` the node holds locked, with no
-job behind it; with no admission on, nothing is held and every offer that passes the per-job
-vCPU check is granted. Leases are cut to 600 seconds and run on the node's monotonic
-clock; an offer of a reservation already held renews it. A node not `ready`, or with acquisition
-stopped, refuses offers and starts without a reservation; so does, as `ceiling`, a node whose
-placed jobs not finished and reservations held reach the hub's ceiling, as the node last
-applied it, and as `concurrency` one whose same count reaches its own
-`[executor.schedule] max_concurrency` when that is the smaller. The node reports that limit as
-`placed.limit`, and its `image_cache_idle_secs` as `placed.image_cache_idle_secs`. A
-quarantined node releases every reservation. Reservations live in memory: a
-restarted node holds none, and the hub releases what it thought held.
+against the node's vCPU budget (`cpu_overcommit`) in all. An offer that would jump waiting
+executor jobs or placed jobs waiting beyond their reservation is refused too, as `memory`
+(`cpus` without a memory budget, `disk` without either). A granted offer is a ledger entry
+`reservation-<id>` the node holds locked, with no job behind it; with no admission on, nothing
+is held and every offer that passes the per-job vCPU check is granted. Leases are cut to 600
+seconds and run on the node's monotonic clock; an offer of a reservation already held renews it.
+A node not `ready`, or with acquisition stopped, refuses offers and starts without a
+reservation; so does, as `ceiling`, a node whose placed jobs not finished and reservations held
+reach the hub's ceiling, as the node last applied it, and as `concurrency` one whose same count
+reaches its own `[executor.schedule] max_concurrency` when that is the smaller. The node reports
+that limit as `placed.limit`, and its `image_cache_idle_secs` as `placed.image_cache_idle_secs`.
+A quarantined node releases every reservation. Reservations live in memory: a restarted node
+holds none, and the hub releases what it thought held.
 
 **Starting a job.** Before answering `accepted`, the node journals the start under
 `<state_dir>/node/jobs/<job id>/` (`0700`), with the spec and its secrets in `start.json`
 (`0600`). Repeated starts are answered from the journal. The reservation's ledger entry is
 renamed to the GitLab job ID and passed to the driver by descriptor, preserving its queue
 position and claim. Executor admission then waits only for additional resources and returns
-any excess. It counts the job's guest and its services, while the hub places and counts the job
-at its envelope alone: a job whose services take it past its envelope waits on the node for the
-difference, at most `wait_timeout_secs`, and one whose guest and services together pass the
-node's whole memory or vCPU budget is refused, so a runner whose jobs run services needs an
-envelope that covers them. A start without a held reservation is admitted immediately or refused
-(`no_reservation` if it named one). The node assigns the lowest free `CI_CONCURRENT_ID`
-among its jobs and `CI_CONCURRENT_PROJECT_ID` within the project.
+any excess. While it waits, its entry keeps its claim and queue position, so the node refuses
+offers that would take its room. It counts the job's guest and its services, while the hub
+places and counts the job at its envelope alone: a job whose services take it past its envelope
+waits on the node for the difference, at most `wait_timeout_secs`, and one whose guest and
+services together pass the node's whole memory or vCPU budget is refused, so a runner whose jobs
+run services needs an envelope that covers them. A start without a held reservation is admitted
+immediately or refused (`no_reservation` if it named one). The node assigns the lowest free
+`CI_CONCURRENT_ID` among its jobs and `CI_CONCURRENT_PROJECT_ID` within the project.
 
 **The driver.** `vk node job <dir>` (hidden) runs each job in a process of its own session,
 so a `vk node run` started outside `vk node service` can restart under it; stopping the

@@ -95,8 +95,8 @@ monitoring:
   defaults 60, 1, 1 and 60.
 - **Then a reservation.** The hub offers the ticket's envelope to a node, least loaded first
   ([Placement](#placement)). The node decides it through its admission ledger at once — a
-  reservation never waits in the ledger's queue — and counts it as granted memory and disk
-  while it lasts. A node that refuses or does not answer within 5 seconds is skipped until
+  reservation never queues, and is refused while an earlier job waits — and counts it as
+  granted memory and disk while it lasts. A node that refuses or does not answer within 5 seconds is skipped until
   every fitting node was tried; they are tried again 2 seconds later. An acceptance grants
   the ticket: `{admission, reservation, node, envelope, lease_secs}`, the lease what remains
   of the node's.
@@ -116,7 +116,9 @@ monitoring:
 - **Then the job.** The job is submitted on the reservation at once, naming its admission. The
   node sizes the job by its own rules — `MICROVM_CPUS`, `MICROVM_MEM`, the script's `# vk:`
   hint, history — and returns what the job does not need to the ledger; a job needing more
-  than its reservation waits for the rest in the ledger, as an executor job waits today.
+  than its reservation waits for the rest in the ledger, as an executor job does. The node
+  refuses offers until it is admitted, so smaller reservations cannot take its room. It fails
+  after the node's `wait_timeout_secs`.
 
 Heartbeats reconcile claims whose outcome was lost. A claimed admission that a heartbeat of
 the claiming session, received at least 10 seconds after the claim, lists in neither list is

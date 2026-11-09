@@ -209,6 +209,8 @@ pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("restricting {} to 0700", dir.display()))?;
     let path = dir.join(job_id);
+    // Whether this job took over a reservation whose entry does not say yet that it waits.
+    let mut topping_up = false;
     let mut entry = Entry {
         want_mib: ask.mem.map_or(0, |m| m.want_mib),
         asked: now_nanos(),
@@ -218,6 +220,7 @@ pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result
         node: None,
         disk: ask.disk.map(|d| d.want),
         cpus: ask.cpus.map(|c| c.want),
+        more: false,
     };
     // Held from here on: while waiting it marks a live request other jobs must queue behind,
     // and once granted it is the reservation itself. Created under the directory lock, which
@@ -232,7 +235,10 @@ pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result
         let reserved = reserved_entry(&path)?;
         let file = open_shared(&path)?;
         match reserved {
-            Some(asked) => entry.asked = asked,
+            Some(asked) => {
+                entry.asked = asked;
+                topping_up = true;
+            }
             // Written before the lock drops, not on the next pass: an entry that exists but is
             // still empty parses as nothing, so a scan catching it in that state would report a
             // ledger anomaly against a job that is merely starting up — and leave its request
@@ -284,7 +290,20 @@ pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result
                     entry.write(&file, &path)?;
                     None
                 }
-                Some(_) => Some(pass),
+                Some(_) => {
+                    // A job waiting on top of its reservation keeps the reservation's claim,
+                    // and from now on also its place in the queue: later asks wait behind it
+                    // and the hub's offers are refused, so neither takes the room it waits
+                    // for.
+                    if topping_up {
+                        let mut held = Entry::read(&file)
+                            .with_context(|| format!("re-reading {}", path.display()))?;
+                        held.more = true;
+                        held.write(&file, &path)?;
+                        topping_up = false;
+                    }
+                    Some(pass)
+                }
             }
         };
         report(&anomalies);
@@ -428,6 +447,7 @@ pub fn try_acquire(
             node: None,
             disk: ask.disk.map(|d| d.want),
             cpus: ask.cpus.map(|c| c.want),
+            more: false,
         }
         .write(&file, &path)?;
         Ok(Ok(Reservation {
@@ -1831,6 +1851,9 @@ fn tally(dir: &Path, job_id: &str, asked: u128, anomalies: &mut Vec<String>) -> 
             if let Some(bytes) = entry.disk {
                 out.disk.push((name.to_os_string(), bytes));
             }
+            if entry.more && entry.asked < asked {
+                out.ahead = out.ahead.saturating_add(1);
+            }
         } else if entry.asked < asked {
             out.ahead = out.ahead.saturating_add(1);
         }
@@ -1849,6 +1872,9 @@ struct Entry {
     disk: Option<u64>,
     /// Its vCPUs, where vCPU admission is on.
     cpus: Option<u32>,
+    /// Granted, and waiting: a placed job not yet admitted at its own size. It holds what its
+    /// reservation was granted and queues, from when the reservation was asked, for its ask.
+    more: bool,
 }
 
 /// Where a job's guest RAM went, as the ledger records it.
@@ -1870,12 +1896,13 @@ impl Place {
 }
 
 impl Entry {
-    /// `<mib> <asked> <granted|waiting> [node=<n>|spread] [disk=<bytes>] [cpus=<n>]`, rewritten
+    /// `<mib> <asked> <granted|waiting> [node=<n>|spread] [disk=<bytes>] [cpus=<n>] [more]`, rewritten
     /// whole each time so a reader either sees the previous line or the new one, never a splice
     /// of both. The node is absent until one is chosen, and absent for good on a host that
     /// places nothing — so a three-field line, all this ledger ever held before, still reads.
     /// The disk claim and the vCPUs go last, where a reader that knows only the node passes over
-    /// them, and one that knows the disk claim passes over the vCPUs.
+    /// them, and one that knows the disk claim passes over the vCPUs. `more` goes last; older
+    /// readers still count the entry as granted.
     fn write(&self, mut file: &File, path: &Path) -> Result<()> {
         let state = if self.granted { "granted" } else { "waiting" };
         let node = match self.node {
@@ -1891,8 +1918,9 @@ impl Entry {
             Some(n) => format!(" cpus={n}"),
             None => String::new(),
         };
+        let more = if self.more { " more" } else { "" };
         let line = format!(
-            "{} {} {state}{node}{disk}{cpus}\n",
+            "{} {} {state}{node}{disk}{cpus}{more}\n",
             self.want_mib, self.asked
         );
         file.set_len(0)
@@ -1915,6 +1943,7 @@ impl Entry {
             node: None,
             disk: None,
             cpus: None,
+            more: false,
         };
         for field in fields {
             // A claim that does not parse makes the entry unreadable, not claimless: it is
@@ -1923,6 +1952,8 @@ impl Entry {
                 entry.disk = Some(bytes.parse().ok()?);
             } else if let Some(n) = field.strip_prefix("cpus=") {
                 entry.cpus = Some(n.parse().ok()?);
+            } else if field == "more" {
+                entry.more = true;
             } else if let Some(place) = Place::parse(field) {
                 // A field this version does not know leaves the node as it was.
                 entry.node = Some(place);
@@ -2189,6 +2220,7 @@ mod tests {
             node,
             disk: None,
             cpus: None,
+            more: false,
         }
         .write(&file, &dir.join(job))
         .unwrap();
@@ -2246,6 +2278,45 @@ mod tests {
         assert_eq!(live_mib(&dir), 1024);
         drop(granted);
         until_ledger_is(&dir, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job waiting beyond a reservation it took over keeps its queue position: the hub's
+    /// offers that fit the free room are refused, so smaller reservations cannot starve it.
+    #[test]
+    fn a_job_waiting_on_its_reservation_is_not_jumped_by_offers() {
+        let dir = tmpdir("topup-queue");
+        let ask = |want| Ask {
+            mem: None,
+            disk: None,
+            cpus: Some(CpuAsk { want, budget: 8 }),
+        };
+        let running = try_acquire(&dir, "running", &ask(2)).unwrap().unwrap();
+        let resv = try_acquire(&dir, "resv", &ask(2)).unwrap().unwrap();
+        let resv = resv.rename(&dir, "job").unwrap();
+        // The job turns out to need the whole budget: it waits for the running one to end.
+        let waiter = std::thread::spawn({
+            let dir = dir.clone();
+            move || {
+                let got = acquire(&dir, "job", &ask(8), Duration::from_secs(30));
+                drop(resv);
+                got.map(drop)
+            }
+        });
+        let entry = dir.join("job");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&entry).is_ok_and(|t| t.trim_end().ends_with(" more")) {
+            assert!(Instant::now() < deadline, "the job never said it waits");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // 4 of 8 vCPUs are free and the offer asks 2, but the job asked first.
+        assert!(matches!(
+            try_acquire(&dir, "offer", &ask(2)).unwrap(),
+            Err(Short::Queue)
+        ));
+        assert!(!dir.join("offer").exists());
+        drop(running);
+        waiter.join().unwrap().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3259,6 +3330,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
             node: None,
             disk: None,
             cpus: None,
+            more: false,
         }
         .write(&garbled, &dir.join("mid-write"))
         .unwrap();
@@ -3659,6 +3731,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
             node: None,
             disk: Some(u64::MAX / 2),
             cpus: None,
+            more: false,
         }
         .write(&blocker, &dir.join("running"))
         .unwrap();
@@ -3725,6 +3798,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
                 node: None,
                 disk: Some(PENDING),
                 cpus: None,
+                more: false,
             }
             .write(&file, &dir.join("running"))
             .unwrap();
