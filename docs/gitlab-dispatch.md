@@ -48,7 +48,9 @@ and audit log hold the spec redacted (`CiJob::redacted`).
 5. The hub sends the node `start`; the node journals the job, converts the reservation into
    the job's ledger entry and answers `accepted`.
 6. Seeing the job accepted, `vk-gitlab` sends GitLab `PUT /jobs/:id` `state=running` — the
-   commit of a job taken under `two_phase_job_commit`.
+   commit of a job taken under `two_phase_job_commit`. GitLab marks the job running before it
+   answers the request, so the job is the fleet's to run or fail from then on (see
+   [Failures](#failures)).
 7. The node runs the stages, streaming masked output to the hub, which stores it and acks.
    Told of more output, `vk-gitlab` reads it from its GitLab offset and patches the trace.
 8. The node uploads the artifacts to GitLab itself, then sends its result once its output
@@ -589,6 +591,12 @@ which it sends without coalescing: the hub refuses an unverified runner's reques
 
 ## Failures
 
+A job GitLab handed over cannot be given back. GitLab ignores `two_phase_job_commit`: it marks
+the job running before it answers the job request (`Ci::RegisterJobService#assign_runner!`),
+`PUT /jobs/:id` takes only `running`, `success` and `failed`, and a running job with no update
+for 30 minutes is dropped as `no_updates_running`. So a job the fleet cannot run is failed,
+never left uncommitted.
+
 The hub never retries a GitLab job. It places a job again only while no node can have
 started it: after a `refused` start, or when the reservation it was sent to is gone and no
 start went out. A start whose answer was lost waits for the node's `held` to say whether it
@@ -774,9 +782,6 @@ Ported from gitlab-runner v19.5.0 (MIT; the notice is in `NOTICE`), as tests of 
 
 ## Open questions
 
-- **Uncommitted jobs.** What GitLab does with a job taken under `two_phase_job_commit` that is
-  never committed — whether it returns it to the queue, and after how long — decides whether
-  a job the fleet cannot place should be failed or left uncommitted.
 - **Registry scopes.** A cache write needs a token scoped to the project's cache repository;
   `vk-registry` grants per-account read and write, not per-repository scopes, so caches start
   with the node's own registry credential.
