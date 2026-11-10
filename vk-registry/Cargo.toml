@@ -48,5 +48,9 @@ futures.workspace = true
 redb.workspace = true
 rand.workspace = true
 
+[dev-dependencies]
+# Paused time for the idle-body test.
+tokio = { workspace = true, features = ["test-util"] }
+
 [target.'cfg(target_env = "musl")'.dependencies]
 jemallocator.workspace = true

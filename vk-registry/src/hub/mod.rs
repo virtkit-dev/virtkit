@@ -801,12 +801,13 @@ impl Link {
             webdav: self.ctx.webdav,
             upstreams: self.ctx.upstreams.clone(),
             store: self.state.store.root.display().to_string(),
-            store_size_bytes: store_space(&self.state.store.root).0,
+            store_size_bytes: self.state.store.space().0,
             config_hash: self.ctx.config_hash.clone(),
             allow: self.ctx.settings.allow.clone(),
             requires_signed: self.policy.required(),
             tokens: self.ctx.settings.tokens,
             revokes_subjects: true,
+            files_put: true,
         }
     }
 
@@ -823,28 +824,9 @@ impl Link {
             max_connections: u32::try_from(self.ctx.max_connections).unwrap_or(u32::MAX),
             uploads: u32::try_from(uploads).unwrap_or(u32::MAX),
             locks: u32::try_from(self.state.locks.held_count()).unwrap_or(u32::MAX),
-            store_free_bytes: store_space(&self.state.store.root).1,
+            store_free_bytes: self.state.store.space().1,
         }
     }
-}
-
-/// The store's filesystem's size and free space, in bytes; zeros when it cannot be read.
-fn store_space(root: &Path) -> (u64, u64) {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(path) = std::ffi::CString::new(root.as_os_str().as_bytes()) else {
-        return (0, 0);
-    };
-    // SAFETY: `path` is NUL-terminated and outlives the call; `st` is a zeroed out-struct
-    // statvfs fills.
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
-        return (0, 0);
-    }
-    let frsize = st.f_frsize as u64;
-    (
-        (st.f_blocks as u64).saturating_mul(frsize),
-        (st.f_bavail as u64).saturating_mul(frsize),
-    )
 }
 
 fn usage_of(s: &crate::StoreStats) -> Usage {

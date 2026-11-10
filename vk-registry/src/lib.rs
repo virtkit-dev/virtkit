@@ -51,6 +51,7 @@ pub(crate) mod captions;
 pub mod client;
 pub mod config;
 pub(crate) mod dav;
+pub(crate) mod files_put;
 pub(crate) mod forms;
 pub mod handover;
 pub(crate) mod html;
@@ -366,7 +367,16 @@ pub struct Store {
     connections: std::sync::atomic::AtomicUsize,
     /// Retention windows of their own for the tags under prefixes ([`Store::gc`]).
     prefix_windows: std::sync::Mutex<Vec<PrefixWindow>>,
+    /// Slots for file puts streaming now ([`Store::file_put_slot`]).
+    file_puts: tokio::sync::Semaphore,
+    /// The bytes of the file puts streaming now that the filesystem could not set aside for
+    /// them, which the free space must still cover.
+    pub(crate) unclaimed_puts: std::sync::Mutex<u64>,
 }
+
+/// File puts a server streams into one store at once: each holds a file's worth of its
+/// space, and a connection for as long as the file takes.
+pub(crate) const FILE_PUTS: usize = 2;
 
 /// A retention window for the tags under a prefix: those of the repositories `prefix` and
 /// `prefix/…`, and of the plain files stored as `files/prefix/…`. Under it, a tag is dropped
@@ -501,7 +511,34 @@ impl Store {
             read_only: std::sync::atomic::AtomicBool::new(false),
             connections: std::sync::atomic::AtomicUsize::new(0),
             prefix_windows: std::sync::Mutex::new(Vec::new()),
+            file_puts: tokio::sync::Semaphore::new(FILE_PUTS),
+            unclaimed_puts: std::sync::Mutex::new(0),
         }
+    }
+
+    /// The store's filesystem's size and free space, in bytes; zeros when it cannot be read.
+    pub(crate) fn space(&self) -> (u64, u64) {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(path) = std::ffi::CString::new(self.root.as_os_str().as_bytes()) else {
+            return (0, 0);
+        };
+        // SAFETY: `path` is NUL-terminated and outlives the call; `st` is a zeroed out-struct
+        // statvfs fills.
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
+            return (0, 0);
+        }
+        let frsize = st.f_frsize as u64;
+        (
+            (st.f_blocks as u64).saturating_mul(frsize),
+            (st.f_bavail as u64).saturating_mul(frsize),
+        )
+    }
+
+    /// A slot for one file put, held while it streams; `None` while all [`FILE_PUTS`] are
+    /// taken.
+    pub(crate) fn file_put_slot(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.file_puts.try_acquire().ok()
     }
 
     /// Identity blob: the stored bytes ARE the canonical (digested) bytes.
@@ -849,6 +886,48 @@ impl Store {
             self.put_raw_file_annotated(name, tag, sha256, size, title, annotations)?;
         }
         Ok(())
+    }
+
+    /// [`Store::put_file`] for a file already staged under `uploads/` ([`Store::stage_file`])
+    /// and hashed on the way in to `sha256`, `size` bytes: installed as it is, uncompressed,
+    /// with no second copy. The staging file is consumed either way. Returns the manifest
+    /// digest every tag names. The tags are written in order, after the blob: one that fails
+    /// leaves the blob and the tags before it, which putting the file again completes.
+    pub(crate) fn put_staged_file(
+        &self,
+        tags: &[(&str, &str)],
+        staging: &Path,
+        sha256: &str,
+        size: u64,
+        title: Option<&str>,
+        annotations: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        let staged = StagedBlob {
+            install: staging.to_path_buf(),
+            discard: None,
+            zstd: false,
+        };
+        if let Some((name, tag)) = tags.iter().find(|(n, t)| !valid_name(n) || !valid_tag(t)) {
+            staged.discard();
+            bail!("{name}:{tag} is not a valid repository and tag");
+        }
+        let _lock = match self.lock_shared() {
+            Ok(lock) => lock,
+            Err(e) => {
+                staged.discard();
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.promote_staged(sha256, staged) {
+            // Gone already when the rename happened; otherwise not left for gc to find.
+            let _ = std::fs::remove_file(staging);
+            return Err(e);
+        }
+        let mut manifest = String::new();
+        for (name, tag) in tags {
+            manifest = self.put_raw_file_annotated(name, tag, sha256, size, title, annotations)?;
+        }
+        Ok(manifest)
     }
 
     /// The raw file tagged `name:tag`; `None` when the tag is absent or is not a raw file.
@@ -4705,6 +4784,9 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     // Disabled WebDAV routes fall through to 404.
     if state.webdav && (path == "/dav" || path.starts_with("/dav/")) {
         return dav::route(&state, &authz, req).await;
+    }
+    if files_put::is_files_path(&path) {
+        return files_put::route(&state, &authz, &path, req).await;
     }
     let store = state.store.clone();
     let method = req.method().clone();
@@ -9273,6 +9355,72 @@ mod tests {
         assert!(store.get_manifest("files/iso", "stale").unwrap().is_none());
         assert!(store.find_blob(&stale).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A staged file is installed as it is under every tag, and consumed even when it is
+    /// refused.
+    #[test]
+    fn a_staged_file_is_installed_or_removed() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-staged-{}", std::process::id()));
+        // Left over from an earlier run, if anything; absent is the usual case.
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let stage = |bytes: &[u8]| {
+            let (path, mut file) = store.stage_file().unwrap();
+            std::io::Write::write_all(&mut file, bytes).unwrap();
+            path
+        };
+        let none = BTreeMap::new();
+
+        let staged = stage(b"medium");
+        let hex = sha256_hex_raw(b"medium");
+        let tags = [("files/sha256", hex.as_str()), ("files/iso", "m.iso")];
+        let manifest = store
+            .put_staged_file(&tags, &staged, &hex, 6, Some("m.iso"), &none)
+            .unwrap();
+        assert!(!staged.exists());
+        for (name, tag) in tags {
+            assert_eq!(store.get_manifest(name, tag).unwrap().unwrap().0, manifest);
+            assert_eq!(store.open_file(name, tag).unwrap().unwrap().size, 6);
+        }
+
+        let staged = stage(b"other");
+        let other = sha256_hex_raw(b"other");
+        assert!(
+            store
+                .put_staged_file(&[("files/iso", "a b")], &staged, &other, 5, None, &none)
+                .is_err()
+        );
+        assert!(!staged.exists());
+        assert!(store.find_blob(&other).is_none());
+
+        // A tag that cannot be written leaves the blob and the tags before it; putting the
+        // file again completes it.
+        let blocker = dir.join("repos/files/blocked");
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, b"").unwrap();
+        let tags = [("files/sha256", other.as_str()), ("files/blocked", "o")];
+        let staged = stage(b"other");
+        assert!(
+            store
+                .put_staged_file(&tags, &staged, &other, 5, None, &none)
+                .is_err()
+        );
+        assert!(!staged.exists());
+        assert!(store.find_blob(&other).is_some());
+        assert!(
+            store
+                .get_manifest("files/sha256", &other)
+                .unwrap()
+                .is_some()
+        );
+        std::fs::remove_file(&blocker).unwrap();
+        let staged = stage(b"other");
+        store
+            .put_staged_file(&tags, &staged, &other, 5, None, &none)
+            .unwrap();
+        assert!(store.open_file("files/blocked", "o").unwrap().is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A dry run reports exactly what the real pass then drops, and removes

@@ -1,10 +1,15 @@
 //! Stream and hash request bodies into staging files under `uploads/` for routes that
 //! accept whole objects in one request rather than OCI upload sessions.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
+use hyper::body::Frame;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -51,6 +56,68 @@ impl Drop for Staging {
             // gc's sweep of idle uploads.
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+}
+
+/// Fail after `idle` without a frame, so a stalled client cannot hold reserved resources
+/// for the lifetime of its connection.
+pub(crate) struct Idle<B> {
+    body: B,
+    idle: Duration,
+    timer: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<B> Idle<B> {
+    pub(crate) fn new(body: B, idle: Duration) -> Self {
+        Idle {
+            body,
+            idle,
+            timer: Box::pin(tokio::time::sleep(idle)),
+        }
+    }
+}
+
+/// Whether `e`, from [`drain_into`] reading an [`Idle`] body, is that body falling idle.
+pub(crate) fn went_idle(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
+}
+
+impl<B> hyper::body::Body for Idle<B>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.body).poll_frame(cx) {
+            Poll::Ready(frame) => {
+                let deadline = tokio::time::Instant::now() + this.idle;
+                this.timer.as_mut().reset(deadline);
+                Poll::Ready(frame.map(|f| f.map_err(std::io::Error::other)))
+            }
+            Poll::Pending => match this.timer.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("no body for {}s", this.idle.as_secs()),
+                )))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
     }
 }
 
@@ -145,5 +212,30 @@ mod tests {
         assert_eq!(hex, crate::sha256_hex_raw(&vec![1u8; 400]));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A body that stops sending fails once idle that long, not before, and not while frames
+    /// keep coming.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_that_stops_sending_goes_idle() {
+        let (mut tx, rx) =
+            futures::channel::mpsc::channel::<std::result::Result<Frame<Bytes>, std::io::Error>>(4);
+        let body = Idle::new(http_body_util::StreamBody::new(rx), Duration::from_secs(60));
+        let drain =
+            tokio::spawn(async move { drain_into(&mut tokio::io::sink(), body, u64::MAX).await });
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_secs(50)).await;
+            futures::SinkExt::send(&mut tx, Ok(Frame::data(Bytes::from_static(b"x"))))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        assert!(!drain.is_finished(), "went idle while frames came");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        match drain.await.unwrap() {
+            Err(DrainError::Failed(e)) => assert!(went_idle(&e), "{e:#}"),
+            _ => panic!("an idle body drained"),
+        }
+        drop(tx);
     }
 }

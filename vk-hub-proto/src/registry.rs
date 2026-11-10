@@ -39,6 +39,41 @@ pub const RELEASE_PATH: &str = "/v1/registry/releases/";
 /// A registry's release download's header carrying its ID.
 pub const REGISTRY_HEADER: &str = "vk-registry";
 
+/// Where a registry takes a file streamed in whole: `PUT` this, then `<dir>/<name>`, and
+/// optionally `?under=<path>`. The file is stored as one blob, tagged
+/// `[<path>/]files/sha256:<its sha256>` and `[<path>/]files/<dir>:<name>`, the manifest's
+/// layer titled `<name>`, and answered with a [`FilePut`] once both tags are written. The
+/// writer needs write on both repositories. An [`Inventory::files_put`] registry takes it.
+pub const FILES_PATH: &str = "/files/";
+
+/// A [`FILES_PATH`] put's header naming the sha256 the file must hash to, lowercase hex.
+pub const FILE_SHA256_HEADER: &str = "vk-sha256";
+
+/// A [`FILES_PATH`] put's header asking the tags be marked [`RETENTION_KEEP`]: kept however
+/// long they sit idle, unless a retention window the registry configures for their prefix
+/// says otherwise.
+pub const FILE_RETENTION_HEADER: &str = "vk-retention";
+
+/// [`FILE_RETENTION_HEADER`]'s one value.
+pub const RETENTION_KEEP: &str = "keep";
+
+/// A [`FILES_PATH`] put's header carrying annotations for the tags' manifest: a JSON object
+/// of strings, base64url without padding, at most [`MAX_FILE_ANNOTATIONS`] bytes once decoded.
+pub const FILE_ANNOTATIONS_HEADER: &str = "vk-annotations";
+
+/// The most a [`FILE_ANNOTATIONS_HEADER`] may carry, decoded.
+pub const MAX_FILE_ANNOTATIONS: usize = 16 * 1024;
+
+/// A registry's answer to a [`FILES_PATH`] put it stored.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilePut {
+    /// What the bytes hash to, lowercase hex, and how many there were.
+    pub sha256: String,
+    pub size: u64,
+    /// The digest of the manifest both tags name, `sha256:<hex>`.
+    pub manifest: String,
+}
+
 /// The protocol versions of a registry's session.
 pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 1 };
 
@@ -127,6 +162,9 @@ pub struct Inventory {
     /// tokens only for a registry that does.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub revokes_subjects: bool,
+    /// Whether it takes files streamed to [`FILES_PATH`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub files_put: bool,
 }
 
 impl Inventory {
@@ -462,6 +500,7 @@ mod tests {
                 requires_signed: true,
                 tokens: false,
                 revokes_subjects: false,
+                files_put: false,
             }),
             r#"{"type":"inventory","hostname":"h","version":"0.89.0","sha256":"s","listen":"0.0.0.0:5000","tls":true,"mode":"accounts","webdav":false,"upstreams":["docker.io"],"store":"/srv","store_size_bytes":100,"config_hash":"c","allow":["gc"],"requires_signed":true}"#,
         );
@@ -491,6 +530,19 @@ mod tests {
                 ..Inventory::default()
             }),
             r#"{"type":"inventory","hostname":"h","version":"0.108.0","listen":"l","tls":false,"mode":"accounts","webdav":false,"store":"/srv","store_size_bytes":0,"config_hash":"c","requires_signed":false,"tokens":true,"revokes_subjects":true}"#,
+        );
+        pinned(
+            &RegistryMsg::Inventory(Inventory {
+                hostname: "h".into(),
+                version: "0.109.0".into(),
+                listen: "l".into(),
+                mode: "accounts".into(),
+                store: "/srv".into(),
+                config_hash: "c".into(),
+                files_put: true,
+                ..Inventory::default()
+            }),
+            r#"{"type":"inventory","hostname":"h","version":"0.109.0","listen":"l","tls":false,"mode":"accounts","webdav":false,"store":"/srv","store_size_bytes":0,"config_hash":"c","requires_signed":false,"files_put":true}"#,
         );
         pinned(
             &RegistryMsg::Heartbeat(Heartbeat {

@@ -361,6 +361,44 @@ Repository captions are administrator-editable, one-line plain text stored in th
 database. They are not garbage-collected with repository content; deleting and later
 recreating a repository restores its previous caption unless an administrator cleared it.
 
+### Streamed file puts
+
+`PUT /files/<dir>/<name>` stores one file streamed whole, as `vk registry put --dir <dir>`
+stores it: one blob, tagged `files/sha256:<sha256>` and `files/<dir>:<name>` on a raw-file
+manifest whose layer is titled `<name>`. With `?under=<path>`, both repositories are under
+`<path>/`, where a client whose registry repository is `<path>` (`vk registry put` with
+`--cache-registry <host>/<path>`) finds them. The writer needs write on both repositories;
+`<dir>` may not be `sha256`, repository names are at most 255 characters and the tag at most
+128. A chunked body is refused with 411; a request with neither `Content-Length` nor a
+chunked body is an empty file. Optional headers: `vk-sha256`, the digest the bytes must hash
+to; `vk-retention: keep`, which marks both tags `keep` (see "Retention by prefix" for where
+that is ignored); `vk-annotations`, a base64url JSON object of strings (at most 16 KiB
+decoded) for the manifest, retention annotations excepted. The answer, `201` with `{sha256,
+size, manifest}`, comes once both tags are written.
+
+The route is checked like any other write: authentication first, then write on both
+repositories, once, when the request arrives. A registry with no authentication takes file
+puts from anyone who reaches it. Everything but the body's length and digest is checked
+before the body is read, so a request refused for it stages nothing.
+
+The body streams to a staging file under `uploads/`, hashed on the way, and is installed
+uncompressed, by choice: compressing would cost a second pass over gigabytes. Nothing is
+tagged unless every declared byte arrived and, when `vk-sha256` is given, the bytes hash to
+it; a body cut short, refused or silent for five minutes (408) leaves no staging file. A
+failure while the tags are written can leave the blob and the digest tag; putting the file
+again completes it.
+
+Each registry process streams two puts into a store at once and answers a third 503 with
+`Retry-After`. A slow client keeps its slot as long as no gap between frames reaches five
+minutes. A put that would leave less than 1 GiB free on the store's filesystem is refused
+with 507 before its body is read. Its staging file is then given the whole declared size
+on disk (`fallocate`), so other writes cannot take the space it was admitted for, and the
+put is refused if the claim leaves less than 1 GiB. Where the filesystem cannot preallocate, the put's size counts
+against the free space of the process's next puts until it ends; another process serving
+the store, during a handover, does not see it. The 1 GiB is checked, not reserved: other
+writes can still fill the store, causing a put to fail while streaming or writing its tags.
+Registries advertise the route to their hub in their inventory.
+
 ## Build-once lock service
 
 The registry process is the authority for leased locks. No Redis or shared filesystem lock

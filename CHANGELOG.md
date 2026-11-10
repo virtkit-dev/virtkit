@@ -11,6 +11,11 @@ All notable changes to virtkit will be documented in this file.
   are kept (`executor.windows_cache_idle_secs`), fleet-wide or per node. A node's own config
   still wins.
 
+- **`vk-registry` takes large files in one request.** `PUT /files/<dir>/<name>` stores a
+  multi-gigabyte file as `vk registry put --dir` does, optionally checked against an expected
+  sha256 and with annotations. A registry streams two at a time, and refuses one its store
+  has no room for before it starts.
+
 ## [0.108.4] - 2026-11-11
 
 ### Fixed
