@@ -328,11 +328,41 @@ fn https_or_loopback(url: &str) -> bool {
 
 /// The registry an upload goes to unless one is named.
 fn default_registry(hub: &Hub) -> Result<String> {
-    let fleet = hub.db.settings_layers()?.fleet;
-    if let Some(id) = fleet.get("registry").and_then(|v| v.as_str()) {
-        return Ok(id.to_string());
+    if let Some(id) = named_registry(hub)? {
+        return Ok(id);
     }
-    let able: Vec<String> = hub
+    let able = able_registries(hub)?;
+    match &able[..] {
+        [(id, _)] => Ok(id.clone()),
+        [] => bail!(
+            "no registry can take the upload now: none is connected, has a URL bound and \
+             takes hub tokens and uploads"
+        ),
+        _ => bail!(
+            "name the registry to upload to: {}",
+            able.iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Registries by ID, with their hostname.
+pub type Registries = Vec<(String, String)>;
+
+/// The registry the fleet-wide `registry` setting names, if any.
+fn named_registry(hub: &Hub) -> Result<Option<String>> {
+    let fleet = hub.db.settings_layers()?.fleet;
+    Ok(fleet
+        .get("registry")
+        .and_then(|v| v.as_str())
+        .map(str::to_string))
+}
+
+/// The registries that can take an upload now.
+fn able_registries(hub: &Hub) -> Result<Registries> {
+    Ok(hub
         .db
         .registries()?
         .into_iter()
@@ -344,15 +374,8 @@ fn default_registry(hub: &Hub) -> Result<String> {
                     .is_some_and(|i| i.files_put && i.tokens)
                 && hub.reach(id) == Reach::Connected
         })
-        .map(|(id, _)| id)
-        .collect();
-    match &able[..] {
-        [id] => Ok(id.clone()),
-        [] => bail!(
-            "no registry can take the upload now: none is connected, has a URL bound and takes hub tokens and uploads"
-        ),
-        _ => bail!("name the registry to upload to: {}", able.join(", ")),
-    }
+        .map(|(id, row)| (id, row.hostname))
+        .collect())
 }
 
 /// What passed through an upload, as the hub saw it.
@@ -633,14 +656,9 @@ pub fn record(
         .db
         .add_medium(&sent.put.sha256, row, location, request.approve)
         .with_context(|| {
-            let under = target
-                .under
-                .as_ref()
-                .map_or(String::new(), |u| format!("{u}/"));
             format!(
-                "registry {} holds medium {} as {under}files/{DIR}:{name}, but the hub could not \
-                 record it; upload it again once that is fixed",
-                target.registry, sent.put.sha256
+                "{}, but the hub could not record it; upload it again once that is fixed",
+                held(target, name, &sent.put.sha256)
             )
         })?;
     eprintln!(
@@ -652,6 +670,18 @@ pub fn record(
     crate::settings::sent(hub, &added.steered);
     hub.touch();
     Ok(added)
+}
+
+/// Where `target` holds medium `sha256`, stored as `name`.
+pub fn held(target: &Target, name: &str, sha256: &str) -> String {
+    let under = target
+        .under
+        .as_ref()
+        .map_or(String::new(), |u| format!("{u}/"));
+    format!(
+        "registry {} holds medium {sha256} as {under}files/{DIR}:{name}",
+        target.registry
+    )
 }
 
 /// One upload at a time: refused while another runs.

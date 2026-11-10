@@ -216,7 +216,7 @@ where
             return Err(Refusal::Malformed("it carries no file"));
         };
         let slot = match part.name.as_str() {
-            "file" if part.file => return Ok(fields),
+            "file" if part.is_file() => return Ok(fields),
             "_csrf" => &mut fields.csrf,
             "program" => &mut fields.program,
             "version" => &mut fields.version,

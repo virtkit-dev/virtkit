@@ -53,11 +53,18 @@ pub fn boundary(content_type: &str) -> Option<String> {
     ok.then(|| value.to_string())
 }
 
-/// One part's name, and whether it is a file.
+/// One part's name, and its file name if it is a file.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Part {
     pub name: String,
-    pub file: bool,
+    /// The file's name, as the browser gave it.
+    pub filename: Option<String>,
+}
+
+impl Part {
+    pub fn is_file(&self) -> bool {
+        self.filename.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,7 +290,7 @@ fn part(headers: &[String]) -> Result<Part, Refusal> {
     let name = value("name").ok_or(Refusal::Malformed("a part has no name"))?;
     Ok(Part {
         name,
-        file: value("filename").is_some(),
+        filename: value("filename"),
     })
 }
 
@@ -399,21 +406,21 @@ mod tests {
             (
                 Part {
                     name: "_csrf".into(),
-                    file: false,
+                    filename: None,
                 },
                 b"abc".to_vec(),
             ),
             (
                 Part {
                     name: "version".into(),
-                    file: false,
+                    filename: None,
                 },
                 b"0.85.0".to_vec(),
             ),
             (
                 Part {
                     name: "file".into(),
-                    file: true,
+                    filename: Some("a;b\"c".into()),
                 },
                 b"\x7fELF\r\n--Xy\r\n-XyZ data".to_vec(),
             ),
