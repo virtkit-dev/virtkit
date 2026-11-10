@@ -87,11 +87,11 @@ pub use keys::{
     MAX_NAME, PrincipalKind, Scope, envelope_text, valid_name,
 };
 pub use media::{
-    Added as MediumAdded, LicenseKind, Location, Medium, MediumEdit, MediumInfo, MediumKind,
-    MediumRow,
+    Added as MediumAdded, ApprovalsFull, LicenseKind, Location, Medium, MediumEdit, MediumInfo,
+    MediumKind, MediumRow, Stale, days_of,
 };
 #[cfg(test)]
-pub(crate) use media::{MAX_LOCATIONS, MAX_MEDIA};
+pub(crate) use media::{MAX_LINE, MAX_LOCATIONS, MAX_MEDIA, MAX_SOURCES, MAX_TEXT, MAX_URL};
 pub use namespaces::{
     CI_BUILD, CI_CACHE, CI_PIPELINE, NamespaceRow, Nodes, NsGrant, PLACEHOLDERS, parse_grants,
     prefix_retention, resolve, resolve_guest, resolve_node,

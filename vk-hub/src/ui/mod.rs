@@ -78,6 +78,7 @@ mod job_output;
 mod jobs;
 mod lanes;
 mod local;
+mod media;
 mod multipart;
 mod oidc;
 mod operations;
@@ -422,6 +423,8 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                     operations::upload(req, ui, site).await
                 } else if path == tools::UPLOAD_PATH {
                     tools::upload(req, ui, site).await
+                } else if let Some((sha256, op)) = media::action_target(&path) {
+                    media::action(req, ui, site, sha256, op).await
                 } else if path == operations::FETCH_PATH {
                     operations::fetch_action(req, ui).await
                 } else if path == users::PATH {

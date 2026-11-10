@@ -273,6 +273,8 @@ table.grid.jobs .mid .tail {
 table.kv { width: 100%; }
 table.kv th, table.kv td { text-align: left; padding: var(--s1) var(--s4) var(--s1) 0; vertical-align: top; }
 table.kv th { color: var(--muted); font-weight: 500; white-space: nowrap; width: 16rem; }
+/* Text written over several lines, kept as written. */
+.pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 pre {
   background: var(--raised);
   border: 1px solid var(--line);

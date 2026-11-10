@@ -1695,7 +1695,8 @@ provider (see [Signing in](#signing-in)).
 
 The UI's top bar has six sections, each opening on its first tab, the current section's tabs in a
 row below: *Fleet* (*Compute*, the nodes table; *Storage*, the registries; *Updates*, releases
-and the versions running; *Rollouts*, every rollout; *Settings*, the hub's settings for its nodes), *GitLab* (*Overview*, the servers and
+and the versions running; *Media*, install media; *Rollouts*, every rollout; *Settings*, the
+hub's settings for its nodes), *GitLab* (*Overview*, the servers and
 relays, then a tab per server), *Lanes*, *Jobs*, *Egress*, and *Administration* (*API keys*,
 *Users* for operators, *Audit*).
 A section's link counts what waits in its tabs, each tab its own. Connections' former
@@ -2225,6 +2226,16 @@ update. Operators get an **Update** form to choose a held `vk-hub` release, post
 `/hub/action` with `op=update` and confirmed first (see [Updating the hub](#updating-the-hub)).
 Confirmation requires the hub to still run the version shown and hold the release as shown.
 The top bar shows the version that served the page.
+
+*Media* (`/media`) lists the install media the hub uploaded, for any viewer: name and sha256,
+kind, what it installs, licence, renewal date (flagged within 30 days and once past), whether
+it is approved for jobs fleet-wide, the registries holding it, size and who uploaded it when. A
+medium's page, `/media/<sha256>`, shows everything said of it, its sources as links, and where
+each registry holds it, under which repository path and manifest. On it, an operator's forms,
+with the same origin, CSRF and role checks and run as the session's principal, are **Approve
+for jobs** or **Withdraw approval**, **Edit**, the whole of what is said of it, refused if it
+changed since the page was shown, and **Remove**, asked first and confirmed only while the
+medium is as shown.
 
 The nodes table, a node's page, `/updates`, `/jobs`' newest page, `/gitlab`, `/keys` and a
 running job's page stay live over server-sent events. The hub notes every heartbeat, report,

@@ -772,11 +772,18 @@ pub async fn add_path(
     .context("recording the medium")?
 }
 
-/// Change what is said of medium `sha256` with `edit`, as `actor`.
-pub fn edit(hub: &Hub, actor: &str, sha256: &str, edit: &MediumEdit) -> Result<Medium> {
+/// Change what is said of medium `sha256` with `edit`, as `actor`, if it is still at revision
+/// `seen` when one is given.
+pub fn edit(
+    hub: &Hub,
+    actor: &str,
+    sha256: &str,
+    edit: &MediumEdit,
+    seen: Option<&str>,
+) -> Result<Medium> {
     let medium = hub
         .db
-        .edit_medium(sha256, edit, actor, crate::now_secs())?
+        .edit_medium(sha256, edit, seen, actor, crate::now_secs())?
         .with_context(|| format!("there is no medium {sha256}"))?;
     hub.touch();
     Ok(medium)
@@ -799,10 +806,14 @@ pub fn approve(hub: &Hub, actor: &str, sha256: &str, approve: bool) -> Result<bo
     Ok(changed)
 }
 
-/// Forget medium `sha256` and withdraw its approval, as `actor`; the registries keep their
-/// copies. The medium, `None` when another removal took it first.
-pub fn remove(hub: &Hub, actor: &str, sha256: &str) -> Result<Option<Medium>> {
-    let Some((medium, steered)) = hub.db.remove_medium(sha256, actor, crate::now_secs())? else {
+/// Forget medium `sha256` and withdraw its approval, as `actor`, if it is still at revision
+/// `seen` when one is given; the registries keep their copies. The medium, `None` when another
+/// removal took it first.
+pub fn remove(hub: &Hub, actor: &str, sha256: &str, seen: Option<&str>) -> Result<Option<Medium>> {
+    let Some((medium, steered)) = hub
+        .db
+        .remove_medium(sha256, seen, actor, crate::now_secs())?
+    else {
         return Ok(None);
     };
     eprintln!("vk-hub: {actor} removed medium {sha256}");

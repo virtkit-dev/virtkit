@@ -208,6 +208,26 @@ pub struct MediumEdit {
 }
 
 impl MediumEdit {
+    /// Every field of `info`, replacing all.
+    pub fn whole(info: MediumInfo) -> Self {
+        MediumEdit {
+            kind: Some(info.kind),
+            sources: Some(info.sources),
+            obtained: Some(info.obtained),
+            product: Some(info.product),
+            edition: Some(info.edition),
+            version: Some(info.version),
+            build: Some(info.build),
+            language: Some(info.language),
+            arch: Some(info.arch),
+            license: Some(info.license),
+            license_terms: Some(info.license_terms),
+            renewal: Some(info.renewal),
+            expires: Some(info.expires),
+            notes: Some(info.notes),
+        }
+    }
+
     /// `info` with this change, checked; the names of the fields it changed.
     pub fn apply(&self, info: &MediumInfo) -> Result<(MediumInfo, Vec<&'static str>)> {
         let mut out = info.clone();
@@ -286,6 +306,26 @@ fn valid_source(url: &str) -> bool {
         && !host.is_empty()
         && !host.starts_with(':')
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// The days since the Unix epoch of date `s` ([`valid_date`]).
+pub fn days_of(s: &str) -> Option<i64> {
+    if !valid_date(s) {
+        return None;
+    }
+    let (y, m, d): (i64, i64, i64) = (
+        s[0..4].parse().ok()?,
+        s[5..7].parse().ok()?,
+        s[8..10].parse().ok()?,
+    );
+    // Howard Hinnant's days_from_civil.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
 }
 
 impl MediumInfo {
@@ -378,7 +418,7 @@ pub struct MediumRow {
     pub locations: Vec<Location>,
 }
 
-/// A medium as the CLI shows it.
+/// A medium as the CLI and the pages show it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Medium {
     pub sha256: String,
@@ -386,6 +426,82 @@ pub struct Medium {
     pub row: MediumRow,
     /// Whether the fleet-wide `executor.windows_media` lists it.
     pub approved: bool,
+}
+
+impl Medium {
+    /// A fingerprint of all that is known of it, approval included: a change asked from a page
+    /// that showed another is refused ([`Stale`]).
+    pub fn revision(&self) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update([u8::from(self.approved)]);
+        hash.update(encode(&self.row)?);
+        Ok(vk_hub_proto::to_hex(&hash.finalize()[..8]))
+    }
+}
+
+/// An approval refused because the fleet-wide list is full; `uploading` with an upload to
+/// approve.
+#[derive(Debug)]
+pub struct ApprovalsFull {
+    listed: usize,
+    uploading: bool,
+}
+
+impl std::fmt::Display for ApprovalsFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{APPROVAL_KEY} lists {} media already, the most it may; withdraw one first",
+            self.listed
+        )?;
+        if self.uploading {
+            f.write_str(", or upload without approving")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ApprovalsFull {}
+
+/// A change refused because the medium is no longer at the revision it was asked of.
+#[derive(Debug)]
+pub struct Stale;
+
+impl std::fmt::Display for Stale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the medium changed since it was shown; look at it again")
+    }
+}
+
+impl std::error::Error for Stale {}
+
+/// Medium `sha256` as `txn` holds it, if any.
+fn medium_in(txn: &redb::WriteTransaction, sha256: &str) -> Result<Option<Medium>> {
+    let Some(row) = txn
+        .open_table(MEDIA)?
+        .get(sha256)?
+        .map(|g| decode::<MediumRow>(g.value()))
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    let approved = digests(fleet_value(&txn.open_table(SETTINGS)?, APPROVAL_KEY)?)
+        .iter()
+        .any(|d| d == sha256);
+    Ok(Some(Medium {
+        sha256: sha256.to_string(),
+        row,
+        approved,
+    }))
+}
+
+/// That `medium` is at `seen`, its [`Medium::revision`], when one is given.
+fn check_seen(medium: &Medium, seen: Option<&str>) -> Result<()> {
+    match seen {
+        Some(seen) if medium.revision()? != seen => Err(Stale.into()),
+        _ => Ok(()),
+    }
 }
 
 /// What [`Db::add_medium`] did.
@@ -432,11 +548,11 @@ fn approve_in(
     }
     if approve {
         if list.len() >= vk_hub_proto::settings::MAX_DIGESTS {
-            bail!(
-                "{APPROVAL_KEY} lists {} media already, the most it may; withdraw one first, or \
-                 upload without approving",
-                list.len()
-            );
+            return Err(ApprovalsFull {
+                listed: list.len(),
+                uploading: false,
+            }
+            .into());
         }
         list.push(sha256.to_string());
     } else {
@@ -521,10 +637,11 @@ impl Db {
         let txn = self.db.begin_read().context("starting a read")?;
         let approved = approved_in(&txn)?.len();
         if approve && approved >= vk_hub_proto::settings::MAX_DIGESTS {
-            bail!(
-                "{APPROVAL_KEY} lists {approved} media already, the most it may; withdraw one \
-                 first, or upload without approving"
-            );
+            return Err(ApprovalsFull {
+                listed: approved,
+                uploading: true,
+            }
+            .into());
         }
         Ok(())
     }
@@ -588,25 +705,24 @@ impl Db {
         }
     }
 
-    /// Change what is said of medium `sha256` with `edit`, as `actor`, audited: the medium,
-    /// `None` when there is none.
+    /// Change what is said of medium `sha256` with `edit`, as `actor`, audited, if it is still
+    /// at revision `seen` when one is given: the medium, `None` when there is none.
     pub fn edit_medium(
         &self,
         sha256: &str,
         edit: &MediumEdit,
+        seen: Option<&str>,
         actor: &str,
         now: u64,
     ) -> Result<Option<Medium>> {
         let txn = self.db.begin_write().context("starting a write")?;
         {
-            let mut table = txn.open_table(MEDIA)?;
-            let Some(mut row) = table
-                .get(sha256)?
-                .map(|g| decode::<MediumRow>(g.value()))
-                .transpose()?
-            else {
+            let Some(medium) = medium_in(&txn, sha256)? else {
                 return Ok(None);
             };
+            check_seen(&medium, seen)?;
+            let mut row = medium.row;
+            let mut table = txn.open_table(MEDIA)?;
             let (info, changed) = edit.apply(&row.info)?;
             if changed.is_empty() {
                 drop(table);
@@ -654,22 +770,22 @@ impl Db {
         }
     }
 
-    /// Forget medium `sha256` and withdraw its fleet-wide approval, as `actor`, audited; the
-    /// registries keep their copies. The medium, and the nodes it steered.
+    /// Forget medium `sha256` and withdraw its fleet-wide approval, as `actor`, audited, if it
+    /// is still at revision `seen` when one is given; the registries keep their copies. The
+    /// medium, and the nodes it steered.
     pub fn remove_medium(
         &self,
         sha256: &str,
+        seen: Option<&str>,
         actor: &str,
         now: u64,
     ) -> Result<Option<(Medium, Vec<String>)>> {
-        let Some(medium) = self.medium(sha256)? else {
+        let txn = self.db.begin_write().context("starting a write")?;
+        let Some(medium) = medium_in(&txn, sha256)? else {
             return Ok(None);
         };
-        let txn = self.db.begin_write().context("starting a write")?;
-        if txn.open_table(MEDIA)?.remove(sha256)?.is_none() {
-            txn.abort().context("dropping a write")?;
-            return Ok(None);
-        }
+        check_seen(&medium, seen)?;
+        txn.open_table(MEDIA)?.remove(sha256)?;
         let event = format!(
             "{actor} removed medium {} ({})",
             short(sha256),
@@ -765,14 +881,14 @@ mod tests {
             build: Some("26100.1742".into()),
             ..MediumEdit::default()
         };
-        let edited = db.edit_medium(A, &edit, "uid 3", 4).unwrap().unwrap();
+        let edited = db.edit_medium(A, &edit, None, "uid 3", 4).unwrap().unwrap();
         assert_eq!(edited.row.info.notes, "activated at build; 180 days");
         assert_eq!(edited.row.edited_by.as_deref(), Some("uid 3"));
         let bad = MediumEdit {
             expires: Some("someday".into()),
             ..MediumEdit::default()
         };
-        assert!(db.edit_medium(A, &bad, "uid 3", 5).is_err());
+        assert!(db.edit_medium(A, &bad, None, "uid 3", 5).is_err());
 
         assert!(db.approve_medium(A, false, "uid 4", 6).unwrap().0);
         assert!(!db.approve_medium(A, false, "uid 4", 6).unwrap().0);
@@ -781,7 +897,7 @@ mod tests {
         assert_eq!(db.resolve_medium(&A[..8]).unwrap().sha256, A);
 
         db.approve_medium(A, true, "uid 4", 7).unwrap();
-        let (removed, _) = db.remove_medium(A, "uid 5", 8).unwrap().unwrap();
+        let (removed, _) = db.remove_medium(A, None, "uid 5", 8).unwrap().unwrap();
         assert_eq!(removed.sha256, A);
         assert!(db.medium(A).unwrap().is_none());
         assert_eq!(approved(&db), vec![B.to_string()]);
@@ -793,6 +909,47 @@ mod tests {
         ] {
             assert!(audit.iter().any(|e| e.event.contains(want)), "{want}");
         }
+    }
+
+    /// An edit or a removal asked of a revision the medium has moved past, by an edit, an
+    /// approval or another upload, changes nothing and audits nothing.
+    #[test]
+    fn a_stale_edit_or_removal_changes_nothing() {
+        let db = Db::open_memory().unwrap();
+        db.add_medium(A, row("ws2025.iso"), at("r1", "uid 1", 2), false)
+            .unwrap();
+        let notes = |n: &str| MediumEdit {
+            notes: Some(n.into()),
+            ..MediumEdit::default()
+        };
+        let stale = |db: &Db, seen: &str| {
+            let audits = db.audits(None, 100).unwrap().len();
+            let before = db.medium(A).unwrap().unwrap();
+            let edit = db.edit_medium(A, &notes("late"), Some(seen), "uid 9", 9);
+            assert!(edit.unwrap_err().downcast_ref::<Stale>().is_some());
+            let removal = db.remove_medium(A, Some(seen), "uid 9", 9);
+            assert!(removal.unwrap_err().downcast_ref::<Stale>().is_some());
+            assert_eq!(db.medium(A).unwrap().unwrap(), before);
+            assert_eq!(db.audits(None, 100).unwrap().len(), audits);
+        };
+        let seen = db.medium(A).unwrap().unwrap().revision().unwrap();
+        db.edit_medium(A, &notes("first"), Some(&seen), "uid 2", 3)
+            .unwrap()
+            .unwrap();
+        stale(&db, &seen);
+        let seen = db.medium(A).unwrap().unwrap().revision().unwrap();
+        db.approve_medium(A, true, "uid 3", 4).unwrap();
+        stale(&db, &seen);
+        let seen = db.medium(A).unwrap().unwrap().revision().unwrap();
+        db.add_medium(A, row("ws2025.iso"), at("r2", "uid 4", 5), false)
+            .unwrap();
+        stale(&db, &seen);
+        let seen = db.medium(A).unwrap().unwrap().revision().unwrap();
+        assert!(
+            db.remove_medium(A, Some(&seen), "uid 5", 6)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -912,6 +1069,8 @@ mod tests {
             };
             assert!(info.check().is_err(), "{bad}");
         }
+        assert_eq!(days_of("1970-01-01"), Some(0));
+        assert_eq!(days_of("2026-11-10"), Some(20_767));
         let mut info = MediumInfo {
             sources: vec!["ftp://x".into()],
             ..MediumInfo::default()

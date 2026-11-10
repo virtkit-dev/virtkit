@@ -1103,7 +1103,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
         Call::ShowMedium { medium } => serde_json::to_value(hub.db.resolve_medium(&medium)?)?,
         Call::EditMedium { medium, edit } => {
             let sha = hub.db.resolve_medium(&medium)?.sha256;
-            serde_json::to_value(crate::media::edit(hub, &actor, &sha, &edit)?)?
+            serde_json::to_value(crate::media::edit(hub, &actor, &sha, &edit, None)?)?
         }
         Call::ApproveMedium { medium, approve } => {
             let sha = hub.db.resolve_medium(&medium)?.sha256;
@@ -1111,7 +1111,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
         }
         Call::RemoveMedium { medium } => {
             let sha = hub.db.resolve_medium(&medium)?.sha256;
-            serde_json::to_value(crate::media::remove(hub, &actor, &sha)?)?
+            serde_json::to_value(crate::media::remove(hub, &actor, &sha, None)?)?
         }
         Call::RemoveTools { tools } => {
             let tools = hub.db.resolve_tools(&tools)?;

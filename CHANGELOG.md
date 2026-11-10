@@ -20,6 +20,10 @@ All notable changes to virtkit will be documented in this file.
   ISO to the fleet's registry for Windows builds and approves it for jobs. `vk-hub media`
   lists and edits its description, source and licence.
 
+- **Manage install media from the hub's web UI.** A Media tab shows what each medium installs,
+  when its licence must be renewed and whether jobs may use it; operators describe, approve
+  and remove media from the browser.
+
 ## [0.108.4] - 2026-11-11
 
 ### Fixed

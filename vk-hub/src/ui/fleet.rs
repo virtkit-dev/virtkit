@@ -301,6 +301,12 @@ pub(super) async fn get(
     if let Some(sha256) = super::tools::detail_target(path) {
         return Ok(Some(super::tools::detail(auth, ui, sha256).await?));
     }
+    if path == super::media::PATH {
+        return Ok(Some(super::media::list(auth, ui).await?));
+    }
+    if let Some(sha256) = super::media::detail_target(path) {
+        return Ok(Some(super::media::detail(auth, ui, sha256).await?));
+    }
     if path == UPDATES_PATH {
         let steer = auth.session.role >= Role::Operator;
         let parts = blocking(move || read_updates(&hub, steer, now)).await?;
@@ -1007,6 +1013,7 @@ fn nav(users: bool, gitlabs: &[String]) -> Vec<pages::Section> {
                     ..tab(super::registries::PATH, "Storage")
                 },
                 tab(UPDATES_PATH, "Updates"),
+                tab(super::media::PATH, "Media"),
                 tab(ROLLOUTS_PATH, "Rollouts"),
                 tab(super::settings::PATH, "Settings"),
             ],

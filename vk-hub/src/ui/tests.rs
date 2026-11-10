@@ -3654,6 +3654,7 @@ async fn releases_and_rollouts_are_shown_live() {
         "<nav class=\"subnav\" aria-label=\"Fleet\"><a href=\"/\">Compute</a>\
          <a href=\"/registries\">Storage</a>\
          <a href=\"/updates\" aria-current=\"page\">Updates</a>\
+         <a href=\"/media\">Media</a>\
          <a href=\"/updates/rollouts\">Rollouts</a>\
          <a href=\"/settings\">Settings</a></nav>",
         "sse-connect=\"/events/updates\"",
@@ -14081,4 +14082,178 @@ async fn a_ci_tools_definition_s_page_shows_its_nodes_files_and_network() {
     );
     assert!(hub.db.tools(&spare).unwrap().is_none());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Install media: the list and a medium's page for any viewer, everything said of it and
+/// where it is; an operator edits it, approves it and withdraws approval, and removes it once
+/// confirmed; a viewer can do none of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn install_media_are_listed_described_and_kept_by_operators() {
+    use crate::store::{LicenseKind, Location, MediumInfo, MediumKind, MediumRow};
+    let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let origin = format!("http://{addr}");
+    let hub = Arc::new(Hub::new(
+        Arc::new(Db::open_memory().unwrap()),
+        Some(origin.clone()),
+    ));
+    tokio::spawn(serve(
+        listener,
+        None,
+        Arc::new(Ui::new(hub.clone(), &origin)),
+    ));
+    let sha = "d0ef4502e350e3c6c53c15b1b3020d38a5ded011bf04998e950720ac8579b23d";
+    let row = MediumRow {
+        file_name: "ws2025-eval-en-us.iso".into(),
+        size: 6_014_152_704,
+        volume_label: Some("SSS_X64FREE_EN-US_DV9".into()),
+        added_at: crate::now_secs(),
+        added_by: "uid 0".into(),
+        edited_at: None,
+        edited_by: None,
+        info: MediumInfo {
+            kind: MediumKind::Windows,
+            product: "Windows Server 2025".into(),
+            build: "26100.1742".into(),
+            license: LicenseKind::Evaluation,
+            sources: vec!["https://go.microsoft.com/fwlink/?linkid=2293312".into()],
+            expires: "2000-01-01".into(),
+            notes: "<script>alert(1)</script>".into(),
+            ..MediumInfo::default()
+        },
+        locations: Vec::new(),
+    };
+    let at = Location {
+        registry: "9c2f4e1a7b3d5e60f1a2b3c4d5e6f708".into(),
+        under: Some("build-cache".into()),
+        name: "ws2025-eval-en-us.iso".into(),
+        manifest: format!("sha256:{}", "0".repeat(64)),
+        at: crate::now_secs(),
+        by: "uid 0".into(),
+    };
+    hub.db.add_medium(sha, row, at, false).unwrap();
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/media", Some(&viewer)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    for want in [
+        "ws2025-eval-en-us.iso",
+        "Windows Server 2025 26100.1742",
+        "Evaluation",
+        "not approved",
+        "days ago",
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    let path = super::media::detail_path(sha);
+    let page = get(addr, &path, Some(&viewer)).await;
+    for want in [
+        "SSS_X64FREE_EN-US_DV9",
+        "href=\"https://go.microsoft.com/fwlink/?linkid=2293312\"",
+        "build-cache/files/win-media:ws2025-eval-en-us.iso",
+        "&lt;script&gt;alert(1)&lt;/script&gt;",
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    assert!(!page.body.contains("<script>alert"), "{}", page.body);
+    assert!(
+        !page.body.contains(&format!("{path}/edit")),
+        "{}",
+        page.body
+    );
+
+    let post = |cookie: String, op: &'static str, body: String| {
+        let origin = origin.clone();
+        let path = format!("{path}/{op}");
+        async move {
+            request(
+                addr,
+                "POST",
+                &path,
+                &[
+                    "Content-Type: application/x-www-form-urlencoded",
+                    &format!("Cookie: {cookie}"),
+                    &format!("Origin: {origin}"),
+                ],
+                &body,
+            )
+            .await
+        }
+    };
+    let reply = post(viewer.clone(), "approve", format!("_csrf={viewer_csrf}")).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let reply = post(operator.clone(), "approve", format!("_csrf={csrf}")).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert!(hub.db.medium(sha).unwrap().unwrap().approved);
+    let was = hidden(&get(addr, &path, Some(&operator)).await.body, "was");
+    let edit = format!(
+        "_csrf={csrf}&was={was}&kind=windows&product=Windows+Server+2025&edition=Datacenter\
+         &license=evaluation&notes=Rearm+once%0D%0Athen+replace&sources=https%3A%2F%2Fa%2Fb\
+         &expires=2027-05-08"
+    );
+    let reply = post(operator.clone(), "edit", edit.clone()).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    // A form from before that edit is stale.
+    let reply = post(operator.clone(), "edit", edit).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    let m = hub.db.medium(sha).unwrap().unwrap();
+    assert_eq!(m.row.info.edition, "Datacenter");
+    assert_eq!(m.row.info.notes, "Rearm once\nthen replace");
+    assert_eq!(
+        m.row.info.build, "",
+        "a field left out of the form is cleared"
+    );
+    let was = hidden(&get(addr, &path, Some(&operator)).await.body, "was");
+    let reply = post(
+        operator.clone(),
+        "edit",
+        format!("_csrf={csrf}&was={was}&expires=someday"),
+    )
+    .await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    let reply = post(operator.clone(), "unapprove", format!("_csrf={csrf}")).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert!(!hub.db.medium(sha).unwrap().unwrap().approved);
+    // Removal is asked first.
+    let reply = post(operator.clone(), "remove", format!("_csrf={csrf}")).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(reply.body.contains("Forget this medium"), "{}", reply.body);
+    assert!(hub.db.medium(sha).unwrap().is_some());
+    let answer_of = |body: &str| {
+        format!(
+            "_csrf={csrf}&op=remove&medium={}&nonce={}&confirm=yes",
+            hidden(body, "medium"),
+            hidden(body, "nonce")
+        )
+    };
+    // Approved meanwhile: the medium is no longer as asked about.
+    let answer = answer_of(&reply.body);
+    let approved = post(operator.clone(), "approve", format!("_csrf={csrf}")).await;
+    assert_eq!(approved.status, 303, "{}", approved.body);
+    let reply = post(operator.clone(), "remove", answer).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(hub.db.medium(sha).unwrap().is_some());
+    let reply = post(operator.clone(), "remove", format!("_csrf={csrf}")).await;
+    let answer = answer_of(&reply.body);
+    // Not by a viewer, nor with another session's token.
+    let reply = post(viewer.clone(), "remove", answer.clone()).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let reply = post(
+        operator.clone(),
+        "remove",
+        answer.replace(&csrf, &viewer_csrf),
+    )
+    .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let reply = post(operator.clone(), "remove", answer.clone()).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert!(hub.db.medium(sha).unwrap().is_none());
+    // An answer counts once.
+    let reply = post(operator.clone(), "remove", answer).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+
+    let audit = hub.db.audits(None, 50).unwrap();
+    for want in ["edited medium d0ef4502e350", "set executor.windows_media"] {
+        assert!(audit.iter().any(|a| a.event.contains(want)), "{want}");
+    }
 }
