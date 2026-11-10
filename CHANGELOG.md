@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A service or job booting its image's own kernel (`kernel: image`) no longer needs
+  decompressors on the host.** gzip, xz and zstd kernels boot without them, fixing Debian
+  kernel boots on nodes without xz-utils. lz4 and bzip2 kernels are rejected with an error
+  naming the format.
+
 ## [0.108.2] - 2026-11-10
 
 ### Fixed

@@ -41,6 +41,7 @@ sha2.workspace = true
 fastcdc.workspace = true
 zstd.workspace = true
 lzma-rs.workspace = true
+lzma-rust2.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util", "signal"] }
 tokio-util = { workspace = true, features = ["io-util"] }
 toml.workspace = true
@@ -76,6 +77,8 @@ default-features = false
 features = ["blk", "net", "snapshot", "tpm", "uefi-vars"]
 
 [dev-dependencies]
+# Writes the BCJ-filtered xz payloads the kernel extraction tests decode.
+lzma-rust2 = { workspace = true, features = ["encoder"] }
 # `vk node`: ed25519 signatures its tests check.
 ring.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

@@ -169,6 +169,10 @@ zstd = "0.14"
 # so it needs no C liblzma and the binary stays musl-static (zstd/gz are covered by the
 # crates above).
 lzma-rs = "0.3"
+# The xz payload of a distribution kernel (bzImage) uses the x86 BCJ filter, which lzma-rs
+# does not decode: lzma-rust2 does, in pure Rust too. The decoder alone ("encoder" is for
+# tests).
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz"] }
 # tokio features are member-specific; only the version is pinned here.
 tokio = { version = "1" }
 # vk-gitlab notes SIGTERM and SIGINT the moment they arrive, beside tokio's own handling

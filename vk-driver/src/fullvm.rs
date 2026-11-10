@@ -171,7 +171,7 @@ const MAX_KERNEL_BYTES: u64 = 256 << 20;
 const MAX_MODULE_BYTES: u64 = 64 << 20;
 /// Maximum `modules.dep` size.
 const MAX_TEXT_BYTES: u64 = 16 << 20;
-/// The most compressed-payload candidates tried in a kernel image, each a codec process: a real
+/// The most compressed-payload candidates tried in a kernel image, each a decompression: a real
 /// bzImage holds one payload and few stray magics before it.
 const MAX_PAYLOAD_CANDIDATES: usize = 16;
 
@@ -205,30 +205,15 @@ const ELF_MAGIC: &[u8] = &[0x7f, 0x45, 0x4c, 0x46];
 /// Reduce a distro kernel image to a bare ELF `vmlinux`. If `image` is already ELF
 /// it is returned as-is; otherwise it is a bzImage whose payload is a compressed
 /// vmlinux — scan for a known compression magic and decompress from there with the
-/// matching decompressor, accepting the first result that is an ELF. This mirrors
-/// the kernel tree's `scripts/extract-vmlinux`, including shelling out to the codec
-/// CLIs: a kernel's xz payload uses the x86 BCJ filter, which the host `xz` handles
-/// but pure-Rust decoders do not, so a codec binary on PATH is required.
+/// matching decoder, accepting the first result that is an ELF. This mirrors the
+/// kernel tree's `scripts/extract-vmlinux`, with the decoders built in: gzip, xz and
+/// zstd, which cover the distributions' kernels.
 fn extract_vmlinux(image: &[u8]) -> Result<Vec<u8>> {
     if image.starts_with(ELF_MAGIC) {
         return Ok(image.to_vec());
     }
-    // (magic, argv) in the order extract-vmlinux probes them. Each command reads the
-    // compressed tail on stdin and writes the plain vmlinux on stdout; a trailing
-    // byte tail after the stream is expected, so single-stream/lenient modes are used.
-    const CODECS: &[(&[u8], &[&str])] = &[
-        (&[0x1f, 0x8b, 0x08], &["gzip", "-dc"]),
-        (
-            &[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00],
-            &["xz", "-dc", "--single-stream"],
-        ),
-        (&[0x28, 0xb5, 0x2f, 0xfd], &["zstd", "-q", "-d", "-c"]),
-        (&[0x02, 0x21, 0x4c, 0x18], &["lz4", "-d", "-c"]),
-        (&[0x42, 0x5a, 0x68], &["bzip2", "-dc"]),
-    ];
-    let mut tried_any = false;
     let mut candidates = 0;
-    for (magic, argv) in CODECS {
+    for (magic, codec) in CODECS {
         let mut from = 0;
         while let Some(off) = find_subslice(&image[from..], magic) {
             if candidates == MAX_PAYLOAD_CANDIDATES {
@@ -239,77 +224,74 @@ fn extract_vmlinux(image: &[u8]) -> Result<Vec<u8>> {
             }
             candidates += 1;
             let at = from + off;
-            match pipe_through(argv, &image[at..], MAX_KERNEL_BYTES) {
-                Ok(out) if out.starts_with(ELF_MAGIC) => return Ok(out),
-                Ok(_) => {}
-                Err(PipeError::Spawn) => break, // codec not installed: skip this magic
-                Err(PipeError::Run) => tried_any = true,
+            if let Some(out) = decode_payload(*codec, &image[at..], MAX_KERNEL_BYTES)
+                && out.starts_with(ELF_MAGIC)
+            {
+                return Ok(out);
             }
             from = at + 1;
         }
     }
-    if tried_any {
+    if let Some((_, name)) = UNSUPPORTED_CODECS
+        .iter()
+        .find(|(magic, _)| find_subslice(image, magic).is_some())
+    {
         bail!(
-            "found a compressed payload in the kernel image but no decompressor \
-             produced an ELF vmlinux"
+            "could not extract an ELF vmlinux: the kernel image looks {name}-compressed, \
+             which vk does not decompress (gzip, xz and zstd only)"
         );
     }
     bail!(
-        "could not extract an ELF vmlinux: no gzip/xz/zstd/lz4/bzip2 payload found, \
-         or the matching decompressor is not installed (install xz-utils for a \
-         Debian kernel)"
+        "could not extract an ELF vmlinux: no gzip, xz or zstd payload in the kernel image \
+         decompresses to ELF"
     );
 }
 
-enum PipeError {
-    /// The codec binary is not on PATH.
-    Spawn,
-    /// The codec ran but failed / produced nothing useful.
-    Run,
+/// A supported kernel compression format.
+#[derive(Clone, Copy, Debug)]
+enum Codec {
+    Gzip,
+    Xz,
+    Zstd,
 }
 
-/// Run `argv` (argv[0] = program), feeding `input` on stdin and returning stdout, killing
-/// the program once stdout passes `max` bytes. The decompressor's exit status is ignored — a
-/// bzImage's compressed stream is followed by a small trailer, so a codec that flags trailing
-/// data still emits the full vmlinux (matching `extract-vmlinux`); the caller validates the
-/// ELF magic.
-fn pipe_through(argv: &[&str], input: &[u8], max: u64) -> std::result::Result<Vec<u8>, PipeError> {
-    use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
+/// The payloads vk decompresses, by magic, in the order extract-vmlinux probes them.
+const CODECS: &[(&[u8], Codec)] = &[
+    (&[0x1f, 0x8b, 0x08], Codec::Gzip),
+    (&[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00], Codec::Xz),
+    (&[0x28, 0xb5, 0x2f, 0xfd], Codec::Zstd),
+];
 
-    let mut child = Command::new(argv[0])
-        .args(&argv[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| PipeError::Spawn)?;
-    // Write on a thread so a codec that starts emitting before consuming all input
-    // cannot deadlock on full pipe buffers.
-    let mut stdin = child.stdin.take().expect("stdin piped");
-    let input = input.to_vec();
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&input);
-        // drop closes the pipe (EOF for the child)
-    });
+/// The other formats a kernel may be compressed with, named in the error when only they match.
+const UNSUPPORTED_CODECS: &[(&[u8], &str)] = &[
+    (&[0x02, 0x21, 0x4c, 0x18], "lz4"),
+    (&[0x42, 0x5a, 0x68], "bzip2"),
+];
+
+/// Decompress the payload at the start of `input`, retaining output on decoder errors:
+/// a bzImage's small trailer can cause an error after the full vmlinux is decoded.
+/// The caller checks the ELF magic. Return `None` for empty output or output over `max` bytes.
+fn decode_payload(codec: Codec, input: &[u8], max: u64) -> Option<Vec<u8>> {
+    let out = match codec {
+        Codec::Gzip => read_lenient(flate2::read::GzDecoder::new(input), max)?,
+        Codec::Zstd => read_lenient(
+            zstd::stream::read::Decoder::new(input).ok()?.single_frame(),
+            max,
+        )?,
+        // A kernel's xz stream uses the x86 BCJ filter, which lzma-rs (the modules') does
+        // not decode.
+        Codec::Xz => read_lenient(lzma_rust2::XzReader::new(input, false), max)?,
+    };
+    (!out.is_empty()).then_some(out)
+}
+
+/// Read until EOF or the first error, retaining output up to `max` bytes.
+/// Return `None` if output exceeds `max`.
+fn read_lenient(r: impl std::io::Read, max: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
     let mut out = Vec::new();
-    let read = child
-        .stdout
-        .take()
-        .expect("stdout piped")
-        .take(max.saturating_add(1))
-        .read_to_end(&mut out);
-    let over = out.len() as u64 > max;
-    if over {
-        let _ = child.kill();
-    }
-    // Reaped whatever happened; the writer then sees EOF or EPIPE and returns.
-    let _ = child.wait();
-    let _ = writer.join();
-    if read.is_err() || over || out.is_empty() {
-        return Err(PipeError::Run);
-    }
-    Ok(out)
+    let _ = r.take(max.saturating_add(1)).read_to_end(&mut out);
+    (out.len() as u64 <= max).then_some(out)
 }
 
 /// First offset of `needle` within `haystack`, if any.
@@ -573,23 +555,70 @@ kernel/net/vmw_vsock/vsock.ko.gz:
         }
     }
 
-    /// A codec whose output passes the cap is killed and its output refused.
+    /// A fake vmlinux: the ELF magic, then x86 call and jump opcodes, which the BCJ filter
+    /// rewrites, so a decoder that skipped the filter would return other bytes.
+    fn fake_vmlinux() -> Vec<u8> {
+        let mut elf = ELF_MAGIC.to_vec();
+        for i in 0u32..4096 {
+            elf.push(if i % 2 == 0 { 0xe8 } else { 0xe9 });
+            elf.extend_from_slice(&(i * 7).to_le_bytes());
+            elf.extend_from_slice(b"\x90\x90\xc3");
+        }
+        elf
+    }
+
+    /// Wrap `payload` in a bzImage setup stub and trailer.
+    fn fake_bzimage(payload: &[u8]) -> Vec<u8> {
+        let mut image = b"MZ setup stub, no payload magic here".to_vec();
+        image.extend_from_slice(payload);
+        image.extend_from_slice(&[0x00, 0x10, 0x3a, 0x01, 0xde, 0xad, 0xbe, 0xef]);
+        image
+    }
+
+    fn xz_bcj(plain: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut options = lzma_rust2::XzOptions::with_preset(6);
+        options.prepend_pre_filter(lzma_rust2::FilterType::BcjX86, 0);
+        let mut w = lzma_rust2::XzWriter::new(Vec::new(), options).unwrap();
+        w.write_all(plain).unwrap();
+        w.finish().unwrap()
+    }
+
+    /// Each built-in decoder extracts the vmlinux from a bzImage, its trailer included; the
+    /// xz payload carries the x86 BCJ filter, as a Debian kernel's does.
     #[test]
-    fn pipe_through_stops_at_its_cap() {
-        let input = vec![b'x'; 64 << 10];
-        let max = input.len() as u64;
-        assert_eq!(
-            pipe_through(&["cat"], &input, max).ok(),
-            Some(input.clone())
-        );
-        assert!(matches!(
-            pipe_through(&["cat"], &input, max - 1),
-            Err(PipeError::Run)
-        ));
-        assert!(matches!(
-            pipe_through(&["yes"], b"", max),
-            Err(PipeError::Run)
-        ));
+    fn extract_vmlinux_decodes_each_payload() {
+        use std::io::Write;
+        let plain = fake_vmlinux();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&plain).unwrap();
+        let gz = gz.finish().unwrap();
+        let zst = zstd::encode_all(&plain[..], 0).unwrap();
+        for (name, payload) in [("gzip", gz), ("xz", xz_bcj(&plain)), ("zstd", zst)] {
+            assert_eq!(
+                extract_vmlinux(&fake_bzimage(&payload)).unwrap(),
+                plain,
+                "{name}"
+            );
+        }
+    }
+
+    /// Accept output at the cap; reject output above it.
+    #[test]
+    fn decode_payload_stops_at_its_cap() {
+        let plain = fake_vmlinux();
+        let max = plain.len() as u64;
+        let payload = xz_bcj(&plain);
+        assert_eq!(decode_payload(Codec::Xz, &payload, max), Some(plain));
+        assert_eq!(decode_payload(Codec::Xz, &payload, max - 1), None);
+    }
+
+    /// A kernel compressed only in a format vk does not decode names that format.
+    #[test]
+    fn extract_vmlinux_names_an_unsupported_format() {
+        let image = fake_bzimage(&[0x02, 0x21, 0x4c, 0x18, 1, 2, 3, 4]);
+        let err = extract_vmlinux(&image).unwrap_err().to_string();
+        assert!(err.contains("lz4"), "{err}");
     }
 
     #[test]
