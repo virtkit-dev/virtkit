@@ -60,6 +60,7 @@ pub(crate) mod keys;
 pub mod lock;
 pub mod oidc;
 pub mod relay;
+pub(crate) mod staging;
 pub(crate) mod tags;
 pub(crate) mod upload;
 
@@ -554,7 +555,7 @@ impl Store {
     }
 
     /// A private staging file under `uploads/` for a body whose digest is only known once it
-    /// has been read — the WebDAV `PUT`. [`Store::stage_promotion`] and
+    /// has been read, such as a WebDAV `PUT`'s. [`Store::stage_promotion`] and
     /// [`Store::promote_staged`] install it; one a crash leaves behind is swept with the
     /// idle uploads by [`Store::gc`].
     pub(crate) fn stage_file(&self) -> Result<(PathBuf, std::fs::File)> {

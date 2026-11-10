@@ -6,24 +6,21 @@
 //! so `files/<dir>/*` covers a whole tree. Entries expire under gc's tag retention and blob
 //! grace windows.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
-use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, LAST_MODIFIED};
 use hyper::{Request, Response, StatusCode};
-use sha2::{Digest, Sha256};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use super::{
     ALLOWED_FILES, ALLOWED_READ, Depth, Entry, blocking, created, href, http_date,
     method_not_allowed, multistatus, no_content, not_found, options, propfind_depth, refuse,
 };
-use crate::{Authz, Body, RepoRemoval, STREAM_CHUNK, ServerState, Store, accounts, error_response};
+use crate::staging::{DrainError, Staging, drain_into};
+use crate::{Authz, Body, RepoRemoval, ServerState, Store, accounts, error_response};
 
 /// The repository every `/dav/files/` path lives under.
 pub(super) const FILES_REPO: &str = "files";
@@ -419,31 +416,6 @@ fn propfind(
     }
 }
 
-/// Why a streamed `PUT` stopped short.
-enum PutError {
-    /// the body crossed [`MAX_OBJECT`] — a 413, decided while reading
-    TooLarge,
-    /// the read or the write failed — a 500
-    Failed(anyhow::Error),
-}
-
-/// A staging file under `uploads/`, unlinked when dropped unless its bytes were promoted —
-/// including when the handler's future is dropped with the connection mid-body.
-struct Staging {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl Drop for Staging {
-    fn drop(&mut self) {
-        if self.armed {
-            // Gone already (a promotion that renamed it, or a discard) is the goal; any
-            // other failure leaves it to the gc's sweep of idle uploads.
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
 /// Why `segs` cannot take an object, re-checked under [`NAMESPACE`] before the tag is
 /// written: a top-level name or a directory is 405, a foreign tag there or any tag above
 /// it 409. `None` when the `PUT` may proceed.
@@ -503,24 +475,24 @@ async fn put(
 
     // Stream uploads to bound memory use; the digest falls out of the same pass.
     let (path, file) = state.store.stage_file()?;
-    let staging = Staging { path, armed: true };
+    let staging = Staging::new(path);
     let mut file = tokio::fs::File::from_std(file);
     let written = drain_into(&mut file, req.into_body(), MAX_OBJECT).await;
     let flushed = file
         .flush()
         .await
-        .map_err(|e| PutError::Failed(anyhow::Error::from(e).context("writing an object")));
+        .map_err(|e| DrainError::Failed(anyhow::Error::from(e).context("writing an object")));
     drop(file);
     let (size, hex) = match written.and_then(|w| flushed.map(|()| w)) {
         Ok(w) => w,
-        Err(PutError::TooLarge) => {
+        Err(DrainError::OverCap) => {
             return Ok(error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "TOOBIG",
                 href,
             ));
         }
-        Err(PutError::Failed(e)) => return Err(e),
+        Err(DrainError::Failed(e)) => return Err(e),
     };
 
     // Off the runtime: staging compresses, and a large object would otherwise block a tokio
@@ -530,7 +502,7 @@ async fn put(
     let href = href.to_string();
     tokio::task::spawn_blocking(move || -> Result<Response<Body>> {
         let mut staging = staging;
-        let staged = store.stage_promotion(&hex, &staging.path)?;
+        let staged = store.stage_promotion(&hex, staging.path())?;
         let _namespace = namespace(&store)?;
         // shared store lock (vs. an exclusive gc) across the promote and the manifest that
         // references it; see Store::lock_shared. A `MKCOL` or another `PUT` may have changed
@@ -551,7 +523,7 @@ async fn put(
             }
         };
         store.promote_staged(&hex, staged)?;
-        staging.armed = false;
+        staging.disarm();
         let (repo, tag) = object_of(&segs).context("a PUT past its checks names an object")?;
         store.put_raw_file(&repo, tag, &hex, size, None)?;
         Ok(if existed { no_content() } else { created() })
@@ -565,12 +537,12 @@ async fn put(
 pub(super) async fn drain(req: Request<Incoming>, href: &str) -> Result<Option<Response<Body>>> {
     match drain_into(&mut tokio::io::sink(), req.into_body(), MAX_OBJECT).await {
         Ok(_) => Ok(None),
-        Err(PutError::TooLarge) => Ok(Some(error_response(
+        Err(DrainError::OverCap) => Ok(Some(error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "TOOBIG",
             href,
         ))),
-        Err(PutError::Failed(e)) => Err(e),
+        Err(DrainError::Failed(e)) => Err(e),
     }
 }
 
@@ -587,52 +559,6 @@ pub(super) async fn drain_then(
 /// not a collection, or the resource is not a plain file.
 fn parent_is_object(href: &str) -> Response<Body> {
     error_response(StatusCode::CONFLICT, "DENIED", href)
-}
-
-/// Stream `body` to `out`, coalescing small frames and enforcing `cap`, including for chunked
-/// bodies; `(bytes written, sha256 hex)` on success. `out` may be a sink when draining a
-/// rejected PUT. The generic body allows tests with a small cap.
-async fn drain_into<B>(
-    out: &mut (impl AsyncWrite + Unpin),
-    mut body: B,
-    cap: u64,
-) -> std::result::Result<(u64, String), PutError>
-where
-    B: hyper::body::Body<Data = Bytes> + Unpin,
-    B::Error: std::error::Error + Send + Sync + 'static,
-{
-    let mut buf: Vec<u8> = Vec::with_capacity(STREAM_CHUNK);
-    let mut hasher = Sha256::new();
-    let mut total: u64 = 0;
-    let io = |e: std::io::Error| PutError::Failed(anyhow::Error::from(e).context("writing"));
-    while let Some(frame) = body.frame().await {
-        let frame = frame
-            .map_err(|e| PutError::Failed(anyhow::Error::from(e).context("reading a PUT body")))?;
-        // Trailers carry no content; a body that has them simply ends after them.
-        let Ok(data) = frame.into_data() else {
-            continue;
-        };
-        total = total.saturating_add(data.len() as u64);
-        if total > cap {
-            return Err(PutError::TooLarge);
-        }
-        hasher.update(&data);
-        // A frame already worth a write goes straight out rather than through the
-        // coalescing buffer, which is there for the small ones.
-        if buf.is_empty() && data.len() >= STREAM_CHUNK {
-            out.write_all(&data).await.map_err(io)?;
-            continue;
-        }
-        buf.extend_from_slice(&data);
-        if buf.len() >= STREAM_CHUNK {
-            out.write_all(&buf).await.map_err(io)?;
-            buf.clear();
-        }
-    }
-    if !buf.is_empty() {
-        out.write_all(&buf).await.map_err(io)?;
-    }
-    Ok((total, crate::hex_of(&hasher.finalize())))
 }
 
 /// Create a directory — an empty repository — and its missing ancestors: 201, 405 when the
@@ -741,47 +667,6 @@ mod tests {
         assert!(!try_lock());
         drop(held);
         assert!(try_lock());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Verify the streaming size cap with a small limit and multiple frames, and the digest
-    /// of what went through.
-    #[tokio::test]
-    async fn a_body_over_the_cap_stops_being_written() {
-        let dir = std::env::temp_dir().join(format!("vk-reg-files-cap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("staged");
-
-        // Several frames, so the cap is crossed part way through rather than at the first.
-        let frames = || {
-            let chunks: Vec<std::result::Result<hyper::body::Frame<Bytes>, std::io::Error>> = (0
-                ..4)
-                .map(|_| Ok(hyper::body::Frame::data(Bytes::from(vec![1u8; 100]))))
-                .collect();
-            http_body_util::StreamBody::new(futures::stream::iter(chunks))
-        };
-
-        let mut file = tokio::fs::File::create(&path).await.unwrap();
-        assert!(matches!(
-            drain_into(&mut file, frames(), 250).await,
-            Err(PutError::TooLarge)
-        ));
-        drop(file);
-        // Refused where the count crossed, so the partial file is bounded by the cap plus
-        // the frame that crossed it — never the whole body.
-        let staged = std::fs::metadata(&path).unwrap().len();
-        assert!(staged <= 300, "wrote {staged} bytes past a 250-byte cap");
-
-        // Exactly at the cap is not over it, and the digest is the body's.
-        let mut file = tokio::fs::File::create(&path).await.unwrap();
-        let (n, hex) = drain_into(&mut file, frames(), 400).await.ok().unwrap();
-        file.flush().await.unwrap();
-        drop(file);
-        assert_eq!(n, 400);
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 400);
-        assert_eq!(hex, crate::sha256_hex_raw(&vec![1u8; 400]));
-
         let _ = std::fs::remove_dir_all(&dir);
     }
 
