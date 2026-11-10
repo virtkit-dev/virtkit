@@ -5327,6 +5327,25 @@ pub(crate) struct VmSession {
 /// Guest mountpoint of the build-context virtiofs share (for `COPY` from the context).
 pub(crate) const CONTEXT_MOUNT: &str = "/run/virtkit-context";
 
+/// Every host id, shown to the guest as root: a context's owners are those of whoever
+/// checked it out, and a build sees them as Docker does, root's.
+const CONTEXT_OWNERS: &str = "squash-host:0:0:4294967295";
+
+/// The read-only virtio-fs share of a build stage's context.
+fn context_share(ctx: &Path) -> crate::vmm::FsShare {
+    crate::vmm::FsShare {
+        tag: "context".into(),
+        host_dir: ctx.to_path_buf(),
+        read_only: true,
+        // Build stages are left out, as they are for reclaim: a stage guest reads the
+        // context once and dies, so the window would be paid for and never reused.
+        dax: None,
+        uid_map: vec![CONTEXT_OWNERS.into()],
+        gid_map: vec![CONTEXT_OWNERS.into()],
+        cache: crate::vmm::ShareCache::Auto,
+    }
+}
+
 /// A run switch's egress policy, as [`spawn_vm_switch`] takes it. With `file` set, the
 /// lists are empty and `restrict` is false.
 struct SwitchEgress<'a> {
@@ -5705,17 +5724,7 @@ pub(crate) async fn boot_session(
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
     if let Some(ctx) = context {
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS=context:{CONTEXT_MOUNT}"));
-        shares.push(crate::vmm::FsShare {
-            tag: "context".into(),
-            host_dir: ctx.to_path_buf(),
-            read_only: true,
-            // Build stages are left out, as they are for reclaim: a stage guest reads the
-            // context once and dies, so the window would be paid for and never reused.
-            dax: None,
-            uid_map: Vec::new(),
-            gid_map: Vec::new(),
-            cache: crate::vmm::ShareCache::Auto,
-        });
+        shares.push(context_share(ctx));
     }
 
     let mut switch: Option<Child> = None;

@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A build sees its context as root's, as under Docker.** `COPY` and `RUN --mount` from the
+  build context, or from a named build context, used to show the owners of the host checkout,
+  so the image and the stage key depended on the uid of the user who checked it out: hosts
+  whose runner user had another uid shared no stage cache, and a cache namespaced on
+  `DOCKER_STAGE_HASH` split per host. Stages that read the context rebuild once.
+
 ## [0.108.3] - 2026-11-10
 
 ### Fixed

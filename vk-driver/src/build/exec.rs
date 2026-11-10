@@ -2393,7 +2393,8 @@ impl Executor for MicroVm {
         std::fs::create_dir_all(&self.scratch)
             .with_context(|| format!("creating {}", self.scratch.display()))?;
         let ext4 = self.image_path(&label);
-        crate::ext4::build_from_dir(dir, &ext4)
+        // Root-owned, as the stage's own context is (see `run::context_share`).
+        crate::ext4::build_from_dir_root_owned(dir, &ext4)
             .with_context(|| format!("packing build context {name} ({})", dir.display()))?;
         self.images.lock().unwrap().insert(label.clone(), ext4);
         Ok(Rootfs { label })

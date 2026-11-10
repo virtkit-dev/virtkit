@@ -1927,7 +1927,6 @@ fn resolve_stages(
                 Instruction::Copy(c) => match &c.from {
                     None => {
                         let meta = SourceMeta {
-                            owner: c.chown.is_none(),
                             mode: c.chmod.is_none(),
                         };
                         Some(context_files_hash(&stage.context, &c.sources, meta))
@@ -4060,12 +4059,13 @@ fn kv(kvs: &[(String, String)], sep: char) -> String {
 }
 
 /// sha256 over the (sorted, `.dockerignore`-filtered) context entries a set of sources
-/// references — files' content, directories and symlinks, with each entry's kind, mode,
-/// ownership and link target — so the cache key tracks what the copy reproduces, not just
+/// references — files' content, directories and symlinks, with each entry's kind, mode and
+/// link target — so the cache key tracks what the copy reproduces, not just
 /// the instruction text. Drives both a context `COPY` (without `--from`) and a `RUN
 /// --mount=type=bind` from the context. Each source may be a file, a directory (recursed),
 /// or a trailing-segment glob (`dir/*.json`). Unreadable/absent sources contribute a marker.
-/// `meta` leaves out the ownership or permission bits a `--chown` or `--chmod` overrides.
+/// `meta` leaves out the permission bits a `--chmod` overrides. Owners are not hashed: a
+/// build sees every context file as root's (see `run::context_share`).
 fn context_files_hash(context: &Path, sources: &[String], meta: SourceMeta) -> String {
     use sha2::{Digest, Sha256};
     let ign = vk_core::dockerignore::Ignore::load(context);
@@ -4088,11 +4088,7 @@ fn context_files_hash(context: &Path, sources: &[String], meta: SourceMeta) -> S
                 } else {
                     md.mode() & libc::S_IFMT
                 };
-                if meta.owner {
-                    h.update(format!("{mode:o} {} {}\0", md.uid(), md.gid()).as_bytes());
-                } else {
-                    h.update(format!("{mode:o}\0").as_bytes());
-                }
+                h.update(format!("{mode:o}\0").as_bytes());
                 if md.file_type().is_symlink() {
                     match std::fs::read_link(f) {
                         Ok(target) => h.update(target.as_os_str().as_encoded_bytes()),
@@ -4113,20 +4109,15 @@ fn context_files_hash(context: &Path, sources: &[String], meta: SourceMeta) -> S
     hex(&h.finalize())
 }
 
-/// Which of its sources' metadata a copy carries into the image: `--chown` replaces every
-/// entry's owner and `--chmod` every entry's permission bits, so a key over the sources
-/// leaves out what those override.
+/// Which of its sources' metadata an instruction carries into the image: `--chmod` replaces
+/// every entry's permission bits, so a key over the sources leaves them out.
 #[derive(Clone, Copy)]
 struct SourceMeta {
-    owner: bool,
     mode: bool,
 }
 
 impl SourceMeta {
-    const ALL: Self = SourceMeta {
-        owner: true,
-        mode: true,
-    };
+    const ALL: Self = SourceMeta { mode: true };
 }
 
 /// ARG values exported to RUN, sorted by name. ENV shadows ARGs of the same name.
@@ -6226,31 +6217,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// `--chmod` and `--chown` replace the sources' mode bits and owner, so the key leaves
-    /// those out — and keeps the rest.
+    /// With --chmod, the key omits the mode bits; it keeps the rest.
     #[test]
-    fn context_hash_skips_what_chmod_and_chown_override() {
+    fn context_hash_skips_what_chmod_sets() {
         use std::os::unix::fs::PermissionsExt;
         let ctx = tmpdir("ctx-override");
         std::fs::write(ctx.join("tool"), b"#!/bin/sh\n").unwrap();
         let srcs = vec!["tool".to_string()];
-        let chmod = SourceMeta {
-            owner: true,
-            mode: false,
-        };
-        let chown = SourceMeta {
-            owner: false,
-            mode: true,
-        };
+        let chmod = SourceMeta { mode: false };
         let h = |meta| context_files_hash(&ctx, &srcs, meta);
 
-        let (all, chmodded, chowned) = (h(SourceMeta::ALL), h(chmod), h(chown));
-        assert_ne!(all, chowned, "--chown drops the owner");
+        let (all, chmodded) = (h(SourceMeta::ALL), h(chmod));
         std::fs::set_permissions(ctx.join("tool"), std::fs::Permissions::from_mode(0o4755))
             .unwrap();
-        assert_ne!(all, h(SourceMeta::ALL));
+        assert_ne!(all, h(SourceMeta::ALL), "the mode bits count");
         assert_eq!(chmodded, h(chmod), "--chmod drops the mode bits");
-        assert_ne!(chowned, h(chown), "--chown keeps the mode bits");
         std::fs::write(ctx.join("tool"), b"changed").unwrap();
         assert_ne!(chmodded, h(chmod), "--chmod keeps the content");
         let _ = std::fs::remove_dir_all(&ctx);

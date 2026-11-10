@@ -136,11 +136,24 @@ impl Node {
 
 /// Build an ext4 image at `out` from the directory tree at `src_dir`.
 pub fn build_from_dir(src_dir: &Path, out: &Path) -> Result<()> {
+    walk_dir(src_dir)?
+        .write_into(0, |size| raw_image_file(out, size))
+        .map(drop)
+}
+
+/// [`build_from_dir`] with every entry owned by root, whoever owns it on the host.
+pub fn build_from_dir_root_owned(src_dir: &Path, out: &Path) -> Result<()> {
+    let mut b = walk_dir(src_dir)?;
+    b.own_by_root();
+    b.write_into(0, |size| raw_image_file(out, size)).map(drop)
+}
+
+fn walk_dir(src_dir: &Path) -> Result<Tree> {
     let mut b = Tree::default();
     b.add_reserved();
     let root = b.walk(src_dir)?;
     debug_assert_eq!(root, ROOT_INO);
-    b.write_into(0, |size| raw_image_file(out, size)).map(drop)
+    Ok(b)
 }
 
 /// Filesystem identity stamped into the superblock. `uuid` (None = random) is set
@@ -1027,6 +1040,12 @@ impl Tree {
     }
 
     /// Recursively add `dir` as the root directory (inode 2) and return its ino.
+    fn own_by_root(&mut self) {
+        for n in &mut self.nodes {
+            (n.uid, n.gid) = (0, 0);
+        }
+    }
+
     fn walk(&mut self, dir: &Path) -> Result<u32> {
         self.add_dir(dir, ROOT_INO, ROOT_INO)
     }
@@ -2113,6 +2132,22 @@ pub(crate) fn fs_uuid(image: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_root_owned_tree_has_no_host_owner() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("ext4-root-owned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/f"), b"x").unwrap();
+        std::os::unix::fs::symlink("sub/f", dir.join("l")).unwrap();
+        let host = std::fs::metadata(&dir).unwrap().uid();
+        let mut t = super::walk_dir(&dir).unwrap();
+        assert!(host == 0 || t.nodes.iter().any(|n| n.uid == host));
+        t.own_by_root();
+        assert!(t.nodes.iter().all(|n| (n.uid, n.gid) == (0, 0)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn rd16(b: &[u8], o: usize) -> u16 {
