@@ -612,6 +612,14 @@ though within them it can claim protection.
 - **Minted by an admin.** `vk-hub registries token <id> --grant <prefix>=<rwl> [--pipeline
   <p>] [--ttl <d>]` mints a token for automation and tests. Its `sub` names the admin, not a
   job, and it carries a `pipeline` claim only when given one.
+- **Minted for the hub's own writes.** Uploading an install medium
+  ([fleet design](fleet-design.md#install-media)), the hub mints itself a token with `sub`
+  `hub:media`, for the target registry alone, granting write on the prefixes of the two
+  repositories the medium is tagged in (`[<path>/]files/sha256` and `[<path>/]files/win-media`;
+  without a path, `sha256` and `win-media`), for at most 12 hours, and streams the file to the
+  registry's file put (`PUT /files/<dir>/<name>`, vk-registry's `DESIGN.md`), over https or
+  plain http on loopback only. It needs no `[hub] allow` value: it is an ordinary write the
+  hub could already mint a token for.
 - **Audit.** The hub logs every token it issues, by `jti`, job or admin, registry and grants,
   never the token itself. The token is not stored with the job: the spec on the hub stays
   redacted.

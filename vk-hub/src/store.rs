@@ -51,6 +51,7 @@ mod egress_rules;
 mod gitlabs;
 mod jobs;
 mod keys;
+mod media;
 mod namespaces;
 mod observed;
 mod packed;
@@ -85,6 +86,12 @@ pub use keys::{
     ANY_POOL, ApiPrincipal, KeyOp, KeyPolicy, KeyRefused, KeyRow, KeysChanged, MAX_KEY_TTL,
     MAX_NAME, PrincipalKind, Scope, envelope_text, valid_name,
 };
+pub use media::{
+    Added as MediumAdded, LicenseKind, Location, Medium, MediumEdit, MediumInfo, MediumKind,
+    MediumRow,
+};
+#[cfg(test)]
+pub(crate) use media::{MAX_LOCATIONS, MAX_MEDIA};
 pub use namespaces::{
     CI_BUILD, CI_CACHE, CI_PIPELINE, NamespaceRow, Nodes, NsGrant, PLACEHOLDERS, parse_grants,
     prefix_retention, resolve, resolve_guest, resolve_node,
@@ -1039,6 +1046,8 @@ impl Db {
             .context("opening the jobs-by-admission table")?;
         txn.open_table(tools::TOOLS)
             .context("opening the tools table")?;
+        txn.open_table(media::MEDIA)
+            .context("opening the media table")?;
         txn.open_table(deploy::DEPLOY)
             .context("opening the tools builds table")?;
         txn.open_table(jobs::JOB_SPECS)

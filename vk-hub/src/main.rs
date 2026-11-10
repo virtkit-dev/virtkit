@@ -36,6 +36,7 @@ mod egress;
 mod fetch;
 mod jobs;
 mod local;
+mod media;
 mod ops;
 mod outputs;
 mod policy;
@@ -159,6 +160,18 @@ enum Cmd {
         config: ConfigArg,
         #[command(subcommand)]
         cmd: ToolsCmd,
+    },
+    /// Upload Windows install media to a registry, approve them for jobs, and keep what is
+    /// known of each: where it came from, what it installs, its licence
+    ///
+    /// An upload streams from the hub's host to the registry, which stores it as `vk
+    /// registry put --keep --dir win-media` does, where nodes' Windows builds fetch media by
+    /// digest. The registry must be connected, take hub tokens and have a URL bound.
+    Media {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: MediaCmd,
     },
     /// Roll a release out to the fleet, a wave at a time
     Rollout {
@@ -412,6 +425,144 @@ enum ToolsCmd {
         /// Its sha256, or at least the first 8 hex digits
         tools: String,
     },
+}
+
+#[derive(Subcommand)]
+enum MediaCmd {
+    /// Upload a medium, read by the hub, and approve it for jobs fleet-wide
+    ///
+    /// Its architecture, language, kind and, for virtio-win, product and version are read
+    /// from its volume label where the flags leave them out.
+    Add {
+        /// The file, readable by the hub's user
+        file: PathBuf,
+        /// The registry to upload to [default: the fleet-wide `registry` setting's, or the
+        /// only one that can take it]
+        #[arg(long)]
+        registry: Option<String>,
+        /// The repository path nodes' `[build] cache_registry` names past the registry's
+        /// host, if any, such as build-cache: where their Windows builds look for media
+        #[arg(long, value_name = "PATH")]
+        under: Option<String>,
+        /// The name to store it under [default: the file's]
+        #[arg(long)]
+        name: Option<String>,
+        /// Do not approve it for jobs
+        #[arg(long)]
+        no_approve: bool,
+        #[command(flatten)]
+        about: Box<MediumArgs>,
+    },
+    /// List the media the hub uploaded
+    List,
+    /// Show what is known of a medium
+    Show {
+        /// Its sha256, or at least the first 8 hex digits
+        medium: String,
+    },
+    /// Change what is said of a medium; an empty value clears a text field
+    Edit {
+        /// Its sha256, or at least the first 8 hex digits
+        medium: String,
+        #[command(flatten)]
+        about: Box<MediumArgs>,
+    },
+    /// Approve a medium for jobs fleet-wide
+    Approve {
+        /// Its sha256, or at least the first 8 hex digits
+        medium: String,
+    },
+    /// Withdraw a medium's fleet-wide approval
+    Unapprove {
+        /// Its sha256, or at least the first 8 hex digits
+        medium: String,
+    },
+    /// Forget a medium and withdraw its approval; registries keep their copies
+    Remove {
+        /// Its sha256, or at least the first 8 hex digits
+        medium: String,
+    },
+}
+
+/// What is said of a medium.
+#[derive(clap::Args)]
+struct MediumArgs {
+    /// windows, drivers or other
+    #[arg(long)]
+    kind: Option<String>,
+    /// Where it was downloaded from; repeat for the page and the link it led to
+    #[arg(long = "source", value_name = "URL")]
+    sources: Vec<String>,
+    /// Drop every source
+    #[arg(long, conflicts_with = "sources")]
+    no_sources: bool,
+    /// When it was downloaded, YYYY-MM-DD
+    #[arg(long)]
+    obtained: Option<String>,
+    /// What it installs, such as "Windows Server 2025" or "virtio-win"
+    #[arg(long)]
+    product: Option<String>,
+    /// Such as Datacenter, or Standard
+    #[arg(long)]
+    edition: Option<String>,
+    #[arg(long = "medium-version", value_name = "VERSION")]
+    version: Option<String>,
+    /// Such as 26100.1742
+    #[arg(long)]
+    build: Option<String>,
+    /// Such as en-us
+    #[arg(long)]
+    language: Option<String>,
+    /// Such as x64
+    #[arg(long)]
+    arch: Option<String>,
+    /// unknown, evaluation, volume, retail, oem, open-source or other
+    #[arg(long)]
+    license: Option<String>,
+    /// What the licence allows and requires, such as how long an installation may run
+    #[arg(long)]
+    license_terms: Option<String>,
+    /// How to renew or replace it
+    #[arg(long)]
+    renewal: Option<String>,
+    /// When it must be renewed or replaced by, YYYY-MM-DD
+    #[arg(long)]
+    expires: Option<String>,
+    #[arg(long)]
+    notes: Option<String>,
+}
+
+impl MediumArgs {
+    fn edit(self) -> Result<store::MediumEdit> {
+        Ok(store::MediumEdit {
+            kind: self
+                .kind
+                .as_deref()
+                .map(store::MediumKind::parse)
+                .transpose()?,
+            sources: if self.no_sources {
+                Some(Vec::new())
+            } else {
+                (!self.sources.is_empty()).then_some(self.sources)
+            },
+            obtained: self.obtained,
+            product: self.product,
+            edition: self.edition,
+            version: self.version,
+            build: self.build,
+            language: self.language,
+            arch: self.arch,
+            license: self
+                .license
+                .as_deref()
+                .map(store::LicenseKind::parse)
+                .transpose()?,
+            license_terms: self.license_terms,
+            renewal: self.renewal,
+            expires: self.expires,
+            notes: self.notes,
+        })
+    }
 }
 
 /// `--program`'s values: the programs the hub holds releases of.
@@ -1553,6 +1704,10 @@ async fn run(cli: Cli) -> Result<()> {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
             tools_cmd(client, cmd).await
         }
+        Cmd::Media { config, cmd } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            media_cmd(client, cmd).await
+        }
         Cmd::Rollout { config, cmd } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
             rollout_cmd(client, cmd).await
@@ -1810,6 +1965,161 @@ async fn tools_cmd(client: admin::Client, cmd: ToolsCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn media_cmd(client: admin::Client, cmd: MediaCmd) -> Result<()> {
+    match cmd {
+        MediaCmd::Add {
+            file,
+            registry,
+            under,
+            name,
+            no_approve,
+            about,
+        } => {
+            // Absolute, since the hub resolves it from its own working directory.
+            let file = std::path::absolute(&file)
+                .with_context(|| format!("resolving {}", file.display()))?;
+            let request = media::Request {
+                registry,
+                under,
+                name: name.unwrap_or_default(),
+                approve: !no_approve,
+                edit: (*about).edit()?,
+            };
+            let m =
+                tokio::task::spawn_blocking(move || client.add_medium(&file, request)).await??;
+            // The sha256 alone on stdout, so `$(vk-hub media add …)` captures it.
+            println!("{}", m.sha256);
+            eprintln!(
+                "vk-hub: uploaded {} ({} bytes){}",
+                m.row.file_name,
+                m.row.size,
+                if m.approved {
+                    "; approved for jobs fleet-wide"
+                } else {
+                    ""
+                }
+            );
+        }
+        MediaCmd::List => {
+            let media = tokio::task::spawn_blocking(move || client.media()).await??;
+            for m in media {
+                println!(
+                    "{}  {:<8}  {:>12}  {:<12}  {}  {}",
+                    m.sha256,
+                    m.kind.name(),
+                    m.size,
+                    if m.approved {
+                        "approved"
+                    } else {
+                        "not approved"
+                    },
+                    m.file_name,
+                    m.registries.join(",")
+                );
+            }
+        }
+        MediaCmd::Show { medium } => {
+            let m = tokio::task::spawn_blocking(move || client.medium(&medium)).await??;
+            print!("{}", render_medium(&m));
+        }
+        MediaCmd::Edit { medium, about } => {
+            let edit = (*about).edit()?;
+            let m =
+                tokio::task::spawn_blocking(move || client.edit_medium(&medium, edit)).await??;
+            print!("{}", render_medium(&m));
+        }
+        MediaCmd::Approve { medium } => {
+            let changed =
+                tokio::task::spawn_blocking(move || client.approve_medium(&medium, true)).await??;
+            if !changed {
+                eprintln!("vk-hub: already approved fleet-wide");
+            }
+        }
+        MediaCmd::Unapprove { medium } => {
+            let changed =
+                tokio::task::spawn_blocking(move || client.approve_medium(&medium, false))
+                    .await??;
+            if !changed {
+                eprintln!("vk-hub: not approved fleet-wide");
+            }
+        }
+        MediaCmd::Remove { medium } => {
+            let what = medium.clone();
+            match tokio::task::spawn_blocking(move || client.remove_medium(&medium)).await?? {
+                Some(m) => eprintln!(
+                    "vk-hub: removed medium {}; the registries holding it keep it",
+                    m.sha256
+                ),
+                None => bail!("there is no medium {what}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What `vk-hub media show` prints of `m`.
+fn render_medium(m: &store::Medium) -> String {
+    let i = &m.row.info;
+    let mut out = String::new();
+    let mut line = |k: &str, v: &str| {
+        if !v.is_empty() {
+            for (n, l) in v.lines().enumerate() {
+                let k = if n == 0 { k } else { "" };
+                out.push_str(&format!("{k:<15} {l}\n"));
+            }
+        }
+    };
+    line("sha256", &m.sha256);
+    line("name", &m.row.file_name);
+    line("size", &m.row.size.to_string());
+    line("kind", i.kind.label());
+    line(
+        "approved",
+        if m.approved { "yes, fleet-wide" } else { "no" },
+    );
+    line(
+        "volume label",
+        m.row.volume_label.as_deref().unwrap_or_default(),
+    );
+    line("product", &i.product);
+    line("edition", &i.edition);
+    line("version", &i.version);
+    line("build", &i.build);
+    line("language", &i.language);
+    line("arch", &i.arch);
+    line("license", i.license.label());
+    line("license terms", &i.license_terms);
+    line("renewal", &i.renewal);
+    line("expires", &i.expires);
+    for s in &i.sources {
+        line("source", s);
+    }
+    line("obtained", &i.obtained);
+    line(
+        "uploaded",
+        &format!("{} by {}", utc(m.row.added_at), m.row.added_by),
+    );
+    if let (Some(at), Some(by)) = (m.row.edited_at, &m.row.edited_by) {
+        line("edited", &format!("{} by {by}", utc(at)));
+    }
+    for l in &m.row.locations {
+        let under = l.under.as_ref().map_or(String::new(), |u| format!("{u}/"));
+        line(
+            "registry",
+            &format!(
+                "{}: {under}files/{}:{}, {} by {}",
+                l.registry,
+                media::DIR,
+                l.name,
+                utc(l.at),
+                l.by
+            ),
+        );
+    }
+    line("notes", &i.notes);
+    out
 }
 
 async fn rollout_cmd(client: admin::Client, cmd: RolloutCmd) -> Result<()> {

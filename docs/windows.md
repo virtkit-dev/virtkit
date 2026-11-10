@@ -143,7 +143,9 @@ build shares its layers as Linux build steps do (`wincache`):
   scope ([build caches](build-cache-design.md)), takes a medium outside its build context only
   when `[executor] windows_media` (also a [hub setting](fleet-design.md#hub-settings)) lists
   its sha256, whether fetched or already in the host's media cache: the file store holds
-  whatever anyone put there, and the job names the digest.
+  whatever anyone put there, and the job names the digest. In a fleet, `vk-hub media add
+  <iso>` puts a medium in the registry from the hub and approves it, keeping where it came
+  from and its licence ([install media](fleet-prototype.md#install-media)).
 - **Scopes.** Such a build keeps its installs, settled bases and layers in its local scope's
   cache, `<data>/windows/scopes/<scope>`, laid out as the host's own, and takes layers from
   its job's build cache, so no other project's or branch's build reuses them; media stay in

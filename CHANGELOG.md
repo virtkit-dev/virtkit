@@ -16,6 +16,10 @@ All notable changes to virtkit will be documented in this file.
   sha256 and with annotations. A registry streams two at a time, and refuses one its store
   has no room for before it starts.
 
+- **Upload Windows install media through the fleet hub.** `vk-hub media add <iso>` streams an
+  ISO to the fleet's registry for Windows builds and approves it for jobs. `vk-hub media`
+  lists and edits its description, source and licence.
+
 ## [0.108.4] - 2026-11-11
 
 ### Fixed

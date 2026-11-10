@@ -42,7 +42,7 @@ pub const SWEEP_EVERY: Duration = Duration::from_secs(3600);
 /// The signing keys, loaded as they are needed.
 pub struct Keys {
     dir: Option<PathBuf>,
-    max_token: Duration,
+    pub(crate) max_token: Duration,
     loaded: Mutex<BTreeMap<String, Arc<Signer>>>,
     /// Held across a sync, a rotation and a sweep, so that a key list computed before a
     /// rotation is never written after it.

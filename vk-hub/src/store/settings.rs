@@ -421,6 +421,18 @@ pub(super) fn set_in(
     Ok((true, steered))
 }
 
+/// The fleet-wide value of `key` in `table`, if set.
+pub(super) fn fleet_value(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: &str,
+) -> Result<Option<Value>> {
+    Ok(table
+        .get(FLEET)?
+        .map(|g| decode::<Layer>(g.value()))
+        .transpose()?
+        .and_then(|mut layer| layer.remove(key)))
+}
+
 /// [`Db::steer_settings`] in `txn`, audited as the hub's.
 fn steer_all_in(txn: &redb::WriteTransaction, now: u64) -> Result<Vec<String>> {
     let expanded = Expanded::read(txn)?;

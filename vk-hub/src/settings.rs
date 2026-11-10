@@ -56,7 +56,7 @@ pub fn steer(hub: &Hub) {
 }
 
 /// Send `nodes` the desired state the store just steered them to.
-fn sent(hub: &Hub, nodes: &[String]) {
+pub(crate) fn sent(hub: &Hub, nodes: &[String]) {
     for id in nodes {
         eprintln!("vk-hub: node {id}: the hub's settings for it changed");
         hub.kick(id);

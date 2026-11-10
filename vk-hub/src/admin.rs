@@ -1,7 +1,7 @@
-//! `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub tools`, `vk-hub rollout`,
-//! `vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub accounts`, `vk-hub keys`,
-//! `vk-hub jobs`, `vk-hub egress` and `vk-hub local login`, `sessions` and `logout` reach the
-//! running hub through a unix socket in its data directory.
+//! `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub tools`, `vk-hub media`,
+//! `vk-hub rollout`, `vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub accounts`,
+//! `vk-hub keys`, `vk-hub jobs`, `vk-hub egress` and `vk-hub local login`, `sessions` and
+//! `logout` reach the running hub through a unix socket in its data directory.
 //!
 //! Enrollment tokens admit machines to the fleet and must be issued outside the node-facing
 //! network; sign-in links must be issued outside the web UI. The CLI cannot open the database:
@@ -31,8 +31,8 @@ use crate::registries::RegistryView;
 use crate::rollout::{DeleteRule, Rollout, RolloutAction};
 use crate::server::Hub;
 use crate::store::{
-    AccountRow, AuditRow, JobRow, KeyPolicy, KeyRow, Program, Release, Role, TokenKind, Tools,
-    UiSession,
+    AccountRow, AuditRow, JobRow, KeyPolicy, KeyRow, Medium, Program, Release, Role, TokenKind,
+    Tools, UiSession,
 };
 use crate::target::TargetRow;
 use vk_hub_proto::registry::{
@@ -43,8 +43,8 @@ use vk_hub_proto::{Acquisition, Command, DesiredState, Operation};
 /// Bumped only for a change an older peer could misread.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Ceiling on a request: the largest is a hundred bytes or so.
-const MAX_REQUEST: u64 = 64 * 1024;
+/// Ceiling on a request: the largest, a medium's description at its bounds, is under 128 KiB.
+const MAX_REQUEST: u64 = 256 * 1024;
 
 /// Ceiling on a reply, for the client: a runaway guard, sized for a listing of a fleet far
 /// past its target size. Every node's workloads, which can pass it, are sent as counts
@@ -61,6 +61,10 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the CLI waits for a release or tools to be added: a gigabyte copied and hashed on
 /// a slow disk. An add retried after this ran out finds the release added and answers with it.
 const ADD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long the CLI waits for a medium to be uploaded: past the hub's own limit on one, the
+/// token's lifetime, so it hears how it ended.
+const MEDIA_WAIT: Duration = Duration::from_secs(crate::media::TOKEN_TTL.as_secs() + 5 * 60);
 
 /// How long the CLI waits for a fetch: past the hub's own limit on one, so it hears how it
 /// ended. A fetch goes on when the CLI stops waiting; the next finds the release held.
@@ -334,6 +338,28 @@ enum Call {
         version: String,
     },
     ListTools,
+    /// Upload the file at `path`, read by the hub, as an install medium; the path's bytes, so
+    /// one that is not UTF-8 crosses whole.
+    AddMedium {
+        path: Vec<u8>,
+        request: crate::media::Request,
+    },
+    ListMedia,
+    /// A medium, named by its sha256 or a prefix of it.
+    ShowMedium {
+        medium: String,
+    },
+    EditMedium {
+        medium: String,
+        edit: crate::store::MediumEdit,
+    },
+    ApproveMedium {
+        medium: String,
+        approve: bool,
+    },
+    RemoveMedium {
+        medium: String,
+    },
     RemoveTools {
         tools: String,
     },
@@ -594,7 +620,8 @@ async fn serve_one(mut stream: UnixStream, hub: Arc<Hub>, uid: u32) -> Result<()
     .context("writing an admin reply")
 }
 
-/// Whether `call` adds or fetches a release or tools and may outlast an update's grace period.
+/// Whether `call` adds or fetches a release or tools, or uploads a medium, and may outlast an
+/// update's grace period.
 /// A latest-release check only reads and can be repeated. Fetches also hold their own long-call
 /// guard ([`crate::fetch::start`]), including those started by the web UI.
 fn is_long(call: &Call) -> bool {
@@ -602,9 +629,47 @@ fn is_long(call: &Call) -> bool {
         call,
         Call::AddRelease { .. }
             | Call::AddTools { .. }
+            | Call::AddMedium { .. }
             | Call::FetchRelease { .. }
             | Call::FetchProgramRelease { .. }
     )
+}
+
+/// A `vk-hub media list` entry, omitting descriptions so the full list fits in one reply.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MediumSummary {
+    pub sha256: String,
+    pub kind: crate::store::MediumKind,
+    pub size: u64,
+    pub approved: bool,
+    pub file_name: String,
+    /// The registries holding it, once each.
+    pub registries: Vec<String>,
+}
+
+impl From<Medium> for MediumSummary {
+    fn from(m: Medium) -> Self {
+        let mut registries: Vec<String> = Vec::new();
+        for l in m.row.locations {
+            if !registries.contains(&l.registry) {
+                registries.push(l.registry);
+            }
+        }
+        MediumSummary {
+            sha256: m.sha256,
+            kind: m.row.info.kind,
+            size: m.row.size,
+            approved: m.approved,
+            file_name: m.row.file_name,
+            registries,
+        }
+    }
+}
+
+/// The path whose bytes a call carries.
+fn path_of(bytes: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(bytes))
 }
 
 /// Extract calls that await network I/O on the runtime rather than a blocking thread.
@@ -621,6 +686,7 @@ fn fetch_call(body: &[u8]) -> Option<Call> {
             | Call::FetchProgramRelease { .. }
             | Call::LatestRelease
             | Call::UpdateHub { .. }
+            | Call::AddMedium { .. }
     )
     .then_some(envelope.call)
 }
@@ -633,6 +699,11 @@ async fn dispatch_fetch(call: Call, hub: &Arc<Hub>, uid: u32) -> Result<serde_js
             fetch(hub, &actor, program, version).await
         }
         Call::LatestRelease => Ok(serde_json::to_value(crate::fetch::latest(hub).await?)?),
+        Call::AddMedium { path, request } => Ok(serde_json::to_value(
+            crate::media::add_path(hub, &actor, &path_of(path), request)
+                .await?
+                .medium,
+        )?),
         // Started with the hub at hand to hand over from; answered before it does.
         Call::UpdateHub { release } => {
             let hub = hub.clone();
@@ -998,8 +1069,11 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             );
             serde_json::to_value(row)?
         }
-        Call::FetchRelease { .. } | Call::FetchProgramRelease { .. } | Call::LatestRelease => {
-            bail!("a fetch is served on its own path")
+        Call::FetchRelease { .. }
+        | Call::FetchProgramRelease { .. }
+        | Call::LatestRelease
+        | Call::AddMedium { .. } => {
+            bail!("a fetch or an upload is served on its own path")
         }
         Call::ListReleases => serde_json::to_value(hub.db.releases()?)?,
         Call::RemoveRelease { release } => {
@@ -1019,6 +1093,26 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             serde_json::to_value(crate::tools::add(hub, &actor, &path, &version)?)?
         }
         Call::ListTools => serde_json::to_value(hub.db.tools_list()?)?,
+        Call::ListMedia => serde_json::to_value(
+            hub.db
+                .media()?
+                .into_iter()
+                .map(MediumSummary::from)
+                .collect::<Vec<_>>(),
+        )?,
+        Call::ShowMedium { medium } => serde_json::to_value(hub.db.resolve_medium(&medium)?)?,
+        Call::EditMedium { medium, edit } => {
+            let sha = hub.db.resolve_medium(&medium)?.sha256;
+            serde_json::to_value(crate::media::edit(hub, &actor, &sha, &edit)?)?
+        }
+        Call::ApproveMedium { medium, approve } => {
+            let sha = hub.db.resolve_medium(&medium)?.sha256;
+            serde_json::to_value(crate::media::approve(hub, &actor, &sha, approve)?)?
+        }
+        Call::RemoveMedium { medium } => {
+            let sha = hub.db.resolve_medium(&medium)?.sha256;
+            serde_json::to_value(crate::media::remove(hub, &actor, &sha)?)?
+        }
         Call::RemoveTools { tools } => {
             let tools = hub.db.resolve_tools(&tools)?;
             let removed = crate::tools::remove(hub, &actor, &tools.sha256)?;
@@ -1681,6 +1775,46 @@ impl Client {
         })
     }
 
+    pub fn add_medium(&self, path: &Path, request: crate::media::Request) -> Result<Medium> {
+        use std::os::unix::ffi::OsStrExt;
+        self.call(Call::AddMedium {
+            path: path.as_os_str().as_bytes().to_vec(),
+            request,
+        })
+    }
+
+    pub fn media(&self) -> Result<Vec<MediumSummary>> {
+        self.call(Call::ListMedia)
+    }
+
+    pub fn medium(&self, medium: &str) -> Result<Medium> {
+        self.call(Call::ShowMedium {
+            medium: medium.to_string(),
+        })
+    }
+
+    pub fn edit_medium(&self, medium: &str, edit: crate::store::MediumEdit) -> Result<Medium> {
+        self.call(Call::EditMedium {
+            medium: medium.to_string(),
+            edit,
+        })
+    }
+
+    /// Whether the approval changed.
+    pub fn approve_medium(&self, medium: &str, approve: bool) -> Result<bool> {
+        self.call(Call::ApproveMedium {
+            medium: medium.to_string(),
+            approve,
+        })
+    }
+
+    /// The medium removed, or `None` when another removal took it first.
+    pub fn remove_medium(&self, medium: &str) -> Result<Option<Medium>> {
+        self.call(Call::RemoveMedium {
+            medium: medium.to_string(),
+        })
+    }
+
     pub fn tools(&self) -> Result<Vec<Tools>> {
         self.call(Call::ListTools)
     }
@@ -1823,6 +1957,7 @@ impl Client {
     fn call<T: DeserializeOwned>(&self, call: Call) -> Result<T> {
         let timeout = match call {
             Call::AddRelease { .. } | Call::AddTools { .. } => ADD_TIMEOUT,
+            Call::AddMedium { .. } => MEDIA_WAIT,
             Call::FetchRelease { .. } | Call::FetchProgramRelease { .. } => FETCH_WAIT,
             Call::LatestRelease => CHECK_WAIT,
             _ => IO_TIMEOUT,
@@ -1861,6 +1996,96 @@ impl Client {
 mod tests {
     use super::*;
     use crate::store::Db;
+
+    #[test]
+    fn an_upload_path_crosses_whole() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = b"/isos/caf\xe9.iso".to_vec();
+        let call = Call::AddMedium {
+            path: raw.clone(),
+            request: crate::media::Request::default(),
+        };
+        let json = serde_json::to_vec(&call).unwrap();
+        let Call::AddMedium { path, .. } = serde_json::from_slice(&json).unwrap() else {
+            panic!("not an upload");
+        };
+        assert_eq!(path_of(path).as_os_str().as_bytes(), raw);
+    }
+
+    /// Every medium the hub may keep lists within a reply, and the largest shows within one.
+    #[test]
+    fn media_fit_a_reply() {
+        use crate::store::{Location, MediumInfo, MediumRow};
+        let line = "\\".repeat(256);
+        let text = "\\".repeat(8 * 1024);
+        let location = |i: usize| Location {
+            registry: format!("{i:032x}"),
+            under: Some("a/".repeat(127) + "a"),
+            name: "a".repeat(128),
+            manifest: format!("sha256:{}", "0".repeat(64)),
+            at: u64::MAX,
+            by: "\\".repeat(256),
+        };
+        let medium = |i: usize| Medium {
+            sha256: format!("{i:064x}"),
+            approved: true,
+            row: MediumRow {
+                file_name: "a".repeat(128),
+                size: u64::MAX,
+                volume_label: Some(line.clone()),
+                added_at: u64::MAX,
+                added_by: line.clone(),
+                edited_at: Some(u64::MAX),
+                edited_by: Some(line.clone()),
+                info: MediumInfo {
+                    sources: vec![format!("https://h/{}", "\\".repeat(2038)); 8],
+                    product: line.clone(),
+                    edition: line.clone(),
+                    version: line.clone(),
+                    build: line.clone(),
+                    language: line.clone(),
+                    arch: line.clone(),
+                    license_terms: text.clone(),
+                    renewal: text.clone(),
+                    notes: text.clone(),
+                    ..MediumInfo::default()
+                },
+                locations: (0..crate::store::MAX_LOCATIONS).map(location).collect(),
+            },
+        };
+        let one = serde_json::to_vec(&medium(0)).unwrap().len();
+        assert!(one <= MAX_REPLY_VALUE, "{one}");
+        // And its description is a request the hub reads.
+        let edit = Envelope {
+            v: PROTOCOL_VERSION,
+            call: Call::EditMedium {
+                medium: "0".repeat(64),
+                edit: {
+                    let i = medium(0).row.info;
+                    crate::store::MediumEdit {
+                        sources: Some(i.sources),
+                        product: Some(i.product),
+                        edition: Some(i.edition),
+                        version: Some(i.version),
+                        build: Some(i.build),
+                        language: Some(i.language),
+                        arch: Some(i.arch),
+                        license_terms: Some(i.license_terms),
+                        renewal: Some(i.renewal),
+                        notes: Some(i.notes),
+                        ..crate::store::MediumEdit::default()
+                    }
+                },
+            },
+        };
+        let edit = serde_json::to_vec(&edit).unwrap().len() as u64;
+        assert!(edit <= MAX_REQUEST, "{edit}");
+        let all: Vec<MediumSummary> = (0..crate::store::MAX_MEDIA)
+            .map(|i| MediumSummary::from(medium(i)))
+            .collect();
+        let all = serde_json::to_vec(&all).unwrap().len();
+        assert!(all <= MAX_REPLY_VALUE, "{all}");
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("vk-hub-{tag}-{}", std::process::id()));

@@ -29,6 +29,8 @@ The prototype provides, all experimentally:
   nodes tools`), each definition served only to a node building it;
 - on the node, those builds, made with `vk build` apart from its build cache and installed as
   `<state_dir>/tools/current`, the directory `[executor] tools_dir` names;
+- on the hub, install media streamed to a registry it manages, approved for jobs and described
+  (`vk-hub media`);
 - resets, which clear what a node's past jobs left (`vk-hub nodes reset`);
 - on the hub, settings for its nodes, fleet-wide and per node (`vk-hub settings`, the web UI's
   Settings tab), taken by each node where its own config file is silent, and a target release
@@ -225,7 +227,7 @@ web UI's keys (see [Web UI](#web-ui)), and `job_lost_after_secs`, `job_history`,
 [Updating the hub](#updating-the-hub)). Every key is optional and an
 unknown one is an error. Without TLS the hub serves only on loopback. TLS is 1.3 only, on both
 the hub and the node. `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub tools`,
-`vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub keys`, `vk-hub jobs` and
+`vk-hub media`, `vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub keys`, `vk-hub jobs` and
 `vk-hub capacity-policy` reach the
 running hub through `<data_dir>/admin.sock`, open to the hub's user and root.
 
@@ -663,7 +665,7 @@ before this — is refused whatever it says, as it could only be rolled back. `v
 not update itself.
 
 An update and long operations refuse each other: `vk-hub release add|fetch`, `vk-hub tools
-add`, and web UI uploads or fetches. Exec would cut these operations and any waiting CLI.
+add`, `vk-hub media add`, and web UI uploads or fetches. Exec would cut these operations and any waiting CLI.
 They remain blocked until the update executes the release or fails; the CLI explains why
 and can be run again then.
 
@@ -1019,6 +1021,53 @@ definition itself is code each node builds in microVMs, with network, as any `vk
 Not built: rolling tools out by wave and canary, as [rollouts](#rollouts) do releases; pinning a
 definition with a signature the node checks, as releases are; and running the version probe in a
 VM, which a node that requires signed releases would need to report versions.
+
+## Install media
+
+`vk-hub media add <file>` uploads an install medium ([design](fleet-design.md#install-media)):
+the hub reads the file, as its own user, and streams it to a registry it manages, which stores
+it as `vk registry put --keep --dir win-media` would: tagged `files/sha256:<sha256>` and
+`files/win-media:<name>`, kept for good unless the registry configures a retention window for
+their prefix, its manifest annotated with what is said of it
+(`org.virtkit.media.*`, and its first source as `org.opencontainers.image.source`). `--under
+<path>` puts both under `<path>/`, for nodes whose `[build] cache_registry` names that path,
+such as `registry.example.com/build-cache`: a Windows build looks for media by digest under its
+cache registry's repository. `--registry <id>` picks the registry; by default it is the one
+the fleet-wide `registry` setting names, or the only one connected with a URL bound that takes
+hub tokens and file puts. `--name` changes the name it is tagged under (the file's, made a tag).
+The medium is approved for jobs fleet-wide unless `--no-approve`. The sha256 alone goes to
+stdout.
+
+What is said of it: `--kind windows|drivers|other`, `--source <url>` (repeated), `--obtained
+<YYYY-MM-DD>`, `--product`, `--edition`, `--medium-version`, `--build`, `--language`, `--arch`,
+`--license unknown|evaluation|volume|retail|oem|open-source|other`, `--license-terms`,
+`--renewal`, `--expires <YYYY-MM-DD>` and `--notes`. Kind, architecture and language, and for
+virtio-win product and version, are read from the ISO 9660 volume label where the flags leave
+them out. `vk-hub media edit <sha256> …` takes the same flags; an empty value clears a text
+field, and `--no-sources` clears the sources. `media list` and `media show <sha256>` show
+them, with where each registry holds the medium; `media approve` and `media unapprove` add it
+to the fleet-wide `executor.windows_media` or take it out; `media remove` forgets it and
+withdraws its approval, leaving the registries' copies. A medium is named by its sha256 or at least its first 8 hex
+digits. Uploading bytes the hub knows adds where they are and leaves what was said of them.
+
+The registry must be connected, take hub tokens (`[hub] tokens = true`) and have its URL bound
+(`vk-hub registries set-url`), `https` or plain `http` on loopback; one too old for file puts,
+or whose last heartbeat reported too little free space for the medium and 1 GiB more, is
+refused before the upload starts. So is one approving its medium when `executor.windows_media`
+lists its 256 digests already (`--no-approve` records it). The hub keeps 256 media, each at up
+to 32 places, registries and paths; past those, the registry stores an upload the hub then
+cannot record. The registry may still refuse an upload as it arrives, when two already run or
+its store has no room, and the CLI says why and when to try again. The hub mints itself a token for the upload, sub `hub:media`,
+write on the prefixes `[<path>/]files/sha256` and `[<path>/]files/win-media` (without
+`--under`, `sha256` and `win-media`, as any grant reaches `files/`), for 12 hours at most (and
+no longer than `max_job_token_secs`), in the hub's audit log under the registry. The upload,
+each edit, approval and removal are audited as the operator's. One upload runs at a time; it
+holds back an update of the hub, as other long operations do. It is abandoned when the
+registry takes no byte for two minutes, does not answer within ten once it has them all, or
+it has not ended within the token's lifetime; the CLI waits up to 12 hours and five minutes.
+A file that grows past the size it had when the upload started is refused, not cut; an empty
+one is refused. When the registry stored a medium the hub then could not record, the error
+names where it is held; uploading it again records it, as it does after an answer lost.
 
 ## Resets
 

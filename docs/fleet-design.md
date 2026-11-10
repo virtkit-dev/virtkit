@@ -519,6 +519,63 @@ See the implemented [CI tools](fleet-prototype.md#ci-tools).
   for an operator, a build drains nothing.
 - Proposed: rollouts of a definition by wave and canary, with the release rollouts' gates.
 
+### Install media
+
+Windows builds fetch their install media (Windows ISOs, driver ISOs, several GB each) by
+digest from the registry nodes' `[build] cache_registry` names, `files/sha256:<hex>` under that
+repository path. A placed job's build takes media from outside its build context only when
+`executor.windows_media` approves them. Operators can upload a file from the hub's host,
+approve it and record its metadata without a registry credential. See the implemented
+[install media](fleet-prototype.md#install-media).
+
+- **Streamed through, never kept.** The bytes go on to the registry as they reach the hub,
+  hashed on the way; the hub holds no copy. Its disk is not sized for media, and a copy would
+  have to be kept in step with the registry's. Sending a medium to another registry means
+  uploading it again.
+- **Transport.** The hub pushes to the registry's file put (`PUT /files/<dir>/<name>`), one
+  streamed request with a declared length, the registry staging the body on its own disk and
+  tagging it only once every declared byte arrived. The hub cannot name the digest up front
+  without reading the medium twice, so it checks the registry's answer instead (below). A
+  request from the hub, rather than a pull by the registry: the registry would otherwise have
+  to fetch from an upload still in flight, which the release download's resumable retries do
+  not fit. Backpressure is TCP's, end to end. It writes with a token it mints itself ([registry
+  tokens](registry-hub.md#tokens)), so it needs a registry that takes hub tokens, is connected
+  and has its URL bound, over https or plain http on loopback only, the token being a bearer
+  credential; any of these missing, or too little free space in the registry's last heartbeat,
+  refuses the upload before it starts. The registry checks again as the request arrives,
+  refusing one it is too busy for (two at a time) or has no room for, and the hub passes on
+  its reason and when to try again.
+- **Recorded on the registry's word.** The hub records a medium, and approves it in the
+  fleet-wide `executor.windows_media` (unless asked not to) in the same transaction, only once
+  the registry answers with the sha256 and size the hub computed itself, and the source ended
+  at the size declared. An upload cut short or stalled before every byte reached the registry
+  (two minutes without a byte taken, twelve hours in all) leaves nothing on either side: no
+  row, no tag, no staging file. Once every byte did, the registry may have stored the file
+  whatever comes of its answer: one lost or late (ten minutes), whose outcome the hub cannot
+  tell, or one the hub cannot record (approval list full, checked before the upload starts too;
+  the hub's 256 media, or a medium's 32 places), which it says, may leave the file tagged
+  there with no record on the hub; uploading it again records it. One upload runs at a time.
+- **Described.** Each medium carries what operators need to keep it: file name, sha256, size,
+  kind (Windows installation, drivers, other), sources and the date it was obtained, who
+  uploaded it, product, edition, version, build, language, architecture, licence kind
+  (evaluation, volume, retail, OEM, open source), licence terms, how to renew it, a date it
+  must be renewed or replaced by, and notes. The ISO 9660 volume label is read from the
+  stream: Microsoft's labels give architecture and language, virtio-win's product and
+  version. Install images (`install.wim`) are not parsed: edition and build are the
+  operator's to say. What operators say of it is editable later, and audited; the file name,
+  label, uploader and locations are as the upload recorded them. The registry's manifest
+  carries part of what was said at upload as annotations (kind, product, edition, version,
+  build, language, architecture, licence kind, dates and the first source), a snapshot that
+  later edits do not follow.
+- **Where it is.** Each medium lists the registries, and repository paths, that confirmed
+  holding it. Removing a medium forgets it and withdraws its fleet-wide approval; the
+  registries keep their copies, to their own retention (kept for good, as `vk registry put
+  --keep` keeps them, unless the registry configures a retention window for their prefix). Approval is the fleet-wide setting itself, read rather than stored
+  twice: a node's own layer or config file can still list other media or none. It is the
+  setting's [exception](#configuration) to what the hub may grant until the fleet root can sign
+  it: an approved medium is read with the node's credential, and its digest proves which bytes
+  it is, not who published them.
+
 ## Resets
 
 | Operation | Effect |

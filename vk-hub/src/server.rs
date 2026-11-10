@@ -200,6 +200,8 @@ pub struct Hub {
     /// The tokens of the runners added on the hub that their relay has not answered yet, by
     /// command ID: held in memory only, until the relay answers or the command expires.
     pub(crate) runner_tokens: crate::relays::RunnerTokens,
+    /// The one install medium upload let run at a time ([`crate::media`]).
+    pub(crate) media_uploads: Arc<Semaphore>,
 }
 
 /// One node's open session.
@@ -284,6 +286,7 @@ impl Hub {
             handover: crate::update::Handover::default(),
             self_update: std::sync::OnceLock::new(),
             runner_tokens: crate::relays::RunnerTokens::default(),
+            media_uploads: Arc::new(Semaphore::new(1)),
         }
     }
 
