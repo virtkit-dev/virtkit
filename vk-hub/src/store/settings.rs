@@ -330,66 +330,11 @@ impl Db {
         now: u64,
     ) -> Result<(bool, Vec<String>)> {
         let txn = self.db.begin_write().context("starting a write")?;
-        let value = match value {
-            Some(value) if key == crate::deploy::KEY => {
-                Some(tools_value(&value, &txn.open_table(TOOLS)?)?)
-            }
-            Some(value) => {
-                check(
-                    key,
-                    &value,
-                    &txn.open_table(REGISTRIES)?,
-                    &txn.open_table(NAMESPACES)?,
-                )?;
-                Some(value)
-            }
-            None if keys().all(|k| k != key) => bail!("{key} is not a setting the hub may set"),
-            None => None,
-        };
-        if let Some(id) = node
-            && txn.open_table(NODES)?.get(id)?.is_none()
-        {
-            return Err(NotEnrolled(id.to_string()).into());
-        }
-        let slot = match node {
-            Some(id) => format!("{NODE_PREFIX}{id}"),
-            None => FLEET.to_string(),
-        };
-        let changed = {
-            let mut table = txn.open_table(SETTINGS)?;
-            let mut layer = table
-                .get(slot.as_str())?
-                .map(|g| decode::<Layer>(g.value()))
-                .transpose()?
-                .unwrap_or_default();
-            let before = match &value {
-                Some(v) => layer.insert(key.to_string(), v.clone()),
-                None => layer.remove(key),
-            };
-            let changed = before != value;
-            if changed {
-                if layer.is_empty() {
-                    table.remove(slot.as_str())?;
-                } else {
-                    table.insert(slot.as_str(), encode(&layer)?.as_slice())?;
-                }
-            }
-            changed
-        };
+        let (changed, steered) = set_in(&txn, node, key, value, actor, now)?;
         if !changed {
             txn.abort().context("dropping a write")?;
             return Ok((false, Vec::new()));
         }
-        let scope = match node {
-            Some(id) => format!(" for node {id}"),
-            None => " fleet-wide".to_string(),
-        };
-        let event = match &value {
-            Some(v) => format!("{actor} set {key} = {}{scope}", shown(v)),
-            None => format!("{actor} unset {key}{scope}"),
-        };
-        append_audit(&txn, node, actor, &event, now)?;
-        let steered = steer_all_in(&txn, now)?;
         txn.commit().context("setting a hub setting")?;
         Ok((true, steered))
     }
@@ -403,6 +348,77 @@ impl Db {
         txn.commit().context("steering the hub's settings")?;
         Ok(changed)
     }
+}
+
+/// [`Db::set_setting`] in `txn`: whether it changed, and the nodes it steered.
+pub(super) fn set_in(
+    txn: &redb::WriteTransaction,
+    node: Option<&str>,
+    key: &str,
+    value: Option<Value>,
+    actor: &str,
+    now: u64,
+) -> Result<(bool, Vec<String>)> {
+    let value = match value {
+        Some(value) if key == crate::deploy::KEY => {
+            Some(tools_value(&value, &txn.open_table(TOOLS)?)?)
+        }
+        Some(value) => {
+            check(
+                key,
+                &value,
+                &txn.open_table(REGISTRIES)?,
+                &txn.open_table(NAMESPACES)?,
+            )?;
+            Some(value)
+        }
+        None if keys().all(|k| k != key) => bail!("{key} is not a setting the hub may set"),
+        None => None,
+    };
+    if let Some(id) = node
+        && txn.open_table(NODES)?.get(id)?.is_none()
+    {
+        return Err(NotEnrolled(id.to_string()).into());
+    }
+    let slot = match node {
+        Some(id) => format!("{NODE_PREFIX}{id}"),
+        None => FLEET.to_string(),
+    };
+    let changed = {
+        let mut table = txn.open_table(SETTINGS)?;
+        let mut layer = table
+            .get(slot.as_str())?
+            .map(|g| decode::<Layer>(g.value()))
+            .transpose()?
+            .unwrap_or_default();
+        let before = match &value {
+            Some(v) => layer.insert(key.to_string(), v.clone()),
+            None => layer.remove(key),
+        };
+        let changed = before != value;
+        if changed {
+            if layer.is_empty() {
+                table.remove(slot.as_str())?;
+            } else {
+                table.insert(slot.as_str(), encode(&layer)?.as_slice())?;
+            }
+        }
+        changed
+    };
+    if !changed {
+        return Ok((false, Vec::new()));
+    }
+    let scope = match node {
+        Some(id) => format!(" for node {id}"),
+        None => " fleet-wide".to_string(),
+    };
+    let event = match &value {
+        Some(v) => format!("{actor} set {key} = {}{scope}", shown(v)),
+        None => format!("{actor} unset {key}{scope}"),
+    };
+    append_audit(txn, node, actor, &event, now)?;
+    let steered = steer_all_in(txn, now)?;
+    Ok((true, steered))
 }
 
 /// [`Db::steer_settings`] in `txn`, audited as the hub's.

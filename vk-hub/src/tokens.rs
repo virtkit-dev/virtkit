@@ -731,6 +731,19 @@ pub fn mint(
     pipeline: Option<String>,
     ttl: Duration,
 ) -> Result<String> {
+    mint_for(hub, actor, &operator_sub(actor), id, grants, pipeline, ttl)
+}
+
+/// [`mint`] a token for subject `sub` at operator `actor`'s request.
+pub(crate) fn mint_for(
+    hub: &Hub,
+    actor: &str,
+    sub: &str,
+    id: &str,
+    grants: Vec<Grant>,
+    pipeline: Option<String>,
+    ttl: Duration,
+) -> Result<String> {
     if ttl.is_zero() || ttl > hub.token_keys.max_token {
         bail!(
             "a token lives between 1s and {}s (max_job_token_secs)",
@@ -765,7 +778,7 @@ pub fn mint(
     let claims = Claims {
         kid: signer.public().kid.clone(),
         aud: id.to_string(),
-        sub: operator_sub(actor),
+        sub: sub.to_string(),
         jti: vk_peer::token::new_jti()?,
         pipeline,
         iat: now,
