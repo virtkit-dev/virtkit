@@ -266,7 +266,7 @@ fn too_large() -> String {
     )
 }
 
-fn status_of(refusal: &Refusal) -> StatusCode {
+pub(super) fn status_of(refusal: &Refusal) -> StatusCode {
     match refusal {
         Refusal::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         Refusal::Slow => StatusCode::REQUEST_TIMEOUT,

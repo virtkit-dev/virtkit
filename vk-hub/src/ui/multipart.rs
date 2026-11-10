@@ -237,6 +237,45 @@ where
         }
     }
 
+    /// Make `deadline` the one all of the body must arrive by.
+    pub fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+    }
+
+    /// Past the last part: read what is left of the body, which must close its last boundary's
+    /// line and end at the length it was given.
+    pub async fn finish(&mut self) -> Result<(), Refusal> {
+        if self.state != State::End {
+            return Err(Refusal::Malformed("it does not end after its last part"));
+        }
+        // The closing boundary's end, as a browser sends it.
+        self.want(4, "it ends inside its closing boundary").await?;
+        if !self.buf.starts_with(b"--\r\n") {
+            return Err(Refusal::Malformed(
+                "its closing boundary does not end its line",
+            ));
+        }
+        self.buf.clear();
+        while self.fill().await? {
+            self.buf.clear();
+        }
+        if self.read != self.max {
+            return Err(Refusal::Malformed("it ends short of its length"));
+        }
+        Ok(())
+    }
+
+    /// The size of the current part's data, when it is the form's last part and the body
+    /// `length` bytes long: what is left past the bytes taken, but for the closing boundary a
+    /// browser ends the body with, `\r\n--<boundary>--\r\n`.
+    pub fn last_part_len(&self, length: u64) -> Option<u64> {
+        // Past the first boundary, the buffer holds only the body's bytes not yet taken.
+        let taken = self.read.checked_sub(self.buf.len() as u64)?;
+        length
+            .checked_sub(taken)?
+            .checked_sub(self.delimiter.len() as u64 + 4)
+    }
+
     /// The current part's data whole, as text of at most `max` bytes.
     pub async fn text(&mut self, max: usize) -> Result<String, Refusal> {
         let mut out = Vec::new();
@@ -437,6 +476,66 @@ mod tests {
         assert_eq!(m.next_part().await.unwrap().unwrap().name, "version");
         assert_eq!(m.next_part().await.unwrap().unwrap().name, "file");
         assert_eq!(m.next_part().await.unwrap(), None);
+    }
+
+    /// A browser's form ending in its file says how long the file is before it is read.
+    #[tokio::test]
+    async fn the_last_part_s_length_is_known_up_front() {
+        let file = b"\x7fELF\r\n--Xy\r\n-XyZ data";
+        let form = [
+            &FORM[..FORM.len() - b"--XyZ--\r\nepilogue".len()],
+            b"--XyZ--\r\n",
+        ]
+        .concat();
+        for size in [1, 7, form.len()] {
+            let chunks: Vec<&[u8]> = form.chunks(size).collect();
+            let mut m = reader(body(&chunks), 1 << 20);
+            while m.next_part().await.unwrap().is_some_and(|p| !p.is_file()) {}
+            assert_eq!(
+                m.last_part_len(form.len() as u64),
+                Some(file.len() as u64),
+                "chunks of {size}"
+            );
+        }
+    }
+
+    /// A body is read whole only once its closing boundary and every declared byte arrived.
+    #[tokio::test]
+    async fn a_body_ends_at_its_length() {
+        let form = [
+            &FORM[..FORM.len() - b"--XyZ--\r\nepilogue".len()],
+            b"--XyZ--\r\n",
+        ]
+        .concat();
+        let read = |body: Vec<u8>, max: usize| async move {
+            let mut m = reader(body_of(body), max as u64);
+            while m.next_part().await?.is_some() {}
+            m.finish().await
+        };
+        read(form.clone(), form.len()).await.unwrap();
+        let short = form[..form.len() - 2].to_vec();
+        assert_eq!(
+            read(short, form.len()).await.unwrap_err(),
+            Refusal::Malformed("it ends inside its closing boundary")
+        );
+        assert_eq!(
+            read(form.clone(), form.len() + 1).await.unwrap_err(),
+            Refusal::Malformed("it ends short of its length")
+        );
+        let mut bad = form.clone();
+        let n = bad.len();
+        bad[n - 2..].copy_from_slice(b"XX");
+        assert_eq!(
+            read(bad, form.len()).await.unwrap_err(),
+            Refusal::Malformed("its closing boundary does not end its line")
+        );
+        let mut m = reader(body(&[&form]), form.len() as u64);
+        m.next_part().await.unwrap();
+        assert!(m.finish().await.is_err(), "finished inside a part");
+    }
+
+    fn body_of(b: Vec<u8>) -> impl Stream<Item = Result<Bytes, Infallible>> + Unpin {
+        futures::stream::iter(vec![Ok(Bytes::from(b))])
     }
 
     #[tokio::test]

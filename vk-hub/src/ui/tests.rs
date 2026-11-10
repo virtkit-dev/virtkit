@@ -14086,7 +14086,8 @@ async fn a_ci_tools_definition_s_page_shows_its_nodes_files_and_network() {
 
 /// Install media: the list and a medium's page for any viewer, everything said of it and
 /// where it is; an operator edits it, approves it and withdraws approval, and removes it once
-/// confirmed; a viewer can do none of it.
+/// confirmed; a viewer can do none of it. With no registry able to take one, the upload form
+/// says so and an upload is refused before its file is read.
 #[tokio::test(flavor = "multi_thread")]
 async fn install_media_are_listed_described_and_kept_by_operators() {
     use crate::store::{LicenseKind, Location, MediumInfo, MediumKind, MediumRow};
@@ -14145,6 +14146,13 @@ async fn install_media_are_listed_described_and_kept_by_operators() {
     ] {
         assert!(page.body.contains(want), "{want}: {}", page.body);
     }
+    assert!(!page.body.contains("/media/upload"), "{}", page.body);
+    let page = get(addr, "/media", Some(&operator)).await;
+    assert!(
+        page.body.contains("No registry can take one now"),
+        "{}",
+        page.body
+    );
     let path = super::media::detail_path(sha);
     let page = get(addr, &path, Some(&viewer)).await;
     for want in [
@@ -14252,6 +14260,99 @@ async fn install_media_are_listed_described_and_kept_by_operators() {
     let reply = post(operator.clone(), "remove", answer).await;
     assert_eq!(reply.status, 404, "{}", reply.body);
 
+    let upload = |cookie: String, form: Vec<(&'static str, Vec<u8>)>| {
+        let origin = origin.clone();
+        async move {
+            let parts: Vec<(&str, &[u8])> = form.iter().map(|(k, v)| (*k, &v[..])).collect();
+            let (content_type, body) = multipart_form(&parts);
+            request_bytes(
+                addr,
+                "POST",
+                super::media::UPLOAD_PATH,
+                &[
+                    &format!("Cookie: {cookie}"),
+                    &format!("Origin: {origin}"),
+                    &format!("Content-Type: {content_type}"),
+                ],
+                &body,
+            )
+            .await
+        }
+    };
+    let file = || ("file", b"not much of an ISO".to_vec());
+    let reply = upload(
+        viewer.clone(),
+        vec![("_csrf", viewer_csrf.clone().into_bytes()), file()],
+    )
+    .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let reply = upload(
+        operator.clone(),
+        vec![("_csrf", viewer_csrf.clone().into_bytes()), file()],
+    )
+    .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let reply = upload(operator.clone(), vec![file()]).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    // Refused before the file is read: the request sends none of it, and is answered.
+    let refused_up_front = |field: (&'static str, &'static [u8])| {
+        let (operator, origin, csrf) = (operator.clone(), origin.clone(), csrf.clone());
+        async move {
+            let (content_type, body) = multipart_form(&[
+                ("_csrf", csrf.as_bytes()),
+                field,
+                ("file", b"not much of an ISO"),
+            ]);
+            let file_at = body
+                .windows(18)
+                .position(|w| w == b"not much of an ISO")
+                .unwrap();
+            let headers = [
+                format!("Cookie: {operator}"),
+                format!("Origin: {origin}"),
+                format!("Content-Type: {content_type}"),
+                format!("Content-Length: {}", body.len()),
+            ];
+            let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+            let reply = request_bytes(
+                addr,
+                "POST",
+                super::media::UPLOAD_PATH,
+                &headers,
+                &body[..file_at],
+            );
+            tokio::time::timeout(Duration::from_secs(10), reply)
+                .await
+                .expect("waited for the file")
+        }
+    };
+    let reply = refused_up_front(("kind", b"windows")).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.body.contains("no registry can take"),
+        "{}",
+        reply.body
+    );
+    // A full approval list refuses an upload to approve before its file goes anywhere.
+    let full: Vec<String> = (0..vk_hub_proto::settings::MAX_DIGESTS)
+        .map(|i| format!("{i:064x}"))
+        .collect();
+    hub.db
+        .set_setting(
+            None,
+            "executor.windows_media",
+            Some(serde_json::Value::from(full)),
+            "op",
+            1,
+        )
+        .unwrap();
+    let reply = refused_up_front(("approve", b"yes")).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.body.contains("approval list is full"),
+        "{}",
+        reply.body
+    );
     let audit = hub.db.audits(None, 50).unwrap();
     for want in ["edited medium d0ef4502e350", "set executor.windows_media"] {
         assert!(audit.iter().any(|a| a.event.contains(want)), "{want}");

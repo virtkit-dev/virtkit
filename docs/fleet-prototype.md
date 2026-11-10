@@ -2231,11 +2231,28 @@ The top bar shows the version that served the page.
 kind, what it installs, licence, renewal date (flagged within 30 days and once past), whether
 it is approved for jobs fleet-wide, the registries holding it, size and who uploaded it when. A
 medium's page, `/media/<sha256>`, shows everything said of it, its sources as links, and where
-each registry holds it, under which repository path and manifest. On it, an operator's forms,
-with the same origin, CSRF and role checks and run as the session's principal, are **Approve
-for jobs** or **Withdraw approval**, **Edit**, the whole of what is said of it, refused if it
-changed since the page was shown, and **Remove**, asked first and confirmed only while the
-medium is as shown.
+each registry holds it, under which repository path and manifest. An operator's pages carry
+forms, with the same origin, CSRF and role checks, run as the session's principal:
+
+- **Upload a medium**, folded behind a button on `/media`, is `vk-hub media add` from a
+  browser: a registry among those that can take it now (the one the fleet-wide `registry`
+  setting names, or the only one, selected; otherwise one must be chosen), the repository path,
+  approval, what is said of it, then the file, last, posted to `/media/upload` as a plain
+  `multipart/form-data` form. Its fields are checked before the file is read, within a deadline
+  of their own, and the file's length is taken from the body's. An upload to approve is refused
+  before the file is read when the approval list is full. The file's start is read for its volume
+  label, as the CLI reads it, then the file goes on to the registry as it arrives, under the
+  release upload's rate floor and pauses and its own one-at-a-time slot; its last bytes go only
+  once the form ended whole. The page answers once the registry holds it and the medium is
+  recorded, the session checked again to still belong to an operator; if it does not, or the
+  hub cannot record it, the page says where the registry holds the file, to upload it again.
+  Bytes the hub knows already keep what was said of them, and the page says so. An upload cut
+  short before every byte reached the registry leaves nothing on either side. A registry that
+  refuses is reported at once, with its own status when it is busy, short of space or timed
+  out (503, 507, 408) and when to try again.
+- On a medium's page, **Approve for jobs** or **Withdraw approval**, **Edit**, the whole of what
+  is said of it, refused if it changed since the page was shown, and **Remove**, asked first
+  and confirmed only while the medium is as shown.
 
 The nodes table, a node's page, `/updates`, `/jobs`' newest page, `/gitlab`, `/keys` and a
 running job's page stay live over server-sent events. The hub notes every heartbeat, report,

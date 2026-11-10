@@ -78,7 +78,7 @@ impl Limits {
 /// Where the ISO 9660 primary volume descriptor starts, and how much of a medium's start
 /// is kept to read it.
 const PVD: usize = 0x8000;
-const HEAD: usize = PVD + 2048;
+pub(crate) const HEAD: usize = PVD + 2048;
 
 /// The registry an upload goes to, and the token it is written with.
 pub struct Target {
@@ -193,7 +193,7 @@ pub fn from_label(label: &str) -> MediumEdit {
 }
 
 /// Fill fields absent from `edit` with `guess`.
-fn guessed(edit: &MediumEdit, guess: MediumEdit) -> MediumEdit {
+pub(crate) fn guessed(edit: &MediumEdit, guess: MediumEdit) -> MediumEdit {
     MediumEdit {
         kind: edit.kind.or(guess.kind),
         product: edit.product.clone().or(guess.product),
@@ -351,6 +351,12 @@ fn default_registry(hub: &Hub) -> Result<String> {
 /// Registries by ID, with their hostname.
 pub type Registries = Vec<(String, String)>;
 
+/// The registries that can take an upload now, and the one the fleet-wide `registry` setting
+/// names, if any.
+pub fn choices(hub: &Hub) -> Result<(Registries, Option<String>)> {
+    Ok((able_registries(hub)?, named_registry(hub)?))
+}
+
 /// The registry the fleet-wide `registry` setting names, if any.
 fn named_registry(hub: &Hub) -> Result<Option<String>> {
     let fleet = hub.db.settings_layers()?.fleet;
@@ -490,7 +496,7 @@ where
     .map_err(|e| anyhow!("reading registry {}'s answer: {e}", target.registry))?
     .to_bytes();
     if status != hyper::StatusCode::CREATED {
-        bail!("{}", refusal(&target.registry, status, retry_after, &said));
+        return Err(refusal(&target.registry, status, retry_after, &said).into());
     }
     let put: FilePut =
         serde_json::from_slice(&said).context("reading the registry's answer to the upload")?;
@@ -576,20 +582,45 @@ where
     )
 }
 
-/// Why registry `id` refused an upload with `status`: what it said, the status, and when
-/// to try again if it said.
-fn refusal(id: &str, status: hyper::StatusCode, retry_after: Option<u64>, said: &[u8]) -> String {
+/// The registry's refusal of an upload: its status, what it said, and when to try again if it
+/// said.
+#[derive(Debug)]
+pub struct Refused {
+    pub status: hyper::StatusCode,
+    pub retry_after: Option<u64>,
+    text: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Registry `id`'s refusal of an upload with `status`, from the body it `said`.
+pub(crate) fn refusal(
+    id: &str,
+    status: hyper::StatusCode,
+    retry_after: Option<u64>,
+    said: &[u8],
+) -> Refused {
     let message = serde_json::from_slice::<serde_json::Value>(said)
         .ok()
         .and_then(|v| v["errors"][0]["message"].as_str().map(str::to_string));
-    let mut out = format!("registry {id} refused the upload (HTTP {status})");
+    let mut text = format!("registry {id} refused the upload (HTTP {status})");
     if let Some(m) = message {
-        out.push_str(&format!(": {}", vk_hub_proto::display_safe(&m)));
+        text.push_str(&format!(": {}", vk_hub_proto::display_safe(&m)));
     }
     if let Some(secs) = retry_after {
-        out.push_str(&format!("; try again in {secs}s"));
+        text.push_str(&format!("; try again in {secs}s"));
     }
-    out
+    Refused {
+        status,
+        retry_after,
+        text,
+    }
 }
 
 /// Once the upload stalls: no byte taken for `limits.stall` while some are still to send, or
