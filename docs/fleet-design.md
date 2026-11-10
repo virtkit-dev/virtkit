@@ -143,14 +143,18 @@ Proposed: local configuration controlling which operations the hub may run.
 - **The hub fills in from an allowlist**, an explicit list in the code: capacity and VM sizing
   — `[executor.schedule]` `mem_budget`, `cpu_overcommit`, `from_history`, `disk_admission`,
   `disk_default`, `wait_timeout_secs`; `[executor.vm]` `cpus`, `mem`, `max_cpus`, `max_mem`;
-  `image_cache_idle_secs` — and `[registry]` (below), whose CA it sends as content, and whose
-  `ca_file`, `username`, `password_file` and `token_file` it never names, nor a store on the
-  host.
-  The concurrency ceiling stays desired state of its own. Any other key is refused. The hub never sets `state_dir`; `[node]`
-  `release_keys`, `require_signed`, `allow_downgrade` or `validate`; `[egress]`, which its
-  egress layer narrows instead; a path or a credential file; or anything that widens what a
-  job VM can reach. The trust model's [routine fields](trust-model.md#routine-and-sensitive)
-  bound what the list may grow to.
+  `image_cache_idle_secs`; `[executor]` `windows_cache_idle_secs` — and `[registry]` (below),
+  whose CA it sends as content, and whose `ca_file`, `username`, `password_file` and
+  `token_file` it never names, nor a store on the host. One key grants access, an exception
+  until the fleet root can sign it: `[executor]` `windows_media`, the digests of the install
+  media a placed job's Windows build may read from the node's media registry or media cache
+  with the node's credential. A node that keeps that decision sets the key itself, `[]` for
+  none.
+  The concurrency ceiling stays desired state of its own. Any other key is refused. The hub
+  never sets `state_dir`; `[node]` `release_keys`, `require_signed`, `allow_downgrade` or
+  `validate`; `[egress]`, which its egress layer narrows instead; a path or a credential file;
+  or anything that widens what a job VM can reach, except those media. The trust model's
+  [routine fields](trust-model.md#routine-and-sensitive) bound what the list may grow to.
 - **Defaults are autodetected on an enrolled node**, one with an enrollment under
   `<state_dir>/node/`. A `vk` on a host that is not enrolled keeps its defaults.
 
@@ -267,7 +271,8 @@ page shows it, so drift between nodes that should match is visible.
 Proposed for the long term: the hub holds the configuration as signed bundles, with an
 offline fleet root signing what the hub may not grant itself. See
 [the trust model](trust-model.md). Hub settings are their unsigned predecessor: the allowlist
-is the routine list, and sensitive settings stay local until the root can sign them.
+is the routine list plus approved Windows media. Other sensitive settings stay local until
+the root can sign them.
 
 ## Inventory
 

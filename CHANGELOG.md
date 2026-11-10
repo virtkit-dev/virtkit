@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **The fleet hub can set nodes' Windows build settings**: which install media placed jobs'
+  Windows builds may use (`executor.windows_media`) and how long unused Windows build caches
+  are kept (`executor.windows_cache_idle_secs`), fleet-wide or per node. A node's own config
+  still wins.
+
 ## [0.108.4] - 2026-11-11
 
 ### Fixed

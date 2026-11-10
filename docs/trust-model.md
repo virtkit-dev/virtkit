@@ -8,11 +8,12 @@ still open to change; each is marked *(default)*. Builds on
 The long-term goal is a fleet administered from the hub alone. The hub holds every node's and
 every registry's configuration, and a host needs almost no administration of its own. Today
 a node's own config is authoritative: the hub only narrows it, or, as proposed, fills in an
-allowlist of capacity settings the config leaves unset (`fleet-design.md`, *Configuration*),
-and trust anchors such as release keys are pinned on each host, from its config or at
-enrollment. This design keeps what that buys, a hub compromise that cannot take over the
-fleet, and drops the per-host administration. The hub holds and distributes everything, but
-an offline **fleet root** signs the few powers the hub may not grant itself.
+allowlist of capacity settings, plus approved Windows install media, the config leaves unset
+(`fleet-design.md`, *Configuration*), and trust anchors such as release keys are pinned on
+each host, from its config or at enrollment. This design keeps what that buys, a hub
+compromise that cannot take over the fleet, and drops the per-host administration. The hub
+holds and distributes everything, but an offline **fleet root** signs the few powers the hub
+may not grant itself.
 
 ## Goals
 
@@ -101,7 +102,8 @@ Everything else arrives from the hub as **bundles**: signed documents the host a
   a job VM can reach, or what a host trusts:
   - credential forwarding (`[executor.auth] ssh_agent`), host shares (`[executor.share]`),
     the host checkout and its overlay (`host_checkout`, `checkout_overlay`), `[egress]`, and
-    the registry's guest proxy (`proxy_guests`, `guest_credential`);
+    the registry's guest proxy (`proxy_guests`, `guest_credential`), and the install media
+    placed Windows builds may read with the node's credential (`windows_media`);
   - release keys, unsigned releases, `allow_downgrade`, and the minimum release that enforces
     this model (`min_enforcing`);
   - a registry's `[hub] allow` list and gc floors;

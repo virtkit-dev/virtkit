@@ -296,8 +296,10 @@ Local build-tier entries and Windows caches (`<data>/windows/scopes/<scope>`) ar
 by prefix. Jobs sharing a prefix share these caches, which are swept when idle. With the
 build cache off, they belong to the job alone and are removed when it ends. A Windows build
 of such a job fetches install media missing from its build context only when
-`[executor] windows_media` lists their sha256. Jobs of a local gitlab-runner and builds outside
-jobs keep `[build] cache_registry` and the unscoped caches.
+`[executor] windows_media` lists their sha256, in the node's config or as a
+[hub setting](fleet-design.md#hub-settings) (`vk-hub settings set executor.windows_media
+<sha256>,<sha256>`) where the config leaves it unset. Jobs of a local gitlab-runner and
+builds outside jobs keep `[build] cache_registry` and the unscoped caches.
 Pulled `image:` references still go through `[build] cache_registry`.
 
 ## Resource usage
@@ -1748,8 +1750,9 @@ ad-tests:
   Internet, so BITS or winget may refuse to run unless the allowlist lets its connectivity
   check through.
 - Its layers, installs and media are reclaimed once no build or job used them for
-  `[executor] windows_cache_idle_secs` (7 days by default, at least 1; reclaiming an install
-  means installing Windows again).
+  `[executor] windows_cache_idle_secs` (7 days by default, at least 1 second, also a
+  [hub setting](fleet-design.md#hub-settings); reclaiming an install means installing Windows
+  again).
 - The Dockerfile's `winiso:` paths (the medium, its `--drivers`) must stay inside the build
   context: an absolute path, a `..` or a symlink out is refused. A stage builds on a
   `winiso:` medium or an earlier stage, never on a bundle: a bundle names its layer by key

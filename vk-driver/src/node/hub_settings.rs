@@ -61,6 +61,12 @@ const KEYS: &[(&str, Read)] = &[
     ("image_cache_idle_secs", |c| {
         json(&c.image_cache_idle().as_secs())
     }),
+    ("executor.windows_cache_idle_secs", |c| {
+        json(&c.windows_cache_idle().as_secs())
+    }),
+    ("executor.windows_media", |c| {
+        json(&c.executor.windows_media)
+    }),
     ("registry", |c| json(&c.registry)),
 ];
 
@@ -578,6 +584,12 @@ mod tests {
             ("executor.vm.cpus", "2"),
             ("executor.vm.max_mem", "64G"),
             ("image_cache_idle_secs", "0"),
+            ("executor.windows_cache_idle_secs", "86400"),
+            (
+                "executor.windows_media",
+                "abababababababababababababababababababababababababababababababab",
+            ),
+            ("executor.windows_media", "none"),
         ] {
             let value = vk_hub_proto::settings::kind(key)
                 .unwrap()
@@ -614,6 +626,74 @@ mod tests {
         assert_eq!(cfg.state_dir, None);
     }
 
+    /// Local settings override the hub's Windows settings. An empty local `windows_media`
+    /// approves no media and is reported as local, regardless of the hub's list.
+    #[test]
+    fn the_windows_settings_from_the_hub_load() {
+        let digest = "ab".repeat(32);
+        let hub = wanted(&[
+            ("executor.windows_media", json!([digest])),
+            ("executor.windows_cache_idle_secs", json!(3600)),
+        ]);
+        let loaded = |text: &str| {
+            let mut local = table(text);
+            let taken = merge(&mut local, &hub);
+            let cfg = crate::config::from_table(local).unwrap();
+            Config {
+                layers: crate::config::Layers {
+                    local: table(text),
+                    hub: taken,
+                    detected: Default::default(),
+                },
+                ..cfg
+            }
+        };
+        let cfg = loaded("");
+        assert_eq!(cfg.executor.windows_media, std::slice::from_ref(&digest));
+        assert_eq!(cfg.windows_cache_idle().as_secs(), 3600);
+        let effective = report(&cfg, &BTreeMap::new()).effective;
+        assert_eq!(
+            effective["executor.windows_media"],
+            Setting {
+                value: Some(json!([digest])),
+                source: SettingSource::Hub
+            }
+        );
+        let cfg = loaded("[executor]\nwindows_media = []\n");
+        assert!(cfg.executor.windows_media.is_empty());
+        assert_eq!(cfg.windows_cache_idle().as_secs(), 3600);
+        let effective = report(&cfg, &BTreeMap::new()).effective;
+        assert_eq!(
+            effective["executor.windows_media"],
+            Setting {
+                value: Some(json!([])),
+                source: SettingSource::Local
+            }
+        );
+        assert_eq!(
+            effective["executor.windows_cache_idle_secs"].source,
+            SettingSource::Hub
+        );
+        let other = "cd".repeat(32);
+        let cfg = loaded(&format!(
+            "[executor]\nwindows_media = [\"{other}\"]\nwindows_cache_idle_secs = 60\n"
+        ));
+        assert_eq!(cfg.executor.windows_media, std::slice::from_ref(&other));
+        assert_eq!(cfg.windows_cache_idle().as_secs(), 60);
+        let effective = report(&cfg, &BTreeMap::new()).effective;
+        assert_eq!(
+            effective["executor.windows_cache_idle_secs"],
+            Setting {
+                value: Some(json!(60)),
+                source: SettingSource::Local
+            }
+        );
+        assert_eq!(
+            effective["executor.windows_media"].source,
+            SettingSource::Local
+        );
+    }
+
     /// Each entry is judged on its own; one refused leaves the others applied.
     #[test]
     fn entries_off_the_list_or_of_the_wrong_kind_are_refused() {
@@ -638,6 +718,8 @@ mod tests {
                 ("node.release_keys", json!([])),
                 ("executor.vm", json!({"cpus": 1})),
                 ("image_cache_idle_secs", json!(null)),
+                ("executor.windows_media", json!(["not-a-digest"])),
+                ("executor.windows_cache_idle_secs", json!(0)),
                 ("executor.schedule.from_history", json!(true)),
             ]),
             Path::new("/state/node"),
@@ -661,6 +743,8 @@ mod tests {
                 "executor.vm",
                 "executor.vm.max_mem",
                 "executor.vm.mem",
+                "executor.windows_cache_idle_secs",
+                "executor.windows_media",
                 "image_cache_idle_secs",
                 "node.release_keys",
                 "state_dir",

@@ -19,10 +19,15 @@ pub enum Kind {
     Vcpus,
     /// A number of seconds, at most [`MAX_SECS`].
     Secs,
+    /// A number of seconds, from 1 to [`MAX_SECS`].
+    PositiveSecs,
     /// A positive ratio, at most [`MAX_RATIO`].
     Ratio,
     /// A `[registry]` table of [`REGISTRY_KEYS`].
     Registry,
+    /// At most [`MAX_DIGESTS`] distinct sha256 digests, each 64 lowercase hex digits.
+    /// Empty means none. A node's own file allows duplicates and has no count limit.
+    Digests,
 }
 
 /// Every key the hub may set, and its kind.
@@ -38,6 +43,8 @@ pub const KEYS: &[(&str, Kind)] = &[
     ("executor.vm.max_cpus", Kind::Count),
     ("executor.vm.max_mem", Kind::Gib),
     ("image_cache_idle_secs", Kind::Secs),
+    ("executor.windows_cache_idle_secs", Kind::PositiveSecs),
+    ("executor.windows_media", Kind::Digests),
     ("registry", Kind::Registry),
 ];
 
@@ -61,6 +68,9 @@ pub const MAX_VCPUS: u64 = 255;
 pub const MAX_SECS: u64 = 10 * 365 * 24 * 3600;
 /// The largest ratio a setting may name.
 pub const MAX_RATIO: f64 = 64.0;
+
+/// The most digests a [`Kind::Digests`] setting may list.
+pub const MAX_DIGESTS: usize = 256;
 
 /// The most a registry's `ca_pem` may hold.
 pub const MAX_CA_PEM: usize = 256 * 1024;
@@ -92,8 +102,13 @@ impl Kind {
             Kind::Count => "a whole number, at least 1",
             Kind::Vcpus => "a whole number, from 1 to 255",
             Kind::Secs => "a number of seconds, at most 315360000 (ten years)",
+            Kind::PositiveSecs => "a number of seconds, from 1 to 315360000 (ten years)",
             Kind::Ratio => "a positive number, at most 64",
             Kind::Registry => "a registry",
+            Kind::Digests => {
+                "distinct sha256 digests (64 hex digits), at most 256, separated by commas or \
+                 spaces, or none"
+            }
         }
     }
 
@@ -108,11 +123,25 @@ impl Kind {
                 "false" => Value::Bool(false),
                 _ => Value::Null,
             },
-            Kind::Count | Kind::Vcpus | Kind::Secs => {
+            Kind::Count | Kind::Vcpus | Kind::Secs | Kind::PositiveSecs => {
                 text.parse::<u64>().map_or(Value::Null, Value::from)
             }
             Kind::Ratio => text.parse::<f64>().map_or(Value::Null, Value::from),
             Kind::Registry => return Err("a registry is named by the registry's ID".to_string()),
+            Kind::Digests if text == "none" => Value::Array(Vec::new()),
+            Kind::Digests => {
+                let digests: Vec<Value> = text
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|d| !d.is_empty())
+                    .map(|d| Value::from(d.to_ascii_lowercase()))
+                    .collect();
+                // Require `none` for an empty list to reject accidental blank input.
+                if digests.is_empty() {
+                    Value::Null
+                } else {
+                    Value::Array(digests)
+                }
+            }
         };
         self.check(&value).map(|()| value)
     }
@@ -134,10 +163,12 @@ impl Kind {
                 .is_some_and(|n| n >= 1 && u32::try_from(n).is_ok()),
             Kind::Vcpus => value.as_u64().is_some_and(|n| (1..=MAX_VCPUS).contains(&n)),
             Kind::Secs => value.as_u64().is_some_and(|n| n <= MAX_SECS),
+            Kind::PositiveSecs => value.as_u64().is_some_and(|n| (1..=MAX_SECS).contains(&n)),
             Kind::Ratio => value
                 .as_f64()
                 .is_some_and(|r| r.is_finite() && r > 0.0 && r <= MAX_RATIO),
             Kind::Registry => return check_registry(value),
+            Kind::Digests => return check_digests(value),
         };
         if ok {
             Ok(())
@@ -158,6 +189,33 @@ fn is_gib(s: &str) -> bool {
         .filter(|n| digits(n))
         .and_then(|n| n.parse::<u64>().ok())
         .is_some_and(|n| (1..=MAX_GIB).contains(&n))
+}
+
+/// That `value` is a [`Kind::Digests`]: a list of distinct sha256 digests in lowercase hex.
+fn check_digests(value: &Value) -> Result<(), String> {
+    let Value::Array(digests) = value else {
+        return Err(format!("expected {}", Kind::Digests.describe()));
+    };
+    if digests.len() > MAX_DIGESTS {
+        return Err(format!("expected at most {MAX_DIGESTS} digests"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (i, digest) in digests.iter().enumerate() {
+        let Some(d) = digest
+            .as_str()
+            .filter(|d| d.len() == 64 && d.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        else {
+            // Not echoed: it may be anything, of any length.
+            return Err(format!(
+                "entry {} is not a sha256 digest (64 lowercase hex digits)",
+                i + 1
+            ));
+        };
+        if !seen.insert(d) {
+            return Err(format!("{d} is listed twice"));
+        }
+    }
+    Ok(())
 }
 
 /// That `value` is a `[registry]` the hub may send: a table of [`REGISTRY_KEYS`] naming a
@@ -256,6 +314,17 @@ mod tests {
         assert!(parse("executor.vm.max_cpus", "4294967296").is_err());
         assert_eq!(parse("image_cache_idle_secs", "0"), Ok(json!(0)));
         assert_eq!(
+            parse("executor.windows_cache_idle_secs", "3600"),
+            Ok(json!(3600))
+        );
+        assert_eq!(parse("executor.windows_cache_idle_secs", "1"), Ok(json!(1)));
+        assert_eq!(
+            parse("executor.windows_cache_idle_secs", "315360000"),
+            Ok(json!(MAX_SECS))
+        );
+        assert!(parse("executor.windows_cache_idle_secs", "0").is_err());
+        assert!(parse("executor.windows_cache_idle_secs", "315360001").is_err());
+        assert_eq!(
             parse("executor.schedule.wait_timeout_secs", "315360000"),
             Ok(json!(315_360_000))
         );
@@ -284,6 +353,28 @@ mod tests {
         assert!(parse("executor.schedule.from_history", "yes").is_err());
         assert!(parse("registry", "r").is_err());
         assert_eq!(kind("state_dir"), None);
+        let a = "ab".repeat(32);
+        let b = "CD".repeat(32);
+        assert_eq!(
+            parse("executor.windows_media", &format!(" {a}, {b}\n")),
+            Ok(json!([a, b.to_ascii_lowercase()]))
+        );
+        assert_eq!(parse("executor.windows_media", " none "), Ok(json!([])));
+        assert!(parse("executor.windows_media", "").is_err());
+        assert!(parse("executor.windows_media", " , ,").is_err());
+        assert!(parse("executor.windows_media", &format!("{a},{a}")).is_err());
+        assert!(parse("executor.windows_media", &a[1..]).is_err());
+        assert!(parse("executor.windows_media", &"g".repeat(64)).is_err());
+        assert!(Kind::Digests.check(&json!(a)).is_err());
+        assert!(Kind::Digests.check(&json!([b])).is_err());
+        assert!(Kind::Digests.check(&json!([null])).is_err());
+        assert!(Kind::Digests.check(&json!([42])).is_err());
+        let lower = b.to_ascii_lowercase();
+        assert!(parse("executor.windows_media", &format!("{b} {lower}")).is_err());
+        let distinct: Vec<String> = (0..=MAX_DIGESTS).map(|n| format!("{n:064x}")).collect();
+        assert_eq!(Kind::Digests.check(&json!(distinct[..MAX_DIGESTS])), Ok(()));
+        let err = Kind::Digests.check(&json!(distinct)).unwrap_err();
+        assert!(err.contains("at most"), "{err}");
         // A whole ratio, as JSON may carry it.
         assert_eq!(Kind::Ratio.check(&json!(2)), Ok(()));
     }

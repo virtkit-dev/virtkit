@@ -218,10 +218,17 @@ pub(super) fn settings_event(generation: u64) -> String {
     format!("sent the node the hub's settings (generation {generation})")
 }
 
-/// `value` as an audit line and the CLI show it.
+/// Format `value` for audit lines and the CLI. String lists, such as digests, use the
+/// input syntax of `vk-hub settings set`.
 pub fn shown(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
+        Value::Array(items) if items.is_empty() => "none".to_string(),
+        Value::Array(items) if items.iter().all(Value::is_string) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(","),
         other => other.to_string(),
     }
 }
@@ -439,6 +446,17 @@ mod tests {
 
     use super::*;
     use crate::store::{Enrollment, NsGrant, RegistryEnrollment, TokenKind};
+
+    /// A value is shown as `vk-hub settings set` takes it back.
+    #[test]
+    fn a_shown_value_parses_back() {
+        let kind = vk_hub_proto::settings::kind("executor.windows_media").unwrap();
+        for value in [json!([]), json!(["ab".repeat(32), "cd".repeat(32)])] {
+            assert_eq!(kind.parse(&shown(&value)), Ok(value));
+        }
+        assert_eq!(shown(&json!(8)), "8");
+        assert_eq!(shown(&json!("8G")), "8G");
+    }
 
     fn node(db: &Db, takes: bool) -> String {
         let (token, _) = db.create_token(Duration::from_secs(60), "u", 0).unwrap();

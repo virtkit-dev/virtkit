@@ -2059,16 +2059,15 @@ fn settings_section(h: &mut Html, settings: &vk_hub_proto::SettingsReport) {
         .raw("\">The hub's settings</a></p></section>");
 }
 
-/// A setting's value in a cell: a string as it is, a registry by its `repo`, anything else as
-/// JSON.
+/// A setting's value in a cell: a registry by its `repo`, anything else as the hub's settings
+/// show it.
 fn setting_text(value: &serde_json::Value) -> String {
     match value {
-        serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Object(table) => match table.get("repo").and_then(|r| r.as_str()) {
             Some(repo) => repo.to_string(),
             None => value.to_string(),
         },
-        other => other.to_string(),
+        other => crate::store::setting_shown(other),
     }
 }
 
