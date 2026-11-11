@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.110.0] - 2026-11-11
+
 ### Added
 
 - **Windows jobs can fetch approved install media without a remote build cache registry.**
@@ -5482,7 +5484,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.109.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.110.0...HEAD
+[0.110.0]: https://github.com/virtkit-dev/virtkit/compare/v0.109.0...v0.110.0
 [0.109.0]: https://github.com/virtkit-dev/virtkit/compare/v0.108.4...v0.109.0
 [0.108.4]: https://github.com/virtkit-dev/virtkit/compare/v0.108.3...v0.108.4
 [0.108.3]: https://github.com/virtkit-dev/virtkit/compare/v0.108.2...v0.108.3
