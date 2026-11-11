@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.110.2] - 2026-11-11
+
 ### Fixed
 
 - **GitLab artifact names, paths and exclusions expand variables.** `paths: [src/${REPORT}.xml]`
@@ -5498,7 +5500,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.110.1...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.110.2...HEAD
+[0.110.2]: https://github.com/virtkit-dev/virtkit/compare/v0.110.1...v0.110.2
 [0.110.1]: https://github.com/virtkit-dev/virtkit/compare/v0.110.0...v0.110.1
 [0.110.0]: https://github.com/virtkit-dev/virtkit/compare/v0.109.0...v0.110.0
 [0.109.0]: https://github.com/virtkit-dev/virtkit/compare/v0.108.4...v0.109.0
