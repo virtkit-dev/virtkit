@@ -127,6 +127,14 @@ impl Vars {
         self.lookup(key, true)
     }
 
+    /// [`Vars::get`] for a name some variable sets, `None` for any other.
+    pub fn find(&self, key: &str) -> Option<String> {
+        self.last(key).map(|v| match v.file {
+            true => self.tmp_file(&v.key),
+            false => v.value.clone(),
+        })
+    }
+
     /// The value of `key`, a file variable's content included (`Variables.Value`).
     pub fn value(&self, key: &str) -> String {
         self.lookup(key, false)
@@ -242,6 +250,128 @@ fn shell_name(s: &str) -> (&str, usize) {
     (&s[..n], n)
 }
 
+/// `s` expanded for the subset of mvdan.cc/sh's `shell.Expand` that artifact names, paths
+/// and excludes use, which gitlab-runner's `artifacts-uploader` applies to them: `$NAME`,
+/// `${NAME}`, `${#NAME}` and the `-`, `:-`, `+`, `:+` operators, `\` escaping `$`, `` ` ``,
+/// `\` and a newline as in a heredoc. An empty value counts as unset, as through
+/// `shell.Expand`'s environment. The rest (command substitution, arithmetic, special and
+/// positional parameters, other operators, quotes inside `${}`, an unclosed `${`) is an
+/// error, on which the caller keeps the value as written.
+pub fn shell_expand(s: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let (mut i, mut lit) = (0, 0);
+    while i < b.len() {
+        match b[i] {
+            b'\\' if matches!(b.get(i + 1), Some(b'$' | b'`' | b'\\' | b'\n')) => {
+                out.push_str(&s[lit..i]);
+                if b[i + 1] != b'\n' {
+                    out.push(b[i + 1] as char);
+                }
+                i += 2;
+                lit = i;
+            }
+            b'`' => return Err("command substitution is not supported".into()),
+            b'$' => {
+                out.push_str(&s[lit..i]);
+                let (text, used) = parameter(&s[i + 1..], lookup)?;
+                out.push_str(&text);
+                i += 1 + used;
+                lit = i;
+            }
+            _ => i += 1,
+        }
+    }
+    out.push_str(&s[lit..]);
+    Ok(out)
+}
+
+/// The expansion of the parameter after a `$` at the start of `s`, and the bytes it took.
+fn parameter(s: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<(String, usize), String> {
+    let b = s.as_bytes();
+    match b.first() {
+        Some(b'{') => braced(s, lookup),
+        Some(b'(') => Err("command substitution and arithmetic are not supported".into()),
+        Some(&c) if c == b'_' || c.is_ascii_alphabetic() => {
+            let n = b.iter().take_while(|&&c| alnum(c)).count();
+            Ok((lookup(&s[..n]).unwrap_or_default(), n))
+        }
+        Some(&c) if special(c) => Err(format!("${} is not supported", c as char)),
+        // A `$` that starts no parameter is itself.
+        _ => Ok(("$".into(), 0)),
+    }
+}
+
+/// `${...}` at the start of `s`.
+fn braced(s: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<(String, usize), String> {
+    let end = closing(s.as_bytes()).ok_or("unclosed ${")?;
+    let inner = &s[1..end];
+    let unsupported = || Err(format!("${{{inner}}} is not supported"));
+    let name_len = |t: &str| match t.as_bytes().first() {
+        Some(&c) if c == b'_' || c.is_ascii_alphabetic() => {
+            t.bytes().take_while(|&c| alnum(c)).count()
+        }
+        _ => 0,
+    };
+    if let Some(name) = inner.strip_prefix('#') {
+        if name.is_empty() || name_len(name) != name.len() {
+            return unsupported();
+        }
+        let len = lookup(name).unwrap_or_default().chars().count();
+        return Ok((len.to_string(), end + 1));
+    }
+    let n = name_len(inner);
+    if n == 0 {
+        return unsupported();
+    }
+    let (name, rest) = inner.split_at(n);
+    let value = lookup(name).filter(|v| !v.is_empty());
+    let text = match rest {
+        "" => value.unwrap_or_default(),
+        _ => {
+            let op = |p: &str| rest.strip_prefix(p);
+            let (word, default) = match (op(":-").or(op("-")), op(":+").or(op("+"))) {
+                (Some(w), _) => (w, true),
+                (None, Some(w)) => (w, false),
+                (None, None) => return unsupported(),
+            };
+            // Expanded either way, so an error in an unused word still fails the value.
+            let word = shell_expand(word, lookup)?;
+            match (default, value) {
+                (true, Some(v)) => v,
+                (true, None) | (false, Some(_)) => word,
+                (false, None) => String::new(),
+            }
+        }
+    };
+    Ok((text, end + 1))
+}
+
+/// The index of the `}` closing the `{` at the start of `b`, past nested `${...}` and
+/// escapes.
+fn closing(b: &[u8]) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut i = 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'$' if b.get(i + 1) == Some(&b'{') => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// The job's registry access when its guest's proxy injects it: `[registry] guest_credential
 /// = "job"` on a remote registry, a token from the hub, and `net.mode = "switch"`, the only
 /// network that serves `registry.vk`.
@@ -300,6 +430,50 @@ fn registry_vars(registry: &JobRegistry) -> Vec<Variable> {
 mod tests {
     use super::*;
     use vk_hub_proto::job::Image;
+
+    #[test]
+    fn shell_expand_follows_the_uploaders_expansion() {
+        let lookup = |name: &str| match name {
+            "REPORT" => Some("reportGoLint".to_owned()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        let ok = |s: &str| shell_expand(s, &lookup).unwrap();
+        assert_eq!(ok("src/${REPORT}.xml"), "src/reportGoLint.xml");
+        assert_eq!(ok("$REPORT/x"), "reportGoLint/x");
+        assert_eq!(ok("a/$UNSET/b"), "a//b");
+        assert_eq!(ok("${#REPORT}${#EMPTY}"), "120");
+        // An empty value counts as unset, with or without the colon.
+        assert_eq!(
+            ok("${UNSET:-o}/${EMPTY:-e}/${EMPTY-e}/${REPORT-x}"),
+            "o/e/e/reportGoLint"
+        );
+        assert_eq!(ok("${REPORT:+on}${REPORT+on}${EMPTY+x}${UNSET:+x}"), "onon");
+        assert_eq!(ok("${UNSET:-${REPORT}}"), "reportGoLint");
+        assert_eq!(ok("${UNSET:-a{b}"), "a{b");
+        assert_eq!(
+            ok(r#"\$REPORT \\ \x \" $ a$/b"#),
+            r#"$REPORT \ \x \" $ a$/b"#
+        );
+        assert_eq!(ok("plain/path/*.xml"), "plain/path/*.xml");
+        assert_eq!(ok("é/${REPORT}"), "é/reportGoLint");
+        let bad = [
+            "$(id)",
+            "`id`",
+            "$((1+2))",
+            "${REPORT",
+            "${REPORT/a/b}",
+            "${REPORT?}",
+            "$1",
+            "$$",
+            "${}",
+            "${REPORT:-$(id)}",
+            "${UNSET:+${}}",
+        ];
+        for bad in bad {
+            assert!(shell_expand(bad, &lookup).is_err(), "{bad:?}");
+        }
+    }
 
     fn var(key: &str, value: &str) -> Variable {
         Variable {

@@ -60,7 +60,16 @@ pub async fn archive(
         entries.feed(chunk);
         Ok(())
     };
-    let ended = run(addr, user, args, None, Some((out, &mut tap)), Some(trace)).await?;
+    let ended = run(
+        addr,
+        user,
+        crate::run::GUEST_AGENT,
+        args,
+        None,
+        Some((out, &mut tap)),
+        Some(trace),
+    )
+    .await?;
     if !ended.ok {
         bail!("vk-agent archive failed: {}", ended.text());
     }
@@ -75,11 +84,51 @@ pub async fn extract(
     input: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
 ) -> Result<()> {
     let args = vec!["extract".to_string(), root.to_string()];
-    let ended = run(addr, user, args, Some(input), None, None).await?;
+    let ended = run(
+        addr,
+        user,
+        crate::run::GUEST_AGENT,
+        args,
+        Some(input),
+        None,
+        None,
+    )
+    .await?;
     if !ended.ok {
         bail!("vk-agent extract failed: {}", ended.text());
     }
     Ok(())
+}
+
+/// The guest file at `path`, read as `user` with `cat`, or `None` when it cannot be read.
+/// More than `limit` bytes is an error.
+pub async fn read_file(
+    addr: &SocketAddr,
+    user: Option<&str>,
+    path: &str,
+    limit: usize,
+) -> Result<Option<Vec<u8>>> {
+    let mut data = Vec::new();
+    let mut seen = 0usize;
+    let mut tap = |chunk: &[u8]| {
+        seen += chunk.len();
+        if seen > limit {
+            bail!("{path} is over {limit} bytes");
+        }
+        Ok(())
+    };
+    let args = vec![path.to_string()];
+    let ended = run(
+        addr,
+        user,
+        "cat",
+        args,
+        None,
+        Some((&mut data, &mut tap)),
+        None,
+    )
+    .await?;
+    Ok(ended.ok.then_some(data))
 }
 
 /// How an agent command ended, with the stderr it wrote that was not a trace line.
@@ -100,12 +149,13 @@ type Output<'a> = (
     &'a mut (dyn FnMut(&[u8]) -> Result<()> + Send),
 );
 
-/// Run the guest's agent with `args`: `input` streamed to its stdin, its stdout to `output`
+/// Run `program` in the guest with `args`: `input` streamed to its stdin, its stdout to `output`
 /// once its tap has passed each chunk, its stderr lines to `trace` when given, else kept for
 /// the error.
 async fn run(
     addr: &SocketAddr,
     user: Option<&str>,
+    program: &str,
     args: Vec<String>,
     mut input: Option<&mut (dyn tokio::io::AsyncRead + Unpin + Send)>,
     mut output: Option<Output<'_>>,
@@ -115,7 +165,7 @@ async fn run(
         .await
         .context("connecting to the VM's vk-agent")?;
     sink.send(Message::CmdExec(CmdExec {
-        name: crate::run::GUEST_AGENT.to_string(),
+        name: program.to_string(),
         args,
         env: vec![],
         clear_env: false,

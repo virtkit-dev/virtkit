@@ -727,7 +727,7 @@ Every field of the response, from gitlab-runner 19.5's `common/spec/spec.go`:
 | `image` `name`, `alias`, `command`, `entrypoint`, `ports`, `variables`, `pull_policy` | `image` | resolved under the node's image rules |
 | `image.executor_opts.docker.platform`, `.docker.user`, `.kubernetes.user` | `image.platform`, `image.user` | `image_executor_opts` is not advertised; when GitLab sends them anyway, these are honoured |
 | `services[]` | `services` | as `image`; run as a compose group beside the job VM, on one node |
-| `artifacts[]` `name`, `untracked`, `paths`, `exclude`, `when`, `artifact_type`, `artifact_format`, `expire_in` | `artifacts` | |
+| `artifacts[]` `name`, `untracked`, `paths`, `exclude`, `when`, `artifact_type`, `artifact_format`, `expire_in` | `artifacts` | sent as written; before archiving, the node expands `name`, `paths` and `exclude` from the job's variables and the steps' `$GITLAB_ENV`, covering `$NAME`, `${NAME}`, `${#NAME}` and `-`, `:-`, `+`, `:+` of the uploader's `shell.Expand`. Any other expression is kept as written, with a warning; variables only the image's environment sets expand to nothing |
 | `cache[]` `key`, `untracked`, `policy`, `paths`, `when`, `fallback_keys` | `caches` | keys expanded against the job's and the runner's variables, as gitlab-runner expands them; variables only the node sets (`CI_PROJECT_DIR`, `CI_CONCURRENT_ID`, …) expand to nothing |
 | `credentials[]` of type `registry` | `registry_credentials` | other types are ignored, as by gitlab-runner |
 | `dependencies[]` `id`, `token`, `name`, `artifacts_file` | `dependencies` | |
