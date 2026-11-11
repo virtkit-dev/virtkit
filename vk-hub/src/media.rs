@@ -251,28 +251,7 @@ pub fn target(
         Some(id) => id.to_string(),
         None => default_registry(hub)?,
     };
-    let Some(row) = hub.db.registry(&id)? else {
-        bail!("there is no registry {id}");
-    };
-    if hub.reach(&id) != crate::server::Reach::Connected {
-        bail!("registry {id} is not connected to the hub");
-    }
-    let inventory = row.inventory.as_ref();
-    if !inventory.is_some_and(|i| i.files_put) {
-        bail!("registry {id} does not take uploads from the hub: update it");
-    }
-    let Some(url) = row.url.clone() else {
-        bail!(
-            "registry {id} has no URL bound; bind one first (vk-hub registries set-url {id} \
-             <url> [--ca <file>])"
-        );
-    };
-    if !https_or_loopback(&url) {
-        bail!(
-            "registry {id} is bound to {url}: the hub sends its upload token over https only, \
-             or plain http on loopback; bind an https URL"
-        );
-    }
+    let (row, url) = bound(hub, &id)?;
     if let Some(free) = row.heartbeat.as_ref().map(|h| h.store_free_bytes)
         && size.saturating_add(HEADROOM) > free
     {
@@ -281,7 +260,7 @@ pub fn target(
         );
     }
     let ttl = TOKEN_TTL.min(hub.token_keys.max_token);
-    let token = mint(hub, actor, &id, under, ttl)?;
+    let token = mint(hub, actor, &id, under, &["sha256", DIR], false, ttl)?;
     Ok(Target {
         registry: id,
         under: under.map(str::to_string),
@@ -292,21 +271,57 @@ pub fn target(
     })
 }
 
-/// The token an upload to registry `id` is written with, minted as `actor` for `ttl`: write
-/// on the prefixes of the two repositories a medium is tagged in, `[<under>/]files/sha256`
-/// and `[<under>/]files/win-media` (without `under`, `sha256` and `win-media`, which reach
-/// `files/` through their own prefix).
-fn mint(hub: &Hub, actor: &str, id: &str, under: Option<&str>, ttl: Duration) -> Result<String> {
-    let grants = ["sha256", DIR]
+/// Registry `id`'s row and URL, checked for connectivity, file puts and a URL the hub may
+/// send tokens to.
+fn bound(hub: &Hub, id: &str) -> Result<(crate::store::RegistryRow, String)> {
+    let Some(row) = hub.db.registry(id)? else {
+        bail!("there is no registry {id}");
+    };
+    if hub.reach(id) != Reach::Connected {
+        bail!("registry {id} is not connected to the hub");
+    }
+    if !row.inventory.as_ref().is_some_and(|i| i.files_put) {
+        bail!("registry {id} does not take uploads from the hub: update it");
+    }
+    let Some(url) = row.url.clone() else {
+        bail!(
+            "registry {id} has no URL bound; bind one first (vk-hub registries set-url {id} \
+             <url> [--ca <file>])"
+        );
+    };
+    if !https_or_loopback(&url) {
+        bail!(
+            "registry {id} is bound to {url}: the hub sends its token over https only, or \
+             plain http on loopback; bind an https URL"
+        );
+    }
+    Ok((row, url))
+}
+
+/// A token for registry `id`, minted as `actor` for `ttl`, granting write and optional read
+/// on each `<under>/files/<dir>` prefix in `dirs`. Without `under`, `<dir>` alone also grants
+/// access under `files/`. Uploads write both media tags: `sha256` and `win-media`.
+fn mint(
+    hub: &Hub,
+    actor: &str,
+    id: &str,
+    under: Option<&str>,
+    dirs: &[&str],
+    read: bool,
+    ttl: Duration,
+) -> Result<String> {
+    let grants = dirs
+        .iter()
         .map(|dir| Grant {
             prefix: match under {
                 Some(u) => format!("{u}/files/{dir}"),
                 None => dir.to_string(),
             },
+            read,
             write: true,
             ..Grant::default()
         })
-        .to_vec();
+        .collect();
     crate::tokens::mint_for(hub, actor, SUBJECT, id, grants, None, ttl)
 }
 
@@ -441,17 +456,11 @@ async fn send_within<S>(
 where
     S: Stream<Item = Result<Bytes>> + Send + 'static,
 {
-    let tls = client_tls(target.ca_pem.as_deref())?;
-    let dialed = tokio::time::timeout(limits.connect, vk_peer::session::dial(&target.url, &tls))
-        .await
-        .map_err(|_| anyhow!("registry {} was not reached in time", target.registry))?
-        .with_context(|| format!("reaching registry {}", target.registry))?;
-    let (mut sender, conn) =
-        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(dialed.io))
-            .await
-            .context("opening the upload")?;
-    let driver = tokio::spawn(conn);
-    let _driver = AbortOnDrop(driver);
+    let Conn {
+        mut sender,
+        authority,
+        _driver,
+    } = connect(target, limits.connect).await?;
     let tap = Arc::new(Mutex::new(Tap::default()));
     let body = tapped(body, tap.clone(), size);
     let mut path = format!("{FILES_PATH}{DIR}/{name}");
@@ -459,7 +468,7 @@ where
         path.push_str(&format!("?under={u}"));
     }
     let mut request = hyper::Request::put(path)
-        .header(hyper::header::HOST, &dialed.authority)
+        .header(hyper::header::HOST, &authority)
         .header(
             hyper::header::AUTHORIZATION,
             format!("Bearer {}", target.token),
@@ -524,6 +533,38 @@ where
     Ok(Sent {
         put,
         volume_label: volume_label(&tap.head),
+    })
+}
+
+/// A connection to a registry.
+struct Conn<B> {
+    sender: hyper::client::conn::http1::SendRequest<B>,
+    /// The `host:port` its requests name.
+    authority: String,
+    /// The task driving it, ended when dropped.
+    _driver: AbortOnDrop<hyper::Result<()>>,
+}
+
+/// A connection to `target`'s registry, reached within `within`.
+async fn connect<B>(target: &Target, within: Duration) -> Result<Conn<B>>
+where
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let tls = client_tls(target.ca_pem.as_deref())?;
+    let dialed = tokio::time::timeout(within, vk_peer::session::dial(&target.url, &tls))
+        .await
+        .map_err(|_| anyhow!("registry {} was not reached in time", target.registry))?
+        .with_context(|| format!("reaching registry {}", target.registry))?;
+    let (sender, conn) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(dialed.io))
+            .await
+            .with_context(|| format!("opening a connection to registry {}", target.registry))?;
+    Ok(Conn {
+        sender,
+        authority: dialed.authority,
+        _driver: AbortOnDrop(tokio::spawn(conn)),
     })
 }
 
@@ -606,9 +647,7 @@ pub(crate) fn refusal(
     retry_after: Option<u64>,
     said: &[u8],
 ) -> Refused {
-    let message = serde_json::from_slice::<serde_json::Value>(said)
-        .ok()
-        .and_then(|v| v["errors"][0]["message"].as_str().map(str::to_string));
+    let message = registry_message(said);
     let mut text = format!("registry {id} refused the upload (HTTP {status})");
     if let Some(m) = message {
         text.push_str(&format!(": {}", vk_hub_proto::display_safe(&m)));
@@ -621,6 +660,13 @@ pub(crate) fn refusal(
         retry_after,
         text,
     }
+}
+
+/// The first message in a registry error body, if present.
+fn registry_message(said: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(said)
+        .ok()
+        .and_then(|v| v["errors"][0]["message"].as_str().map(str::to_string))
 }
 
 /// Once the upload stalls: no byte taken for `limits.stall` while some are still to send, or
@@ -1167,7 +1213,8 @@ mod tests {
         .with_token_keys(dir.join("token-keys"), crate::tokens::DEFAULT_MAX_JOB_TOKEN);
         let id = crate::tests::tokens::token_registry(&hub, "https://reg.example.com", "aa");
         let ttl = Duration::from_secs(3600);
-        let token = mint(&hub, "uid 0", &id, Some("build-cache"), ttl).unwrap();
+        let dirs = ["sha256", DIR];
+        let token = mint(&hub, "uid 0", &id, Some("build-cache"), &dirs, false, ttl).unwrap();
         let keys = hub
             .db
             .registry(&id)
@@ -1188,8 +1235,9 @@ mod tests {
         );
         assert!(claims.grants.iter().all(|g| g.write && !g.read && !g.lock));
         // Past the hub's ceiling, or for a registry that does not take tokens, none.
-        assert!(mint(&hub, "uid 0", &id, None, Duration::from_secs(u64::MAX / 2)).is_err());
-        assert!(mint(&hub, "uid 0", "nope", None, ttl).is_err());
+        let long = Duration::from_secs(u64::MAX / 2);
+        assert!(mint(&hub, "uid 0", &id, None, &dirs, false, long).is_err());
+        assert!(mint(&hub, "uid 0", "nope", None, &dirs, false, ttl).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
