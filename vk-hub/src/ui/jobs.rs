@@ -843,9 +843,9 @@ fn job_row(
             h.raw("-");
         }
     }
-    h.raw("</td><td>");
-    node_link(h, j, names);
-    h.raw("</td><td>");
+    h.raw("</td><td><div class=\"fit\">");
+    node_link(h, j, names, NODE_TAIL);
+    h.raw("</div></td><td>");
     // The job's page has its output, live while it runs; the router takes only hex.
     if vk_hub_proto::valid_id(id) {
         h.raw("<a href=\"").raw(DETAIL_PREFIX).text(id).raw("\">");
@@ -903,9 +903,11 @@ fn narrowing_cut(
     h.raw("</a>");
 }
 
-// The last characters kept when a job's name, a branch or a project is cut.
+// The last characters kept when a job's name, a branch, a project or a node is cut.
 const NAME_TAIL: usize = 8;
 const BRANCH_TAIL: usize = 12;
+/// Preserve the suffix to distinguish nodes with a shared prefix.
+const NODE_TAIL: usize = 8;
 const PROJECT_TAIL: usize = 8;
 /// Splitting a head this short shows no more than the whole label: the stylesheet reserves
 /// about this much (2.2em) for the head before the tail shrinks.
@@ -964,18 +966,21 @@ fn pipeline_url(job_url: Option<&str>, pipeline: u64) -> Option<String> {
 }
 
 /// The node job `j` was sent to, linked to its page, or `-`.
-fn node_link(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>) {
+/// [`cut_middle`] truncates names to fit, favoring the last `tail` characters; `0` keeps
+/// them whole.
+fn node_link(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>, tail: usize) {
     match &j.node {
         // The router takes only hex for a node's ID.
         Some(node) if vk_hub_proto::valid_id(node) => {
             h.raw("<a href=\"/node/").text(node).raw("\">");
             match names.get(node.as_str()) {
-                Some(name) => h.node(name),
-                None => h
-                    .raw("<code>")
-                    .text(node.get(..8).unwrap_or(node))
-                    .raw("</code>"),
-            };
+                Some(name) => cut_middle(h, name, "", tail),
+                None => {
+                    h.raw("<code>")
+                        .text(node.get(..8).unwrap_or(node))
+                        .raw("</code>");
+                }
+            }
             h.raw("</a>");
         }
         _ => {
@@ -1326,7 +1331,7 @@ pub(super) fn record(
         pages::kv_html(h, "Branch", &cell);
     }
     let mut cell = Html::new();
-    node_link(&mut cell, j, names);
+    node_link(&mut cell, j, names, 0);
     pages::kv_html(h, "Node", &cell);
     pages::kv_node(h, "Pool", &j.placement.pool);
     pages::kv_node(h, "Submitted by", &format!("key {}", j.key_name));

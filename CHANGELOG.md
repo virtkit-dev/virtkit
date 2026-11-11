@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Node names fit the hub's jobs list.** A wider node column truncates long names like
+  branches, favoring the endings that distinguish nodes. Hover to see the full name.
+
 ## [0.110.0] - 2026-11-11
 
 ### Added

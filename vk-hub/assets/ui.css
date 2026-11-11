@@ -238,11 +238,11 @@ dl.facts dd { margin: 0; }
    its branch about 8rem each, room for a name's head and kept end. Below it the page scrolls
    sideways, the table running past its section's edge: a scrolling section would take the
    sticky header with it. */
-table.grid.jobs { table-layout: fixed; min-width: 109rem; }
-/* The job and its branch, without a width, share what these 93rem leave. */
+table.grid.jobs { table-layout: fixed; min-width: 112rem; }
+/* The job and branch columns share the space left by these 95.5rem. */
 table.grid.jobs col.project { width: 8rem; }      /* git/proxies-rs */
 table.grid.jobs col.pipeline { width: 6.5rem; }   /* 509098 ↗ */
-table.grid.jobs col.node { width: 9rem; }         /* hq-srv41-rd-hv05 */
+table.grid.jobs col.node { width: 12rem; }        /* build-node-long-07, else cut */
 table.grid.jobs col.result { width: 10rem; }      /* running: step_script */
 table.grid.jobs col.network { width: 10rem; }     /* Blocked: 12 destinations */
 table.grid.jobs col.started { width: 15rem; }     /* Oct 11, 01:40 PM · 1 day ago */

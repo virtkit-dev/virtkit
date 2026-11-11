@@ -4205,7 +4205,11 @@ async fn the_job_history_is_shown_filtered_and_paged() {
          </div></td><td><div class=\"fit\"><a href=\"/jobs?ref=main\">\
          <span class=\"mid\" title=\"main @ ab12\"><span class=\"head\">main</span></span></a></div></td>\
          <td>-</td>",
-        &format!("<a href=\"/node/{node}\">ci-1</a>"),
+        // Node names use the same truncation markup as branches, with the full name on hover.
+        &format!(
+            "<td><div class=\"fit\"><a href=\"/node/{node}\"><span class=\"mid\" title=\"ci-1\">\
+             <span class=\"head\">ci-1</span></span></a></div></td>"
+        ),
         "<span class=\"badge ok\">success</span>",
         "<td class=\"num\">1m01s</td><td class=\"num\">3.0 GiB</td>\
          <td class=\"num\">2m00s</td><td class=\"num\">4 vCPUs, 8.0 GiB</td>",
@@ -4218,7 +4222,8 @@ async fn the_job_history_is_shown_filtered_and_paged() {
          <span class=\"mid\" title=\"fix/&lt;x&gt;\"><span class=\"head\">fix/&lt;x&gt;</span>\
          </span></a></div></td>\
          <td><a href=\"/jobs?pipeline=77\">77</a></td>\
-         <td><a href=\"/node/efefefefefefefefefefefefefefefef\"><code>efefefef</code></a></td>",
+         <td><div class=\"fit\"><a href=\"/node/efefefefefefefefefefefefefefefef\">\
+         <code>efefefef</code></a></div></td>",
         // A branch too long for its column keeps its end, and is whole on hover.
         "<a href=\"/jobs?ref=feature%2Fmain-menu\"><span class=\"mid\" title=\"feature/main-menu\">\
          <span class=\"head\">featu</span><span class=\"tail\">re/main-menu</span></span></a>",
