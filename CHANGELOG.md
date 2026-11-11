@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.108.4] - 2026-11-11
+
 ### Fixed
 
 - **A build sees its context as root's, as under Docker.** `COPY` and `RUN --mount` from the
@@ -5431,7 +5433,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.108.3...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.108.4...HEAD
+[0.108.4]: https://github.com/virtkit-dev/virtkit/compare/v0.108.3...v0.108.4
 [0.108.3]: https://github.com/virtkit-dev/virtkit/compare/v0.108.2...v0.108.3
 [0.108.2]: https://github.com/virtkit-dev/virtkit/compare/v0.108.1...v0.108.2
 [0.108.1]: https://github.com/virtkit-dev/virtkit/compare/v0.108.0...v0.108.1
