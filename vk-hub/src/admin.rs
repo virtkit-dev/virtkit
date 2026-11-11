@@ -1244,18 +1244,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             serde_json::to_value(detail)?
         }
         Call::RemoveNode { id } => {
-            let removed = crate::tokens::remove_node(hub, &id, &actor)?;
-            if removed {
-                hub.revoke(&id);
-                hub.touch();
-                // The revocation is recorded; the hourly sync sends it if this fails.
-                if let Err(e) = crate::tokens::sync_all(hub) {
-                    eprintln!(
-                        "vk-hub: sending node {}'s revocation to registries: {e:#}",
-                        vk_hub_proto::display_safe(&id)
-                    );
-                }
-            }
+            let removed = crate::ops::remove_node(hub, &actor, &id)?;
             eprintln!(
                 "vk-hub: admin: uid {uid} removed node {} ({})",
                 vk_hub_proto::display_safe(&id),

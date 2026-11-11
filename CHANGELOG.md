@@ -24,6 +24,9 @@ All notable changes to virtkit will be documented in this file.
   when its licence must be renewed and whether jobs may use it; operators upload, describe,
   approve and remove media from the browser.
 
+- **Remove a node from the hub's web UI.** A node's page offers *Remove* in its danger zone,
+  as `vk-hub nodes remove` does, after asking to confirm.
+
 ## [0.108.4] - 2026-11-11
 
 ### Fixed

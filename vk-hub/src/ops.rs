@@ -279,6 +279,24 @@ pub fn set_acquisition(
     Ok(changed)
 }
 
+/// Remove node `id` as `actor`: unpin its key, end its session and withdraw its registry
+/// access. Return whether the node existed.
+pub fn remove_node(hub: &Hub, actor: &str, id: &str) -> Result<bool> {
+    let removed = crate::tokens::remove_node(hub, id, actor)?;
+    if removed {
+        hub.revoke(id);
+        hub.touch();
+        // The revocation is recorded; the hourly sync sends it if this fails.
+        if let Err(e) = crate::tokens::sync_all(hub) {
+            eprintln!(
+                "vk-hub: sending node {}'s revocation to registries: {e:#}",
+                vk_hub_proto::display_safe(id)
+            );
+        }
+    }
+    Ok(removed)
+}
+
 /// Issue `operation` to node `id`, as `actor`, valid for [`COMMAND_TTL`]. An update is issued
 /// by [`update`], which names a release the hub holds, and a tools build by [`tools`].
 pub fn command(hub: &Hub, actor: &str, id: &str, operation: Operation) -> Result<Command> {

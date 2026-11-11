@@ -3005,7 +3005,7 @@ async fn the_fleet_takes_only_node_actions_and_names_its_ui_url() {
                 &format!("Origin: {origin}"),
                 "Content-Type: application/x-www-form-urlencoded",
             ],
-            &format!("_csrf={csrf}&op=remove&confirm=yes"),
+            &format!("_csrf={csrf}&op=delete&confirm=yes"),
         )
         .await;
         assert_eq!(reply.status, status, "{path}: {}", reply.body);
@@ -3526,6 +3526,45 @@ async fn a_reset_is_issued_only_once_confirmed() {
     assert_eq!(reply.status, 409, "{}", reply.body);
     assert!(reply.body.contains("update its vk"), "{}", reply.body);
     assert!(hub.db.node_commands(&old).unwrap().is_empty());
+}
+
+/// Removing a node from its page asks first; the answer removes it, audited as the operator,
+/// and sends the browser back to the nodes list.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_is_removed_only_once_confirmed() {
+    let (addr, hub, origin) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (cookie, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let path = format!("/node/{node}/action");
+    let page = get(addr, &format!("/node/{node}"), Some(&cookie)).await;
+    assert!(
+        page.body
+            .contains("<button class=\"danger\">Remove</button>"),
+        "{}",
+        page.body
+    );
+
+    let answer = ask(addr, &origin, &cookie, &csrf, &path, "remove").await;
+    assert!(hub.db.node(&node).unwrap().is_some());
+    let reply = post_action(addr, &origin, &cookie, &path, &answer, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.header("hx-redirect"), Some("/"));
+    assert!(hub.db.node(&node).unwrap().is_none());
+    // Answered once.
+    let reply = post_action(addr, &origin, &cookie, &path, &answer, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+
+    // A plain form is redirected; a node already gone is refused.
+    let node = enrolled_node(&hub, "ci-2");
+    let path = format!("/node/{node}/action");
+    let answer = ask(addr, &origin, &cookie, &csrf, &path, "remove").await;
+    let reply = post_action(addr, &origin, &cookie, &path, &answer, false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some("/"));
+    assert!(hub.db.node(&node).unwrap().is_none());
+    let answer = ask(addr, &origin, &cookie, &csrf, &path, "remove").await;
+    let reply = post_action(addr, &origin, &cookie, &path, &answer, true).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
 }
 
 /// Checking "Keep cached images" preserves that choice through confirmation and reset.

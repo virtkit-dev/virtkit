@@ -1749,18 +1749,20 @@ applicable actions with short explanations: pause intake or resume it, set the l
 it, drain from ready or during maintenance (the node stays drained once it ends), undrain while
 draining or drained, quarantine unless quarantined, release only then, reset from ready,
 draining or drained; no reset when the runner is external; everything while the node has
-reported nothing. They are the admin socket's operations — ceiling set or lifted, acquisition
-stopped or resumed, drain, undrain, quarantine, release, reset — posted to `/node/<id>/action`
-as before, which still refuses what does not apply. A reset requires confirmation from the same
-session, once and within ten minutes, as local mode's stops do. The panel is part of the node's
+reported nothing; removal is available in every state. These admin-socket operations —
+ceiling set or lifted, acquisition stopped or resumed, drain, undrain, quarantine, release,
+reset and node removal — post to `/node/<id>/action`, which refuses inapplicable actions.
+A reset or removal requires confirmation from the same session, once and within ten minutes,
+as local mode's stops do. Removal redirects to the nodes list. The panel is part of the node's
 live fragment, rendered for an operator's stream with that session's CSRF token, so what it
 offers follows the node; the limit's number field is kept through updates (`hx-preserve`). Each
-action returns a status line through htmx, and also works as a plain form. Monitoring-only nodes
+action other than removal returns a status line through htmx, and every action also works as a
+plain form. Monitoring-only nodes
 are marked, offer no actions and reject steering posts. Viewers see where the node stands and no
 actions. Operators also issue enrollment tokens from the nodes page, like `vk-hub token create`,
 valid for an hour, ten minutes, a day or seven days. A plain POST to `/tokens` uses the same
 origin, CSRF and role checks and returns a page showing the token once. Issuance is audited as
-the session's principal; the token is never logged. Removing a node stays on the admin socket.
+the session's principal; the token is never logged.
 Operators grant who signs in through the OIDC provider, and as what, from `/users` (see [Signing
 in](#signing-in)). A page is refused to a request whose `Sec-Fetch-Site` is `same-site` or
 `cross-site`.

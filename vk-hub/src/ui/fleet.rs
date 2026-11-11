@@ -654,7 +654,8 @@ fn steer(form: &[(String, String)]) -> Result<Steer, &'static str> {
 
 /// `POST /node/<id>/action`: run the shared admin-socket operation as the operator's session
 /// principal. For htmx, return a status line while the node's fragment updates live.
-/// For plain forms, redirect to the node's page or show the refusal.
+/// For plain forms, redirect to the node's page or show the refusal. A removal goes to the
+/// nodes list instead.
 pub(super) async fn node_action(
     req: Request<Incoming>,
     ui: &Ui,
@@ -666,6 +667,9 @@ pub(super) async fn node_action(
         Ok(checked) => checked,
         Err((status, text)) => return Ok(actions::refused(htmx, status, text)),
     };
+    if field(&form, "op") == Some(REMOVE.op) {
+        return remove_node(ui, site, htmx, &auth, &form, id).await;
+    }
     let steer = match steer(&form) {
         Ok(steer) => steer,
         Err(why) => return Ok(actions::refused(htmx, StatusCode::BAD_REQUEST, why)),
@@ -804,6 +808,50 @@ pub(super) async fn node_action(
         return Ok(resp);
     }
     Ok(said_so(&said))
+}
+
+/// Remove node `id` once the operator confirms, then go to the nodes list (`/`): the node's page
+/// is gone.
+async fn remove_node(
+    ui: &Ui,
+    site: &FleetSite,
+    htmx: bool,
+    auth: &Auth,
+    form: &[(String, String)],
+    id: &str,
+) -> Result<Response<Body>> {
+    let back = format!("/node/{id}");
+    let ask = actions::Ask {
+        path: format!("{back}/action"),
+        back,
+        op: "remove".into(),
+        what: "Remove this node? The hub unpins its key, ends its session and withdraws its \
+               registry access. The host can join again only as a new node, with a new token.",
+        detail: Html::new(),
+        asked: Vec::new(),
+    };
+    if let Some(asked) = actions::ask_first(&site.questions, layout, htmx, auth, form, &ask)? {
+        return Ok(asked);
+    }
+    let principal = auth.session.principal();
+    let hub = ui.hub.clone();
+    let node = id.to_string();
+    if !blocking(move || ops::remove_node(&hub, &principal, &node)).await? {
+        return Ok(actions::refused(
+            htmx,
+            StatusCode::NOT_FOUND,
+            "There is no such node.",
+        ));
+    }
+    let mut resp = Response::new(Body::default());
+    let to = HeaderValue::from_static("/");
+    if htmx {
+        resp.headers_mut().insert("hx-redirect", to);
+    } else {
+        *resp.status_mut() = StatusCode::SEE_OTHER;
+        resp.headers_mut().insert(header::LOCATION, to);
+    }
+    Ok(resp)
 }
 
 /// For htmx, `said` in the flash, swapped in on its own: the live fragment follows the change.
@@ -1482,6 +1530,12 @@ const RESET: Act = Act {
            past jobs, deletes their job directories and idle checkouts, and evicts idle cached \
            images unless \"Keep cached images\" is ticked.",
 };
+const REMOVE: Act = Act {
+    op: "remove",
+    label: "Remove",
+    does: "Forgets the node, after asking you to confirm: unpins its key and ends its session. \
+           The host can join again only as a new node, with a new token.",
+};
 
 /// A node page's steering, by group: where the node stands on each thing an operator
 /// steers, and the actions that apply from there. Every action posts to the same route
@@ -1610,6 +1664,7 @@ impl Panel {
         {
             danger_acts.push(RESET);
         }
+        danger_acts.push(REMOVE);
         let note = match (external, external_runner) {
             (true, true) => Some(
                 "This node's runner is external. Pausing intake, draining and quarantining do \
@@ -2969,25 +3024,46 @@ mod tests {
                 "undrain",
                 "quarantine",
                 "release",
-                "reset"
+                "reset",
+                "remove"
             ]
         );
         for (state, want) in [
             (
                 Ready,
-                &["ceiling", "stop", "drain", "quarantine", "reset"][..],
+                &["ceiling", "stop", "drain", "quarantine", "reset", "remove"][..],
             ),
             (
                 Draining,
-                &["ceiling", "stop", "undrain", "quarantine", "reset"],
+                &[
+                    "ceiling",
+                    "stop",
+                    "undrain",
+                    "quarantine",
+                    "reset",
+                    "remove",
+                ],
             ),
             (
                 Drained,
-                &["ceiling", "stop", "undrain", "quarantine", "reset"],
+                &[
+                    "ceiling",
+                    "stop",
+                    "undrain",
+                    "quarantine",
+                    "reset",
+                    "remove",
+                ],
             ),
-            (Maintenance, &["ceiling", "stop", "drain", "quarantine"]),
-            (Validating, &["ceiling", "stop", "drain", "quarantine"]),
-            (Quarantined, &["ceiling", "stop", "release"]),
+            (
+                Maintenance,
+                &["ceiling", "stop", "drain", "quarantine", "remove"],
+            ),
+            (
+                Validating,
+                &["ceiling", "stop", "drain", "quarantine", "remove"],
+            ),
+            (Quarantined, &["ceiling", "stop", "release", "remove"]),
         ] {
             assert_eq!(ops(&view(state, Managed, None)), want, "{state:?}");
         }
@@ -2998,11 +3074,11 @@ mod tests {
         );
         assert_eq!(
             ops(&view(Ready, External, None)),
-            ["ceiling", "stop", "drain", "quarantine"]
+            ["ceiling", "stop", "drain", "quarantine", "remove"]
         );
         assert_eq!(
             ops(&view(Ready, RunnerMode::None, None)),
-            ["ceiling", "stop", "drain", "quarantine", "reset"]
+            ["ceiling", "stop", "drain", "quarantine", "reset", "remove"]
         );
         let mut unreported = view(Ready, External, None);
         if let Some(r) = unreported.report.as_mut() {
@@ -3016,7 +3092,8 @@ mod tests {
                 "drain",
                 "undrain",
                 "quarantine",
-                "release"
+                "release",
+                "remove"
             ]
         );
 
@@ -3035,12 +3112,20 @@ mod tests {
                 "lift-ceiling",
                 "drain",
                 "quarantine",
-                "reset"
+                "reset",
+                "remove"
             ]
         );
         assert_eq!(
             ops(&view(Ready, External, Some(paused.clone()))),
-            ["ceiling", "resume", "lift-ceiling", "drain", "quarantine"]
+            [
+                "ceiling",
+                "resume",
+                "lift-ceiling",
+                "drain",
+                "quarantine",
+                "remove"
+            ]
         );
     }
 
