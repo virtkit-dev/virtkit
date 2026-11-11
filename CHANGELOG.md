@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.109.0] - 2026-11-11
+
 ### Added
 
 - **The fleet hub can set nodes' Windows build settings**: which install media placed jobs'
@@ -5467,7 +5469,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.108.4...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.109.0...HEAD
+[0.109.0]: https://github.com/virtkit-dev/virtkit/compare/v0.108.4...v0.109.0
 [0.108.4]: https://github.com/virtkit-dev/virtkit/compare/v0.108.3...v0.108.4
 [0.108.3]: https://github.com/virtkit-dev/virtkit/compare/v0.108.2...v0.108.3
 [0.108.2]: https://github.com/virtkit-dev/virtkit/compare/v0.108.1...v0.108.2
