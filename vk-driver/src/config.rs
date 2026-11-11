@@ -1139,6 +1139,12 @@ impl JobToken {
         self.required
     }
 
+    /// The hub's Windows media token, marked [`JobToken::required`] so expiry fails a fetch
+    /// rather than falling back to the node's credential.
+    pub(crate) fn of_media(media: &vk_hub_proto::dispatch::MediaToken) -> JobToken {
+        JobToken::new(&media.token, media.expires_at).required()
+    }
+
     /// The token while it is live. From its expiry on, a registry refuses it, so a request
     /// does not send it.
     pub(crate) fn live(&self) -> Option<&str> {

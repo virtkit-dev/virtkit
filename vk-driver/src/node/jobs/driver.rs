@@ -282,6 +282,11 @@ pub async fn run(cfg: Config, dir: &Path, ledger_fd: Option<i32>) -> Result<()> 
 fn masked_phrases(vars: &Vars, job: &CiJob, registry: Option<&JobRegistry>) -> Vec<String> {
     let mut phrases = vars.masked();
     phrases.extend(registry.map(|r| r.token.clone()));
+    phrases.extend(
+        registry
+            .and_then(|r| r.media.as_ref())
+            .map(|m| m.token.clone()),
+    );
     // Credentials shorter than GitLab's shortest masked value would mask every occurrence of
     // some common word instead.
     let credentials = std::iter::once(&job.token)
@@ -1175,6 +1180,7 @@ mod tests {
             pipeline_prefix: None,
             areas: vec![],
             build_prefix: None,
+            media: None,
         };
         let job = CiJob::default();
         let phrases = masked_phrases(&Vars::default(), &job, Some(&registry));

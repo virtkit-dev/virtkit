@@ -5601,7 +5601,9 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
         mem,
         net,
         reinstall: *reinstall,
-        media_registry: registry.clone(),
+        media_registry: registry
+            .clone()
+            .ok_or_else(|| winiso::NO_REGISTRY.to_string()),
         registry,
         approved_media: None,
         scope: None,

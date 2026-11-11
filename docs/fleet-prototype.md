@@ -1033,7 +1033,9 @@ their prefix, its manifest annotated with what is said of it
 (`org.virtkit.media.*`, and its first source as `org.opencontainers.image.source`). `--under
 <path>` puts both under `<path>/`, for nodes whose `[build] cache_registry` names that path,
 such as `registry.example.com/build-cache`: a Windows build looks for media by digest under its
-cache registry's repository. `--registry <id>` picks the registry; by default it is the one
+cache registry's repository. Without a remote cache registry, a scoped placed job fetches
+media with the hub's media token from the registry's root alone, so omit `--under` for these
+nodes. `--registry <id>` picks the registry; by default it is the one
 the fleet-wide `registry` setting names, or the only one connected with a URL bound that takes
 hub tokens and file puts. `--name` changes the name it is tagged under (the file's, made a tag).
 The medium is approved for jobs fleet-wide unless `--no-approve`. The sha256 alone goes to

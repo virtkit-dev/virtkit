@@ -103,7 +103,8 @@ Everything else arrives from the hub as **bundles**: signed documents the host a
   - credential forwarding (`[executor.auth] ssh_agent`), host shares (`[executor.share]`),
     the host checkout and its overlay (`host_checkout`, `checkout_overlay`), `[egress]`, and
     the registry's guest proxy (`proxy_guests`, `guest_credential`), and the install media
-    placed Windows builds may read with the node's credential (`windows_media`);
+    placed Windows builds may read with the node's credential or the hub's per-job media token
+    (`windows_media`);
   - release keys, unsigned releases, `allow_downgrade`, and the minimum release that enforces
     this model (`min_enforcing`);
   - a registry's `[hub] allow` list and gc floors;

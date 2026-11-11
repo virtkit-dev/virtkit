@@ -381,6 +381,20 @@ impl JobCtx {
         )
     }
 
+    /// Resolve this job's Windows media registry ([`media_registry`]); `approved` restricts
+    /// media outside the build context to `[executor] windows_media`'s digests.
+    pub fn media_registry(
+        &self,
+        approved: bool,
+    ) -> Result<std::result::Result<crate::config::Registry, String>> {
+        media_registry(
+            &self.cfg,
+            self.job_registry.as_ref(),
+            approved,
+            vk_peer::now_secs(),
+        )
+    }
+
     /// The local scope of this job alone: no other job on this node has it.
     fn private_scope(&self) -> String {
         use std::os::unix::ffi::OsStrExt;
@@ -959,6 +973,47 @@ fn cache_dest(
     }
 }
 
+/// Resolve the registry for fetching Windows media by digest at `now`, or explain its absence:
+/// - the node's remote `[build] cache_registry` takes precedence for every job;
+/// - otherwise, `approved` jobs (placed jobs on nodes caching by scope) use the root of
+///   `[registry]` with the hub's media token. The file store holds arbitrary uploads, so the
+///   node accepts only `[executor] windows_media`'s digests. The ordinary job token is not
+///   used for these fetches because its guest's proxy lends it.
+///
+/// The outer error reports invalid node configuration, independent of the job.
+pub(crate) fn media_registry(
+    cfg: &Config,
+    registry: Option<&vk_hub_proto::dispatch::JobRegistry>,
+    approved: bool,
+    now: u64,
+) -> Result<std::result::Result<crate::config::Registry, String>> {
+    use crate::winiso::NO_REGISTRY;
+    if let Some(rg) = crate::windows_registry(None, false, &cfg.build)? {
+        return Ok(Ok(rg));
+    }
+    if !approved {
+        return Ok(Err(NO_REGISTRY.to_string()));
+    }
+    let none = |why: &str| Ok(Err(format!("{NO_REGISTRY}: {why}")));
+    let Some(media) = registry.and_then(|r| r.media.as_ref()) else {
+        return none(
+            "this node has no [build] cache_registry, and the hub gave this job no media token \
+             (a hub that predates them, a registry it mints no tokens for, or one that has not \
+             yet heard this node lists [executor] windows_media)",
+        );
+    };
+    if now >= media.expires_at {
+        return none("the job's media token has expired");
+    }
+    let Some(rg) = cfg.registry.as_ref() else {
+        return none("this node has no [registry] to use the hub's media token on");
+    };
+    match crate::registry::at_path(rg, "", Some(crate::config::JobToken::of_media(media))) {
+        Some(rg) => Ok(Ok(rg)),
+        None => none("this node's [registry] is not a remote registry"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,6 +1070,7 @@ mod tests {
             pipeline_prefix: None,
             areas: vec![],
             build_prefix: None,
+            media: None,
         };
         let token = |registry: &str, job: Option<&vk_hub_proto::dispatch::JobRegistry>| {
             let cfg = crate::config::from_table(toml::from_str(registry).unwrap()).unwrap();
@@ -1081,6 +1137,7 @@ mod tests {
             pipeline_prefix: None,
             areas: vec![],
             build_prefix: None,
+            media: None,
         };
         let sent = |job: &vk_hub_proto::dispatch::JobRegistry| {
             let mut cfg = crate::config::from_table(toml::from_str(lends).unwrap()).unwrap();
@@ -1131,6 +1188,7 @@ mod tests {
             pipeline_prefix: None,
             areas: vec![],
             build_prefix: None,
+            media: None,
         };
         let job = JobStart {
             job: "j".into(),
@@ -1371,6 +1429,7 @@ mod tests {
             pipeline_prefix: None,
             areas: vec![],
             build_prefix: Some("ci-build/gl/42/protected/all".into()),
+            media: None,
         };
         let configured = |d: &CacheDest| match d {
             CacheDest::Configured(c) => c.registry.clone(),
@@ -1427,6 +1486,115 @@ mod tests {
                 "{c:?}"
             );
             assert_eq!(c.local, LocalScope::Private("mine".into()));
+        }
+    }
+
+    /// A remote `[build] cache_registry` takes precedence. Otherwise, approved-media jobs use
+    /// the root of `[registry]` with the hub's media token, never the ordinary job token.
+    /// Missing prerequisites produce specific errors.
+    #[test]
+    fn media_come_from_the_nodes_cache_registry_else_the_hubs_media_token() {
+        use vk_hub_proto::dispatch::{JobRegistry, MediaToken};
+        let configless: Config = toml::from_str(
+            "state_dir = \"/s\"\n[registry]\nrepo = \"reg.example/node\"\n\
+             guest_credential = \"job\"\n",
+        )
+        .unwrap();
+        let job = JobRegistry {
+            registry_id: "r".into(),
+            token: "vkt_job.x".into(),
+            expires_at: 100,
+            grants: Vec::new(),
+            cache_repo: None,
+            pipeline_prefix: None,
+            areas: vec![],
+            build_prefix: None,
+            media: Some(MediaToken {
+                token: "vkt_media.x".into(),
+                expires_at: 100,
+            }),
+        };
+        let rg = media_registry(&configless, Some(&job), true, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rg.repo, "reg.example");
+        assert_eq!(
+            rg.job_token.as_ref().map(|t| t.secret()),
+            Some("vkt_media.x")
+        );
+        // The media token replaces the job's own, which a placed job's [registry] carries.
+        let mut placed: Config = toml::from_str(
+            "state_dir = \"/s\"\n[registry]\nrepo = \"reg.example/node\"\n\
+             guest_credential = \"job\"\n",
+        )
+        .unwrap();
+        placed.registry.as_mut().unwrap().job_token = Some(crate::config::JobToken::of(&job));
+        let rg = media_registry(&placed, Some(&job), true, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rg.job_token.as_ref().map(|t| t.secret()),
+            Some("vkt_media.x")
+        );
+        // Expiry after selection must not fall back to another credential.
+        let expired = JobRegistry {
+            media: Some(MediaToken {
+                token: "vkt_media.x".into(),
+                expires_at: 1,
+            }),
+            ..job.clone()
+        };
+        let rg = media_registry(&configless, Some(&expired), true, 0)
+            .unwrap()
+            .unwrap();
+        let e = crate::registry::credential(&rg).err().unwrap();
+        assert!(format!("{e:#}").contains("has expired"), "{e:#}");
+        // The node's own cache registry comes first, with its own credential.
+        let own: Config = toml::from_str(
+            "state_dir = \"/s\"\n[build]\ncache_registry = \"cache.example\"\n\
+             [registry]\nrepo = \"reg.example/node\"\n",
+        )
+        .unwrap();
+        for approved in [true, false] {
+            let rg = media_registry(&own, Some(&job), approved, 1)
+                .unwrap()
+                .unwrap();
+            assert_eq!(rg.repo, "cache.example");
+            assert!(rg.job_token.is_none());
+        }
+        // Missing prerequisites produce specific errors.
+        let no_media = JobRegistry {
+            media: None,
+            ..job.clone()
+        };
+        let local: Config =
+            toml::from_str("state_dir = \"/s\"\n[registry]\nrepo = \"/srv/store\"\n").unwrap();
+        let none: Config = toml::from_str("state_dir = \"/s\"\n").unwrap();
+        for (cfg, registry, approved, now, want) in [
+            (
+                &configless,
+                Some(&job),
+                false,
+                1,
+                crate::winiso::NO_REGISTRY,
+            ),
+            (&configless, None, true, 1, "no media token"),
+            (&configless, Some(&no_media), true, 1, "no media token"),
+            (
+                &configless,
+                Some(&job),
+                true,
+                100,
+                "media token has expired",
+            ),
+            (&none, Some(&job), true, 1, "no [registry]"),
+            (&local, Some(&job), true, 1, "not a remote registry"),
+        ] {
+            let why = media_registry(cfg, registry, approved, now)
+                .unwrap()
+                .unwrap_err();
+            assert!(why.contains(want), "{why}");
+            assert!(why.starts_with(crate::winiso::NO_REGISTRY), "{why}");
         }
     }
 

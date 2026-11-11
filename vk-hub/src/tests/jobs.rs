@@ -5884,11 +5884,20 @@ async fn a_relay_s_approved_job_gets_a_token_for_its_node_s_registry() {
         alias: "task-cache".into(),
         prefix: "task-cache/gl/42/unprotected".into(),
     };
-    // The build prefix requires build-cache support, independently of registry-area support.
-    for (n, maps, caches, want) in [(40, false, true, vec![]), (41, true, false, vec![area])] {
+    assert_eq!(
+        access.media, None,
+        "the node does not fetch media with a token"
+    );
+    // Build prefixes and media tokens require their respective capabilities, independently
+    // of registry-area support.
+    for (n, maps, caches, media, want) in [
+        (40, false, true, true, vec![]),
+        (41, true, false, false, vec![area]),
+    ] {
         let mut inventory = hub.db.node(&node_id).unwrap().unwrap().inventory.unwrap();
         inventory.registry_areas = maps;
         inventory.job_build_cache = caches;
+        inventory.job_media = media;
         hub.db
             .record_inventory(&node_id, inventory, true, now_secs())
             .unwrap();
@@ -5903,6 +5912,27 @@ async fn a_relay_s_approved_job_gets_a_token_for_its_node_s_registry() {
             access.build_prefix.as_deref(),
             caches.then_some("ci-build/gl/42/unprotected/all")
         );
+        assert_eq!(access.media.is_some(), media);
+        let Some(m) = access.media.clone() else {
+            continue;
+        };
+        // A separate token for the same registry and lifetime, granting read on sha256:
+        // no inherited namespace grants, write, lock, or pipeline.
+        let job = vk_peer::token::verify(&access.token, &keys, &registry, now_secs()).unwrap();
+        let claims = vk_peer::token::verify(&m.token, &keys, &registry, now_secs()).unwrap();
+        assert_ne!(claims.jti, job.jti);
+        assert_eq!((claims.exp, m.expires_at), (job.exp, access.expires_at));
+        assert_eq!(claims.pipeline, None);
+        assert_eq!(
+            claims.grants,
+            [vk_hub_proto::token::Grant {
+                prefix: "sha256".into(),
+                read: true,
+                write: false,
+                lock: false,
+            }]
+        );
+        assert!(!format!("{access:?}").contains("vkt_"));
     }
     // Jobs go without when anything a token needs is missing: a node that uses none or names
     // no registry the hub binds.

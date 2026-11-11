@@ -161,9 +161,9 @@ pub(crate) struct Options {
     /// The build cache registry the hosts share layers through ([`crate::wincache`]); `None`
     /// keeps them on this host.
     pub registry: Option<crate::config::Registry>,
-    /// Registry for fetching install media missing from the build context by digest;
-    /// `None` disables fetching.
-    pub media_registry: Option<crate::config::Registry>,
+    /// Registry for fetching install media by digest, or the error to report when a needed
+    /// medium is absent from both the build context and media cache.
+    pub media_registry: Result<crate::config::Registry, String>,
     /// The only media digests a medium outside the build context may have, for a placed job
     /// ([`crate::winiso::MediaSource::approved`]); `None` for any.
     pub approved_media: Option<Vec<String>>,
@@ -459,7 +459,7 @@ fn build_with(opts: &Options) -> Result<Vec<crate::cachelock::Guard>> {
     let media_dir = shared.join("winiso");
     let media = crate::winiso::MediaSource {
         dir: &media_dir,
-        registry: opts.media_registry.as_ref(),
+        registry: opts.media_registry.as_ref().map_err(String::as_str),
         approved: opts.approved_media.as_deref(),
     };
     let started = Instant::now();
@@ -1801,7 +1801,7 @@ mod tests {
             net: crate::build::BuildNet::All,
             reinstall: false,
             registry: None,
-            media_registry: None,
+            media_registry: Err(crate::winiso::NO_REGISTRY.to_string()),
             approved_media: None,
             scope: None,
             pull_layers: true,
@@ -2364,7 +2364,7 @@ mod tests {
             net: crate::build::BuildNet::All,
             reinstall: false,
             registry: None,
-            media_registry: None,
+            media_registry: Err(crate::winiso::NO_REGISTRY.to_string()),
             approved_media: None,
             scope: None,
             pull_layers: true,
@@ -2377,7 +2377,7 @@ mod tests {
             cache: &cache,
             media: crate::winiso::MediaSource {
                 dir: &media_dir,
-                registry: None,
+                registry: Err(crate::winiso::NO_REGISTRY),
                 approved: None,
             },
             built: HashMap::new(),

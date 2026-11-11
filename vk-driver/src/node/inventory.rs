@@ -95,6 +95,7 @@ pub fn inventory(cfg: &Config) -> Inventory {
         // Its guest registry proxy maps `job/<alias>` to the job's areas.
         registry_areas: true,
         job_build_cache: super::caches_jobs_by_scope(cfg),
+        job_media: job_media(cfg),
         // Each placed job's result carries its egress report.
         egress_reports: true,
         // A placed job's start may carry the hub's egress layer, which its switches enforce in
@@ -462,9 +463,39 @@ fn parse_runner(text: &str) -> Option<Runner> {
     })
 }
 
+/// Request media tokens only for scoped jobs with approved media, `[registry]`, and no remote
+/// `[build] cache_registry`. Invalid build-registry configuration also suppresses the request:
+/// the build fails on that configuration instead.
+fn job_media(cfg: &Config) -> bool {
+    super::caches_jobs_by_scope(cfg)
+        && !cfg.executor.windows_media.is_empty()
+        && cfg.registry.is_some()
+        && matches!(crate::windows_registry(None, false, &cfg.build), Ok(None))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_media_token_is_asked_for_only_where_it_would_be_used() {
+        let cfg = |toml: &str| -> Config { toml::from_str(toml).unwrap() };
+        let media = format!("[executor]\nwindows_media = [\"{}\"]\n", "a".repeat(64));
+        let registry = "[registry]\nrepo = \"reg.example/node\"\n";
+        assert!(job_media(&cfg(&format!("{media}{registry}"))));
+        // No registry to use it on.
+        assert!(!job_media(&cfg(&media)));
+        // No media approved.
+        assert!(!job_media(&cfg(registry)));
+        // A cache registry of its own fetches them.
+        assert!(!job_media(&cfg(&format!(
+            "{media}[build]\ncache_registry = \"cache.example\"\n{registry}"
+        ))));
+        // A node lending its own credential does not cache placed jobs by scope.
+        assert!(!job_media(&cfg(&format!(
+            "{media}[registry]\nrepo = \"reg.example/node\"\nproxy_guests = true\nguest_credential = \"node\"\n"
+        ))));
+    }
 
     #[test]
     fn load_average_is_read_in_hundredths() {

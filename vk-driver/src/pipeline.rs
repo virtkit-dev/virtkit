@@ -361,6 +361,7 @@ mod tests {
             pipeline_prefix: prefix.map(str::to_string),
             areas: vec![],
             build_prefix: None,
+            media: None,
         }
     }
 

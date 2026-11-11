@@ -937,6 +937,7 @@ mod tests {
             pipeline_prefix: None,
             areas: vec![],
             build_prefix: None,
+            media: None,
         }
     }
 

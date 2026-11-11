@@ -153,15 +153,20 @@ A guest can bypass build-cache scoping with the node's credential:
 cache layers. It takes two:
 
 - **Media**: ISOs and drivers, fetched by digest (`files/sha256:<hex>`) from the registry's
-  file store with the node's credential, read-only, into the node's shared media directory,
-  as today. That store holds whatever anyone uploaded, not only media, and a job's
-  `winiso:` stage names the digest: with the node's credential, a hub-placed job could fetch
-  any file whose digest it knows. A node setting, `[executor] windows_media`, which the hub
-  may also set, lists the approved digests; for a hub-placed job on a node caching by scope,
-  the node takes only those, from its media cache or the registry, and a stage naming another
-  fails unless the file is in its build context. Other builds fetch as today. Media are not
-  project content: the media cache (`<data>/windows/winiso/{iso,media,verified}`) is shared
-  by every scope, its entries keyed by the pinned digests.
+  file store, read-only, into the node's shared media directory: with the node's remote
+  `[build] cache_registry` credential, or, without one, a separate token the hub mints for
+  the placed job (`JobRegistry.media`). The token grants read on the `sha256` prefix,
+  including `files/sha256`, for the same registry and lifetime as the job token. It is never
+  lent to the guest and is minted only for nodes announcing `job_media`. The store holds
+  arbitrary uploaded files, and the job's `winiso:` stage names the digest. Either credential
+  could therefore fetch non-media files. The job token is not widened for media access,
+  since its guest's proxy lends it. A node setting,
+  `[executor] windows_media`, which the hub may also set, lists the approved digests; for a
+  hub-placed job on a node caching by scope, the node takes only those, from its media cache
+  or the registry, and a stage naming another fails unless the file is in its build context.
+  Other builds fetch as today. Media are not project content: the media cache
+  (`<data>/windows/winiso/{iso,media,verified}`) is shared by every scope, its entries keyed
+  by the pinned digests.
 - **Layers**: the job's cache setting, as for Linux — scoped at `<prefix>/build-cache:win-<key>`
   or off — and on the node its local scope's Windows cache ([the local tier](#the-local-tier)).
 

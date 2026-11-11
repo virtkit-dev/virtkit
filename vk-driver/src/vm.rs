@@ -1368,12 +1368,15 @@ fn build_windows_unit(
     if let Some(dir) = &ctx.egress_record {
         let _ = std::fs::write(dir.join(crate::egress_report::UNRECORDED_BUILD), b"");
     }
-    // Media are not project-specific: fetch them by digest from the node's own registry,
-    // regardless of the job's cache. Layers use the job's build cache.
-    let media_registry = crate::windows_registry(None, false, &cfg.build)?;
+    // Media are shared across projects: fetch by digest through a remote `[build] cache_registry`,
+    // else with the hub's media token for scoped jobs. Layers use the job's build cache.
     let job_cache = job_cache_dest(ctx);
+    // A placed job on a node caching by scope takes only approved media from outside its
+    // build context.
+    let approved = job_cache.local != crate::jobctx::LocalScope::Unscoped;
+    let media_registry = ctx.media_registry(approved)?;
     let registry = match &job_cache.dest {
-        crate::build::CacheDest::Configured(_) => media_registry.clone(),
+        crate::build::CacheDest::Configured(_) => crate::windows_registry(None, false, &cfg.build)?,
         crate::build::CacheDest::Scoped(rg) => Some(rg.clone()),
         crate::build::CacheDest::Off => None,
     };
@@ -1389,10 +1392,7 @@ fn build_windows_unit(
         reinstall: false,
         registry,
         media_registry,
-        // A placed job on a node caching by scope takes only approved media from outside its
-        // build context.
-        approved_media: (job_cache.local != crate::jobctx::LocalScope::Unscoped)
-            .then(|| cfg.executor.windows_media.clone()),
+        approved_media: approved.then(|| cfg.executor.windows_media.clone()),
         scope: job_cache.local.key().map(str::to_string),
         pull_layers: true,
         // A job's Dockerfile sizes its build guests no larger than its services.
@@ -5195,6 +5195,7 @@ mod tests {
             pipeline_prefix: None,
             areas: vec![],
             build_prefix: None,
+            media: None,
         };
         let remote_job =
             rg("repo = \"reg.example/t\"\nguest_credential = \"job\"\nproxy_guests = true\n");
@@ -5388,6 +5389,7 @@ mod tests {
                 pipeline_prefix: prefix.map(str::to_string),
                 areas: vec![],
                 build_prefix: None,
+                media: None,
             });
             ctx
         };

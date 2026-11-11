@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use vk_hub_proto::dispatch::JobRegistry;
+use vk_hub_proto::dispatch::{JobRegistry, MediaToken};
 use vk_hub_proto::job::JobSpec;
 use vk_hub_proto::token::{Claims, Grant, MAX_LABEL_LEN, MAX_TTL_SECS, SKEW_SECS, TokenKey};
 use vk_peer::token::Signer;
@@ -392,6 +392,7 @@ pub fn for_job(
         gitlab,
         areas: inventory.is_some_and(|i| i.registry_areas),
         build_cache: inventory.is_some_and(|i| i.job_build_cache),
+        media: inventory.is_some_and(|i| i.job_media),
     };
     match mint_for_job(hub, ctx, &target, (node.0, job), spec) {
         Ok((access, audit, jti)) => {
@@ -424,6 +425,9 @@ struct MintTarget<'a> {
     /// Whether the node caches a job's builds at its build prefix
     /// ([`vk_hub_proto::Inventory::job_build_cache`]).
     build_cache: bool,
+    /// Whether the node fetches Windows job media with a separate token
+    /// ([`vk_hub_proto::Inventory::job_media`]).
+    media: bool,
 }
 
 fn mint_for_job(
@@ -440,6 +444,7 @@ fn mint_for_job(
         gitlab,
         areas,
         build_cache,
+        media,
     } = *target;
     let Some(signer) = ctx.signers.get(&key.public.kid) else {
         bail!("token-signing key {} is not loaded", key.public.kid);
@@ -464,11 +469,37 @@ fn mint_for_job(
         exp: now.saturating_add(ttl),
         grants: resolved.grants,
     };
-    let event = format!(
+    // Keep media access separate from the job token lent by the guest proxy. The media token
+    // reads MEDIA_PREFIX, including files/sha256 and image repositories under sha256.
+    // The store holds arbitrary uploads, so the node accepts only operator-approved digests.
+    let media = media
+        .then(|| -> Result<_> {
+            let grant = Grant {
+                prefix: vk_hub_proto::dispatch::MEDIA_PREFIX.to_string(),
+                read: true,
+                write: false,
+                lock: false,
+            };
+            Ok(Claims {
+                jti: vk_peer::token::new_jti()?,
+                pipeline: None,
+                grants: vec![grant],
+                ..claims.clone()
+            })
+        })
+        .transpose()?;
+    let mut event = format!(
         "issued registry token {} for job {job} on node {node}: {}",
         claims.jti,
         grants_text(&claims.grants)
     );
+    if let Some(m) = &media {
+        event.push_str(&format!(
+            "; media token {}: {}",
+            m.jti,
+            grants_text(&m.grants)
+        ));
+    }
     // The audit row is written once the start is sent; this line stands in should that fail.
     eprintln!("vk-hub: registry {registry}: {event}");
     let jti = claims.jti.clone();
@@ -482,6 +513,14 @@ fn mint_for_job(
         areas: if areas { resolved.areas } else { Vec::new() },
         // An older node would cache the job's builds in its shared cache all the same.
         build_prefix: resolved.build_prefix.filter(|_| build_cache),
+        media: media
+            .map(|m| -> Result<_> {
+                Ok(MediaToken {
+                    expires_at: m.exp,
+                    token: signer.sign(m)?,
+                })
+            })
+            .transpose()?,
         token: signer.sign(claims)?,
     };
     Ok((access, (Some(registry), event), jti))

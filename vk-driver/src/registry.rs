@@ -310,10 +310,10 @@ async fn inspect_async(rg: &Registry, name: &str, reference: &Reference) -> Resu
         .with_context(|| format!("{}/{name}: reference not found in the registry", rg.repo))
 }
 
-/// `rg` with its repository prefix replaced by `path`, an absolute path on the same registry,
-/// and `token`, when given, in place of its credential (a job's own content takes it
-/// [`crate::config::JobToken::required`]); without one, it keeps `rg`'s. `None` for a local
-/// store or a `repo` naming no host.
+/// `rg` with its repository prefix replaced by `path`, an absolute path on the same registry
+/// (empty for its root), and `token`, when given, in place of its credential (a job's own
+/// content takes it [`crate::config::JobToken::required`]); without one, it keeps `rg`'s.
+/// `None` for a local store or a `repo` naming no host.
 pub(crate) fn at_path(
     rg: &Registry,
     path: &str,
@@ -322,7 +322,11 @@ pub(crate) fn at_path(
     let (base, _) = rg.base_url()?;
     let authority = base.split_once("://").map_or(base.as_str(), |(_, a)| a);
     let mut out = rg.clone();
-    out.repo = format!("{authority}/{path}");
+    out.repo = if path.is_empty() {
+        authority.to_string()
+    } else {
+        format!("{authority}/{path}")
+    };
     if token.is_some() {
         out.job_token = token;
     }

@@ -817,6 +817,11 @@ pub struct Inventory {
     /// without it gets no `build_prefix`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub job_build_cache: bool,
+    /// Whether the node uses [`dispatch::JobRegistry::media`] to fetch approved Windows media
+    /// for scoped placed jobs without a remote `[build] cache_registry`. Only digests listed
+    /// in `[executor] windows_media` are accepted. Nodes without this capability get no token.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub job_media: bool,
     /// Whether the node sends each placed job's egress report ([`job::JobResult::egress`]): a job
     /// placed on one that does not has no report to show.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1705,6 +1710,7 @@ mod tests {
             job_tokens: false,
             registry_areas: false,
             job_build_cache: false,
+            job_media: false,
             egress_reports: false,
             egress_rules: false,
             egress_fallback: false,
@@ -2629,6 +2635,7 @@ mod tests {
         tokens["job_tokens"] = json!(true);
         tokens["registry_areas"] = json!(true);
         tokens["job_build_cache"] = json!(true);
+        tokens["job_media"] = json!(true);
         tokens["egress_reports"] = json!(true);
         tokens["egress_rules"] = json!(true);
         tokens["egress_fallback"] = json!(true);
@@ -2638,6 +2645,7 @@ mod tests {
                 job_tokens: true,
                 registry_areas: true,
                 job_build_cache: true,
+                job_media: true,
                 egress_reports: true,
                 egress_rules: true,
                 egress_fallback: true,

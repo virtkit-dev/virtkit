@@ -259,11 +259,25 @@ with the source `detected` where the host's size supplied or held down the value
   through `registry.vk` with the node's guest token (`guest_credential = "job-or-node"`),
   granting what namespaces grant `guests` within the node's grants, none by default. Limits:
   `vk status --stale` asks for base images as nobody, and reports a private one's VM as unknown;
-  Windows
-  install media and layers go through `[build]`'s cache settings, which take the node's token
-  only when they name this registry and no credential of their own; and an image already in
-  the node's cache by digest is served to any job without asking the registry, as it is under
-  a node credential.
+  Windows install media use a remote `[build] cache_registry` when configured; scoped placed
+  jobs otherwise use a separate media token for this registry's file store (below).
+  `[build]` takes the node's token only when it names this registry and has no credential of
+  its own. An image already in the node's cache by digest is served to any job without
+  asking the registry, as with a node credential.
+
+  Without a remote build cache registry, a scoped placed job fetches missing Windows media
+  from this registry's root (`files/sha256:<hex>`, where `vk registry put` tags every file).
+  The hub supplies a separate token granting read on the `sha256` prefix, including
+  `files/sha256`, for the job token's lifetime. It is never lent to the guest. The node
+  announces `job_media` only when it caches placed jobs by scope, has `[registry]` configured,
+  lists at least one `[executor] windows_media` digest and has no remote
+  `[build] cache_registry`. The hub sends media tokens only to nodes announcing this
+  capability; the node fetches only approved digests. Upload media for these nodes at the
+  registry's root (`vk-hub media add` without `--under`, or
+  `vk registry put --cache-registry <host>`). A remote `[build] cache_registry` takes
+  precedence, using its own credential, or the node's token when it names this registry and
+  has no credential of its own. In the latter case, the node's namespaces must grant read on
+  `files/sha256` under that path.
 
 The node reports a hash of its effective configuration, hub settings included, and its node
 page shows it, so drift between nodes that should match is visible.
@@ -523,8 +537,10 @@ See the implemented [CI tools](fleet-prototype.md#ci-tools).
 
 Windows builds fetch their install media (Windows ISOs, driver ISOs, several GB each) by
 digest from the registry nodes' `[build] cache_registry` names, `files/sha256:<hex>` under that
-repository path. A placed job's build takes media from outside its build context only when
-`executor.windows_media` approves them. Operators can upload a file from the hub's host,
+repository path; a scoped placed job without a remote cache registry fetches them from the
+root of the node's `[registry]` with the job's media token
+([build caches](build-cache-design.md)). Media outside a placed job's build context require
+approval in `executor.windows_media`. Operators can upload a file from the hub's host,
 approve it and record its metadata without a registry credential. See the implemented
 [install media](fleet-prototype.md#install-media).
 

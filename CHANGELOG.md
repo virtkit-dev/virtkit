@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Windows jobs can fetch approved install media without a remote build cache registry.**
+  The node fetches missing media from its registry's file store with a read-only credential
+  the hub gives each job and keeps from its guest. Media outside the build context must be
+  approved in `[executor] windows_media`. If a fetch is needed and neither credential is
+  available, the build reports what is missing.
+
 ## [0.109.0] - 2026-11-11
 
 ### Added

@@ -129,6 +129,35 @@ pub struct JobRegistry {
     /// namespace gives the job one, and the node then builds with the cache off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_prefix: Option<String>,
+    /// A separate token for fetching Windows install media by digest from the same registry,
+    /// granting read on [`MEDIA_PREFIX`]. Never lent to the guest, whose proxy injects
+    /// [`JobRegistry::token`] alone. Sent only to a node announcing
+    /// [`Inventory::job_media`](crate::Inventory::job_media).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaToken>,
+}
+
+/// The grant prefix of a [`MediaToken`]: read on it covers the repository `files/sha256`, where
+/// `vk registry put` tags every file it puts by its sha256, and, as for any grant, the image
+/// repositories at and under `sha256`.
+pub const MEDIA_PREFIX: &str = "sha256";
+
+/// A token reading the registry's files by digest ([`MEDIA_PREFIX`]), with its expiry.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaToken {
+    /// The token, `vkt_…`: a secret, never logged nor shown to the guest.
+    pub token: String,
+    /// The token's `exp`, seconds since the epoch.
+    pub expires_at: u64,
+}
+
+impl std::fmt::Debug for MediaToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaToken")
+            .field("token", &"[redacted]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// An alias a job reaches one of its prefixes by, whatever its project or protection.
@@ -151,6 +180,7 @@ impl std::fmt::Debug for JobRegistry {
             .field("pipeline_prefix", &self.pipeline_prefix)
             .field("areas", &self.areas)
             .field("build_prefix", &self.build_prefix)
+            .field("media", &self.media)
             .finish()
     }
 }
@@ -574,6 +604,10 @@ mod tests {
             pipeline_prefix: Some("ci-pipeline/gl/42/7".into()),
             areas: vec![],
             build_prefix: Some("ci-build/gl/42/protected/all".into()),
+            media: Some(MediaToken {
+                token: "vkt_m.n".into(),
+                expires_at: 1_700_000_000,
+            }),
         };
         let wire = json!({
             "registry_id": id("r"),
@@ -583,6 +617,7 @@ mod tests {
             "cache_repo": "ci-cache/gl/42/protected",
             "pipeline_prefix": "ci-pipeline/gl/42/7",
             "build_prefix": "ci-build/gl/42/protected/all",
+            "media": {"token": "vkt_m.n", "expires_at": 1_700_000_000},
         });
         assert_eq!(serde_json::to_value(&access).unwrap(), wire);
         assert_eq!(serde_json::from_value::<JobRegistry>(wire).unwrap(), access);
@@ -590,6 +625,19 @@ mod tests {
         let read: JobRegistry = serde_json::from_value(bare.clone()).unwrap();
         assert_eq!(serde_json::to_value(&read).unwrap(), bare);
         assert!(!format!("{access:?}").contains("vkt_"));
+        // What the media token reads: the file store's by-digest repository, and the image
+        // repositories under the same prefix.
+        let media = crate::token::Grant {
+            prefix: MEDIA_PREFIX.into(),
+            read: true,
+            write: false,
+            lock: false,
+        };
+        assert!(crate::token::valid_prefix(MEDIA_PREFIX));
+        assert!(media.allows_repo("files/sha256", crate::token::RepoRight::Read));
+        assert!(!media.allows_repo("files/sha256", crate::token::RepoRight::Write));
+        assert!(!media.allows_repo("files/win-media", crate::token::RepoRight::Read));
+        assert!(media.allows_repo("sha256", crate::token::RepoRight::Read));
     }
 
     /// The hub's egress layer, pinned: a start without one reads as today's, and a phase of a

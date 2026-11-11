@@ -307,9 +307,14 @@ of such a job fetches install media missing from its build context only when
 `[executor] windows_media` lists their sha256, in the node's config or as a
 [hub setting](fleet-design.md#hub-settings) (`vk-hub settings set executor.windows_media
 <sha256>,<sha256>`) where the config leaves it unset; `vk-hub media add` uploads a medium to
-the registry and approves it there ([install media](fleet-prototype.md#install-media)). Jobs
-of a local gitlab-runner and builds outside jobs keep `[build] cache_registry` and the
-unscoped caches.
+the registry and approves it there ([install media](fleet-prototype.md#install-media)). Media
+come through a remote `[build] cache_registry` when configured, else from the root file store
+of `[registry]` with a media token the hub mints for the job. It grants read on the `sha256`
+prefix, including `files/sha256`, and is never lent to the guest. Only nodes announcing
+`job_media` receive it; this requires approved media, `[registry]`, and no remote build cache
+registry. If a fetch is needed and neither credential is available, the build reports what
+is missing. Jobs of a local gitlab-runner and builds outside jobs keep
+`[build] cache_registry` and the unscoped caches.
 Pulled `image:` references still go through `[build] cache_registry`.
 
 ## Resource usage

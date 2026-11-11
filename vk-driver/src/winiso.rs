@@ -146,13 +146,13 @@ impl Pinned {
     }
 
     /// Use the medium at the Dockerfile's path, or fetch it once by digest from `registry`
-    /// into `cache` ([`crate::files`]). Preserve its file name: the install script uses it.
-    /// With `approved`, only those digests are taken from outside the build context
-    /// ([`Pinned::check_approved`]).
+    /// into `cache` ([`crate::files`]); a required fetch reports why no registry is available.
+    /// Preserve its file name: the install script uses it. With `approved`, only those digests
+    /// are taken from outside the build context ([`Pinned::check_approved`]).
     fn local_or_fetched(
         &self,
         cache: &Path,
-        registry: Option<&crate::config::Registry>,
+        registry: Result<&crate::config::Registry, &str>,
         approved: Option<&[String]>,
     ) -> Result<Pinned> {
         if self.path.exists() {
@@ -194,11 +194,9 @@ impl Pinned {
             .remember_verified(cache)?;
             return Ok(local);
         }
-        let Some(rg) = registry else {
-            bail!(
-                "{}: no such file, and no build cache registry to fetch it from",
-                self.path.display()
-            );
+        let rg = match registry {
+            Ok(rg) => rg,
+            Err(why) => bail!("{}: no such file, and {why}", self.path.display()),
         };
         eprintln!(
             "virtkit: winiso: fetching {} from the build cache ({}:{})",
@@ -587,15 +585,18 @@ fn count_reinstall(path: &Path) -> Result<()> {
 }
 
 /// Where a build's install media come from: their cache `dir`, its entries keyed by the
-/// pinned digests, and the `registry` missing ones are fetched from by digest. With
-/// `approved`, a medium not in the build context must have one of those digests, whether it
-/// would be fetched or found in the cache.
+/// pinned digests, and the `registry` missing ones are fetched from by digest, or why there is
+/// none. With `approved`, a medium not in the build context must have one of those digests,
+/// whether it would be fetched or found in the cache.
 #[derive(Clone, Copy)]
 pub(crate) struct MediaSource<'a> {
     pub dir: &'a Path,
-    pub registry: Option<&'a crate::config::Registry>,
+    pub registry: Result<&'a crate::config::Registry, &'a str>,
     pub approved: Option<&'a [String]>,
 }
+
+/// Why a build outside a placed job has no registry to fetch media from.
+pub(crate) const NO_REGISTRY: &str = "no build cache registry to fetch it from";
 
 /// Mark the media `source` pins as in use in `rg`, so the registry's retention keeps them for
 /// as long as builds use what was installed from them. Best effort: only the asking matters,
@@ -650,12 +651,12 @@ pub(crate) fn base(
     };
     if let Some(base) = read_base(&dir, &key)? {
         eprintln!("virtkit: winiso: base {} (cached)", &key[..12]);
-        if let Some(rg) = media.registry {
+        if let Ok(rg) = media.registry {
             keep_media(rg, source, media.approved);
         }
         return here(base);
     }
-    if let Some(rg) = media.registry {
+    if let Ok(rg) = media.registry {
         keep_media(rg, source, media.approved);
     }
     let Some(rg) = registry else {
@@ -1693,11 +1694,13 @@ mod tests {
         };
         let err = format!(
             "{:#}",
-            missing.local_or_fetched(&cache, None, None).unwrap_err()
+            missing
+                .local_or_fetched(&cache, Err(NO_REGISTRY), None)
+                .unwrap_err()
         );
         assert!(err.contains("no build cache registry"), "{err}");
 
-        let local = missing.local_or_fetched(&cache, Some(&rg), None).unwrap();
+        let local = missing.local_or_fetched(&cache, Ok(&rg), None).unwrap();
         assert_eq!(
             local.path,
             cache.join("iso").join(&sha256).join("ws2025.iso")
@@ -1711,7 +1714,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.join("store"));
         assert_eq!(
             missing
-                .local_or_fetched(&cache, Some(&rg), None)
+                .local_or_fetched(&cache, Ok(&rg), None)
                 .unwrap()
                 .path,
             local.path
@@ -1721,7 +1724,7 @@ mod tests {
             path: dir.join("context/renamed.iso"),
             sha256: sha256.clone(),
         }
-        .local_or_fetched(&cache, Some(&rg), None)
+        .local_or_fetched(&cache, Ok(&rg), None)
         .unwrap();
         assert_eq!(
             renamed.path,
@@ -1735,7 +1738,7 @@ mod tests {
                 path: src.clone(),
                 sha256: sha256.clone()
             }
-            .local_or_fetched(&cache, Some(&rg), None)
+            .local_or_fetched(&cache, Ok(&rg), None)
             .unwrap()
             .path,
             src
@@ -1747,9 +1750,7 @@ mod tests {
         };
         let err = format!(
             "{:#}",
-            absent
-                .local_or_fetched(&cache, Some(&rg), None)
-                .unwrap_err()
+            absent.local_or_fetched(&cache, Ok(&rg), None).unwrap_err()
         );
         assert!(err.contains("vk registry put"), "{err}");
 
@@ -1757,13 +1758,13 @@ mod tests {
         let err = format!(
             "{:#}",
             missing
-                .local_or_fetched(&cache, Some(&rg), Some(&["cd".repeat(32)]))
+                .local_or_fetched(&cache, Ok(&rg), Some(&["cd".repeat(32)]))
                 .unwrap_err()
         );
         assert!(err.contains("[executor] windows_media"), "{err}");
         assert_eq!(
             missing
-                .local_or_fetched(&cache, Some(&rg), Some(std::slice::from_ref(&sha256)))
+                .local_or_fetched(&cache, Ok(&rg), Some(std::slice::from_ref(&sha256)))
                 .unwrap()
                 .path,
             local.path
@@ -1773,10 +1774,112 @@ mod tests {
                 path: src.clone(),
                 sha256: sha256.clone()
             }
-            .local_or_fetched(&cache, None, Some(&[]))
+            .local_or_fetched(&cache, Err(NO_REGISTRY), Some(&[]))
             .unwrap()
             .path,
             src
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without a remote `[build] cache_registry`, approved media use the hub's token at the
+    /// root of `[registry]`. This registry rejects the ordinary job token; a missing media
+    /// token produces a specific fetch error.
+    #[test]
+    fn a_configless_node_fetches_approved_media_with_the_hubs_token() {
+        use vk_hub_proto::dispatch::{JobRegistry, MediaToken};
+        let dir = std::env::temp_dir().join(format!("vk-winiso-hub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("ws2025.iso");
+        std::fs::write(&src, b"an approved medium").unwrap();
+        let (sha256, _) = crate::files::put(
+            &local_registry(&dir),
+            &src,
+            Some("win-media"),
+            crate::files::PutRetention::Idle,
+        )
+        .unwrap();
+        let store = std::sync::Arc::new(vk_registry::Store::new(dir.join("store")).unwrap());
+        let auth = vk_registry::auth::Auth::Bearer {
+            token: "vkt_media.x".into(),
+        };
+        let url = crate::registry::tests::serve_store(store, auth);
+        let cfg = crate::config::Config {
+            registry: Some(crate::config::Registry::for_share(
+                format!("{url}/node"),
+                true,
+                None,
+                String::new(),
+                None,
+                None,
+                None,
+            )),
+            ..Default::default()
+        };
+        let job = JobRegistry {
+            registry_id: "r".into(),
+            token: "vkt_job.x".into(),
+            expires_at: u64::MAX,
+            grants: Vec::new(),
+            cache_repo: None,
+            pipeline_prefix: None,
+            areas: vec![],
+            build_prefix: None,
+            media: Some(MediaToken {
+                token: "vkt_media.x".into(),
+                expires_at: u64::MAX,
+            }),
+        };
+        let approved = [sha256.clone()];
+        let missing = Pinned {
+            path: dir.join("context/ws2025.iso"),
+            sha256: sha256.clone(),
+        };
+        // This registry accepts only the media token.
+        let with_job = crate::registry::at_path(
+            cfg.registry.as_ref().unwrap(),
+            "",
+            Some(crate::config::JobToken::of(&job)),
+        )
+        .unwrap();
+        assert!(
+            missing
+                .local_or_fetched(&dir.join("c1"), Ok(&with_job), Some(&approved))
+                .is_err()
+        );
+        let rg = crate::jobctx::media_registry(&cfg, Some(&job), true, 1)
+            .unwrap()
+            .unwrap();
+        let local = missing
+            .local_or_fetched(&dir.join("c2"), Ok(&rg), Some(&approved))
+            .unwrap();
+        assert_eq!(std::fs::read(&local.path).unwrap(), b"an approved medium");
+        // Reject unapproved digests before contacting the registry.
+        let err = format!(
+            "{:#}",
+            missing
+                .local_or_fetched(&dir.join("c3"), Ok(&rg), Some(&["cd".repeat(32)]))
+                .unwrap_err()
+        );
+        assert!(err.contains("[executor] windows_media"), "{err}");
+        // No media token: the error names what is missing.
+        let older = JobRegistry {
+            media: None,
+            ..job.clone()
+        };
+        let why = crate::jobctx::media_registry(&cfg, Some(&older), true, 1)
+            .unwrap()
+            .unwrap_err();
+        let err = format!(
+            "{:#}",
+            missing
+                .local_or_fetched(&dir.join("c4"), Err(&why), Some(&approved))
+                .unwrap_err()
+        );
+        assert!(
+            err.contains("no [build] cache_registry") && err.contains("no media token"),
+            "{err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1810,7 +1913,7 @@ mod tests {
         fn with<'a>(cache: &'a Path, approved: Option<&'a [String]>) -> MediaSource<'a> {
             MediaSource {
                 dir: cache,
-                registry: None,
+                registry: Err(NO_REGISTRY),
                 approved,
             }
         }
@@ -1887,7 +1990,7 @@ mod tests {
 
         let from = MediaSource {
             dir: &cache,
-            registry: Some(&rg),
+            registry: Ok(&rg),
             approved: None,
         };
         let base = base(
@@ -1965,7 +2068,7 @@ mod tests {
         let refs = crate::wincache::Refs::default();
         let from = MediaSource {
             dir: &cache,
-            registry: None,
+            registry: Err(NO_REGISTRY),
             approved: None,
         };
         let base = base(
@@ -2009,7 +2112,7 @@ mod tests {
         // Stops at the ISO's digest, which these bytes do not have.
         let from = MediaSource {
             dir: &cache,
-            registry: None,
+            registry: Err(NO_REGISTRY),
             approved: None,
         };
         assert!(media(&source, from, &refs).is_err());

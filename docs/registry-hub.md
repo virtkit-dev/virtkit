@@ -991,7 +991,10 @@ build prefix. A registry seeded before `ci-build` was a default gets it once on 
 unless a namespace holds its name or root. A `ci-build` path must hold `{gitlab}`,
 `{project_id}`, `{protection}` and `{scope}`, and its grants select only `own project`; its
 prefix reaches a job as `build_prefix` only on a node announcing `job_build_cache`
-([build caches](build-cache-design.md)). A window below the registry's `min_retention_days`,
+([build caches](build-cache-design.md)). A node announcing `job_media` gets a second token with
+each placed job, granting read on the `sha256` prefix, including `files/sha256`. Its grant
+comes from no namespace. It shares the job token's subject and lifetime, so subject revocation
+affects both. A window below the registry's `min_retention_days`,
 such as `ci-pipeline`'s 2 days, takes effect only on a registry whose `[[gc.prefix]]` allows
 it: the hub may only lengthen a registry's own window.
 

@@ -2121,6 +2121,7 @@ pub(crate) mod tests {
             pipeline_prefix: None,
             areas: vec![],
             build_prefix: None,
+            media: None,
         });
         journal::write_json(&job_dir.join(journal::START), &start).unwrap();
         let cfg: Config =
