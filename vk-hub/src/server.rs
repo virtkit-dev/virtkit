@@ -202,6 +202,8 @@ pub struct Hub {
     pub(crate) runner_tokens: crate::relays::RunnerTokens,
     /// The one install medium upload let run at a time ([`crate::media`]).
     pub(crate) media_uploads: Arc<Semaphore>,
+    /// The one install medium rename let run at a time ([`crate::media::rename`]).
+    pub(crate) media_renames: Semaphore,
 }
 
 /// One node's open session.
@@ -287,6 +289,7 @@ impl Hub {
             self_update: std::sync::OnceLock::new(),
             runner_tokens: crate::relays::RunnerTokens::default(),
             media_uploads: Arc::new(Semaphore::new(1)),
+            media_renames: Semaphore::new(1),
         }
     }
 

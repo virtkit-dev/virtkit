@@ -8405,7 +8405,7 @@ async fn an_operator_updates_the_hub_from_the_updates_page() {
     let reply = post_action(addr, &origin, &operator, action, &answer, true).await;
     assert_eq!(reply.status, 409, "{}", reply.body);
     assert!(
-        reply.body.contains("being added or fetched"),
+        reply.body.contains("being added, fetched or renamed"),
         "{}",
         reply.body
     );
@@ -14269,6 +14269,38 @@ async fn install_media_are_listed_described_and_kept_by_operators() {
         operator.clone(),
         "edit",
         format!("_csrf={csrf}&was={was}&expires=someday"),
+    )
+    .await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    // A rename its registry could not follow is recorded, and said so; the registry's tag
+    // stays as it is.
+    let was = hidden(&get(addr, &path, Some(&operator)).await.body, "was");
+    let rename = format!("_csrf={csrf}&was={was}&name=eval.iso");
+    let reply = post(
+        viewer.clone(),
+        "rename",
+        format!("_csrf={viewer_csrf}&was={was}"),
+    )
+    .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let reply = post(operator.clone(), "rename", rename.clone()).await;
+    assert_eq!(reply.status, 502, "{}", reply.body);
+    assert!(
+        reply.body.contains("Renamed, but registry"),
+        "{}",
+        reply.body
+    );
+    let m = hub.db.medium(sha).unwrap().unwrap();
+    assert_eq!(m.row.file_name, "eval.iso");
+    assert_eq!(m.row.locations[0].name, "ws2025-eval-en-us.iso");
+    // A form from before is stale; a name that makes no tag is refused.
+    let reply = post(operator.clone(), "rename", rename).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    let was = hidden(&get(addr, &path, Some(&operator)).await.body, "was");
+    let reply = post(
+        operator.clone(),
+        "rename",
+        format!("_csrf={csrf}&was={was}&name=%2F%2F%2F"),
     )
     .await;
     assert_eq!(reply.status, 400, "{}", reply.body);

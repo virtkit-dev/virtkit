@@ -504,6 +504,14 @@ fn check_seen(medium: &Medium, seen: Option<&str>) -> Result<()> {
     }
 }
 
+/// Where `l` is, as an audit names it: `registry <id>`, and `under <path>` if any.
+fn place(l: &Location) -> String {
+    match &l.under {
+        Some(u) => format!("registry {} under {u}", l.registry),
+        None => format!("registry {}", l.registry),
+    }
+}
+
 /// What [`Db::add_medium`] did.
 #[derive(Debug)]
 pub struct Added {
@@ -745,6 +753,80 @@ impl Db {
         self.medium(sha256)
     }
 
+    /// Medium `sha256`, if it is still at revision `seen` when one is given.
+    pub fn medium_at(&self, sha256: &str, seen: Option<&str>) -> Result<Option<Medium>> {
+        let Some(medium) = self.medium(sha256)? else {
+            return Ok(None);
+        };
+        check_seen(&medium, seen)?;
+        Ok(Some(medium))
+    }
+
+    /// Name medium `sha256` `name`, as `actor`, audited, and its locations `retagged` too, each
+    /// still holding the manifest it was retagged for: the medium, `None` when there is none.
+    /// The audit names locations still recorded under another name.
+    pub fn rename_medium(
+        &self,
+        sha256: &str,
+        name: &str,
+        retagged: &[Location],
+        actor: &str,
+        now: u64,
+    ) -> Result<Option<Medium>> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        {
+            let Some(medium) = medium_in(&txn, sha256)? else {
+                return Ok(None);
+            };
+            let mut row = medium.row;
+            let old = std::mem::replace(&mut row.file_name, name.to_string());
+            let mut moved = Vec::new();
+            for l in &mut row.locations {
+                // Its name aside: the retag replaced it, and the manifest is what was retagged.
+                // A location uploaded again meanwhile holds another manifest, and keeps its name.
+                let done = retagged.iter().any(|r| {
+                    (&r.registry, &r.under, &r.manifest) == (&l.registry, &l.under, &l.manifest)
+                });
+                if done && l.name != name {
+                    l.name = name.to_string();
+                    moved.push(place(l));
+                }
+            }
+            if old == name && moved.is_empty() {
+                txn.abort().context("dropping a write")?;
+                return self.medium(sha256);
+            }
+            row.edited_at = Some(now);
+            row.edited_by = Some(actor.to_string());
+            txn.open_table(MEDIA)?
+                .insert(sha256, encode(&row)?.as_slice())?;
+            let mut event = if old == name {
+                format!(
+                    "{actor} retagged medium {} as {name} on {}",
+                    short(sha256),
+                    moved.join(", ")
+                )
+            } else {
+                format!(
+                    "{actor} renamed medium {} from {old} to {name}",
+                    short(sha256)
+                )
+            };
+            let behind: Vec<String> = row
+                .locations
+                .iter()
+                .filter(|l| l.name != name)
+                .map(place)
+                .collect();
+            if !behind.is_empty() {
+                event.push_str(&format!("; not retagged on {}", behind.join(", ")));
+            }
+            append_audit(&txn, None, actor, &event, now)?;
+        }
+        txn.commit().context("renaming a medium")?;
+        self.medium(sha256)
+    }
+
     /// Approve medium `sha256` for jobs fleet-wide, or withdraw it, as `actor`: whether it
     /// changed, and the nodes it steered.
     pub fn approve_medium(
@@ -949,6 +1031,85 @@ mod tests {
             db.remove_medium(A, Some(&seen), "uid 5", 6)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// A rename renames the record and the locations retagged, still holding the manifest they
+    /// were retagged for; the others keep their tag, and the audit names them.
+    #[test]
+    fn a_rename_renames_the_locations_retagged() {
+        let db = Db::open_memory().unwrap();
+        let r2 = Location {
+            under: Some("build-cache".into()),
+            ..at("r2", "uid 1", 3)
+        };
+        db.add_medium(A, row("ws2025.iso"), at("r1", "uid 1", 2), false)
+            .unwrap();
+        db.add_medium(A, row("ws2025.iso"), r2.clone(), false)
+            .unwrap();
+        let seen = db.medium(A).unwrap().unwrap().revision().unwrap();
+        assert!(db.medium_at(A, Some(&seen)).unwrap().is_some());
+        assert!(db.medium_at(B, None).unwrap().is_none());
+
+        // r2 was retagged for a manifest it no longer holds.
+        let moved = Location {
+            manifest: format!("sha256:{A}"),
+            ..r2.clone()
+        };
+        let m = db
+            .rename_medium(A, "eval.iso", &[at("r1", "uid 1", 2), moved], "uid 2", 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.row.file_name, "eval.iso");
+        let names: Vec<_> = m.row.locations.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["eval.iso", "ws2025.iso"]);
+        assert_eq!(
+            (m.row.edited_at, m.row.edited_by.as_deref()),
+            (Some(4), Some("uid 2"))
+        );
+        let event = |at: u64| {
+            db.audits(None, 100)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.at == at)
+                .unwrap()
+                .event
+        };
+        assert_eq!(
+            event(4),
+            "uid 2 renamed medium d0ef4502e350 from ws2025.iso to eval.iso; not retagged on \
+             registry r2 under build-cache"
+        );
+        // The record moved on: a page showing it before is refused.
+        assert!(
+            db.medium_at(A, Some(&seen))
+                .unwrap_err()
+                .downcast_ref::<Stale>()
+                .is_some()
+        );
+
+        // Again, once r2 is retagged: only r2 changes.
+        let m = db
+            .rename_medium(A, "eval.iso", &[r2], "uid 2", 5)
+            .unwrap()
+            .unwrap();
+        assert!(m.row.locations.iter().all(|l| l.name == "eval.iso"));
+        assert_eq!(
+            event(5),
+            "uid 2 retagged medium d0ef4502e350 as eval.iso on registry r2 under build-cache"
+        );
+        // Nothing left to do changes nothing and audits nothing.
+        let audits = db.audits(None, 100).unwrap().len();
+        let same = db
+            .rename_medium(A, "eval.iso", &[], "uid 3", 6)
+            .unwrap()
+            .unwrap();
+        assert_eq!(same, m);
+        assert_eq!(db.audits(None, 100).unwrap().len(), audits);
+        assert!(
+            db.rename_medium(B, "x.iso", &[], "uid 3", 6)
+                .unwrap()
+                .is_none()
         );
     }
 

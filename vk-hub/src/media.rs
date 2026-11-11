@@ -18,6 +18,17 @@
 //! The hub writes as `hub:media`, with a token it mints itself, audited, for the registry
 //! alone, granting writes under the two repositories' prefixes, and living as long as an
 //! upload may. One upload runs at a time.
+//!
+//! `vk-hub media rename` retags each registry holding the medium under another name: its
+//! manifest, read back by digest and checked, is put under the new `files/win-media` tag,
+//! refused if the lookup finds another manifest. The old tag is dropped if its lookup still
+//! names this one. Both checks are best effort: another client's push between the check and
+//! PUT or DELETE can be overwritten or dropped. Tag presence comes from the registry's own
+//! store, never an upstream it relays to. Each registry gets a token of its own, reading and
+//! writing the `win-media` prefix, for minutes. The hub records the new name, and which
+//! registries took it. Failed locations keep their previously recorded names, though registry
+//! tags may have partly changed; renaming again retries them.
+//! One rename runs at a time, beside an upload.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -27,6 +38,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http_body_util::BodyExt;
+use hyper::StatusCode;
 use sha2::{Digest, Sha256};
 use vk_hub_proto::registry::{
     FILE_ANNOTATIONS_HEADER, FILE_RETENTION_HEADER, FILES_PATH, FilePut, RETENTION_KEEP,
@@ -74,6 +86,24 @@ impl Limits {
         }
     }
 }
+
+/// The longest each request of a rename may take, from reaching the registry to its answer
+/// read.
+const RETAG_STEP: Duration = Duration::from_secs(30);
+
+/// How long a rename may take on each registry: its seven requests, the manifest read, two
+/// tags looked up in two each, one put and one dropped.
+pub(crate) const RETAG_TIMEOUT: Duration = RETAG_STEP.saturating_mul(7);
+
+/// vk-registry's tag probe, answered from its own store alone: `POST` with `?name=<repo>` and
+/// `{"tags":[…]}`, answered `{"present":[…]}`.
+const EXISTS_PATH: &str = "/vk/manifests/exists";
+
+/// How long a rename's token lives.
+const RETAG_TTL: Duration = RETAG_TIMEOUT.saturating_add(Duration::from_secs(60));
+
+/// The largest manifest the hub reads back: the registry's own limit.
+const MAX_MANIFEST: usize = 4 << 20;
 
 /// Where the ISO 9660 primary volume descriptor starts, and how much of a medium's start
 /// is kept to read it.
@@ -899,6 +929,342 @@ pub fn remove(hub: &Hub, actor: &str, sha256: &str, seen: Option<&str>) -> Resul
     Ok(Some(medium))
 }
 
+/// The repository a medium's `files/` tags are in, under repository path `under`, if any.
+pub fn tags_repo(under: Option<&str>) -> String {
+    match under {
+        Some(u) => format!("{u}/files/{DIR}"),
+        None => format!("files/{DIR}"),
+    }
+}
+
+/// The registry holding a medium at `location`, checked to be reachable, with a token minted
+/// as `actor` to read and write the medium's tags there.
+fn retag_target(hub: &Hub, actor: &str, location: &Location) -> Result<Target> {
+    let id = &location.registry;
+    let (row, url) = bound(hub, id)?;
+    let ttl = RETAG_TTL.min(hub.token_keys.max_token);
+    let token = mint(hub, actor, id, location.under.as_deref(), &[DIR], true, ttl)?;
+    Ok(Target {
+        registry: id.clone(),
+        under: location.under.clone(),
+        url,
+        ca_pem: row.ca_pem,
+        token,
+        limits: Limits::new(ttl),
+    })
+}
+
+/// That registry `id` answered `doing` with one of `ok`; otherwise what it said.
+fn answered(id: &str, doing: &str, resp: &hyper::Response<Bytes>, ok: &[StatusCode]) -> Result<()> {
+    if ok.contains(&resp.status()) {
+        return Ok(());
+    }
+    let mut text = format!("registry {id} refused {doing} (HTTP {})", resp.status());
+    if let Some(m) = registry_message(resp.body()) {
+        text.push_str(&format!(": {}", vk_hub_proto::display_safe(&m)));
+    }
+    Err(anyhow!(text))
+}
+
+/// A rename's requests to one registry, on one connection while the registry keeps it open.
+struct Session<'a> {
+    target: &'a Target,
+    conn: Option<Conn<http_body_util::Full<Bytes>>>,
+}
+
+impl Session<'_> {
+    /// Send `method` `path`, with `body` of `content_type` if any: the answer, at most
+    /// [`MAX_MANIFEST`] bytes of body, within [`RETAG_STEP`] all told.
+    async fn ask(
+        &mut self,
+        method: hyper::Method,
+        path: &str,
+        content_type: Option<&str>,
+        body: Bytes,
+    ) -> Result<hyper::Response<Bytes>> {
+        let target = self.target;
+        let id = &target.registry;
+        let asked = async {
+            let open = match self.conn.take() {
+                Some(mut conn) => conn.sender.ready().await.is_ok().then_some(conn),
+                None => None,
+            };
+            let mut conn = match open {
+                Some(conn) => conn,
+                None => connect(target, RETAG_STEP).await?,
+            };
+            let mut request = hyper::Request::builder()
+                .method(method.clone())
+                .uri(path)
+                .header(hyper::header::HOST, &conn.authority)
+                .header(
+                    hyper::header::AUTHORIZATION,
+                    format!("Bearer {}", target.token),
+                );
+            if let Some(ctype) = content_type {
+                request = request.header(hyper::header::CONTENT_TYPE, ctype);
+            }
+            let request = request.body(http_body_util::Full::new(body))?;
+            let resp = conn
+                .sender
+                .send_request(request)
+                .await
+                .with_context(|| format!("asking registry {id} {method} {path}"))?;
+            let (parts, body) = resp.into_parts();
+            let body = http_body_util::Limited::new(body, MAX_MANIFEST)
+                .collect()
+                .await
+                .map_err(|e| anyhow!("reading registry {id}'s answer to {method} {path}: {e}"))?
+                .to_bytes();
+            self.conn = Some(conn);
+            Ok(hyper::Response::from_parts(parts, body))
+        };
+        tokio::time::timeout(RETAG_STEP, asked).await.map_err(|_| {
+            anyhow!(
+                "registry {id} did not answer {method} {path} within {}s",
+                RETAG_STEP.as_secs()
+            )
+        })?
+    }
+
+    /// Whether `repo` holds `tag` here and the digest of the manifest it names. Asked of the
+    /// registry's own store: a tag's `HEAD` that misses there is answered by an upstream, when
+    /// the registry has one for `repo`.
+    async fn tagged(&mut self, repo: &str, tag: &str) -> Result<Option<String>> {
+        let id = &self.target.registry;
+        let ask = serde_json::to_vec(&serde_json::json!({ "tags": [tag] }))?;
+        // Unencoded: `repo` is a checked repository path, with nothing to escape.
+        let path = format!("{EXISTS_PATH}?name={repo}");
+        let resp = self
+            .ask(
+                hyper::Method::POST,
+                &path,
+                Some("application/json"),
+                ask.into(),
+            )
+            .await?;
+        let doing = format!("looking up {repo}:{tag}");
+        answered(id, &doing, &resp, &[StatusCode::OK])?;
+        #[derive(serde::Deserialize)]
+        struct Present {
+            present: Vec<bool>,
+        }
+        let present: Present = serde_json::from_slice(resp.body())
+            .with_context(|| format!("reading registry {id}'s answer to {doing}"))?;
+        if present.present != [true] {
+            return Ok(None);
+        }
+        let path = format!("/v2/{repo}/manifests/{tag}");
+        let resp = self
+            .ask(hyper::Method::HEAD, &path, None, Bytes::new())
+            .await?;
+        answered(id, &doing, &resp, &[StatusCode::OK])?;
+        resp.headers()
+            .get("docker-content-digest")
+            .and_then(|v| v.to_str().ok())
+            .map(|d| Some(d.to_string()))
+            .with_context(|| format!("registry {id} named no digest for {repo}:{tag}"))
+    }
+}
+
+/// Tag `name` with the manifest held at `location`, then drop its old tag if the lookup still
+/// names that manifest. Refuse a digest mismatch or a lookup finding `name` on another manifest.
+/// OCI does not require conditional manifest PUTs. Both checks are best effort: another
+/// client's push between lookup and PUT or DELETE can be overwritten or dropped.
+/// An error may follow a successful PUT or DELETE; it does not imply unchanged tags.
+pub async fn retag(target: &Target, location: &Location, name: &str) -> Result<()> {
+    let (id, manifest) = (&target.registry, &location.manifest);
+    let repo = tags_repo(location.under.as_deref());
+    let path = |reference: &str| format!("/v2/{repo}/manifests/{reference}");
+    let mut s = Session { target, conn: None };
+    let got = s
+        .ask(hyper::Method::GET, &path(manifest), None, Bytes::new())
+        .await?;
+    answered(id, "reading the medium's manifest", &got, &[StatusCode::OK])?;
+    let digest = format!(
+        "sha256:{}",
+        vk_hub_proto::to_hex(&Sha256::digest(got.body()))
+    );
+    if digest != *manifest {
+        bail!("registry {id} served manifest {manifest} hashing to {digest}");
+    }
+    let ctype = got
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .with_context(|| format!("registry {id} served manifest {manifest} with no media type"))?;
+    match s.tagged(&repo, name).await? {
+        Some(d) if d == *manifest => {}
+        Some(_) => bail!("registry {id} tags another manifest {repo}:{name} already"),
+        None => {
+            let body = got.body().clone();
+            let put = s
+                .ask(hyper::Method::PUT, &path(name), Some(ctype), body)
+                .await?;
+            let doing = format!("tagging {repo}:{name}");
+            answered(id, &doing, &put, &[StatusCode::CREATED])?;
+        }
+    }
+    // Best effort: the registry drops a tag whatever it names, so one moved between this look
+    // and the drop that follows it is dropped all the same.
+    let old = &location.name;
+    if s.tagged(&repo, old).await?.as_ref() == Some(manifest) {
+        let gone = s
+            .ask(hyper::Method::DELETE, &path(old), None, Bytes::new())
+            .await?;
+        let doing = format!("untagging {repo}:{old}");
+        answered(
+            id,
+            &doing,
+            &gone,
+            &[StatusCode::ACCEPTED, StatusCode::NOT_FOUND],
+        )?;
+    }
+    Ok(())
+}
+
+/// A rename refused because another runs.
+#[derive(Debug)]
+pub struct RenameBusy;
+
+impl std::fmt::Display for RenameBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("another rename runs; wait for it to end")
+    }
+}
+
+impl std::error::Error for RenameBusy {}
+
+/// A rename the hub recorded with failed locations still recorded under their previous names.
+#[derive(Debug)]
+pub struct NotRetagged {
+    /// Whether the medium's name changed or any registry was successfully retagged.
+    pub renamed: bool,
+    pub sha256: String,
+    pub name: String,
+    /// Each failed registry, its previously recorded name, and the error.
+    pub why: String,
+}
+
+impl std::fmt::Display for NotRetagged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (sha, name) = (&self.sha256, &self.name);
+        if self.renamed {
+            write!(f, "renamed medium {sha} {name}")?;
+        } else {
+            write!(f, "medium {sha} is named {name}")?;
+        }
+        write!(f, ", but {}; rename it again to retry", self.why)
+    }
+}
+
+impl std::error::Error for NotRetagged {}
+
+/// Name medium `sha256` `name`, made a tag, as `actor`, if it is still at revision `seen` when
+/// one is given: retag each registry holding it by another name, then record the new name,
+/// and the locations retagged. Failed locations keep their previously recorded names, though
+/// registry tags may have partly changed. [`NotRetagged`] names the failures; renaming again
+/// retries them. The hub runs one rename at a time.
+pub async fn rename(
+    hub: &Arc<Hub>,
+    actor: &str,
+    sha256: &str,
+    name: &str,
+    seen: Option<&str>,
+) -> Result<Medium> {
+    let name = tag_name(name)?;
+    // Two at once could leave both names tagged, each kept for good.
+    let _one = hub
+        .media_renames
+        .try_acquire()
+        .map_err(|_| anyhow::Error::new(RenameBusy))?;
+    let (hub2, sha, seen) = (hub.clone(), sha256.to_string(), seen.map(str::to_string));
+    let medium = tokio::task::spawn_blocking(move || hub2.db.medium_at(&sha, seen.as_deref()))
+        .await
+        .context("reading the medium")??
+        .with_context(|| format!("there is no medium {sha256}"))?;
+    let stale: Vec<Location> = medium
+        .row
+        .locations
+        .iter()
+        .filter(|l| l.name != name)
+        .cloned()
+        .collect();
+    if stale.is_empty() && medium.row.file_name == name {
+        return Ok(medium);
+    }
+    let (hub2, actor2, at) = (hub.clone(), actor.to_string(), stale.clone());
+    let targets: Vec<Result<Target>> = tokio::task::spawn_blocking(move || {
+        at.iter().map(|l| retag_target(&hub2, &actor2, l)).collect()
+    })
+    .await
+    .context("minting the registries' tokens")?;
+    let name = name.as_str();
+    let tried = futures::future::join_all(stale.iter().zip(targets).map(
+        |(location, target)| async move {
+            let target = target?;
+            // Within the token's lifetime, which `max_job_token_secs` may cut short.
+            let budget = RETAG_TIMEOUT.min(target.limits.total);
+            tokio::time::timeout(budget, retag(&target, location, name))
+                .await
+                .map_err(|_| anyhow!("not done within {}s", budget.as_secs()))?
+        },
+    ))
+    .await;
+    let (mut retagged, mut failed) = (Vec::new(), Vec::new());
+    for (location, tried) in stale.into_iter().zip(tried) {
+        match tried {
+            Ok(()) => retagged.push(location),
+            Err(e) => failed.push((location, e)),
+        }
+    }
+    let renamed = medium.row.file_name != name || !retagged.is_empty();
+    let (hub2, actor2, sha, name2) = (
+        hub.clone(),
+        actor.to_string(),
+        sha256.to_string(),
+        name.to_string(),
+    );
+    let recorded = tokio::task::spawn_blocking(move || {
+        hub2.db
+            .rename_medium(&sha, &name2, &retagged, &actor2, crate::now_secs())
+    })
+    .await
+    .context("recording the rename")?
+    .context("the hub could not record the rename; rename it again once that is fixed")?
+    .with_context(|| format!("medium {sha256} was removed while it was renamed"))?;
+    if renamed {
+        let did = if medium.row.file_name == name {
+            "retagged"
+        } else {
+            "renamed"
+        };
+        eprintln!("vk-hub: {actor} {did} medium {sha256} as {name}");
+        hub.touch();
+    }
+    if failed.is_empty() {
+        return Ok(recorded);
+    }
+    let why: Vec<String> = failed
+        .iter()
+        .map(|(l, e)| {
+            format!(
+                "registry {} still tags it {}:{}: {e:#}",
+                l.registry,
+                tags_repo(l.under.as_deref()),
+                l.name
+            )
+        })
+        .collect();
+    Err(NotRetagged {
+        renamed,
+        sha256: sha256.to_string(),
+        name: name.to_string(),
+        why: why.join("; "),
+    }
+    .into())
+}
+
 /// The client TLS for a registry: its bound CA alone when it has one, the platform's roots
 /// otherwise.
 fn client_tls(ca_pem: Option<&str>) -> Result<Arc<rustls::ClientConfig>> {
@@ -1181,6 +1547,325 @@ mod tests {
         });
         let err = send_err(&slow, 1 << 20, trickle).await;
         assert!(err.contains("not done within 2s"), "{err}");
+    }
+
+    /// A registry's `files/win-media` manifests, by hand.
+    #[derive(Default)]
+    struct Oci {
+        /// Manifests by digest.
+        manifests: BTreeMap<String, Vec<u8>>,
+        /// Tags, and the digest each names.
+        tags: BTreeMap<String, String>,
+        /// Whether a manifest read by digest comes back other than it is.
+        lie: bool,
+        /// The digest an upstream names for every tag not held here, which a tag's `HEAD` or
+        /// `GET` relays.
+        upstream: Option<String>,
+        /// The connections taken.
+        dials: usize,
+    }
+
+    const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+
+    impl Oci {
+        /// Hold `body`, tagged `tag`: its digest.
+        fn tag(&mut self, tag: &str, body: &[u8]) -> String {
+            let digest = format!("sha256:{}", vk_hub_proto::to_hex(&Sha256::digest(body)));
+            self.manifests.insert(digest.clone(), body.to_vec());
+            self.tags.insert(tag.into(), digest.clone());
+            digest
+        }
+
+        fn tags(&self) -> Vec<(&str, &str)> {
+            self.tags
+                .iter()
+                .map(|(t, d)| (t.as_str(), d.as_str()))
+                .collect()
+        }
+    }
+
+    /// A registry's manifest API and tag probe on `oci`, by hand.
+    async fn fake_oci(oci: Arc<Mutex<Oci>>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                oci.lock().unwrap().dials += 1;
+                let oci = oci.clone();
+                let service = hyper::service::service_fn(
+                    move |req: hyper::Request<hyper::body::Incoming>| {
+                        let oci = oci.clone();
+                        async move {
+                            let bearer = req.headers()["authorization"].to_str().unwrap();
+                            assert!(bearer.starts_with("Bearer vkt_"), "{bearer}");
+                            let path = req.uri().path().to_string();
+                            let query = req.uri().query().map(str::to_string);
+                            let method = req.method().clone();
+                            let ctype = req.headers().get("content-type").cloned();
+                            let body = req.into_body().collect().await?.to_bytes();
+                            let mut oci = oci.lock().unwrap();
+                            let reply = |status: u16| hyper::Response::builder().status(status);
+                            let resp = if path == EXISTS_PATH {
+                                assert_eq!(method, "POST");
+                                assert_eq!(query.as_deref(), Some("name=files/win-media"));
+                                let ask: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                                let present: Vec<bool> = ask["tags"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .map(|t| oci.tags.contains_key(t.as_str().unwrap()))
+                                    .collect();
+                                let said = serde_json::json!({ "present": present });
+                                reply(200).body(said.to_string().into_bytes())
+                            } else {
+                                let reference = path
+                                    .strip_prefix("/v2/files/win-media/manifests/")
+                                    .unwrap()
+                                    .to_string();
+                                let digest = oci
+                                    .tags
+                                    .get(&reference)
+                                    .cloned()
+                                    .unwrap_or(reference.clone());
+                                let held = oci.manifests.get(&digest).cloned();
+                                let read = method == "GET" || method == "HEAD";
+                                match (method.as_str(), held) {
+                                    (_, Some(mut held)) if read => {
+                                        if oci.lie {
+                                            held.push(b' ');
+                                        }
+                                        reply(200)
+                                            .header("docker-content-digest", &digest)
+                                            .header("content-type", MANIFEST_TYPE)
+                                            .body(if method == "GET" { held } else { Vec::new() })
+                                    }
+                                    (_, None) if read && oci.upstream.is_some() => reply(200)
+                                        .header(
+                                            "docker-content-digest",
+                                            oci.upstream.clone().unwrap(),
+                                        )
+                                        .body(Vec::new()),
+                                    ("PUT", _) => {
+                                        assert_eq!(ctype.unwrap(), MANIFEST_TYPE);
+                                        oci.tag(&reference, &body);
+                                        reply(201).body(Vec::new())
+                                    }
+                                    ("DELETE", _) if oci.tags.remove(&reference).is_some() => {
+                                        reply(202).body(Vec::new())
+                                    }
+                                    _ => reply(404).body(Vec::new()),
+                                }
+                            };
+                            Ok::<_, hyper::Error>(
+                                resp.unwrap()
+                                    .map(|b| http_body_util::Full::new(Bytes::from(b))),
+                            )
+                        }
+                    },
+                );
+                tokio::spawn(
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service),
+                );
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Where registry `id` holds the medium named `old.iso` by `manifest`.
+    fn old_at(id: &str, manifest: &str) -> Location {
+        Location {
+            registry: id.into(),
+            under: None,
+            name: "old.iso".into(),
+            manifest: manifest.into(),
+            at: 1,
+            by: "uid 0".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rename_moves_the_tag_it_still_owns() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let start = |oci: Oci| async move {
+            let oci = Arc::new(Mutex::new(oci));
+            (fake_target(fake_oci(oci.clone()).await), oci)
+        };
+        let mut held = Oci::default();
+        let ours = held.tag("old.iso", br#"{"medium":1}"#);
+        let location = old_at("r", &ours);
+
+        // The new tag names it, the old one no longer, all on one connection.
+        let (target, oci) = start(std::mem::take(&mut held)).await;
+        retag(&target, &location, "new.iso").await.unwrap();
+        assert_eq!(oci.lock().unwrap().tags(), [("new.iso", ours.as_str())]);
+        assert_eq!(oci.lock().unwrap().dials, 1);
+        // Done again, there is nothing left to do.
+        retag(&target, &location, "new.iso").await.unwrap();
+        assert_eq!(oci.lock().unwrap().tags(), [("new.iso", ours.as_str())]);
+
+        // A lookup finding the new tag on another manifest refuses the retag.
+        held.tag("old.iso", br#"{"medium":1}"#);
+        let theirs = held.tag("new.iso", br#"{"medium":2}"#);
+        let (target, oci) = start(std::mem::take(&mut held)).await;
+        let err = retag(&target, &location, "new.iso").await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("tags another manifest"),
+            "{err:#}"
+        );
+        assert_eq!(
+            oci.lock().unwrap().tags(),
+            [("new.iso", theirs.as_str()), ("old.iso", ours.as_str())]
+        );
+
+        // A lookup finding the old tag on another manifest leaves it alone.
+        held.tag("x.iso", br#"{"medium":1}"#);
+        held.tag("old.iso", br#"{"medium":2}"#);
+        let (target, oci) = start(std::mem::take(&mut held)).await;
+        retag(&target, &location, "new.iso").await.unwrap();
+        assert_eq!(
+            oci.lock().unwrap().tags(),
+            [
+                ("new.iso", ours.as_str()),
+                ("old.iso", theirs.as_str()),
+                ("x.iso", ours.as_str())
+            ]
+        );
+
+        // What an upstream tags decides nothing: the new tag is put here.
+        held.tag("old.iso", br#"{"medium":1}"#);
+        held.upstream = Some(theirs.clone());
+        let (target, oci) = start(std::mem::take(&mut held)).await;
+        retag(&target, &location, "new.iso").await.unwrap();
+        assert_eq!(oci.lock().unwrap().tags(), [("new.iso", ours.as_str())]);
+
+        // A manifest that does not hash to its digest is not tagged.
+        held.tag("old.iso", br#"{"medium":1}"#);
+        held.lie = true;
+        let (target, oci) = start(held).await;
+        let err = retag(&target, &location, "new.iso").await.unwrap_err();
+        assert!(format!("{err:#}").contains("hashing to"), "{err:#}");
+        assert_eq!(oci.lock().unwrap().tags(), [("old.iso", ours.as_str())]);
+    }
+
+    /// A rename retags every registry it can with a token of its own, records the name and the
+    /// registries that took it, says which did not, and retries those when asked again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rename_records_what_each_registry_took() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("vk-hub-media-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = Arc::new(
+            Hub::new(Arc::new(crate::store::Db::open_memory().unwrap()), None)
+                .with_token_keys(dir.join("token-keys"), crate::tokens::DEFAULT_MAX_JOB_TOKEN),
+        );
+        let mut one = Oci::default();
+        let ours = one.tag("old.iso", br#"{"medium":1}"#);
+        let mut two = Oci::default();
+        two.tag("old.iso", br#"{"medium":1}"#);
+        two.tag("new.iso", br#"{"medium":2}"#);
+        let (one, two) = (Arc::new(Mutex::new(one)), Arc::new(Mutex::new(two)));
+        let r1 = crate::tests::tokens::token_registry(&hub, &fake_oci(one.clone()).await, "aa");
+        let r2 = crate::tests::tokens::token_registry(&hub, &fake_oci(two.clone()).await, "bb");
+        let sha = "a".repeat(64);
+        for id in [&r1, &r2] {
+            // Registries holding media took file puts.
+            let mut inventory = hub.db.registry(id).unwrap().unwrap().inventory.unwrap();
+            inventory.files_put = true;
+            hub.db
+                .record_registry(
+                    id,
+                    crate::store::RegistryWrite::Inventory(inventory),
+                    crate::now_secs(),
+                )
+                .unwrap();
+            hub.open_session(id);
+            let row = MediumRow {
+                file_name: "old.iso".into(),
+                size: 3,
+                volume_label: None,
+                added_at: 1,
+                added_by: "uid 0".into(),
+                edited_at: None,
+                edited_by: None,
+                info: MediumInfo::default(),
+                locations: Vec::new(),
+            };
+            hub.db
+                .add_medium(&sha, row, old_at(id, &ours), false)
+                .unwrap();
+        }
+        let names = |hub: &Hub| {
+            let m = hub.db.medium(&sha).unwrap().unwrap();
+            let at: Vec<String> = m.row.locations.iter().map(|l| l.name.clone()).collect();
+            (m.row.file_name, at)
+        };
+
+        // r2 tags another manifest new.iso: renamed all the same, r2 left on old.iso.
+        let err = rename(&hub, "uid 1", &sha, "new.iso", None)
+            .await
+            .unwrap_err();
+        let not = err.downcast_ref::<NotRetagged>().unwrap();
+        assert!(not.renamed);
+        assert!(
+            not.why.contains(&format!("registry {r2} still tags it")),
+            "{not}"
+        );
+        assert!(format!("{err:#}").starts_with("renamed medium"), "{err:#}");
+        assert_eq!(
+            names(&hub),
+            ("new.iso".into(), vec!["new.iso".into(), "old.iso".into()])
+        );
+        assert_eq!(one.lock().unwrap().tags(), [("new.iso", ours.as_str())]);
+        // Again, still refused there: nothing renamed, and said so.
+        let err = rename(&hub, "uid 1", &sha, "new.iso", None)
+            .await
+            .unwrap_err();
+        assert!(!err.downcast_ref::<NotRetagged>().unwrap().renamed);
+        assert!(format!("{err:#}").starts_with("medium "), "{err:#}");
+        // Once r2 frees the name, a rename to it retags r2 alone.
+        two.lock().unwrap().tags.remove("new.iso");
+        rename(&hub, "uid 1", &sha, "new.iso", None).await.unwrap();
+        assert_eq!(
+            names(&hub),
+            ("new.iso".into(), vec!["new.iso".into(), "new.iso".into()])
+        );
+        assert_eq!(two.lock().unwrap().tags(), [("new.iso", ours.as_str())]);
+        let audit = hub.db.audits(None, 100).unwrap();
+        assert!(
+            audit
+                .iter()
+                .any(|e| e.event.contains(&format!("as new.iso on registry {r2}"))),
+            "{audit:?}"
+        );
+        // The hub minted each registry's token, audited.
+        for id in [&r1, &r2] {
+            let minted = hub.db.audits(Some(id), 100).unwrap();
+            assert!(
+                minted
+                    .iter()
+                    .any(|e| e.event.starts_with("uid 1 minted") && e.event.contains("win-media")),
+                "{minted:?}"
+            );
+        }
+
+        // One at a time, and a stale page changes nothing.
+        let held = hub.media_renames.try_acquire().unwrap();
+        let err = rename(&hub, "uid 1", &sha, "x.iso", None)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("another rename runs"),
+            "{err:#}"
+        );
+        drop(held);
+        let err = rename(&hub, "uid 1", &sha, "x.iso", Some("0000"))
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<crate::store::Stale>().is_some());
+        assert!(rename(&hub, "uid 1", &sha, "///", None).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

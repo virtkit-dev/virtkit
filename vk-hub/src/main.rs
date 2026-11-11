@@ -467,6 +467,15 @@ enum MediaCmd {
         #[command(flatten)]
         about: Box<MediumArgs>,
     },
+    /// Rename a medium, and retag each registry holding it under another name
+    ///
+    /// A registry that cannot be retagged keeps its old tag; renaming again retries it.
+    Rename {
+        /// Its sha256, or at least the first 8 hex digits
+        medium: String,
+        /// The new name, made a tag as an upload's is
+        name: String,
+    },
     /// Approve a medium for jobs fleet-wide
     Approve {
         /// Its sha256, or at least the first 8 hex digits
@@ -2028,6 +2037,11 @@ async fn media_cmd(client: admin::Client, cmd: MediaCmd) -> Result<()> {
             let edit = (*about).edit()?;
             let m =
                 tokio::task::spawn_blocking(move || client.edit_medium(&medium, edit)).await??;
+            print!("{}", render_medium(&m));
+        }
+        MediaCmd::Rename { medium, name } => {
+            let m =
+                tokio::task::spawn_blocking(move || client.rename_medium(&medium, &name)).await??;
             print!("{}", render_medium(&m));
         }
         MediaCmd::Approve { medium } => {

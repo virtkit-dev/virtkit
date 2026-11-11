@@ -10525,6 +10525,131 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The hub's rename of an install medium, with a token reading and writing the `win-media`
+    /// prefix: the file's manifest read back by digest, its tags looked up in this store alone
+    /// however an upstream answers, the manifest put under a new tag and the old tag dropped.
+    #[tokio::test]
+    async fn a_hub_token_retags_a_stored_file() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // An upstream tagging everything, which a tag's `HEAD` missing here is relayed to.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let theirs = format!("sha256:{}", "f".repeat(64));
+        let said = theirs.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let said = said.clone();
+                let service = hyper::service::service_fn(move |_req: Request<Incoming>| {
+                    let said = said.clone();
+                    async move {
+                        Response::builder()
+                            .header("docker-content-digest", said)
+                            .header(hyper::header::CONTENT_TYPE, DEFAULT_MANIFEST_TYPE)
+                            .body(http_body_util::Full::new(Bytes::from_static(b"{}")))
+                    }
+                });
+                tokio::spawn(
+                    http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service),
+                );
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("vk-regserve-retag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::new(dir.join("store")).unwrap());
+        let layer = store.put_blob(b"medium bytes").unwrap();
+        let ours = store
+            .put_raw_file(
+                "files/win-media",
+                "old.iso",
+                layer.trim_start_matches("sha256:"),
+                12,
+                Some("old.iso"),
+            )
+            .unwrap();
+        let signer = vk_peer::token::Signer::generate(&dir.join("signer")).unwrap();
+        let aud = "00112233445566778899aabbccddeeff";
+        let state = Arc::new(ServerState {
+            store,
+            upstreams: vec![relay::Upstream {
+                prefix: String::new(),
+                base: format!("http://{upstream_addr}"),
+                username: None,
+                password: None,
+                client: reqwest::Client::new(),
+            }],
+            locks: lock::LockManager::new(),
+            auth: Authenticator::Shared(auth::Auth::None),
+            tls: None,
+            webdav: false,
+            tokens: Default::default(),
+            handover: Default::default(),
+        });
+        state.tokens.open(aud, vec![signer.public().clone()], &[]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(serve_on(listener, state));
+
+        let now = vk_peer::now_secs();
+        let mut c = claims(&[("win-media", "rw")]);
+        (c.aud, c.sub, c.iat, c.exp) = (aud.into(), "hub:media".into(), now, now + 600);
+        let token = signer.sign(c).unwrap();
+        let client = reqwest::Client::new();
+        let manifests = format!("{base}/v2/files/win-media/manifests");
+        let ask =
+            |method: reqwest::Method, url: String| client.request(method, url).bearer_auth(&token);
+        let present = |tags: [&str; 2]| {
+            let url = format!("{base}{EXISTS_PATH}?name=files/win-media");
+            let req = ask(reqwest::Method::POST, url).json(&serde_json::json!({ "tags": tags }));
+            async move {
+                let resp = req.send().await.unwrap();
+                assert_eq!(resp.status(), reqwest::StatusCode::OK);
+                let said: serde_json::Value = resp.json().await.unwrap();
+                said["present"].clone()
+            }
+        };
+
+        let got = ask(reqwest::Method::GET, format!("{manifests}/{ours}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(got.status(), reqwest::StatusCode::OK);
+        let ctype = got.headers()[hyper::header::CONTENT_TYPE].clone();
+        let body = got.bytes().await.unwrap();
+        assert_eq!(format!("sha256:{}", sha256_hex_raw(&body)), ours);
+        // Here, only the old tag; a tag's `HEAD` would have the upstream's word for the new.
+        assert_eq!(
+            present(["old.iso", "new.iso"]).await,
+            serde_json::json!([true, false])
+        );
+        let head = ask(reqwest::Method::HEAD, format!("{manifests}/new.iso"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.headers()["docker-content-digest"], theirs.as_str());
+
+        let put = ask(reqwest::Method::PUT, format!("{manifests}/new.iso"))
+            .header(hyper::header::CONTENT_TYPE, ctype)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status(), reqwest::StatusCode::CREATED);
+        assert_eq!(put.headers()["docker-content-digest"], ours.as_str());
+        let gone = ask(reqwest::Method::DELETE, format!("{manifests}/old.iso"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), reqwest::StatusCode::ACCEPTED);
+        assert_eq!(
+            present(["old.iso", "new.iso"]).await,
+            serde_json::json!([false, true])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A prefix's window drops its idle tags well inside the store-wide one, and holds a far
     /// `expires` annotation to itself, and a `keep` too under a window the config sets; under
     /// one the hub added, `keep` and a far `expires` hold, and a past `expires` does not.

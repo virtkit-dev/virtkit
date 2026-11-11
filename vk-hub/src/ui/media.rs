@@ -6,8 +6,9 @@
 //! registries hold it; for an operator, the upload form.
 //!
 //! **A medium's page**, `/media/<sha256>`: everything said of it and where each registry holds
-//! it; for an operator, its approval, the form that edits what is said of it, and its removal,
-//! confirmed first.
+//! it; for an operator, its approval, the form that edits what is said of it, its rename, which
+//! retags the registries holding it ([`crate::media::rename`]), and its removal, confirmed
+//! first.
 //!
 //! **An upload** is `vk-hub media add` from a browser: a plain form post,
 //! `multipart/form-data`, its CSRF token and what is said of the medium first — checked, within
@@ -19,7 +20,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
@@ -68,8 +69,9 @@ pub(super) fn action_target(path: &str) -> Option<(&str, &str)> {
         .strip_prefix(PATH)?
         .strip_prefix('/')?
         .split_once('/')?;
-    (vk_hub_proto::valid_sha256(sha) && matches!(op, "edit" | "approve" | "unapprove" | "remove"))
-        .then_some((sha, op))
+    (vk_hub_proto::valid_sha256(sha)
+        && matches!(op, "edit" | "rename" | "approve" | "unapprove" | "remove"))
+    .then_some((sha, op))
 }
 
 fn see_other(path: &str) -> Result<Response<Body>> {
@@ -500,7 +502,25 @@ fn medium_page(h: &mut Html, m: &Medium, operator: Option<(&Auth, &str)>, today:
             .text(revision)
             .raw("\">");
         info_fields(h, i, false);
-        h.raw("<button class=\"primary\">Save</button></form></details>");
+        h.raw("<button class=\"primary\">Save</button></form></details>")
+            .raw("<details class=\"upload\"><summary class=\"button\">Rename</summary>")
+            .raw("<form class=\"wide\" method=\"post\" action=\"")
+            .text(format!("{}/rename", detail_path(&m.sha256)))
+            .raw("\">");
+        csrf_field(h, auth);
+        h.raw("<input type=\"hidden\" name=\"was\" value=\"")
+            .text(revision)
+            .raw("\"><label>Name <input name=\"name\" size=\"40\" maxlength=\"128\" ")
+            .raw("required value=\"")
+            .text(&row.file_name)
+            .raw("\"></label><button class=\"primary\">Rename</button></form><p class=\"sub\">")
+            .raw("The name becomes a tag: letters, digits, <code>.</code>, <code>_</code> and ")
+            .raw("<code>-</code>, any other character made <code>-</code>, a leading path ")
+            .raw("dropped, at most 128. ")
+            .raw("Each registry holding it is retagged <code>files/")
+            .raw(crate::media::DIR)
+            .raw(":&lt;name&gt;</code> and its old tag dropped. One that cannot be keeps its ")
+            .raw("old tag, shown above; renaming again retries it.</p></details>");
         action_button(h, auth, &m.sha256, "remove", "Remove");
     }
 }
@@ -551,8 +571,8 @@ fn info_of(get: impl Fn(&str) -> Option<String>) -> Result<MediumEdit> {
     Ok(MediumEdit::whole(info))
 }
 
-/// `POST /media/<sha256>/<op>`: edit, approve, unapprove or remove, as the operator session's
-/// principal; removal asked first.
+/// `POST /media/<sha256>/<op>`: edit, rename, approve, unapprove or remove, as the operator
+/// session's principal; removal asked first.
 pub(super) async fn action(
     req: Request<Incoming>,
     ui: &Ui,
@@ -570,7 +590,9 @@ pub(super) async fn action(
         return Ok(message(StatusCode::NOT_FOUND, "There is no such medium."));
     };
     let refuse = |e: anyhow::Error| {
-        let status = if e.downcast_ref::<crate::store::Stale>().is_some() {
+        let status = if e.downcast_ref::<crate::store::Stale>().is_some()
+            || e.downcast_ref::<crate::media::RenameBusy>().is_some()
+        {
             StatusCode::CONFLICT
         } else {
             StatusCode::BAD_REQUEST
@@ -596,6 +618,41 @@ pub(super) async fn action(
                 Ok(crate::media::edit(&hub, &principal, &sha, &edit, Some(&seen)).map(|_| ()))
             })
             .await?
+        }
+        "rename" => {
+            let name = super::field(&form, "name")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let seen = super::field(&form, "was").unwrap_or_default().to_string();
+            // Held until recorded: an update of the hub would cut it.
+            let long = match ui.hub.handover.long_call() {
+                Ok(long) => long,
+                Err(e) => {
+                    let said = format!("Refused: {e:#}.");
+                    return Ok(actions::refused(false, StatusCode::CONFLICT, &said));
+                }
+            };
+            // A task of its own, so a browser gone away does not cut it between the registries'
+            // retag and its record.
+            let renamed = tokio::spawn(async move {
+                let _long = long;
+                crate::media::rename(&hub, &principal, &sha, &name, Some(&seen))
+                    .await
+                    .map(|_| ())
+            })
+            .await
+            .context("renaming the medium")?;
+            if let Err(e) = &renamed
+                && let Some(not) = e.downcast_ref::<crate::media::NotRetagged>()
+            {
+                return Ok(actions::refused(
+                    false,
+                    StatusCode::BAD_GATEWAY,
+                    &not_retagged(not),
+                ));
+            }
+            renamed
         }
         "approve" | "unapprove" => {
             let approve = op == "approve";
@@ -656,6 +713,19 @@ pub(super) async fn action(
     match done {
         Ok(()) => see_other(&detail_path(sha256)),
         Err(e) => refuse(e),
+    }
+}
+
+/// Report a rename with failed locations still recorded under their previous names.
+fn not_retagged(not: &crate::media::NotRetagged) -> String {
+    let why = vk_hub_proto::display_safe(&not.why);
+    if not.renamed {
+        format!("Renamed, but {why}; rename it again to retry.")
+    } else {
+        format!(
+            "Named {} already, but {why}; rename it again to retry.",
+            not.name
+        )
     }
 }
 
@@ -1099,6 +1169,10 @@ mod tests {
         assert_eq!(
             action_target(&format!("/media/{sha}/approve")),
             Some((sha.as_str(), "approve"))
+        );
+        assert_eq!(
+            action_target(&format!("/media/{sha}/rename")),
+            Some((sha.as_str(), "rename"))
         );
         assert_eq!(action_target(&format!("/media/{sha}/delete")), None);
         assert_eq!(action_target("/media/upload"), None);

@@ -1053,6 +1053,29 @@ to the fleet-wide `executor.windows_media` or take it out; `media remove` forget
 withdraws its approval, leaving the registries' copies. A medium is named by its sha256 or at least its first 8 hex
 digits. Uploading bytes the hub knows adds where they are and leaves what was said of them.
 
+`vk-hub media rename <sha256> <name>` renames a medium, its name made a tag as an upload's is,
+and retags each registry holding it under another name. In `[<path>/]files/win-media`, the
+hub reads the medium's manifest back by its recorded digest and checks it hashes to it, puts
+it under the new tag, then drops the old tag if it still names that manifest. Which tags exist
+is asked of the registry's own store (`POST /vk/manifests/exists`), never an upstream it
+relays to. A new tag found naming another manifest is refused for that registry; an old tag
+found naming another manifest is left. OCI does not require conditional manifest PUTs.
+Both checks are best effort: another client's push between the check and PUT can be
+overwritten, and one between the check and DELETE can be dropped. The manifest is the same,
+annotations and retention included; its layer's `org.opencontainers.image.title` keeps the
+old name, which OCI clients naming downloads by title still use. Each registry gets its own token, sub
+`hub:media`, read and write on the prefix `[<path>/]files/win-media` (`win-media` without
+`--under`, which also covers a top-level `win-media` repository), for four and a half minutes
+at most, audited as an upload's; it must be connected and have its URL bound, as for an
+upload. Registries are retagged at once, over one connection each, each request within 30
+seconds and each registry within three and a half minutes; the CLI waits four and a half. One
+rename runs at a time, beside an upload, and holds back an update of the hub. The hub records
+the new name even when a registry fails, retaining that location's previously recorded name.
+Registry tags may have partly changed before the failure. The error names the registry and
+reason; renaming again to the same name retries it. The rename is
+audited as the operator's, with the registries not retagged; from the web UI, it is refused if
+the medium changed since its page was shown, and goes on if the browser leaves.
+
 The registry must be connected, take hub tokens (`[hub] tokens = true`) and have its URL bound
 (`vk-hub registries set-url`), `https` or plain `http` on loopback; one too old for file puts,
 or whose last heartbeat reported too little free space for the medium and 1 GiB more, is

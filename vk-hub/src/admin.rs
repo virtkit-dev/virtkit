@@ -66,6 +66,10 @@ const ADD_TIMEOUT: Duration = Duration::from_secs(600);
 /// token's lifetime, so it hears how it ended.
 const MEDIA_WAIT: Duration = Duration::from_secs(crate::media::TOKEN_TTL.as_secs() + 5 * 60);
 
+/// How long the CLI waits for a medium to be renamed: past the hub's own limit on retagging a
+/// registry, which it does for each at once.
+const RENAME_WAIT: Duration = Duration::from_secs(crate::media::RETAG_TIMEOUT.as_secs() + 60);
+
 /// How long the CLI waits for a fetch: past the hub's own limit on one, so it hears how it
 /// ended. A fetch goes on when the CLI stops waiting; the next finds the release held.
 const FETCH_WAIT: Duration = Duration::from_secs(35 * 60);
@@ -360,6 +364,11 @@ enum Call {
     RemoveMedium {
         medium: String,
     },
+    /// Rename a medium, and retag the registries holding it.
+    RenameMedium {
+        medium: String,
+        name: String,
+    },
     RemoveTools {
         tools: String,
     },
@@ -620,8 +629,8 @@ async fn serve_one(mut stream: UnixStream, hub: Arc<Hub>, uid: u32) -> Result<()
     .context("writing an admin reply")
 }
 
-/// Whether `call` adds or fetches a release or tools, or uploads a medium, and may outlast an
-/// update's grace period.
+/// Whether `call` adds or fetches a release or tools, or uploads or renames a medium, and may
+/// outlast an update's grace period.
 /// A latest-release check only reads and can be repeated. Fetches also hold their own long-call
 /// guard ([`crate::fetch::start`]), including those started by the web UI.
 fn is_long(call: &Call) -> bool {
@@ -630,6 +639,7 @@ fn is_long(call: &Call) -> bool {
         Call::AddRelease { .. }
             | Call::AddTools { .. }
             | Call::AddMedium { .. }
+            | Call::RenameMedium { .. }
             | Call::FetchRelease { .. }
             | Call::FetchProgramRelease { .. }
     )
@@ -687,6 +697,7 @@ fn fetch_call(body: &[u8]) -> Option<Call> {
             | Call::LatestRelease
             | Call::UpdateHub { .. }
             | Call::AddMedium { .. }
+            | Call::RenameMedium { .. }
     )
     .then_some(envelope.call)
 }
@@ -704,6 +715,16 @@ async fn dispatch_fetch(call: Call, hub: &Arc<Hub>, uid: u32) -> Result<serde_js
                 .await?
                 .medium,
         )?),
+        Call::RenameMedium { medium, name } => {
+            let hub2 = hub.clone();
+            let sha = tokio::task::spawn_blocking(move || hub2.db.resolve_medium(&medium))
+                .await
+                .context("finding the medium")??
+                .sha256;
+            Ok(serde_json::to_value(
+                crate::media::rename(hub, &actor, &sha, &name, None).await?,
+            )?)
+        }
         // Started with the hub at hand to hand over from; answered before it does.
         Call::UpdateHub { release } => {
             let hub = hub.clone();
@@ -1072,8 +1093,9 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
         Call::FetchRelease { .. }
         | Call::FetchProgramRelease { .. }
         | Call::LatestRelease
-        | Call::AddMedium { .. } => {
-            bail!("a fetch or an upload is served on its own path")
+        | Call::AddMedium { .. }
+        | Call::RenameMedium { .. } => {
+            bail!("a fetch, an upload or a rename is served on its own path")
         }
         Call::ListReleases => serde_json::to_value(hub.db.releases()?)?,
         Call::RemoveRelease { release } => {
@@ -1804,6 +1826,13 @@ impl Client {
         })
     }
 
+    pub fn rename_medium(&self, medium: &str, name: &str) -> Result<Medium> {
+        self.call(Call::RenameMedium {
+            medium: medium.to_string(),
+            name: name.to_string(),
+        })
+    }
+
     pub fn tools(&self) -> Result<Vec<Tools>> {
         self.call(Call::ListTools)
     }
@@ -1947,6 +1976,7 @@ impl Client {
         let timeout = match call {
             Call::AddRelease { .. } | Call::AddTools { .. } => ADD_TIMEOUT,
             Call::AddMedium { .. } => MEDIA_WAIT,
+            Call::RenameMedium { .. } => RENAME_WAIT,
             Call::FetchRelease { .. } | Call::FetchProgramRelease { .. } => FETCH_WAIT,
             Call::LatestRelease => CHECK_WAIT,
             _ => IO_TIMEOUT,
@@ -1999,6 +2029,25 @@ mod tests {
             panic!("not an upload");
         };
         assert_eq!(path_of(path).as_os_str().as_bytes(), raw);
+    }
+
+    /// A rename reaches registries, so it is served on the runtime, not a blocking thread.
+    #[test]
+    fn a_rename_is_served_on_its_own_path() {
+        let call = Envelope {
+            v: PROTOCOL_VERSION,
+            call: Call::RenameMedium {
+                medium: "d0ef4502".into(),
+                name: "eval.iso".into(),
+            },
+        };
+        let Some(Call::RenameMedium { medium, name }) =
+            fetch_call(&serde_json::to_vec(&call).unwrap())
+        else {
+            panic!("not served as a rename");
+        };
+        assert_eq!((medium.as_str(), name.as_str()), ("d0ef4502", "eval.iso"));
+        assert!(is_long(&call.call));
     }
 
     /// Every medium the hub may keep lists within a reply, and the largest shows within one.

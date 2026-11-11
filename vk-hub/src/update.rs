@@ -1,9 +1,10 @@
 //! The hub updating itself to a `vk-hub` release it holds, on trial, without closing its
 //! listeners: `/updates` or `vk-hub update --release <prefix>`, once `[update] allow`.
 //!
-//! 1. An update is refused while a release or tools are being added or fetched, and those are
-//!    refused from its start on ([`Handover::long_call`]): the exec would cut them, and the CLI
-//!    waiting on them, after the seconds the hand-over gives connections. The release
+//! 1. An update is refused while a release, tools or an install medium is being added, fetched
+//!    or renamed, and those are refused from its start on ([`Handover::long_call`]): the exec
+//!    would cut them, and the CLI waiting on them, after the seconds the hand-over gives
+//!    connections. The release
 //!    is copied into `<data_dir>/update/releases/`, checked against its digest, its signature
 //!    against `[update] release_keys` and its `--version`; the running binary is kept beside it
 //!    to go back to ([`vk_peer::trial`]).
@@ -228,7 +229,8 @@ pub struct Handover {
     long_calls: Arc<AtomicUsize>,
 }
 
-/// A long call under way — a release or tools added or fetched — until dropped.
+/// A long call under way — a release, tools or an install medium added, fetched or renamed —
+/// until dropped.
 pub struct LongCall(Arc<AtomicUsize>);
 
 impl Drop for LongCall {
@@ -271,8 +273,8 @@ impl Handover {
         self.turns.try_read().ok()
     }
 
-    /// Count a call that may run for minutes — a release or tools added, a release fetched —
-    /// until the guard drops: refused while the hub updates itself, which would cut it, and
+    /// Count a call that may run for minutes — a release or tools added, a release fetched, an
+    /// install medium uploaded or renamed — until the guard drops: refused while the hub updates itself, which would cut it, and
     /// refusing an update meanwhile ([`Handover::hold_long_calls`]).
     pub fn long_call(&self) -> Result<LongCall> {
         // Counted before looking, as the update sets its flag before looking: one of the two
@@ -294,8 +296,8 @@ impl Handover {
         if self.long_calls.load(Ordering::SeqCst) > 0 {
             self.updating.store(false, Ordering::SeqCst);
             bail!(
-                "a release or tools are being added or fetched, which the update would cut; \
-                 update the hub once that has ended"
+                "a release, tools or an install medium is being added, fetched or renamed, which \
+                 the update would cut; update the hub once that has ended"
             );
         }
         Ok(())
@@ -1333,7 +1335,7 @@ mod tests {
         let call = handover.long_call().unwrap();
         let refused = handover.hold_long_calls().unwrap_err();
         assert!(
-            format!("{refused:#}").contains("being added or fetched"),
+            format!("{refused:#}").contains("being added, fetched or renamed"),
             "{refused:#}"
         );
         drop(call);

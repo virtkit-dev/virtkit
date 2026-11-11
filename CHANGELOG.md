@@ -12,6 +12,11 @@ All notable changes to virtkit will be documented in this file.
   approved in `[executor] windows_media`. If a fetch is needed and neither credential is
   available, the build reports what is missing.
 
+- **Rename install media after upload.** `vk-hub media rename` and a Rename form on a medium's
+  page in the web UI change the name it is listed and stored under, on the hub and on each
+  registry holding it. The hub reports failures and keeps those registries listed under their
+  old names; renaming again retries them. A failed rename may have partly changed registry tags.
+
 ## [0.109.0] - 2026-11-11
 
 ### Added

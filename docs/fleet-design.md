@@ -578,11 +578,23 @@ approve it and record its metadata without a registry credential. See the implem
   must be renewed or replaced by, and notes. The ISO 9660 volume label is read from the
   stream: Microsoft's labels give architecture and language, virtio-win's product and
   version. Install images (`install.wim`) are not parsed: edition and build are the
-  operator's to say. What operators say of it is editable later, and audited; the file name,
-  label, uploader and locations are as the upload recorded them. The registry's manifest
-  carries part of what was said at upload as annotations (kind, product, edition, version,
-  build, language, architecture, licence kind, dates and the first source), a snapshot that
-  later edits do not follow.
+  operator's to say. What operators say of it is editable later, and audited; the file name
+  changes only by a rename (below), which also updates names at each location. Rename leaves
+  the label, uploader and other location details untouched. The registry's manifest carries
+  part of what was said at upload as annotations (kind, product, edition, version, build,
+  language, architecture, licence kind, dates and the first source), a snapshot that later
+  edits do not follow.
+- **Renamed in place.** Renaming a medium retags each registry holding it: the same manifest,
+  read back by its recorded digest and checked, put under the new `files/win-media` tag, and
+  the old tag dropped, best effort, if it still names it, so annotations and retention follow;
+  the layer's title keeps the old name. Which tags exist is asked of the registry's own store,
+  never an upstream it relays to. A new tag found naming another manifest is refused; an old
+  tag found naming another manifest is left. Both checks are best effort: another client's
+  push between the check and PUT or DELETE can be overwritten or dropped.
+  The record takes the new name even when a registry cannot be retagged. Failed locations
+  keep their previously recorded names, though registry tags may have partly changed;
+  renaming again retries them. One rename runs at a time. Each registry
+  is written with a short-lived token of its own, reading and writing the `win-media` prefix.
 - **Where it is.** Each medium lists the registries, and repository paths, that confirmed
   holding it. Removing a medium forgets it and withdraws its fleet-wide approval; the
   registries keep their copies, to their own retention (kept for good, as `vk registry put
