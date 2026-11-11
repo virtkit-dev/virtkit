@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **GitLab artifact names, paths and exclusions expand variables.** `paths: [src/${REPORT}.xml]`
+  now uploads the file it names, from the job's variables and those its steps set through
+  `$GITLAB_ENV`. An expression beyond `$NAME`, `${NAME}`, `${#NAME}` and the `-`, `+`
+  operators is kept as written, with a warning in the job log.
+
 ## [0.110.1] - 2026-11-11
 
 ### Fixed

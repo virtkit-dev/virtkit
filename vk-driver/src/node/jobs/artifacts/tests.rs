@@ -218,6 +218,51 @@ fn the_upload_url_carries_the_query_gitlab_reads() {
 }
 
 #[test]
+fn name_paths_and_excludes_expand_and_a_bad_one_is_kept() {
+    let a = ArtifactSpec {
+        name: "$CI_JOB_NAME".into(),
+        paths: vec!["src/${REPORT}.xml".into(), "$(id)/x".into()],
+        exclude: vec!["${OUT:-build}/*.tmp".into()],
+        ..artifact()
+    };
+    let lookup = |name: &str| match name {
+        "CI_JOB_NAME" => Some("lint_go".to_owned()),
+        "REPORT" => Some("reportGoLint".to_owned()),
+        _ => None,
+    };
+    let (got, warnings) = expanded(&a, &lookup);
+    assert_eq!(got.name, "lint_go");
+    assert_eq!(got.paths, ["src/reportGoLint.xml", "$(id)/x"]);
+    assert_eq!(got.exclude, ["build/*.tmp"]);
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].starts_with("invalid path \"$(id)/x\": "),
+        "{warnings:?}"
+    );
+    assert_eq!(
+        (got.when, got.format, got.expire_in),
+        (a.when, a.format, a.expire_in)
+    );
+}
+
+#[test]
+fn gitlab_env_lines_are_read_as_the_steps_export_them() {
+    let data = b"REPORT=a=b\n  SPACED=x y \nCR=v\r\n\nnot a var=1\nNOEQ\nBAD=\xff\n_U1=\nLAST=unterminated";
+    let want = [
+        ("REPORT", "a=b"),
+        ("SPACED", "x y"),
+        ("CR", "v\r"),
+        ("_U1", ""),
+    ];
+    let want: Vec<_> = want
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    assert_eq!(parse_gitlab_env(data), want);
+    assert!(parse_gitlab_env(b"ONLY=unterminated").is_empty());
+}
+
+#[test]
 fn archive_names_follow_the_uploader() {
     assert_eq!(
         artifact_filename("artifacts", ArtifactFormat::Zip),

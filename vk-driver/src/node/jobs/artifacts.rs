@@ -24,7 +24,9 @@ use vk_hub_proto::job::{ArtifactFormat, ArtifactOutcome, ArtifactSpec, Dependenc
 
 use super::StageCtx;
 use super::guest::{self, Selection};
+use super::script::GITLAB_ENV_FILE;
 use super::transfer::{self, Capped, MAX_STAGED, create, too_large};
+use super::vars::shell_expand;
 
 /// The upload tries gitlab-runner makes (`defaultTries`), and after a 503
 /// (`serviceUnavailableTries`).
@@ -41,6 +43,8 @@ const MAX_REDIRECTS: usize = 10;
 /// How much of an error answer is read for its message.
 const MAX_ERROR_BODY: usize = 4096;
 const CHUNK: usize = 256 * 1024;
+/// The most of `$GITLAB_ENV` read for the expansion of artifact paths.
+const MAX_GITLAB_ENV: usize = 1024 * 1024;
 
 /// Whether `download_artifacts` has anything to do: a dependency with an archive.
 pub fn download_applies(ctx: &StageCtx<'_>) -> bool {
@@ -258,6 +262,8 @@ pub async fn upload(ctx: &StageCtx<'_>, succeeded: bool) -> (Vec<ArtifactOutcome
         Ok(c) => (Some(c), None),
         Err(e) => (None, Some(e)),
     };
+    // Read once, before the first upload.
+    let mut env: Option<Vec<(String, String)>> = None;
     for (i, a) in ctx.job.artifacts.iter().enumerate() {
         let outcome = |state| ArtifactOutcome {
             name: a.name.clone(),
@@ -273,6 +279,19 @@ pub async fn upload(ctx: &StageCtx<'_>, succeeded: bool) -> (Vec<ArtifactOutcome
             continue;
         }
         ctx.trace.notice("Uploading artifacts...");
+        if env.is_none() {
+            env = Some(gitlab_env(ctx).await);
+        }
+        let env = env.as_deref().unwrap_or_default();
+        let lookup = |name: &str| {
+            let set = env.iter().rev().find(|(k, _)| k == name);
+            set.map(|(_, v)| v.clone()).or_else(|| ctx.vars.find(name))
+        };
+        let (a, warnings) = expanded(a, &lookup);
+        for w in warnings {
+            ctx.trace.warning(&w);
+        }
+        let a = &a;
         let state = match upload_one(ctx, client, a, i).await {
             Ok(state) => state,
             Err(e) => {
@@ -290,6 +309,82 @@ pub async fn upload(ctx: &StageCtx<'_>, succeeded: bool) -> (Vec<ArtifactOutcome
         outcomes.push(outcome(state));
     }
     (outcomes, failed.map_or(Ok(()), Err))
+}
+
+/// `a` with its name, paths and excludes expanded as `artifacts-uploader` expands them
+/// (`normalizeArgs`): GitLab sends them as written. A value that does not expand is kept as
+/// written, with a warning in the uploader's words. The outcome keeps the spec's name.
+fn expanded(
+    a: &ArtifactSpec,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> (ArtifactSpec, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut one = |v: &String, what: &dyn Fn(&str) -> String| match shell_expand(v, lookup) {
+        Ok(x) => x,
+        Err(e) => {
+            warnings.push(format!("{}: {e}", what(v)));
+            v.clone()
+        }
+    };
+    let name = one(&a.name, &|_| "invalid artifact name".into());
+    let mut list = |l: &[String]| -> Vec<String> {
+        l.iter()
+            .map(|p| one(p, &|p| format!("invalid path {p:?}")))
+            .collect()
+    };
+    let (paths, exclude) = (list(&a.paths), list(&a.exclude));
+    let spec = ArtifactSpec {
+        name,
+        paths,
+        exclude,
+        ..a.clone()
+    };
+    (spec, warnings)
+}
+
+/// The variables the job's steps set through `$GITLAB_ENV`, which gitlab-runner's upload
+/// stage loads before the uploader expands. A file that cannot be read gives none, with a
+/// warning: the steps always create it.
+async fn gitlab_env(ctx: &StageCtx<'_>) -> Vec<(String, String)> {
+    let path = ctx.vars.tmp_file(GITLAB_ENV_FILE);
+    let read = guest::read_file(&ctx.addr, ctx.user.as_deref(), &path, MAX_GITLAB_ENV).await;
+    match read {
+        Ok(Some(data)) => parse_gitlab_env(&data),
+        Ok(None) => {
+            ctx.trace.warning(&format!(
+                "{path}: not readable; artifact paths expand without $GITLAB_ENV"
+            ));
+            Vec::new()
+        }
+        Err(e) => {
+            ctx.trace
+                .warning(&format!("{e:#}; artifact paths expand without $GITLAB_ENV"));
+            Vec::new()
+        }
+    }
+}
+
+/// `$GITLAB_ENV`'s lines as the steps' `while read -r line; do export "$line"; done` takes
+/// them: each newline-terminated line with its spaces and tabs trimmed, `NAME=value` with
+/// the value as written (a carriage return included). An unterminated last line is not
+/// read, and a line that is not UTF-8 or names no valid variable is skipped.
+fn parse_gitlab_env(data: &[u8]) -> Vec<(String, String)> {
+    let Some(end) = data.iter().rposition(|&b| b == b'\n') else {
+        return Vec::new();
+    };
+    data[..end]
+        .split(|&b| b == b'\n')
+        .filter_map(|line| {
+            let line = std::str::from_utf8(line).ok()?;
+            let (key, value) = line.trim_matches([' ', '\t']).split_once('=')?;
+            let mut chars = key.chars();
+            let valid = chars
+                .next()
+                .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+                && chars.all(|c| c == '_' || c.is_ascii_alphanumeric());
+            valid.then(|| (key.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 /// The name gitlab-runner gives the file it uploads (`artifactFilename`).

@@ -20,7 +20,8 @@ use super::settings::{GitStrategy, Settings, Submodules};
 use super::trace::{ANSI_BOLD_GREEN, ANSI_BOLD_RED, ANSI_RESET, ANSI_YELLOW};
 use super::vars::Vars;
 
-const GITLAB_ENV_FILE: &str = "gitlab_runner_env";
+/// The file the steps append `KEY=VALUE` lines to, `$GITLAB_ENV`, under the temporary dir.
+pub(super) const GITLAB_ENV_FILE: &str = "gitlab_runner_env";
 const EXTERNAL_GIT_CONFIG: &str = ".gitlab-runner.ext.conf";
 const GIT_TEMPLATE_DIR: &str = "git-template";
 const EXT_CONFIG_VAR: &str = "GLR_EXT_GIT_CONFIG_PATH";
