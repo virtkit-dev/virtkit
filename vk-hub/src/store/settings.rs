@@ -649,7 +649,7 @@ mod tests {
                    "guest_credential": "job"})
         );
         // A node that takes its own registry access lends its runner's guests theirs.
-        db.record_session(&id, &"c".repeat(32), REGISTRY_ACCESS, 8, || true)
+        db.record_session(&id, &"c".repeat(32), REGISTRY_ACCESS, None, 8, || true)
             .unwrap();
         assert_eq!(db.steer_settings(8).unwrap(), std::slice::from_ref(&id));
         assert_eq!(

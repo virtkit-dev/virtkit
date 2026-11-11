@@ -840,6 +840,10 @@ pub struct Inventory {
     /// their effective values ([`Report::settings`]): an older node would ignore them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hub_settings: bool,
+    /// The account `vk node run` runs as; `None` from an older node or when its passwd entry
+    /// is missing, cannot be read, or has a non-UTF-8 name or home directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1706,6 +1710,7 @@ mod tests {
             egress_fallback: false,
             egress_caps: None,
             hub_settings: false,
+            user: Some("gitlab-runner".into()),
         }
     }
 
@@ -2105,6 +2110,7 @@ mod tests {
                     "concurrent": 8,
                     "runners": ["ci-7"],
                 },
+                "user": "gitlab-runner",
             }),
         );
         pinned(

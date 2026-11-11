@@ -293,7 +293,8 @@ and storing it at the next ping. Heartbeats are written without an fsync, one a 
 durable; an inventory is made durable at most once a heartbeat. Each of an inventory's lists
 (filesystems, memory nodes, checks, runner names) is cut to 64 entries. `vk-hub nodes` lists
 ID, NAME, REACH, STATE, ACQUIRE, CEILING, CONC, SYNC, LAST SEEN, VK, CPUS, RAM, ADMITTED, VCPUS
-(committed of the budget) and VMS; under the table, a node that takes hub settings says how many
+(committed of the budget), VMS, ADDRESS (the IP its latest session came from, as the hub saw
+it) and USER (the account `vk node run` runs as, from its inventory); under the table, a node that takes hub settings says how many
 of its settings come from the hub and from its config file, and each of the hub's it refused.
 
 The node redials a lost session with a backoff doubling from 1 to 60 seconds, plus up to a

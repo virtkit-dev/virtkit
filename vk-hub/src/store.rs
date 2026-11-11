@@ -23,6 +23,7 @@
 //! Everything else is durable.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -360,6 +361,9 @@ pub struct NodeRow {
     /// When the node last authenticated or sent anything.
     #[serde(default)]
     pub last_seen: Option<u64>,
+    /// The IP address the node's latest session came from, as the hub saw it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<IpAddr>,
     #[serde(default)]
     pub inventory: Option<Inventory>,
     #[serde(default)]
@@ -1291,7 +1295,7 @@ impl Db {
         nodes_in(&txn)
     }
 
-    /// Record an authenticated session's `incarnation` and protocol `version` only if
+    /// Record an authenticated session's `incarnation`, protocol `version` and peer `address` only if
     /// `current` holds inside the write, preserving a newer session's values if superseded.
     /// Return whether the session was recorded.
     pub fn record_session(
@@ -1299,6 +1303,7 @@ impl Db {
         id: &str,
         incarnation: &str,
         version: u32,
+        address: Option<IpAddr>,
         now: u64,
         current: impl FnOnce() -> bool,
     ) -> Result<bool> {
@@ -1307,6 +1312,7 @@ impl Db {
             if current {
                 row.incarnation = Some(incarnation.to_string());
                 row.protocol = Some(version);
+                row.address = address;
                 row.last_seen = Some(now);
             }
             Ok((current, Vec::new(), Durability::Immediate))
@@ -3391,6 +3397,7 @@ fn display_safe_inventory(mut inventory: Inventory) -> Inventory {
     clean(&mut inventory.hostname);
     clean_opt(&mut inventory.hardware.cpu_model);
     clean_opt(&mut inventory.registry);
+    clean_opt(&mut inventory.user);
     for check in &mut inventory.hardware.checks {
         clean(&mut check.name);
         clean(&mut check.detail);
@@ -3955,8 +3962,16 @@ mod tests {
         else {
             panic!("expected an enrollment");
         };
-        assert!(db.record_session(&node_id, "inc", 2, 2, || true).unwrap());
-        assert!(!db.record_session(&node_id, "old", 1, 2, || false).unwrap());
+        let address = Some("192.0.2.7".parse().unwrap());
+        assert!(
+            db.record_session(&node_id, "inc", 2, address, 2, || true)
+                .unwrap()
+        );
+        assert!(
+            !db.record_session(&node_id, "old", 1, None, 2, || false)
+                .unwrap()
+        );
+        assert_eq!(db.node(&node_id).unwrap().unwrap().address, address);
         let inventory = Inventory {
             hostname: "renamed\u{1b}[2J".into(),
             versions: vk_hub_proto::Versions {
@@ -4508,7 +4523,7 @@ mod tests {
         .unwrap();
         db.issue_command(&id, Operation::Drain, DAY, "uid 0", 1)
             .unwrap();
-        assert!(db.record_session(&id, "ab", 1, 2, || true).unwrap());
+        assert!(db.record_session(&id, "ab", 1, None, 2, || true).unwrap());
         let err = db
             .set_desired(
                 &id,
@@ -4531,7 +4546,10 @@ mod tests {
         );
         assert_eq!(db.node_commands(&id).unwrap().len(), 1);
         assert_eq!(db.audits(Some(&id), 10).unwrap().len(), 3);
-        assert!(db.record_session(&id, "ab", STEERING, 4, || true).unwrap());
+        assert!(
+            db.record_session(&id, "ab", STEERING, None, 4, || true)
+                .unwrap()
+        );
         db.issue_command(&id, Operation::Undrain, DAY, "uid 0", 5)
             .unwrap();
     }
@@ -5221,7 +5239,10 @@ mod tests {
         let id = enrolled(&db);
         // The row as such a hub leaves it: a report without what the node applied.
         db.record_report(&id, Report::default(), 2).unwrap();
-        assert!(db.record_session(&id, "ab", STEERING, 3, || true).unwrap());
+        assert!(
+            db.record_session(&id, "ab", STEERING, None, 3, || true)
+                .unwrap()
+        );
         db.set_desired(
             &id,
             DesiredChange::Acquisition(Acquisition::Stop),

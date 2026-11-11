@@ -1864,7 +1864,7 @@ async fn a_rollout_updates_wave_by_wave_and_pauses_on_a_failure() {
     // A node whose latest session ran version 1 is monitored only, and left out.
     assert!(
         hub.db
-            .record_session(&old, "ab", 1, now_secs(), || true)
+            .record_session(&old, "ab", 1, None, now_secs(), || true)
             .unwrap()
     );
     let plan = rollout_plan(&release.sha256[..8], true, 1);
@@ -2752,6 +2752,8 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
                 ..Report::default()
             }),
             pending_commands: 1,
+            address: Some("192.0.2.7".parse().unwrap()),
+            user: Some("gitlab-runner".into()),
             ..ops::NodeView::default()
         },
         ops::NodeView {
@@ -2809,6 +2811,8 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
         ("LAST SEEN", "5s ago"),
         ("ADMITTED", "8G/400G"),
         ("VMS", "-"),
+        ("ADDRESS", "192.0.2.7"),
+        ("USER", "gitlab-runner"),
     ] {
         assert_eq!(cell(header, a, column), want, "{column}\n{table}");
     }

@@ -1877,6 +1877,12 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
         Some(t) => time_ago(&mut h, now, t),
         None => h.raw("never"),
     };
+    if let Some(a) = v.address {
+        h.raw(" from <code>").text(a.to_string()).raw("</code>");
+    }
+    if let Some(user) = &v.user {
+        h.raw(" · runs as <code>").text(user).raw("</code>");
+    }
     h.raw("</p>");
 
     if !v.monitoring_only() {

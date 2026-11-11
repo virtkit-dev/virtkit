@@ -94,7 +94,7 @@ pub async fn run(
     // Registered before it is recorded: a removal from here on either finds the session to
     // revoke or leaves no row to record it in.
     let (session, ending) = hub.open_session(&node.id);
-    let welcomed = welcome(&mut ws, &hub, &node, session).await;
+    let welcomed = welcome(&mut ws, &hub, &node, session, peer).await;
     drop(permit);
     if let Err(r) = welcomed {
         hub.close_session(&node.id, session);
@@ -357,15 +357,27 @@ pub(crate) async fn handshake(
     })
 }
 
-/// Record `session` of the authenticated `node` and welcome it, unless the node was removed
-/// or a newer session took over meanwhile.
-async fn welcome(ws: &mut Ws, hub: &Arc<Hub>, node: &Peer, session: u64) -> Result<(), Refusal> {
+/// Record `session` of the authenticated `node`, connected from `peer`, and welcome it, unless
+/// the node was removed or a newer session took over meanwhile.
+async fn welcome(
+    ws: &mut Ws,
+    hub: &Arc<Hub>,
+    node: &Peer,
+    session: u64,
+    peer: SocketAddr,
+) -> Result<(), Refusal> {
     let (db, live) = (hub.db.clone(), hub.clone());
     let (id, incarnation, version) = (node.id.clone(), node.incarnation.clone(), node.version);
+    let address = Some(peer.ip().to_canonical());
     let recorded = tokio::task::spawn_blocking(move || {
-        db.record_session(&id, &incarnation, version, crate::now_secs(), || {
-            live.is_current(&id, session)
-        })
+        db.record_session(
+            &id,
+            &incarnation,
+            version,
+            address,
+            crate::now_secs(),
+            || live.is_current(&id, session),
+        )
     })
     .await?;
     match recorded {

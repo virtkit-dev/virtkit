@@ -278,7 +278,7 @@ async fn a_tools_build_for_every_node_skips_those_that_cannot_or_need_not() {
     .map(|name| enroll_as(&hub, name));
     let connect = |id: &str, version| {
         hub.db
-            .record_session(id, "inc", version, now_secs(), || true)
+            .record_session(id, "inc", version, None, now_secs(), || true)
             .unwrap();
     };
     connect(&old, vk_hub_proto::JOBS);
@@ -448,7 +448,7 @@ async fn nodes_are_kept_on_the_tools_the_setting_names() {
         (&ready, "d-ready", TOOLS),
     ] {
         hub.db
-            .record_session(id, "inc", version, now_secs(), || true)
+            .record_session(id, "inc", version, None, now_secs(), || true)
             .unwrap();
         inventory(id, host, (id == &current).then_some(a.as_str()));
     }
@@ -633,7 +633,7 @@ async fn a_failing_build_is_retried_until_its_attempts_are_spent() {
         .sha256;
     let node = enroll_as(&hub, "n");
     hub.db
-        .record_session(&node, "inc", TOOLS, now_secs(), || true)
+        .record_session(&node, "inc", TOOLS, None, now_secs(), || true)
         .unwrap();
     hub.db
         .record_inventory(
@@ -800,7 +800,7 @@ async fn tools_that_differ_across_nodes_or_changed_are_noted_audited_and_rebuilt
     };
     for (id, host, git) in [(&n1, "n1", "1"), (&n2, "n2", "1"), (&n3, "n3", "2")] {
         hub.db
-            .record_session(id, "inc", TOOLS, now_secs(), || true)
+            .record_session(id, "inc", TOOLS, None, now_secs(), || true)
             .unwrap();
         hub.db
             .record_report(id, vk_hub_proto::Report::default(), now_secs())

@@ -2619,7 +2619,10 @@ async fn workloads_are_shown_live_and_as_text() {
     let first = nodes.next().await.unwrap();
     assert!(first.contains("<th class=\"num\">VMS</th>"), "{first}");
     assert!(utc_time_after(&first, "<td>"), "{first}");
-    assert!(first.contains("<td class=\"num\">1</td></tr>"), "{first}");
+    assert!(
+        first.contains("<td class=\"num\">1</td><td>-</td><td>-</td></tr>"),
+        "{first}"
+    );
 
     let mut detail = Events::open(addr, &format!("/events/node/{node}"), &cookie).await;
     let first = detail.next().await.unwrap();
@@ -2640,7 +2643,11 @@ async fn workloads_are_shown_live_and_as_text() {
     hub.db.record_report(&node, report(Vec::new()), 4).unwrap();
     hub.changed(&node);
     next_with(&mut detail, "none running").await;
-    next_with(&mut nodes, "<td class=\"num\">0</td></tr>").await;
+    next_with(
+        &mut nodes,
+        "<td class=\"num\">0</td><td>-</td><td>-</td></tr>",
+    )
+    .await;
 }
 
 /// A CI job the node names a GitLab page for leads to it, in a tab of its own; a URL that is
@@ -3402,7 +3409,7 @@ async fn a_version_1_node_s_page_offers_no_steering() {
     let node = enrolled_node(&hub, "ci-1");
     assert!(
         hub.db
-            .record_session(&node, "inc", 1, crate::now_secs(), || true)
+            .record_session(&node, "inc", 1, None, crate::now_secs(), || true)
             .unwrap()
     );
     let (cookie, csrf) = sign_in(addr, &hub, Role::Operator).await;
@@ -3510,7 +3517,7 @@ async fn a_reset_is_issued_only_once_confirmed() {
     };
     assert!(
         hub.db
-            .record_session(&old, "inc", 1, crate::now_secs(), || true)
+            .record_session(&old, "inc", 1, None, crate::now_secs(), || true)
             .unwrap()
     );
     let form = format!("_csrf={csrf}&op=reset");
@@ -13963,7 +13970,14 @@ async fn a_ci_tools_definition_s_page_shows_its_nodes_files_and_network() {
     ] {
         let id = enrolled_as(&hub, host, key);
         hub.db
-            .record_session(&id, "inc", vk_hub_proto::TOOLS, crate::now_secs(), || true)
+            .record_session(
+                &id,
+                "inc",
+                vk_hub_proto::TOOLS,
+                None,
+                crate::now_secs(),
+                || true,
+            )
             .unwrap();
         let mut inventory = vk_hub_proto::Inventory {
             hostname: host.into(),

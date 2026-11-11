@@ -30,6 +30,12 @@ pub struct NodeView {
     pub hostname: String,
     pub connected: bool,
     pub last_seen: Option<u64>,
+    /// The IP address its latest session came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<std::net::IpAddr>,
+    /// The account its `vk node run` runs as, from its inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
     pub vk: Option<String>,
     pub cpus: Option<u32>,
     pub mem_total_mib: Option<u64>,
@@ -161,6 +167,8 @@ fn node_view_among(
         connected: hub.reach(&id) == Reach::Connected,
         hostname: row.hostname.clone(),
         last_seen: row.last_seen,
+        address: row.address,
+        user: inventory.and_then(|i| i.user.clone()),
         vk: inventory.map(|i| i.versions.vk.clone()),
         cpus: inventory.map(|i| i.hardware.cpus),
         mem_total_mib: inventory.and_then(|i| i.hardware.mem_total_mib),

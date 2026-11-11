@@ -27,6 +27,10 @@ All notable changes to virtkit will be documented in this file.
 - **Remove a node from the hub's web UI.** A node's page offers *Remove* in its danger zone,
   as `vk-hub nodes remove` does, after asking to confirm.
 
+- **The hub shows each node's address and service account.** `vk-hub nodes` and the web UI
+  list the IP a node's latest session came from, which follows a host with a dynamic address,
+  and the account its `vk node run` runs as. The account needs a node at this version.
+
 ## [0.108.4] - 2026-11-11
 
 ### Fixed

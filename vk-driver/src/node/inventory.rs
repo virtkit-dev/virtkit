@@ -88,6 +88,7 @@ pub fn inventory(cfg: &Config) -> Inventory {
         // Checked when `vk node run` starts; one gone wrong since is left out.
         labels: labels(cfg).unwrap_or_default(),
         registry: registry_url(cfg),
+        user: crate::hostpolicy::self_passwd().ok().map(|(name, _)| name),
         // This node uses a job's registry token wherever the hub sends one: its caches and,
         // under `guest_credential = "job"`, its guest's proxy.
         job_tokens: true,
