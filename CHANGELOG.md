@@ -31,6 +31,13 @@ All notable changes to virtkit will be documented in this file.
   list the IP a node's latest session came from, which follows a host with a dynamic address,
   and the account its `vk node run` runs as. The account needs a node at this version.
 
+### Changed
+
+- **Host checkouts use the CI tools' git.** With `host_checkout`, the clone uses an executable
+  `git` from `[executor] tools_dir`, falling back to PATH. Once installed, tools built at the
+  hub's request are the enrolled default, so nodes need no separate host git. Nodes requiring
+  signed releases use that default only in job VMs.
+
 ## [0.108.4] - 2026-11-11
 
 ### Fixed

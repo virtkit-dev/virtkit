@@ -1087,6 +1087,36 @@ concurrent = 4
         dir
     }
 
+    /// The enrolled default tools run on the host only when unsigned releases are allowed.
+    #[test]
+    fn the_hub_s_tools_run_on_the_host_only_without_required_signatures() {
+        let state = scratch("tools-host");
+        let mut cfg = Config {
+            state_dir: Some(state.clone()),
+            ..Config::default()
+        };
+        assert!(!tools::run_on_host(&cfg), "not enrolled");
+        let dir = dir(&cfg);
+        create_dir(&dir).unwrap();
+        let mut e = Enrollment {
+            hub: "https://hub".into(),
+            node_id: "cd".repeat(16),
+            ca: false,
+            release_keys: Vec::new(),
+        };
+        let write = |e: &Enrollment| {
+            std::fs::write(dir.join(ENROLLMENT_FILE), serde_json::to_vec(e).unwrap()).unwrap();
+        };
+        write(&e);
+        assert!(tools::run_on_host(&cfg), "no keys");
+        e.release_keys = vec![crate::release_key::generate(&state.join("release.pk8")).unwrap()];
+        write(&e);
+        assert!(!tools::run_on_host(&cfg), "pinned keys require signatures");
+        cfg.node.require_signed = Some(false);
+        assert!(tools::run_on_host(&cfg), "signatures optional");
+        std::fs::remove_dir_all(&state).unwrap();
+    }
+
     #[test]
     fn an_enrolled_host_is_enrolled_again_only_when_asked_its_old_identity_kept() {
         let parent = scratch("replace");

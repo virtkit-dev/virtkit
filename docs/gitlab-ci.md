@@ -105,6 +105,14 @@ checkout_dir = "/builds"
 checkout_cache_idle_secs = 1800
 ```
 
+The clone uses an executable `git` from `[executor] tools_dir`, falling back to PATH.
+The static CI tools also run on the host, using the first available host CA bundle from
+the standard locations unless `GIT_SSL_CAINFO` is set. Once installed, tools built at the
+hub's request (`<state_dir>/tools/current`) are the enrolled default, so nodes need no separate
+host git. Nodes requiring signed releases use that default only in job VMs and clone with
+PATH's git. An explicit `tools_dir` in the local config is used regardless of release-signature
+policy.
+
 A tree is reused by concurrent slot and project, so a second job on the same slot fetches
 rather than re-clones. Before each checkout, and during `vk gc`, trees unused for longer than
 this are removed — which is what keeps a tmpfs `checkout_dir` from filling with the

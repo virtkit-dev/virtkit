@@ -10,6 +10,9 @@
 //! or log — only its redacted form — so a git failure cannot spill the credential into the
 //! runner's job trace.
 //!
+//! Host checkouts use an executable `git` from `[executor] tools_dir`, falling back to PATH.
+//! The CI tools are static, so they run on hosts as well as guests.
+//!
 //! A checkout is kept and reused by later jobs on the same slot, so it is a cache and is
 //! reclaimed like one — on [`crate::cachelock`]'s protocol, the same one the materialized image
 //! bases use. That matters most where a checkout is worth caching at all: a `checkout_dir` on a
@@ -469,7 +472,7 @@ pub(crate) fn mark_guest_writable(dest: &Path) -> Result<()> {
 /// or if its origin differs or `.git` is not a real directory, so the next job's guest cannot
 /// read another remote's objects and refs. This also covers id-less runs whose slugs fold
 /// together. Called before [`claim`]; a fresh clone follows.
-pub(crate) fn discard_if_untrusted(dest: &Path, url: &str) -> Result<()> {
+pub(crate) fn discard_if_untrusted(dest: &Path, url: &str, git: &Git) -> Result<()> {
     let s = sidecars(dest)?;
     // A mark that cannot be checked is taken as present: re-cloning costs a fetch's worth of
     // time, trusting a tree the guest wrote costs the host.
@@ -480,7 +483,7 @@ pub(crate) fn discard_if_untrusted(dest: &Path, url: &str) -> Result<()> {
     let reason = if marked {
         "it was shared read-write with a guest"
     } else if dest.exists()
-        && origin_of(dest).as_deref().map(without_userinfo) != Some(without_userinfo(url))
+        && origin_of(dest, git).as_deref().map(without_userinfo) != Some(without_userinfo(url))
     {
         "it is not a checkout of this project's remote"
     } else {
@@ -557,13 +560,14 @@ fn open_up_dirs(root: &Path) {
 /// The `origin` URL recorded in `dest`'s own `.git/config`, read as a file rather than by
 /// running `git` in the tree. `None` when `.git` is not a real directory there — a symlink or
 /// a `gitdir:` file could send the host's `git` into another repository.
-fn origin_of(dest: &Path) -> Option<String> {
+fn origin_of(dest: &Path, git: &Git) -> Option<String> {
     let git_dir = dest.join(".git");
     if !std::fs::symlink_metadata(&git_dir).is_ok_and(|m| m.is_dir()) {
         return None;
     }
     // From `/`, so git finds no repository of its own around the process's cwd to read.
-    let out = git_command()
+    let out = git
+        .command()
         .current_dir("/")
         .args(["config", "--file"])
         .arg(git_dir.join("config"))
@@ -593,7 +597,7 @@ fn without_userinfo(url: &str) -> String {
 /// bare commit resolves without server-side `uploadpack.allowAnySHA1InWant`. The tree is
 /// cleaned to match a fresh CI checkout. Submodules and LFS are not handled here — add them if
 /// a job needs them.
-pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path) -> Result<()> {
+pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path, git: &Git) -> Result<()> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         bail!(
             "refusing to clone {}: only http(s) URLs are allowed for host_checkout",
@@ -612,7 +616,7 @@ pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path) -> Result<()> {
 
     if dest.join(".git").is_dir() {
         // Re-point at the current URL (the embedded token rotates per job), then fetch.
-        git(
+        git.run_in(
             dest,
             &["remote", "set-url", "origin", url],
             "remote set-url",
@@ -625,7 +629,7 @@ pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path) -> Result<()> {
         // so the reused-slot `fetch` below stays blobless too.
         let dest_s = dest.to_str().context("checkout dir is not utf-8")?;
         run(
-            git_command().args([
+            git.command().args([
                 "clone",
                 "--quiet",
                 "--no-checkout",
@@ -646,9 +650,9 @@ pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path) -> Result<()> {
     // "forced update" block) from the job trace — virtkit already prints its own
     // `host checkout of <sha>` line.
     if ref_name.is_empty() {
-        git(dest, &["fetch", "--quiet", "--prune", "origin"], "fetch")?;
+        git.run_in(dest, &["fetch", "--quiet", "--prune", "origin"], "fetch")?;
     } else {
-        fetch_ref(dest, ref_name)?;
+        fetch_ref(dest, ref_name, git)?;
     }
     // Detach onto exactly `sha`. HEAD is moved with `update-ref` rather than
     // `git checkout --detach`: this per-slot repo is always on a detached HEAD, and after a
@@ -657,11 +661,11 @@ pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path) -> Result<()> {
     // by ref skips that detection; `reset --hard` then syncs the index + working tree (lazily
     // fetching the pinned commit's blobs from the blobless promisor remote). `sha` is
     // validated hex above, so it cannot be read as an option even without a `--` guard.
-    git(dest, &["update-ref", "--no-deref", "HEAD", sha], "detach")?;
-    git(dest, &["reset", "--hard", sha], "reset")?;
-    git(dest, &["clean", "-ffdx"], "clean")?;
-    settle_index(dest)?;
-    trust_stat_for_guest(dest)?;
+    git.run_in(dest, &["update-ref", "--no-deref", "HEAD", sha], "detach")?;
+    git.run_in(dest, &["reset", "--hard", sha], "reset")?;
+    git.run_in(dest, &["clean", "-ffdx"], "clean")?;
+    settle_index(dest, git)?;
+    trust_stat_for_guest(dest, git)?;
     Ok(())
 }
 
@@ -677,8 +681,8 @@ pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path) -> Result<()> {
 /// which the share carries unchanged; racy-git's protection for files written within the
 /// index's own second is independent of it and stays. Set in the repository's config, which
 /// the guest reads through the share.
-fn trust_stat_for_guest(dest: &Path) -> Result<()> {
-    git(
+fn trust_stat_for_guest(dest: &Path, git: &Git) -> Result<()> {
+    git.run_in(
         dest,
         &["config", "core.checkStat", "minimal"],
         "config core.checkStat",
@@ -696,7 +700,7 @@ fn trust_stat_for_guest(dest: &Path) -> Result<()> {
 /// later timestamp, so the guest's first git command is a stat pass. The one-second wait
 /// assumes ≤1s mtime granularity (tmpfs/ext4, as `checkout_dir` realistically is); on a coarser
 /// filesystem it may not clear the second, harmlessly leaving the refresh a no-op.
-fn settle_index(dest: &Path) -> Result<()> {
+fn settle_index(dest: &Path, git: &Git) -> Result<()> {
     let index = dest.join(".git").join("index");
     // A failed stat or backward clock step (Err from duration_since) skips only the wait.
     // The refresh still runs; it remains correct but may take the pre-settle slow path.
@@ -706,16 +710,16 @@ fn settle_index(dest: &Path) -> Result<()> {
     {
         std::thread::sleep(Duration::from_secs(1) - age);
     }
-    git(dest, &["update-index", "-q", "--refresh"], "refresh")
+    git.run_in(dest, &["update-index", "-q", "--refresh"], "refresh")
 }
 
 /// Fetch the job's `ref_name` from `origin` into slot repository `dest`, clearing stale
 /// tracking refs first ([`drop_conflicting_tracking_refs`]). With an explicit refspec,
 /// `--prune` only removes matching refs, leaving these conflicts.
-fn fetch_ref(dest: &Path, ref_name: &str) -> Result<()> {
-    drop_conflicting_tracking_refs(dest, ref_name)?;
+fn fetch_ref(dest: &Path, ref_name: &str, git: &Git) -> Result<()> {
+    drop_conflicting_tracking_refs(dest, ref_name, git)?;
     // `--` guards a ref that begins with '-'.
-    git(
+    git.run_in(
         dest,
         &["fetch", "--quiet", "--prune", "origin", "--", ref_name],
         "fetch",
@@ -728,7 +732,7 @@ fn fetch_ref(dest: &Path, ref_name: &str) -> Result<()> {
 /// either, so a conflicting tracking ref is stale. Tags occupy a separate namespace:
 /// fetching one may delete tracking refs that the next fetch of their branches restores.
 /// Names with empty path components are invalid for fetch and leave tracking refs untouched.
-fn drop_conflicting_tracking_refs(dest: &Path, ref_name: &str) -> Result<()> {
+fn drop_conflicting_tracking_refs(dest: &Path, ref_name: &str, git: &Git) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     if ref_name.split('/').any(str::is_empty) {
         return Ok(());
@@ -736,7 +740,8 @@ fn drop_conflicting_tracking_refs(dest: &Path, ref_name: &str) -> Result<()> {
     // `for-each-ref` matches a pattern and every ref under it, so the name's first component
     // lists every ref that can be in the way; the check below keeps those that are.
     let first = ref_name.split_once('/').map_or(ref_name, |(f, _)| f);
-    let out = git_command()
+    let out = git
+        .command()
         .arg("-C")
         .arg(dest)
         .args(["for-each-ref", "--format=%(refname)"])
@@ -759,7 +764,7 @@ fn drop_conflicting_tracking_refs(dest: &Path, ref_name: &str) -> Result<()> {
         if above || below {
             // `--no-deref`: `origin/HEAD` is a symref, whose own name is what is in the way.
             run(
-                git_command()
+                git.command()
                     .arg("-C")
                     .arg(dest)
                     .args(["update-ref", "--no-deref", "-d"])
@@ -795,21 +800,76 @@ fn redact_url(url: &str) -> String {
     }
 }
 
-/// Use the C locale so host git's messages in the job log have the same language
-/// on every host.
-fn git_command() -> Command {
-    let mut cmd = Command::new("git");
-    cmd.env("LC_ALL", "C").env_remove("LANGUAGE");
-    cmd
+/// Host CA bundle paths, shared with vk-agent's guest lookup. The static CI tools' git
+/// defaults to a build-environment CA path that may be absent on the host.
+const CA_CANDIDATES: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt", // debian/ubuntu/alpine
+    "/etc/pki/tls/certs/ca-bundle.crt",   // rhel/fedora
+    "/etc/ssl/ca-bundle.pem",             // suse
+    "/etc/ssl/cert.pem",                  // alpine/busybox default
+];
+
+/// Host checkout's executable `git` from `[executor] tools_dir`, falling back to PATH.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Git {
+    /// The tools directory holding the `git` to run; `None` for PATH's.
+    tools: Option<PathBuf>,
 }
 
-/// Run `git -C <dir> <args…>`, erroring on a non-zero exit. `what` is a fixed, secret-free
-/// label for diagnostics — the command (which may carry the token-bearing URL) is never
-/// rendered.
-fn git(dir: &Path, args: &[&str], what: &str) -> Result<()> {
-    let mut cmd = git_command();
-    cmd.arg("-C").arg(dir).args(args);
-    run(&mut cmd, what)
+impl Git {
+    /// `tools_dir`'s git when it holds an executable one, else PATH's.
+    pub(crate) fn host(tools_dir: Option<&Path>) -> Git {
+        let tools = tools_dir
+            .filter(|dir| {
+                std::fs::metadata(dir.join("git"))
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+            .map(Path::to_path_buf);
+        Git { tools }
+    }
+
+    /// The `git` program, as the job log names it.
+    pub(crate) fn shown(&self) -> String {
+        self.tools.as_ref().map_or_else(
+            || "git from PATH".to_string(),
+            |dir| dir.join("git").display().to_string(),
+        )
+    }
+
+    /// Use the C locale for consistent job-log messages. As in guests, the tools' git finds
+    /// `git-remote-https` and `git-lfs` on PATH, so put their directory first. Use the first
+    /// available host CA bundle unless `GIT_SSL_CAINFO` is set.
+    fn command(&self) -> Command {
+        let mut cmd = match &self.tools {
+            None => Command::new("git"),
+            Some(dir) => {
+                let mut cmd = Command::new(dir.join("git"));
+                let mut path = OsString::from(dir.as_os_str());
+                if let Some(rest) = std::env::var_os("PATH").filter(|p| !p.is_empty()) {
+                    path.push(":");
+                    path.push(rest);
+                }
+                cmd.env("PATH", path);
+                if std::env::var_os("GIT_SSL_CAINFO").is_none()
+                    && let Some(ca) = CA_CANDIDATES.iter().find(|p| Path::new(p).exists())
+                {
+                    cmd.env("GIT_SSL_CAINFO", ca);
+                }
+                cmd
+            }
+        };
+        cmd.env("LC_ALL", "C").env_remove("LANGUAGE");
+        cmd
+    }
+
+    /// Run `git -C <dir> <args…>`, erroring on a non-zero exit. `what` is a fixed, secret-free
+    /// label for diagnostics — the command (which may carry the token-bearing URL) is never
+    /// rendered.
+    fn run_in(&self, dir: &Path, args: &[&str], what: &str) -> Result<()> {
+        let mut cmd = self.command();
+        cmd.arg("-C").arg(dir).args(args);
+        run(&mut cmd, what)
+    }
 }
 
 fn run(cmd: &mut Command, what: &str) -> Result<()> {
@@ -825,6 +885,48 @@ fn run(cmd: &mut Command, what: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PATH's git, as the tests run it.
+    fn git_command() -> Command {
+        Git::default().command()
+    }
+
+    fn git(dir: &Path, args: &[&str], what: &str) -> Result<()> {
+        Git::default().run_in(dir, args, what)
+    }
+
+    /// The tools directory's git is run, with its helpers first on PATH, only when it holds an
+    /// executable one; otherwise PATH's.
+    #[test]
+    fn host_git_is_the_tools_dirs_when_it_has_one() {
+        use std::ffi::OsStr;
+        let tools = root("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        assert_eq!(Git::host(None), Git::default());
+        assert_eq!(Git::host(Some(&tools)), Git::default(), "no git there");
+        let git = tools.join("git");
+        std::fs::write(&git, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(Git::host(Some(&tools)), Git::default(), "not executable");
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let host = Git::host(Some(&tools));
+        assert_eq!(host.shown(), git.display().to_string());
+        let cmd = host.command();
+        assert_eq!(cmd.get_program(), git.as_os_str());
+        let path = cmd
+            .get_envs()
+            .find(|(k, _)| *k == OsStr::new("PATH"))
+            .and_then(|(_, v)| v)
+            .unwrap();
+        assert!(
+            path.as_encoded_bytes()
+                .starts_with(tools.as_os_str().as_encoded_bytes()),
+            "{path:?}"
+        );
+        assert_eq!(Git::default().command().get_program(), "git");
+        assert_eq!(Git::default().shown(), "git from PATH");
+        std::fs::remove_dir_all(&tools).unwrap();
+    }
 
     #[test]
     fn host_git_speaks_the_c_locale() {
@@ -869,27 +971,27 @@ mod tests {
 
         // Its own remote, under another job's token: kept.
         init("https://gitlab-ci-token:b@gitlab.example.com/g/project.git");
-        discard_if_untrusted(&dest, url).unwrap();
+        discard_if_untrusted(&dest, url, &Git::default()).unwrap();
         assert!(dest.join(".git").is_dir());
 
         // Another project's remote: removed.
         init("https://gitlab-ci-token:b@gitlab.example.com/g/other.git");
-        discard_if_untrusted(&dest, url).unwrap();
+        discard_if_untrusted(&dest, url, &Git::default()).unwrap();
         assert!(!dest.exists());
 
         // Shared read-write with a guest, whatever its remote now says: removed, once.
         init(url);
         mark_guest_writable(&dest).unwrap();
-        discard_if_untrusted(&dest, url).unwrap();
+        discard_if_untrusted(&dest, url, &Git::default()).unwrap();
         assert!(!dest.exists());
         init(url);
-        discard_if_untrusted(&dest, url).unwrap();
+        discard_if_untrusted(&dest, url, &Git::default()).unwrap();
         assert!(dest.exists(), "the mark goes with the tree it dated");
 
         // A `.git` that is not a real directory names no remote of ours: removed.
         std::fs::remove_dir_all(dest.join(".git")).unwrap();
         std::os::unix::fs::symlink("/", dest.join(".git")).unwrap();
-        discard_if_untrusted(&dest, url).unwrap();
+        discard_if_untrusted(&dest, url, &Git::default()).unwrap();
         assert!(!dest.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -909,7 +1011,7 @@ mod tests {
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
         mark_guest_writable(&dest).unwrap();
 
-        discard_if_untrusted(&dest, "https://h/p.git").unwrap();
+        discard_if_untrusted(&dest, "https://h/p.git", &Git::default()).unwrap();
         assert!(!dest.exists());
         assert!(!sidecars(&dest).unwrap().guest_rw.exists());
         let _ = std::fs::remove_dir_all(&root);
@@ -961,14 +1063,23 @@ mod tests {
         let dest = Path::new("/nonexistent/vk-checkout-test");
         // A non-http(s) transport (git-remote-ext RCE vector) is refused, and the error is
         // redacted — never echoing the raw ref back verbatim.
-        let err = ensure("ext::sh -c whoami", "main", "abcdef", dest).unwrap_err();
+        let err = ensure("ext::sh -c whoami", "main", "abcdef", dest, &Git::default()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("only http(s)"), "got: {msg}");
         assert!(!msg.contains("ext::sh"), "raw ext URL leaked: {msg}");
         // A non-hex sha is refused before any git runs.
-        assert!(ensure("https://h/p.git", "main", "deadbeefZZ", dest).is_err());
+        assert!(
+            ensure(
+                "https://h/p.git",
+                "main",
+                "deadbeefZZ",
+                dest,
+                &Git::default()
+            )
+            .is_err()
+        );
         // An option-injection ref is refused before any git runs.
-        assert!(ensure("https://h/p.git", "-x", "deadbeef", dest).is_err());
+        assert!(ensure("https://h/p.git", "-x", "deadbeef", dest, &Git::default()).is_err());
     }
 
     /// Fetch past stale tracking refs in a reused slot: ancestor and descendant conflicts,
@@ -1026,7 +1137,7 @@ mod tests {
                 git_in(&remote, &["branch", "-q", "-D", b]);
             }
             git_in(&remote, &["branch", new]);
-            fetch_ref(&dest, new).unwrap();
+            fetch_ref(&dest, new, &Git::default()).unwrap();
             assert!(has(new), "{new}");
             for b in gone {
                 assert!(!has(b), "{b}");
@@ -1040,20 +1151,20 @@ mod tests {
         swap(&["a"], "a/b/c");
         // Several below at once.
         git_in(&remote, &["branch", "a/d"]);
-        fetch_ref(&dest, "a/d").unwrap();
+        fetch_ref(&dest, "a/d", &Git::default()).unwrap();
         swap(&["a/b/c", "a/d"], "a");
 
         // A name merely sharing a prefix is not in the way.
         git_in(&remote, &["branch", "ab"]);
-        fetch_ref(&dest, "ab").unwrap();
-        fetch_ref(&dest, "a").unwrap();
+        fetch_ref(&dest, "ab", &Git::default()).unwrap();
+        fetch_ref(&dest, "a", &Git::default()).unwrap();
         assert!(has("ab") && has("a"));
 
         // A tag named under a branch costs that branch's tracking ref, until it is fetched again.
         git_in(&remote, &["tag", "a/t"]);
-        fetch_ref(&dest, "a/t").unwrap();
+        fetch_ref(&dest, "a/t", &Git::default()).unwrap();
         assert!(!has("a"));
-        fetch_ref(&dest, "a").unwrap();
+        fetch_ref(&dest, "a", &Git::default()).unwrap();
         assert!(has("a"));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1424,7 +1535,7 @@ mod tests {
             std::fs::remove_file(repo.join(format!("f{i}"))).unwrap();
         }
         sh(&["reset", "-q", "--hard"]);
-        settle_index(repo).unwrap();
+        settle_index(repo, &Git::default()).unwrap();
         let index = std::fs::metadata(repo.join(".git/index"))
             .unwrap()
             .modified()
@@ -1472,10 +1583,10 @@ mod tests {
             String::from_utf8(out.stdout).unwrap()
         };
         sh(&["init", "-q"]);
-        trust_stat_for_guest(repo).unwrap();
+        trust_stat_for_guest(repo, &Git::default()).unwrap();
         assert_eq!(checkstat().trim(), "minimal");
         // Idempotent: a reused slot sets it again without error or duplication.
-        trust_stat_for_guest(repo).unwrap();
+        trust_stat_for_guest(repo, &Git::default()).unwrap();
         assert_eq!(checkstat().lines().count(), 1);
     }
 }

@@ -625,7 +625,9 @@ pub struct Executor {
     /// guest over virtio-fs, instead of the in-guest `get_sources` clone. The job then sets
     /// `GIT_STRATEGY: none` so the checkout is reused and the git token never enters the guest
     /// (a security win), and the host has the tree available to build a git-defined image
-    /// (`ci-boots-git-defined-images`). Off by default.
+    /// (`ci-boots-git-defined-images`). The host uses an executable `git` from `tools_dir`,
+    /// falling back to PATH; the enrolled default only on a node accepting unsigned releases
+    /// ([`crate::node::tools::run_on_host`]). Off by default.
     pub host_checkout: bool,
     /// Host storage directory for `host_checkout`. Trees are keyed by concurrent slot + project
     /// in its private `vk` subtree, so sibling content from another executor is outside the idle

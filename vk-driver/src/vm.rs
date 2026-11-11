@@ -4026,15 +4026,33 @@ fn host_checkout(ctx: &JobCtx) -> Result<Option<crate::cachelock::Guard>> {
     // elapsed cannot evict the tree this job is about to reuse and turn its fetch into a
     // re-clone.
     crate::checkout::gc_idle(&ctx.host_checkout_root(), ctx.cfg.checkout_cache_idle());
-    println!("virtkit: host checkout of {sha} -> {}", dest.display());
-    crate::checkout::discard_if_untrusted(&dest, url)
+    // An explicit tools_dir in the local config is the operator's trust decision. The hub's
+    // tools are the enrolled default: they run on the host only when unsigned releases are
+    // allowed, otherwise only in job VMs.
+    let tools = ctx.cfg.executor.tools_dir.as_deref().filter(|_| {
+        crate::node::hub_settings::is_set(&ctx.cfg.layers.local, "executor.tools_dir")
+            || crate::node::tools::run_on_host(&ctx.cfg)
+    });
+    let git = crate::checkout::Git::host(tools);
+    println!(
+        "virtkit: host checkout of {sha} -> {} ({})",
+        dest.display(),
+        git.shown()
+    );
+    crate::checkout::discard_if_untrusted(&dest, url, &git)
         .with_context(|| format!("checking host checkout {}", dest.display()))?;
     // Bind the external bookkeeping to the destination before the clone fills it, so a
     // prepare killed part-way through leaves a partial tree the idle sweep can still find.
     crate::checkout::claim(&dest)
         .with_context(|| format!("claiming host checkout {}", dest.display()))?;
-    crate::checkout::ensure(url, ctx.ci_commit_ref.as_deref().unwrap_or(""), sha, &dest)
-        .context("host checkout")?;
+    crate::checkout::ensure(
+        url,
+        ctx.ci_commit_ref.as_deref().unwrap_or(""),
+        sha,
+        &dest,
+        &git,
+    )
+    .context("host checkout")?;
     Ok(Some(guard))
 }
 

@@ -20,7 +20,9 @@
 //! [`vk_hub_proto::REQUIRED_TOOLS`] must be static x86-64 ELF executables, so they run
 //! regardless of the guest image's libc. Host `--version` probes run only when the node
 //! accepts unsigned releases, which already lets its hub run arbitrary code on the host.
-//! Nodes requiring signed releases run the tools only in job VMs and report no versions.
+//! Nodes requiring signed releases keep the default tools in job VMs and record no versions
+//! for newly built tools. Host checkouts use PATH's git unless the local config sets
+//! `tools_dir` ([`run_on_host`]).
 //!
 //! Tools are installed in `<state_dir>/tools/<sha256>/` (directory and files `0755`), with
 //! a `<sha256>.json` manifest beside it recording each file's sha256 and each link's target.
@@ -95,6 +97,21 @@ fn root(cfg: &Config) -> PathBuf {
 /// The link `[executor] tools_dir` names to give jobs the tools installed here, current or not.
 pub fn current_path(cfg: &Config) -> PathBuf {
     root(cfg).join(CURRENT)
+}
+
+/// Allow the installed tools for host checkout when the local config sets no `tools_dir`.
+/// Requires enrollment and permission for unsigned releases, which already lets the hub run
+/// code on the host. An unreadable enrollment or invalid release policy denies host use.
+pub fn run_on_host(cfg: &Config) -> bool {
+    let Ok(enrollment) = super::read_enrollment(&super::dir(cfg)) else {
+        return false;
+    };
+    crate::release_key::Policy::for_node(
+        &cfg.node.release_keys,
+        &enrollment.release_keys,
+        cfg.node.require_signed,
+    )
+    .is_ok_and(|policy| !policy.required())
 }
 
 /// What is kept beside an installed tools directory, `<sha256>.json`.
