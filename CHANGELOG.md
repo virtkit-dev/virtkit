@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.111.0] - 2026-11-13
+
 ### Added
 
 - **The nodes table shows each node's pools.** `vk-hub nodes` and the web UI's nodes table
@@ -5532,7 +5534,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.110.2...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.111.0...HEAD
+[0.111.0]: https://github.com/virtkit-dev/virtkit/compare/v0.110.2...v0.111.0
 [0.110.2]: https://github.com/virtkit-dev/virtkit/compare/v0.110.1...v0.110.2
 [0.110.1]: https://github.com/virtkit-dev/virtkit/compare/v0.110.0...v0.110.1
 [0.110.0]: https://github.com/virtkit-dev/virtkit/compare/v0.109.0...v0.110.0
