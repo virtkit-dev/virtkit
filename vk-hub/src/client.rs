@@ -505,12 +505,16 @@ fn parse_json<T: serde::de::DeserializeOwned + serde::Serialize>(
     Ok((value, canonical))
 }
 
-/// Refuse a placement that is malformed, or outside `principal`'s policy.
-fn check_placement(placement: &Placement, principal: &ApiPrincipal) -> Result<(), ApiError> {
-    if !valid_name(&placement.pool) {
+/// Refuse malformed placements or those outside `principal`'s policy. Discard a relay's
+/// pool: its runner's lane selects where its work goes.
+fn check_placement(placement: &mut Placement, principal: &ApiPrincipal) -> Result<(), ApiError> {
+    if principal.is_relay() {
+        placement.pool.clear();
+    } else if !crate::policy::valid_target(&placement.pool) {
         return Err(ApiError::invalid(format!(
-            "{:?} is not a pool's name",
-            placement.pool
+            "{:?} is not a pool's name, or a node as `{}<node ID>`",
+            placement.pool,
+            crate::policy::NODE_POOL_PREFIX
         )));
     }
     if placement.labels.len() > MAX_LABELS || placement.labels.iter().any(|l| !valid_name(l)) {
@@ -568,13 +572,13 @@ async fn capacity(
     hub: &Hub,
     principal: &ApiPrincipal,
 ) -> Result<Response<Body>, ApiError> {
-    let (ask, _) = parse_json::<CapacityRequest>(body)?;
+    let (mut ask, _) = parse_json::<CapacityRequest>(body)?;
     if principal.session().is_some() && ask.wait_secs > 0 {
         return Err(ApiError::invalid(
             "a relay's connection does not long-poll: wait_secs is refused",
         ));
     }
-    check_placement(&ask.placement, principal)?;
+    check_placement(&mut ask.placement, principal)?;
     resolve_identity(hub, principal, ask.runner.as_deref(), &ask.placement, None).await?;
     let deadline = Instant::now() + wait_for(ask.wait_secs);
     loop {
@@ -703,7 +707,7 @@ async fn resolve_identity(
                 "runner {runner:?} is not verified with GitLab"
             )));
         }
-        if found.placement != placement {
+        if !jobs::same_requirements(&found.placement, &placement) {
             return Err(identity_refused(&format!(
                 "runner {runner:?}'s placement differs from the request's"
             )));
@@ -844,9 +848,9 @@ async fn reserve(
     hub: &Hub,
     principal: &ApiPrincipal,
 ) -> Result<Response<Body>, ApiError> {
-    let (ask, canonical) = parse_json::<ReservationRequest>(body)?;
+    let (mut ask, canonical) = parse_json::<ReservationRequest>(body)?;
     request_id(&ask.request_id)?;
-    check_placement(&ask.placement, principal)?;
+    check_placement(&mut ask.placement, principal)?;
     let digest = vk_hub_proto::to_hex(&Sha256::digest(&canonical));
     let _serving = jobs::begin_request(hub, &format!("{}/{}", principal.id, ask.request_id))?;
     let (key, rid) = (principal.id.clone(), ask.request_id.clone());
@@ -1038,7 +1042,7 @@ async fn submit(
     hub: &Arc<Hub>,
     principal: &ApiPrincipal,
 ) -> Result<Response<Body>, ApiError> {
-    let (ask, canonical) = parse_json::<JobSubmission>(body)?;
+    let (mut ask, canonical) = parse_json::<JobSubmission>(body)?;
     request_id(&ask.request_id)?;
     if !principal.is_relay() {
         return Err(ApiError::new(
@@ -1061,7 +1065,7 @@ async fn submit(
     {
         return Err(ApiError::invalid("admission is not an ID"));
     }
-    check_placement(&ask.placement, principal)?;
+    check_placement(&mut ask.placement, principal)?;
     let spec_len = serde_json::to_vec(&ask.spec)
         .map_err(|e| ApiError::from(anyhow::anyhow!(e)))?
         .len();

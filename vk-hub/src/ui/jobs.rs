@@ -1333,7 +1333,10 @@ pub(super) fn record(
     let mut cell = Html::new();
     node_link(&mut cell, j, names, 0);
     pages::kv_html(h, "Node", &cell);
-    pages::kv_node(h, "Pool", &j.placement.pool);
+    // A relay's job names no pool: its lane selects where it runs.
+    if !j.placement.pool.is_empty() {
+        pages::kv_node(h, "Pool", &j.placement.pool);
+    }
     pages::kv_node(h, "Submitted by", &format!("key {}", j.key_name));
     for (key, at) in [
         ("Submitted", Some(j.created_at)),

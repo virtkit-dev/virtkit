@@ -1850,7 +1850,7 @@ async fn run(cli: Cli) -> Result<()> {
                                     }
                                     bail!(
                                         "{} uses placement rules that do not convert to lanes: \
-                                         set each lane's nodes in a policy of version {}",
+                                         set each lane's pools in a policy of version {}",
                                         file.display(),
                                         crate::policy::VERSION
                                     );
@@ -1863,6 +1863,14 @@ async fn run(cli: Cli) -> Result<()> {
                                 converted.policy
                             }
                         };
+                        for lane in policy.lanes.iter().filter(|l| l.selects_nothing()) {
+                            if let Some(id) = lane.id() {
+                                eprintln!(
+                                    "Review: {id}'s lane selects no pool or node: it gets no \
+                                     work until it does"
+                                );
+                            }
+                        }
                         if !client.set_capacity_policy(policy, expected)? {
                             eprintln!("Policy unchanged");
                         }
@@ -3525,7 +3533,9 @@ fn render_jobs(jobs: &[(String, store::JobRow)], now: u64) -> String {
             [
                 id.clone(),
                 j.key_name.clone(),
-                j.placement.pool.clone(),
+                Some(j.placement.pool.clone())
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| "-".to_string()),
                 jobs::state_text(j),
                 j.node.clone().unwrap_or_else(|| "-".to_string()),
                 j.output_len.to_string(),
@@ -3592,7 +3602,12 @@ fn render_job(id: &str, j: &store::JobRow, output: Option<&[u8]>, now: u64) -> S
     }
     fields.extend([
         ("node", j.node.clone().unwrap_or_else(dash)),
-        ("pool", j.placement.pool.clone()),
+        (
+            "pool",
+            Some(j.placement.pool.clone())
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(dash),
+        ),
         ("key", j.key_name.clone()),
         ("submitted", utc(j.created_at)),
         ("started", at(j.started_at)),

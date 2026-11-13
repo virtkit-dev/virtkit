@@ -53,7 +53,7 @@ const REPLACE: &str = "replace";
 /// Why an edit based on a replaced policy is refused.
 const STALE: &str = "the policy changed after this page was shown. Reload the page and try again";
 
-/// The most nodes, or pools, a page lists of a lane; the rest are counted.
+/// The most nodes a page lists a lane's work can go to; the rest are counted.
 const MAX_LISTED_TARGETS: usize = 8;
 
 /// Map a page's `path` from before lanes or navigation sections to its current page.
@@ -105,25 +105,45 @@ pub(super) fn known_nodes(hub: &Hub) -> Result<Vec<KnownNode>> {
     Ok(nodes)
 }
 
-/// Node `id` as `nodes` name it, or as given for a pool or a node the hub has not enrolled.
-fn node_label<'a>(nodes: &'a [KnownNode], id: &'a str) -> &'a str {
+/// Nodes allowed by `lane`: members of its selected pools and nodes, or all supplied nodes
+/// for an API key lane selecting nothing.
+pub(super) fn resolved<'a>(lane: &Lane, nodes: &'a [KnownNode]) -> Vec<&'a KnownNode> {
     (nodes.iter())
-        .find(|n| n.id == id)
-        .map_or(id, |n| n.label.as_str())
+        .filter(|n| lane.allows_node(&n.id, &n.pools))
+        .collect()
 }
 
-/// The nodes `lane` may use, as a page names them.
-pub(super) fn may_use_text(lane: &Lane, nodes: &[KnownNode]) -> String {
-    let Some(targets) = &lane.nodes else {
-        return "any node".to_owned();
-    };
-    let shown: Vec<_> = (targets.iter())
-        .take(MAX_LISTED_TARGETS)
-        .map(|t| node_label(nodes, t))
+/// What a page says of an API key lane selecting nothing.
+const ANY_NODE_OF_THE_JOBS_POOL: &str = "any node of the job's pool";
+
+/// Where `lane`'s work can go, as a page says it, and whether that is no node: the first
+/// `limit` nodes resolved, `any node of the job's pool` for an API key lane selecting nothing.
+fn runs_on_parts(lane: &Lane, nodes: &[KnownNode], limit: usize) -> (String, bool) {
+    if !lane.selects() {
+        return (ANY_NODE_OF_THE_JOBS_POOL.to_owned(), false);
+    }
+    let found = resolved(lane, nodes);
+    if found.is_empty() {
+        return ("no node".to_owned(), true);
+    }
+    let shown: Vec<_> = (found.iter())
+        .take(limit)
+        .map(|n| n.label.as_str())
         .collect();
-    match targets.len().saturating_sub(MAX_LISTED_TARGETS) {
+    let text = match found.len().saturating_sub(limit) {
         0 => shown.join(", "),
         more => format!("{} and {more} more", shown.join(", ")),
+    };
+    (text, false)
+}
+
+/// Where `lane`'s work can go, as a cell: [`runs_on_parts`], marked when it is no node.
+pub(super) fn runs_on(h: &mut Html, lane: &Lane, nodes: &[KnownNode]) {
+    let (text, none) = runs_on_parts(lane, nodes, MAX_LISTED_TARGETS);
+    if none {
+        h.raw("<span class=\"bad\">").text(text).raw("</span>");
+    } else {
+        h.text(text);
     }
 }
 
@@ -378,7 +398,7 @@ fn lanes_table(h: &mut Html, shown: &Shown, policy: &Policy, steer: bool) {
         .map(|(id, tenant)| (id, tenant.as_str()))
         .collect();
     h.raw("<table class=\"grid\"><thead><tr><th>lane</th><th>class</th>")
-        .raw("<th class=\"num\">weight</th><th class=\"num\">max slots</th><th>nodes</th>")
+        .raw("<th class=\"num\">weight</th><th class=\"num\">max slots</th><th>runs on</th>")
         .raw("<th>projects · branches</th><th class=\"num\">slots held</th>")
         .raw("<th class=\"num\">waiting</th>");
     if steer {
@@ -404,9 +424,9 @@ fn lanes_table(h: &mut Html, shown: &Shown, policy: &Policy, steer: bool) {
                 lane.max_slots
                     .map_or_else(|| "-".to_owned(), |n| n.to_string()),
             )
-            .raw("</td><td>")
-            .text(may_use_text(lane, &shown.known.nodes))
-            .raw("</td><td>")
+            .raw("</td><td>");
+        runs_on(h, lane, &shown.known.nodes);
+        h.raw("</td><td>")
             .text(shown.known.projects_text(lane))
             .raw("</td><td class=\"num\">")
             .text(held)
@@ -502,11 +522,7 @@ fn edit_page(
         h.text(max);
     }
     h.raw("\"></label>");
-    let (nodes, pools): (Vec<String>, Vec<String>) = (lane.nodes.iter().flatten())
-        .cloned()
-        .partition(|t| vk_hub_proto::valid_id(t));
-    targets_picker(h, &known.nodes, &nodes, &pools);
-    h.raw("<p class=\"sub\">Tick none for any node.</p>");
+    targets_picker(h, &known.nodes, &lane);
     if let LaneId::Runner { gitlab, .. } = id {
         projects_picker(h, gitlab, &lane, known);
     }
@@ -581,22 +597,52 @@ fn projects_picker(h: &mut Html, gitlab: &str, lane: &Lane, known: &Known) {
         .raw("with its branches.</p></fieldset>");
 }
 
-/// Checkboxes for known nodes by hostname and pools, with `nodes` and `pools` ticked.
-/// Unknown selections stay ticked so a save keeps them; a pool with no nodes can be typed.
-fn targets_picker(h: &mut Html, known: &[KnownNode], nodes: &[String], pools: &[String]) {
-    /// A checkbox posting `value` as `field`, labelled by what `label` writes.
-    fn tick(h: &mut Html, field: &str, value: &str, ticked: bool, label: impl FnOnce(&mut Html)) {
-        h.raw("<label><input type=\"checkbox\" name=\"")
-            .text(field)
-            .raw("\" value=\"")
+/// Checkboxes posting `pools`: known pools with their members, then nodes as implicit pools
+/// with their pool memberships. Keep unknown selections ticked so saving preserves them;
+/// pools with no nodes can also be typed. Below, show resolved nodes, updated by `checks.js`
+/// from each checked box's `data-nodes`.
+fn targets_picker(h: &mut Html, known: &[KnownNode], lane: &Lane) {
+    /// A checkbox posting `value` as `pools`, resolving to `members`, labelled by what `label`
+    /// writes.
+    fn tick(
+        h: &mut Html,
+        value: &str,
+        ticked: bool,
+        members: &[&str],
+        label: impl FnOnce(&mut Html),
+    ) {
+        h.raw("<label><input type=\"checkbox\" name=\"pools\" value=\"")
             .text(value)
+            .raw("\" data-nodes=\"")
+            .text(members.join("\n"))
             .raw(if ticked { "\" checked> " } else { "\"> " });
         label(h);
         h.raw("</label>");
     }
-    h.raw("<fieldset class=\"pick\"><legend>Nodes</legend>");
+    let selected = |t: &str| lane.pools.iter().any(|p| p == t);
+    // An empty API key selection leaves each job to its pool.
+    h.raw("<fieldset class=\"pick\" data-runs-on=\"");
+    if lane.runner.is_none() {
+        h.text(ANY_NODE_OF_THE_JOBS_POOL);
+    }
+    h.raw("\"><legend>Where its work runs</legend>");
+    let mut pools: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for n in known {
-        tick(h, "nodes", &n.id, nodes.contains(&n.id), |h| {
+        for pool in &n.pools {
+            pools.entry(pool).or_default().push(&n.label);
+        }
+    }
+    for (pool, members) in &pools {
+        tick(h, pool, selected(pool), members, |h| {
+            h.text(pool)
+                .raw(" <span class=\"sub\">")
+                .text(members.join(", "))
+                .raw("</span>");
+        });
+    }
+    for n in known {
+        let pool = crate::policy::node_pool(&n.id);
+        tick(h, &pool, selected(&pool), &[&n.label], |h| {
             h.text(&n.label);
             if !n.pools.is_empty() {
                 h.raw(" <span class=\"sub\">")
@@ -605,37 +651,42 @@ fn targets_picker(h: &mut Html, known: &[KnownNode], nodes: &[String], pools: &[
             }
         });
     }
-    for id in nodes.iter().filter(|id| known.iter().all(|n| &n.id != *id)) {
-        tick(h, "nodes", id, true, |h| {
-            h.raw("<code>")
-                .text(id)
-                .raw("</code> <span class=\"sub\">not enrolled</span>");
+    for t in &lane.pools {
+        if pools.contains_key(t.as_str())
+            || crate::policy::node_of_pool(t).is_some_and(|id| known.iter().any(|n| n.id == id))
+        {
+            continue;
+        }
+        tick(h, t, true, &[], |h| match crate::policy::node_of_pool(t) {
+            Some(id) => {
+                h.raw("<code>")
+                    .text(id)
+                    .raw("</code> <span class=\"sub\">node not enrolled</span>");
+            }
+            None => {
+                h.text(t).raw(" <span class=\"sub\">no node</span>");
+            }
         });
     }
-    if known.is_empty() && nodes.is_empty() {
+    if known.is_empty() && lane.pools.is_empty() {
         h.raw("<span class=\"sub\">No node enrolled yet.</span>");
     }
-    h.raw("</fieldset><fieldset class=\"pick\"><legend>Pools</legend>");
-    let mut offered: BTreeMap<&str, usize> = BTreeMap::new();
-    for pool in known.iter().flat_map(|n| &n.pools) {
-        *offered.entry(pool).or_default() += 1;
+    h.raw("<label>Another pool <input type=\"text\" name=\"pools\" spellcheck=\"false\" ")
+        .raw("aria-label=\"Another pool\"></label><p id=\"runs-on\"");
+    let (text, none) = runs_on_parts(lane, known, usize::MAX);
+    if none {
+        h.raw(" class=\"bad\"");
     }
-    for pool in pools {
-        offered.entry(pool).or_default();
+    h.raw(">Its work can go to: <span>")
+        .text(text)
+        .raw("</span></p></fieldset>");
+    if lane.runner.is_some() {
+        h.raw("<p class=\"sub\">A runner's work goes only where its lane selects; selecting ")
+            .raw("nothing gives it none.</p>");
+    } else {
+        h.raw("<p class=\"sub\">A job naming a pool also goes only to that pool's nodes; ")
+            .raw("selecting nothing leaves each job to the pool it names.</p>");
     }
-    for (pool, count) in offered {
-        tick(h, "pools", pool, pools.iter().any(|p| p == pool), |h| {
-            h.text(pool).raw(" <span class=\"sub\">");
-            match count {
-                0 => h.raw("no node"),
-                1 => h.raw("1 node"),
-                n => h.text(format_args!("{n} nodes")),
-            };
-            h.raw("</span>");
-        });
-    }
-    h.raw("<label>Another <input type=\"text\" name=\"pools\" spellcheck=\"false\" ")
-        .raw("aria-label=\"Another pool\"></label></fieldset>");
 }
 
 fn headroom_section(h: &mut Html, policy: &Policy, auth: &Auth, digest: &str, steer: bool) {
@@ -926,7 +977,7 @@ pub(super) fn project_section(
         return;
     }
     h.raw("<table class=\"grid\"><thead><tr><th>lane</th><th>class</th><th>branches</th>")
-        .raw("<th>nodes</th></tr></thead><tbody>");
+        .raw("<th>runs on</th></tr></thead><tbody>");
     for (lane, listed) in lanes {
         let branches = match listed {
             None => "all (any project)".to_owned(),
@@ -945,9 +996,9 @@ pub(super) fn project_section(
             .text(lane.class)
             .raw("</td><td>")
             .text(branches)
-            .raw("</td><td>")
-            .text(may_use_text(lane, nodes))
-            .raw("</td></tr>");
+            .raw("</td><td>");
+        runs_on(h, lane, nodes);
+        h.raw("</td></tr>");
     }
     h.raw("</tbody></table></section>");
 }
@@ -994,12 +1045,12 @@ fn lane_from(id: &LaneId, current: Option<&Lane>, form: &[(String, String)]) -> 
         max => Some(number(max, "max slots")?),
     };
     let mut targets: Vec<String> = Vec::new();
-    for t in values(form, "nodes").chain(values(form, "pools")) {
+    for t in values(form, "pools") {
         if !targets.iter().any(|seen| seen == t) {
             targets.push(t.to_owned());
         }
     }
-    lane.nodes = (!targets.is_empty()).then(|| same_or(lane.nodes.as_ref(), targets));
+    lane.pools = same_or(Some(&lane.pools), targets);
     if let LaneId::Runner { gitlab, .. } = id {
         lane.class = match value("class") {
             "normal" => Class::Normal,
@@ -1184,6 +1235,16 @@ pub(super) async fn action(
     for change in changes {
         detail.raw("<li>").text(change).raw("</li>");
     }
+    // Warn that an empty runner selection gets no work before confirming the save.
+    if op == SAVE
+        && let Some(lane) = field(&form, "lane").and_then(parse_lane)
+        && proposed.lane(&lane).is_some_and(Lane::selects_nothing)
+    {
+        detail.raw(
+            "<li class=\"bad\">This lane selects no pool or node: its runner gets no work \
+                    until it does.</li>",
+        );
+    }
     detail.raw("</ul>");
     let ask = actions::Ask {
         path: PATH.to_owned(),
@@ -1283,22 +1344,51 @@ mod tests {
     #[test]
     fn a_lane_s_nodes_and_projects_are_named() {
         let node = "0123456789abcdef0123456789abcdef";
+        let other = "fedcba9876543210fedcba9876543210";
         let known = Known {
-            nodes: vec![KnownNode {
-                id: node.into(),
-                label: "n1".into(),
-                pools: Vec::new(),
-            }],
+            nodes: vec![
+                KnownNode {
+                    id: node.into(),
+                    label: "n1".into(),
+                    pools: Vec::new(),
+                },
+                KnownNode {
+                    id: other.into(),
+                    label: "n2".into(),
+                    pools: vec!["trusted".into()],
+                },
+            ],
             ..Known::default()
         };
         let mut lane = Lane::new(&LaneId::Runner {
             gitlab: "gl".into(),
             id: 42,
         });
-        assert_eq!(may_use_text(&lane, &known.nodes), "any node");
+        assert_eq!(
+            runs_on_parts(&lane, &known.nodes, MAX_LISTED_TARGETS).0,
+            "no node"
+        );
         assert_eq!(known.projects_text(&lane), "any");
-        lane.nodes = Some(vec![node.into(), "trusted".into()]);
-        assert_eq!(may_use_text(&lane, &known.nodes), "n1, trusted");
+        lane.pools = vec!["trusted".into()];
+        assert_eq!(
+            runs_on_parts(&lane, &known.nodes, MAX_LISTED_TARGETS).0,
+            "n2"
+        );
+        lane.pools = vec![crate::policy::node_pool(node), "trusted".into()];
+        assert_eq!(
+            runs_on_parts(&lane, &known.nodes, MAX_LISTED_TARGETS).0,
+            "n1, n2"
+        );
+        lane.pools = vec!["nowhere".into()];
+        assert_eq!(
+            runs_on_parts(&lane, &known.nodes, MAX_LISTED_TARGETS).0,
+            "no node"
+        );
+        let key = Lane::new(&LaneId::Key("k".into()));
+        assert_eq!(
+            runs_on_parts(&key, &known.nodes, MAX_LISTED_TARGETS).0,
+            "any node of the job's pool"
+        );
         lane.projects = Some(vec![
             LaneProject {
                 gitlab: "gl".into(),
@@ -1401,7 +1491,7 @@ mod tests {
             id: 42,
         };
         let mut before = Lane::new(&id);
-        before.nodes = Some(vec!["b".into(), "a".into()]);
+        before.pools = vec!["b".into(), "a".into()];
         before.projects = Some(vec![
             LaneProject {
                 gitlab: "gl".into(),
@@ -1437,7 +1527,7 @@ mod tests {
         assert_eq!(lane.class, Class::Production);
         assert_eq!((lane.weight, lane.max_slots), (3, None));
         // The same targets in another order: kept as they were.
-        assert_eq!(lane.nodes, before.nodes);
+        assert_eq!(lane.pools, before.pools);
         let projects: Vec<_> = (lane.projects.iter().flatten())
             .map(|p| (p.id, p.branches.clone().unwrap_or_default().join("|")))
             .collect();
@@ -1461,8 +1551,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            (lane.max_slots, lane.nodes, lane.projects),
-            (Some(4), None, None)
+            (lane.max_slots, lane.pools, lane.projects),
+            (Some(4), Vec::new(), None)
         );
         let missing = form(&[("class", "normal"), ("weight", "1")]);
         assert!(lane_from(&id, None, &missing).is_err());

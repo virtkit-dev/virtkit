@@ -5,12 +5,14 @@ use super::capacity::{
 };
 use super::*;
 
-/// Let every runner lane use only `nodes` and nodes in `pools`; any node with neither.
+/// Have every runner lane select `nodes` and `pools`, and nothing else.
 fn confine(hub: &Hub, nodes: &[&str], pools: &[&str]) {
     let mut policy = hub.db.capacity_policy().unwrap();
-    let targets: Vec<String> = nodes.iter().chain(pools).map(|s| (*s).into()).collect();
+    let targets: Vec<String> = (nodes.iter().map(|n| crate::policy::node_pool(n)))
+        .chain(pools.iter().map(|p| (*p).to_owned()))
+        .collect();
     for lane in policy.lanes.iter_mut().filter(|l| l.runner.is_some()) {
-        lane.nodes = (!targets.is_empty()).then(|| targets.clone());
+        lane.pools.clone_from(&targets);
     }
     hub.db
         .set_capacity_policy(&policy, "u", now_secs())
@@ -285,10 +287,70 @@ async fn the_lane_s_reason_lasts_while_nodes_are_full_and_goes_with_its_nodes() 
     accept_ticket(addr, &key, &ticket, &mut node).await;
     crate::jobs::testing::step(&hub).await;
     assert_eq!(blocked(), Some("its lane's allowed nodes"));
-    // Free to use any node, it merely finds the node full.
-    confine(&hub, &[], &[]);
+    // Free to use the node's pool, it merely finds the node full.
+    confine(&hub, &[], &["ci"]);
     crate::jobs::testing::step(&hub).await;
     assert_eq!(blocked(), None);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A lane's work goes to the union of what it selects: a node in no pool at all, selected as
+/// its implicit pool, beside the members of a pool.
+#[tokio::test]
+async fn a_lane_s_work_goes_to_the_members_of_the_pools_and_nodes_it_selects() {
+    let dir = scratch("placement-union");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    ready_relay(&hub, &key);
+    // The idle node is in no pool at all; the others are busier, in `trusted`.
+    let mut idle = ready_node(addr, &hub, 16384).await;
+    hub.db.set_pools(&idle.id, &[], "u", now_secs()).unwrap();
+    let mut busy = loaded_node(addr, &hub, 16384, Some(400)).await;
+    let mut busier = loaded_node(addr, &hub, 16384, Some(800)).await;
+    for node in [&busy.id, &busier.id] {
+        hub.db
+            .set_pools(node, &["trusted".into()], "u", now_secs())
+            .unwrap();
+    }
+    // The pool alone: the least loaded of its members, never the idle node.
+    confine(&hub, &[], &["trusted"]);
+    let job = submit(addr, &key, job_body(1, None, 30), None).await;
+    assert_eq!(next_start(&mut busy).await.job, job);
+    idle.quiet(Duration::from_millis(100)).await;
+    // The pool and the node: the idle node, outside every pool, joins and goes first.
+    confine(&hub, &[&idle.id], &["trusted"]);
+    let job = submit(addr, &key, job_body(2, None, 30), None).await;
+    assert_eq!(next_start(&mut idle).await.job, job);
+    busier.quiet(Duration::from_millis(100)).await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A runner lane selecting nothing gets no work, its requests and queued jobs saying so, until
+/// it selects something.
+#[tokio::test]
+async fn a_lane_selecting_nothing_gets_no_work_and_says_so() {
+    let dir = scratch("placement-empty");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    ready_relay(&hub, &key);
+    let mut node = ready_node(addr, &hub, 16384).await;
+    confine(&hub, &[], &[]);
+    let ticket = queue(addr, &key, 1).await;
+    wait_reason(&hub, "its lane selects no pool or node").await;
+    node.quiet(Duration::from_millis(100)).await;
+    confine(&hub, &[], &["ci"]);
+    accept_ticket(addr, &key, &ticket, &mut node).await;
+    confine(&hub, &[], &[]);
+    let job = submit(addr, &key, job_body(2, None, 30), None).await;
+    crate::jobs::testing::step(&hub).await;
+    assert_eq!(
+        crate::jobs::testing::job_blocked(&hub, &job),
+        Some("its lane selects no pool or node")
+    );
+    node.quiet(Duration::from_millis(100)).await;
+    confine(&hub, &[], &["ci"]);
+    crate::jobs::testing::step(&hub).await;
+    assert_eq!(next_start(&mut node).await.job, job);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

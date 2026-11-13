@@ -69,7 +69,7 @@ h3 { font-size: 0.95rem; font-weight: 600; margin: var(--s4) 0 var(--s2); }
 p { margin: var(--s2) 0; }
 .sub, .empty { color: var(--muted); }
 .empty { font-style: italic; }
-.notes, .reason { color: var(--bad); }
+.notes, .reason, .bad { color: var(--bad); }
 .notes { padding-left: 1.2rem; }
 
 /* The top bar: the product, the site's pages, who is signed in. */

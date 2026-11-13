@@ -11,6 +11,15 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **A lane selects the pools and nodes its runner's work runs on.** The relay's pool no
+  longer controls placement, and an empty runner selection gets no work. On upgrade, empty
+  runner lanes select their relays' last reported pools, if any. Existing lane `nodes` are
+  read as `pools`; selected nodes no longer need to belong to the relay's pool.
+
+- **The lane form shows where its work runs.** It lists pools and nodes in one place with the
+  nodes the selection resolves to, and asks before saving a runner lane that selects nothing.
+  The Lanes table, runner rows and project pages show the nodes a lane's work can go to.
+
 - **The hub logs who changes a node's pools**, including the assigned pools or removal
   from every pool, as it does for quarantine and concurrency ceiling changes.
 

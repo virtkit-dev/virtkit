@@ -1097,6 +1097,8 @@ impl Db {
         egress::share_history(&txn).context("gathering the history's egress reports")?;
         policy::convert_stored(&txn, crate::now_secs())
             .context("converting the capacity policy to lanes")?;
+        policy::select_reported_pools(&txn, crate::now_secs())
+            .context("having the capacity policy's lanes select pools")?;
         txn.commit().context("initializing the hub database")?;
         let spec_dicts = packed::SpecDicts::load(&db).context("loading the job spec dictionary")?;
         let db = Db {
@@ -2621,6 +2623,10 @@ impl Db {
                  and '-', starting with a letter or digit"
             ))
             .into());
+        }
+        // Lane selections reject bare node IDs as pool names.
+        if let Some(bad) = pools.iter().find(|p| vk_hub_proto::valid_id(p)) {
+            return Err(PoolsRefused(format!("{bad:?} is a node ID, not a pool's name")).into());
         }
         let mut pools = pools.to_vec();
         pools.sort();
@@ -4353,6 +4359,10 @@ mod tests {
         assert_eq!(db.node(&id).unwrap().unwrap().pools.len(), MAX_NODE_POOLS);
         let err = db.set_pools(&id, &["a b".into()], "u", 1).unwrap_err();
         assert!(err.to_string().contains("is not a pool's name"), "{err:#}");
+        let err = db
+            .set_pools(&id, std::slice::from_ref(&id), "u", 1)
+            .unwrap_err();
+        assert!(err.to_string().contains("is a node ID"), "{err:#}");
     }
 
     #[test]

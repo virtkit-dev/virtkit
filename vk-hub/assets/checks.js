@@ -1,7 +1,10 @@
 // vk-hub web UI: a button with `data-check="all"` or `data-check="none"` checks or unchecks
-// every checkbox of its fieldset, such as the nodes a rollout updates. A `data-dismiss`
-// button, such as a question's Cancel, empties `#flash`; every message swapped into `#flash`
-// gets one, as the flash stays pinned to the window until dismissed. An opened
+// every checkbox of its fieldset, such as the nodes a rollout updates. In a
+// `<fieldset data-runs-on>`, a lane's selection of pools and nodes, its `#runs-on` line
+// follows the boxes ticked: the union of each ticked box's `data-nodes`, or, when none is
+// ticked, the fieldset's `data-runs-on` text; `no node`, in red, when neither gives one. A
+// `data-dismiss` button, such as a question's Cancel, empties `#flash`; every message swapped
+// into `#flash` gets one, as the flash stays pinned to the window until dismissed. An opened
 // `<details data-keep>` stays open across live updates. Listening on the document, it serves
 // what is swapped in later too. Without this script the boxes are
 // checked one by one and a message stays until replaced.
@@ -28,6 +31,42 @@
   }
   document.addEventListener("htmx:oobAfterSwap", closable);
   document.addEventListener("htmx:afterSwap", closable);
+
+  // The nodes a lane's ticked pools and nodes resolve to, as the server lists them on load.
+  function runsOn(fieldset) {
+    var line = fieldset.querySelector("#runs-on");
+    var out = line === null ? null : line.querySelector("span");
+    if (out === null) {
+      return;
+    }
+    var boxes = fieldset.querySelectorAll("input[type=checkbox][data-nodes]");
+    var seen = {};
+    var names = [];
+    var ticked = 0;
+    for (var i = 0; i < boxes.length; i++) {
+      if (!boxes[i].checked) {
+        continue;
+      }
+      ticked++;
+      var members = boxes[i].getAttribute("data-nodes").split("\n");
+      for (var j = 0; j < members.length; j++) {
+        if (members[j] !== "" && !Object.prototype.hasOwnProperty.call(seen, members[j])) {
+          seen[members[j]] = true;
+          names.push(members[j]);
+        }
+      }
+    }
+    // A pool typed in resolves on the server: until saved, it adds no node here.
+    var idle = ticked === 0 ? fieldset.getAttribute("data-runs-on") : "";
+    out.textContent = names.length > 0 ? names.join(", ") : idle || "no node";
+    line.className = names.length === 0 && !idle ? "bad" : "";
+  }
+  document.addEventListener("change", function (e) {
+    var fieldset = e.target instanceof Element ? e.target.closest("fieldset[data-runs-on]") : null;
+    if (fieldset !== null) {
+      runsOn(fieldset);
+    }
+  });
 
   document.addEventListener("click", function (e) {
     var dismiss = e.target instanceof Element ? e.target.closest("[data-dismiss]") : null;

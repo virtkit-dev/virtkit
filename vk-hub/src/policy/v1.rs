@@ -92,7 +92,7 @@ pub struct Converted {
     /// Lanes given the whole weight and cap of a tenant other lanes share, each telling which.
     pub shared: Vec<(LaneId, String)>,
     /// Placement rules no lane can express exactly, each with the lanes it applies to: the
-    /// policy must not take effect before an operator sets those lanes' nodes.
+    /// policy must not take effect before an operator sets those lanes' pools.
     pub unconverted: Vec<String>,
 }
 
@@ -111,9 +111,16 @@ impl Converted {
             )
         });
         let rules = (self.unconverted.iter())
-            .map(|rule| format!("{rule}: set its lanes' nodes before activating"));
+            .map(|rule| format!("{rule}: set its lanes' pools before activating"));
         shared.chain(rules).collect()
     }
+}
+
+/// Node IDs and pool names as a lane selects them: a node as its implicit pool.
+fn targets<'a>(list: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    list.into_iter()
+        .map(|t| crate::policy::as_target(t))
+        .collect()
 }
 
 /// Convert `bytes`, a policy of the earlier format: one lane per runner mapped, copying its
@@ -157,8 +164,7 @@ pub fn convert(bytes: &[u8]) -> Result<Converted> {
         };
         let mut lane = take(id.clone(), &r.tenant, t);
         lane.class = r.class;
-        let own: Vec<String> = r.nodes.iter().chain(&r.pools).cloned().collect();
-        lane.nodes = (!own.is_empty()).then_some(own);
+        lane.pools = targets(r.nodes.iter().chain(&r.pools));
         let mut projects = Vec::new();
         let mut ruled = Vec::new();
         for p in t.projects.iter().filter(|p| p.gitlab == r.gitlab) {
@@ -181,7 +187,7 @@ pub fn convert(bytes: &[u8]) -> Result<Converted> {
             unconverted.push(format!("pool {pool} of {id}, named as a node ID"));
         }
         match narrowed(r, &ruled) {
-            Ok(Some(nodes)) => lane.nodes = Some(nodes),
+            Ok(Some(nodes)) => lane.pools = targets(&nodes),
             Ok(None) => {}
             Err(rules) => {
                 unconverted.extend(rules.into_iter().map(|rule| format!("{rule} ({id})")))
@@ -272,7 +278,7 @@ fn rule_text(gitlab: &str, id: u64, rule: &PlacementRule) -> String {
 
 /// The nodes runner `r`'s lane must be narrowed to for the placement rules of its `projects`,
 /// each with its branch filter: `None` when no rule applies, `Err` with the rules that cannot
-/// be expressed as the lane's nodes. Exact when every project is held to the same rules, each
+/// be expressed as the lane's pools. Exact when every project is held to the same rules, each
 /// applying to all of its jobs, and those rules with the runner's own nodes come to one list:
 /// one list alone, or lists of node IDs alone, intersected.
 fn narrowed(
@@ -415,8 +421,8 @@ mod tests {
         let production = lane(&c, &runner(43));
         assert_eq!(production.class, Class::Production);
         assert_eq!(
-            production.nodes.as_deref(),
-            Some(&[A.to_owned(), "trusted".to_owned()][..])
+            production.pools,
+            [crate::policy::node_pool(A), "trusted".to_owned()]
         );
         // Only the project with production branches, as its filter.
         let ids: Vec<_> = (production.projects.iter().flatten())
@@ -476,15 +482,12 @@ mod tests {
     fn a_rule_applying_to_every_job_of_a_lane_narrows_its_nodes() {
         let c = ruled(json!([{ "nodes": [A] }]), "normal", json!([]));
         assert!(c.exact(), "{:?}", c.unconverted);
-        assert_eq!(lane(&c, &runner(42)).nodes, Some(vec![A.to_owned()]));
+        assert_eq!(lane(&c, &runner(42)).pools, [crate::policy::node_pool(A)]);
         let c = ruled(json!([{ "pools": ["trusted"] }]), "normal", json!([]));
-        assert_eq!(
-            lane(&c, &runner(42)).nodes,
-            Some(vec!["trusted".to_owned()])
-        );
+        assert_eq!(lane(&c, &runner(42)).pools, ["trusted".to_owned()]);
         // Node lists intersect.
         let c = ruled(json!([{ "nodes": [A, B] }]), "normal", json!([B]));
-        assert_eq!(lane(&c, &runner(42)).nodes, Some(vec![B.to_owned()]));
+        assert_eq!(lane(&c, &runner(42)).pools, [crate::policy::node_pool(B)]);
         // A production lane's branches all matched by the rule's.
         let c = ruled(
             json!([{ "branches": ["main", "release/*"], "nodes": [A] }]),
@@ -492,7 +495,7 @@ mod tests {
             json!([]),
         );
         assert!(c.exact(), "{:?}", c.unconverted);
-        assert_eq!(lane(&c, &runner(42)).nodes, Some(vec![A.to_owned()]));
+        assert_eq!(lane(&c, &runner(42)).pools, [crate::policy::node_pool(A)]);
         // None of its branches: the rule bears on none of its jobs.
         let c = ruled(
             json!([{ "branches": ["dev"], "nodes": [A] }]),
@@ -500,7 +503,7 @@ mod tests {
             json!([]),
         );
         assert!(c.exact());
-        assert_eq!(lane(&c, &runner(42)).nodes, None);
+        assert!(lane(&c, &runner(42)).pools.is_empty());
     }
 
     #[test]

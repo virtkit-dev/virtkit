@@ -202,6 +202,138 @@ pub(super) fn convert_stored(txn: &redb::WriteTransaction, now: u64) -> Result<(
     Ok(())
 }
 
+/// Marks the pool-selection migration checked, even with no policy or an unreadable one.
+const POOLS_SELECTED: &str = "pools.selected";
+
+/// On first start, fill empty runner selections from their relays' last reported pools,
+/// which previously controlled placement. Rewrite the policy with `nodes` read as `pools`.
+/// If relays reported different pools for a runner, select them all. If none was reported,
+/// leave the lane empty and log that it gets no work until an operator selects a target.
+/// Leave an unreadable policy unchanged and do not retry: its replacement is written under
+/// the new selection rules.
+pub(super) fn select_reported_pools(txn: &redb::WriteTransaction, now: u64) -> Result<()> {
+    let mut table = txn.open_table(CAPACITY_POLICY)?;
+    if table.get(POOLS_SELECTED)?.is_some() {
+        return Ok(());
+    }
+    let Some(bytes) = table.get("policy")?.map(|row| row.value().to_vec()) else {
+        table.insert(POOLS_SELECTED, &b"1"[..])?;
+        return Ok(());
+    };
+    let mut policy: Policy = match decode(&bytes) {
+        Ok(policy) => policy,
+        Err(e) => {
+            eprintln!(
+                "vk-hub: the stored capacity policy is unreadable, so its runner lanes were not \
+                 given the pools their relays reported: {e:#}"
+            );
+            table.insert(POOLS_SELECTED, &b"1"[..])?;
+            return Ok(());
+        }
+    };
+    let reported = reported_pools(txn)?;
+    let mut given = Vec::new();
+    for lane in &mut policy.lanes {
+        let Some(LaneId::Runner { gitlab, id }) = lane.id() else {
+            continue;
+        };
+        if !lane.pools.is_empty() {
+            continue;
+        }
+        match reported.get(&(gitlab.clone(), id)) {
+            Some(pools) => {
+                lane.pools = pools.iter().cloned().collect();
+                given.push(format!("runner {gitlab}/{id} {}", lane.pools.join(", ")));
+            }
+            None => eprintln!(
+                "vk-hub: capacity policy: runner {gitlab}/{id}'s lane selects no pool or node \
+                 and its relay reported no pool it can select: it gets no work until its lane \
+                 selects some"
+            ),
+        }
+    }
+    let encoded = encode(&policy)?;
+    if encoded != bytes {
+        let (from, to) = (digest_bytes(&bytes), digest_bytes(&encoded));
+        table.insert("policy", encoded.as_slice())?;
+        let mut event = format!(
+            "rewrote capacity policy {} as {}: lanes select pools and nodes",
+            crate::store::short(&from),
+            crate::store::short(&to)
+        );
+        if !given.is_empty() {
+            event.push_str(&format!(
+                "; runner lanes given the pool their relay reported: {}",
+                listed(&given)
+            ));
+        }
+        append_audit(txn, None, "hub", &event, now)?;
+        eprintln!("vk-hub: {event}");
+    }
+    table.insert(POOLS_SELECTED, &b"1"[..])?;
+    Ok(())
+}
+
+/// The pools each runner's relays last reported, by the runner's instance name and GitLab ID,
+/// read from the relay rows as a hub before 0.111 wrote them: `inventory.runners[].placement.pool`.
+/// A GitLab instance or relay row that does not read is skipped, saying so.
+fn reported_pools(
+    txn: &redb::WriteTransaction,
+) -> Result<BTreeMap<(String, u64), BTreeSet<String>>> {
+    let gitlabs = txn.open_table(super::gitlabs::GITLABS)?;
+    let mut names: BTreeMap<String, String> = BTreeMap::new();
+    for entry in gitlabs.iter()? {
+        let (name, row) = entry?;
+        match decode::<super::gitlabs::GitlabRow>(row.value()) {
+            Ok(row) => {
+                names.insert(row.url, name.value().to_owned());
+            }
+            Err(e) => eprintln!(
+                "vk-hub: GitLab instance {} is unreadable, so the pools its relays reported \
+                 were not given to its runners' lanes: {e:#}",
+                name.value()
+            ),
+        }
+    }
+    let relays = txn.open_table(super::relays::RELAYS)?;
+    let mut pools: BTreeMap<(String, u64), BTreeSet<String>> = BTreeMap::new();
+    for entry in relays.iter()? {
+        let (relay, row) = entry?;
+        let row: serde_json::Value = match decode(row.value()) {
+            Ok(row) => row,
+            Err(e) => {
+                eprintln!(
+                    "vk-hub: relay {} is unreadable, so the pools it reported were not given \
+                     to its runners' lanes: {e:#}",
+                    relay.value()
+                );
+                continue;
+            }
+        };
+        let Some(gitlab) =
+            (row.get("server_url").and_then(|u| u.as_str())).and_then(|u| names.get(u))
+        else {
+            continue;
+        };
+        let runners = (row.pointer("/inventory/runners").and_then(|r| r.as_array()))
+            .into_iter()
+            .flatten();
+        for runner in runners {
+            let id = runner.get("runner_id").and_then(|id| id.as_u64());
+            let pool = runner.pointer("/placement/pool").and_then(|p| p.as_str());
+            if let (Some(id), Some(pool)) = (id, pool)
+                && crate::policy::valid_target(pool)
+            {
+                pools
+                    .entry((gitlab.clone(), id))
+                    .or_default()
+                    .insert(pool.to_owned());
+            }
+        }
+    }
+    Ok(pools)
+}
+
 /// Have each admission and job not finished name its lane: a runner's, an API key's own or
 /// the default lane.
 fn rewrite_identities(txn: &redb::WriteTransaction, policy: &Policy) -> Result<()> {
@@ -296,14 +428,15 @@ impl Db {
         Ok(())
     }
 
-    /// Store `bytes` as the policy row, as a later or earlier hub may have left it.
+    /// Store `bytes` as the policy row, as a later or earlier hub may have left it: one whose
+    /// lanes were not yet given the pools their relays reported.
     #[cfg(test)]
     pub fn set_raw_capacity_policy(&self, bytes: &[u8]) {
         let txn = self.db.begin_write().unwrap();
-        txn.open_table(CAPACITY_POLICY)
-            .unwrap()
-            .insert("policy", bytes)
-            .unwrap();
+        let mut table = txn.open_table(CAPACITY_POLICY).unwrap();
+        table.insert("policy", bytes).unwrap();
+        table.remove(POOLS_SELECTED).unwrap();
+        drop(table);
         txn.commit().unwrap();
     }
 
@@ -316,6 +449,15 @@ impl Db {
             .insert(CONVERSION, encode(note).unwrap().as_slice())
             .unwrap();
         txn.commit().unwrap();
+    }
+
+    /// The policy row as stored.
+    #[cfg(test)]
+    pub fn capacity_policy_raw(&self) -> String {
+        let txn = self.db.begin_read().unwrap();
+        let table = txn.open_table(CAPACITY_POLICY).unwrap();
+        let row = table.get("policy").unwrap().unwrap();
+        String::from_utf8(row.value().to_vec()).unwrap()
     }
 
     /// The policy row kept from before the conversion to lanes.
@@ -565,8 +707,11 @@ mod tests {
         );
     }
 
-    /// A database whose policy row is `v1`, reopened by this hub.
-    fn reopened(v1: serde_json::Value, setup: impl FnOnce(&Db)) -> (Db, Vec<u8>, impl Drop) {
+    /// A database whose policy row is `v1`, reopened by this hub, with its path.
+    fn reopened(
+        v1: serde_json::Value,
+        setup: impl FnOnce(&Db),
+    ) -> (Db, Vec<u8>, std::path::PathBuf, impl Drop) {
         struct Gone(std::path::PathBuf);
         impl Drop for Gone {
             fn drop(&mut self) {
@@ -583,7 +728,7 @@ mod tests {
         db.set_raw_capacity_policy(&bytes);
         setup(&db);
         drop(db);
-        (Db::open(&path).unwrap(), bytes, Gone(dir))
+        (Db::open(&path).unwrap(), bytes, path, Gone(dir))
     }
 
     #[test]
@@ -596,7 +741,7 @@ mod tests {
             "runners": [{ "gitlab": "gl", "runner_id": 42, "tenant": "web", "class": "normal" }],
             "clients": { "ci-bot": "web" }
         });
-        let (db, bytes, _dir) = reopened(v1, |_| {});
+        let (db, bytes, _, _dir) = reopened(v1, |_| {});
         let policy = db.capacity_policy().unwrap();
         let lane = policy.runner("gl", 42).unwrap();
         assert_eq!(lane.weight, 2);
@@ -635,6 +780,163 @@ mod tests {
         assert_eq!(note.shared.len(), 1, "{note:?}");
     }
 
+    /// Enroll relay `key` of gitlab `gl` reporting `runners`: name, GitLab ID and pool.
+    fn reporting_relay(db: &Db, key: &str, runners: &[(&str, Option<u64>, &str)]) {
+        use vk_hub_proto::gitlab::{Inventory, Runner, Server};
+        let (token, _) = db
+            .create_token_for(
+                crate::store::TokenKind::Gitlab,
+                std::time::Duration::from_secs(60),
+                None,
+                "u",
+                1,
+            )
+            .unwrap();
+        let hostname = format!("relay-{key}");
+        let crate::store::RelayEnrollment::Enrolled { id } =
+            db.enroll_relay(&token, key, &hostname, "p", 1).unwrap()
+        else {
+            panic!("not enrolled");
+        };
+        let runners = runners
+            .iter()
+            .map(|&(name, id, pool)| {
+                let mut runner = Runner {
+                    name: name.into(),
+                    runner_id: id,
+                    verified: true,
+                    ..Runner::default()
+                };
+                runner.placement.pool = pool.into();
+                runner
+            })
+            .collect();
+        let inventory = Inventory {
+            hostname,
+            concurrent: 4,
+            server: Server {
+                url: "https://gitlab.example.com".into(),
+                ..Server::default()
+            },
+            runners,
+            ..Inventory::default()
+        };
+        db.record_relay(&id, crate::store::RelayWrite::Inventory(inventory), 1)
+            .unwrap();
+    }
+
+    /// On the first start of a hub whose lanes select pools, each runner lane selecting nothing
+    /// gets the pool its relay last reported, `nodes` is read as `pools`, and the policy is
+    /// written back; once, so a lane emptied since stays empty.
+    #[test]
+    fn runner_lanes_are_given_the_pools_their_relays_reported_once() {
+        let node = "0123456789abcdef0123456789abcdef";
+        let stored = serde_json::json!({ "version": 2, "lanes": [
+            { "runner": { "gitlab": "gl", "id": 42 } },
+            { "runner": { "gitlab": "gl", "id": 43 }, "nodes": [node, "trusted"] },
+            { "runner": { "gitlab": "gl", "id": 44 } },
+            { "runner": { "gitlab": "other", "id": 1 } },
+            { "default": true }
+        ]});
+        let (db, bytes, path, _dir) = reopened(stored, |db| {
+            db.add_gitlab("gl", "https://gitlab.example.com", "u", 1)
+                .unwrap();
+            reporting_relay(
+                db,
+                "aa",
+                &[
+                    ("ci", Some(42), "ci"),
+                    ("big", Some(43), "big"),
+                    ("new", None, "ci"),
+                    ("odd", Some(44), "no pool"),
+                ],
+            );
+            // A second relay of the same runner, in another pool: the lane selects both.
+            reporting_relay(db, "bb", &[("ci", Some(42), "fast")]);
+        });
+        let policy = db.capacity_policy().unwrap();
+        assert_eq!(policy.runner("gl", 42).unwrap().pools, ["ci", "fast"]);
+        assert_eq!(
+            policy.runner("gl", 43).unwrap().pools,
+            [crate::policy::node_pool(node), "trusted".to_owned()]
+        );
+        // No valid pool reported for 44, no relay of `other`: left selecting nothing.
+        assert!(policy.runner("gl", 44).unwrap().pools.is_empty());
+        assert!(policy.runner("other", 1).unwrap().pools.is_empty());
+        let digest = policy.digest().unwrap();
+        assert_ne!(digest, digest_bytes(&bytes));
+        let audits = db.audits(None, 10).unwrap();
+        let last = audits.last().unwrap();
+        assert!(
+            last.actor == "hub"
+                && last.event.contains("rewrote capacity policy")
+                && last.event.contains(crate::store::short(&digest))
+                && last.event.ends_with("reported: runner gl/42 ci, fast"),
+            "{audits:?}"
+        );
+        // Stored as this hub writes it: `pools`, never `nodes`.
+        let raw = db.capacity_policy_raw();
+        assert!(
+            !raw.contains("\"nodes\"") && raw.contains("\"pools\":[\"ci\",\"fast\"]"),
+            "{raw}"
+        );
+        // Emptied by an operator, the lane stays empty across a restart.
+        let mut emptied = policy.clone();
+        emptied
+            .lanes
+            .iter_mut()
+            .find(|l| {
+                l.id()
+                    == Some(LaneId::Runner {
+                        gitlab: "gl".into(),
+                        id: 42,
+                    })
+            })
+            .unwrap()
+            .pools = Vec::new();
+        db.replace_capacity_policy_if(&emptied, &digest, "operator", 2)
+            .unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert!(
+            db.capacity_policy()
+                .unwrap()
+                .runner("gl", 42)
+                .unwrap()
+                .pools
+                .is_empty()
+        );
+        assert_eq!(
+            db.audits(None, 10).unwrap().last().unwrap().actor,
+            "operator"
+        );
+    }
+
+    /// A policy unreadable on the first start is not given reported pools later: the one that
+    /// replaced it was written under lanes that select pools.
+    #[test]
+    fn a_policy_replacing_an_unreadable_one_keeps_its_empty_runner_lanes() {
+        let stored = serde_json::json!({ "version": 3, "from_a_later_hub": true });
+        let (db, bytes, path, _dir) = reopened(stored, |db| {
+            db.add_gitlab("gl", "https://gitlab.example.com", "u", 1)
+                .unwrap();
+            reporting_relay(db, "aa", &[("ci", Some(42), "ci")]);
+        });
+        assert!(db.capacity_policy().is_err());
+        let mut policy = Policy::default();
+        policy.lanes.push(Lane::new(&LaneId::Runner {
+            gitlab: "gl".into(),
+            id: 42,
+        }));
+        assert!(
+            db.replace_capacity_policy_if(&policy, &digest_bytes(&bytes), "operator", 1)
+                .unwrap()
+        );
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.capacity_policy().unwrap(), policy);
+    }
+
     #[test]
     fn a_conversion_with_rules_left_over_is_held_until_set_again() {
         let node = "0123456789abcdef0123456789abcdef";
@@ -646,7 +948,7 @@ mod tests {
             },
             "runners": [{ "gitlab": "gl", "runner_id": 42, "tenant": "web", "class": "normal" }]
         });
-        let (db, _, _dir) = reopened(v1, |_| {});
+        let (db, _, _, _dir) = reopened(v1, |_| {});
         let (policy, held) = db.capacity_policy_state().unwrap();
         assert!(held);
         let note = db.capacity_conversion().unwrap().unwrap();
@@ -708,7 +1010,7 @@ mod tests {
             ("c".repeat(32), admission("ci-bot", None)),
             ("d".repeat(32), admission("other", None)),
         ];
-        let (db, _, _dir) = reopened(v1, |db| {
+        let (db, _, _, _dir) = reopened(v1, |db| {
             let txn = db.db.begin_write().unwrap();
             {
                 let mut table = txn

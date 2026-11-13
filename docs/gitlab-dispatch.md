@@ -210,12 +210,17 @@ That node boots it in seconds where another spends a minute or two building the 
 submitted on a reservation on a node without the image then starts on the warm node without it,
 and the hub releases the reservation. Under heavier load the order above holds.
 
-A lane of the capacity policy may restrict where its work goes with `nodes`: node IDs and pool
-names (at most 256). Room is granted only on those nodes, and the job submitted on it runs there;
-a queued job may move among them, image affinity included. A queued job whose reservation is on
+Where a runner's work goes is its lane's `pools` in the capacity policy: pool names, and nodes
+as `#node#<node ID>` (at most 256), the union of whose members the lane may use. Room is granted
+only on those nodes, and the job submitted on it runs there; a queued job may move among them,
+image affinity included. A runner whose lane selects nothing gets no room, its requests and
+queued jobs waiting for `its lane selects no pool or node`. A queued job whose reservation is on
 a node its lane no longer allows has the reservation released and waits for an allowed node,
 ending at its `place_within_secs` deadline with `its lane's allowed nodes` as the reason when
-nodes had room but none was allowed (see [capacity arbitration](capacity-arbitration.md)).
+nodes had room but none was allowed (see [capacity arbitration](capacity-arbitration.md)). A
+pool a relay's request or job names is ignored; an API key's names where its job goes, a pool
+or a node's `#node#<node ID>`, which the key must allow by name: a key limited to pools reaches
+a node only through those pools.
 
 A relay job its lane no longer allows after it was submitted — the runner unmapped, its project
 no longer listed, or its branch no longer matching the project's `branches` — is held: it waits,
