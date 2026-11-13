@@ -201,6 +201,14 @@ impl Db {
         Ok(outcome)
     }
 
+    /// Store `bytes` as relay `id`'s row, as an earlier hub may have written it.
+    #[cfg(test)]
+    pub fn set_raw_relay(&self, id: &str, bytes: &[u8]) {
+        let txn = self.db.begin_write().unwrap();
+        txn.open_table(RELAYS).unwrap().insert(id, bytes).unwrap();
+        txn.commit().unwrap();
+    }
+
     pub fn relay(&self, id: &str) -> Result<Option<RelayRow>> {
         let txn = self.db.begin_read().context("starting a read")?;
         txn.open_table(RELAYS)?

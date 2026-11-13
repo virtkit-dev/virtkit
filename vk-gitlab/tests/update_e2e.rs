@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use vk_hub_proto::gitlab::{CONNECTION, Command, HubRelayMsg, Operation, PROTOCOL, RelayMsg};
+use vk_hub_proto::gitlab::{Command, HubRelayMsg, LANES, Operation, PROTOCOL, RelayMsg};
 use vk_hub_proto::{CommandAck, HubMsg, NodeMsg, Outcome, UpdatePhase};
 use vk_peer::identity::Identity;
 
@@ -105,7 +105,7 @@ async fn session(
         return;
     };
     let challenge = HubMsg::Challenge {
-        version: CONNECTION,
+        version: LANES,
         versions: PROTOCOL,
         nonce: vk_hub_proto::to_hex(&[7u8; vk_hub_proto::CHALLENGE_LEN]),
     };

@@ -11,9 +11,10 @@
 //! sent none.
 //!
 //! Likewise it adds a runner to, or removes one from, only a relay whose `[hub] allow` lists
-//! `runners`, at version [`RUNNERS`](vk_hub_proto::gitlab::RUNNERS) or later. An added runner's
-//! token stays in memory, never stored, until the relay answers: a hub restarted before then
-//! has lost it, and fails the add `token_lost` at the relay's next first report.
+//! `runners`, at version [`RUNNERS`](vk_hub_proto::gitlab::RUNNERS) or later — adds one only at
+//! [`LANES`](vk_hub_proto::gitlab::LANES) or later, an older relay wanting a pool. An added
+//! runner's token stays in memory, never stored, until the relay answers: a hub restarted
+//! before then has lost it, and fails the add `token_lost` at the relay's next first report.
 //!
 //! A relay at version [`CONNECTION`](vk_hub_proto::gitlab::CONNECTION) holds its session on
 //! its HTTP/2 connection, which the session authenticates for the relay's client API requests
@@ -35,11 +36,10 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_tungstenite::tungstenite::Message;
-use vk_hub_proto::client::Placement;
 use vk_hub_proto::gitlab::{
-    ALLOW_RUNNERS, ALLOW_UPDATE, Command, HubRelayMsg, MAX_ADMISSIONS, MAX_LABELS, MAX_RUNNERS,
-    Operation, RUNNERS, RelayMsg, Report, Runner, RunnerSource, RunnerToken, ServerState,
-    ServerStatus,
+    ALLOW_RUNNERS, ALLOW_UPDATE, Command, HubRelayMsg, LANES, MAX_ADMISSIONS, MAX_LABELS,
+    MAX_RUNNERS, Operation, RUNNERS, RelayMsg, Report, Runner, RunnerPlacement, RunnerSource,
+    RunnerToken, ServerState, ServerStatus,
 };
 use vk_hub_proto::{CommandAck, HubMsg, Outcome, RefusalCode};
 
@@ -822,7 +822,7 @@ fn issued(hub: &Hub, actor: &str, id: &str, command: &Command) {
 /// How a runner added on the hub is set up: a `[[runners]]` table's settings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunnerSettings {
-    pub placement: Placement,
+    pub placement: RunnerPlacement,
     /// Its `limit`, when limited.
     pub limit: Option<u32>,
     /// Its `request_concurrency`, at least 1.
@@ -853,9 +853,6 @@ pub fn check_runner(name: &str, token: &RunnerToken, settings: &RunnerSettings) 
     }
     let p = &settings.placement;
     let printable = |s: &str| vk_hub_proto::display_safe(s) == s;
-    if p.pool.trim().is_empty() || !printable(&p.pool) {
-        bail!("the pool must be printable and not empty");
-    }
     if p.labels.len() > MAX_LABELS {
         bail!("a runner has at most {MAX_LABELS} labels");
     }
@@ -903,13 +900,32 @@ pub fn runners_refusal(row: &RelayRow) -> Option<String> {
     None
 }
 
-/// Relay `id`, if it lets the hub add and remove its runners as it last reported.
-fn taking_runners(hub: &Hub, id: &str) -> Result<RelayRow> {
+/// Why relay `row` would refuse a runner added from the hub: [`runners_refusal`], or a protocol
+/// below [`LANES`], which reads an added runner only with a pool.
+pub fn add_runner_refusal(row: &RelayRow) -> Option<String> {
+    if let Some(why) = runners_refusal(row) {
+        return Some(why);
+    }
+    if row.protocol.unwrap_or(0) < LANES {
+        return Some(format!(
+            "relay {} runs an older vk-gitlab: update it to add runners from the hub",
+            row.hostname
+        ));
+    }
+    None
+}
+
+/// Relay `id`, unless `refusal` rejects its last reported state.
+fn taking_runners(
+    hub: &Hub,
+    id: &str,
+    refusal: fn(&RelayRow) -> Option<String>,
+) -> Result<RelayRow> {
     let row = hub
         .db
         .relay(id)?
         .ok_or_else(|| NotEnrolled(id.to_string()))?;
-    if let Some(why) = runners_refusal(&row) {
+    if let Some(why) = refusal(&row) {
         bail!(why);
     }
     Ok(row)
@@ -926,7 +942,7 @@ pub fn add_runner(
     settings: RunnerSettings,
 ) -> Result<Command> {
     check_runner(name, &token, &settings)?;
-    let row = taking_runners(hub, id)?;
+    let row = taking_runners(hub, id, add_runner_refusal)?;
     let runners = row.inventory.as_ref().map_or(&[][..], |i| &i.runners[..]);
     if runners.iter().any(|r| r.name == name) {
         bail!("relay {} has a runner named {name} already", row.hostname);
@@ -960,7 +976,7 @@ pub fn remove_runner(
     name: &str,
     added_by: Option<&str>,
 ) -> Result<Command> {
-    let row = taking_runners(hub, id)?;
+    let row = taking_runners(hub, id, runners_refusal)?;
     let Some(runner) = row
         .inventory
         .as_ref()

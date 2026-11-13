@@ -161,7 +161,6 @@ url = "$GL_URL"
 [[runners]]
 name = "e2e"
 token_file = "$RUN/runner.token"
-pool = "e2e"
 labels = ["e2e"]
 envelope = { mem = "1G", cpus = 1, disk = "4G" }
 EOF

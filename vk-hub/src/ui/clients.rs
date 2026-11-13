@@ -966,7 +966,7 @@ fn relays_table(h: &mut Html, shown: &Shown, now: u64, steer: bool) {
             .raw("</td>");
         if steer {
             h.raw("<td class=\"actions\">");
-            if crate::relays::runners_refusal(&r.row).is_none() {
+            if crate::relays::add_runner_refusal(&r.row).is_none() {
                 h.raw("<a href=\"")
                     .text(page.unwrap_or_else(|| super::relays::add_runner_href(&r.id)))
                     .raw("\">Add runner</a> ");
@@ -1083,7 +1083,7 @@ fn relay_blocks(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64, st
         {
             h.raw("<span class=\"badge warn\">upgrade vk-gitlab: no new jobs</span>");
         }
-        if steer && crate::relays::runners_refusal(&r.row).is_none() {
+        if steer && crate::relays::add_runner_refusal(&r.row).is_none() {
             h.raw("<a href=\"")
                 .text(super::relays::add_runner_href(&r.id))
                 .raw("\">Add runner</a>");
@@ -1097,7 +1097,7 @@ fn relay_blocks(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64, st
                 h.raw("<p class=\"sub\">Add <code>").raw(ALLOW_RUNNERS).raw(
                     "</code> to this relay's <code>[hub] allow</code> to add runners here.</p>",
                 );
-            } else if r.row.protocol.unwrap_or(0) < vk_hub_proto::gitlab::RUNNERS {
+            } else if r.row.protocol.unwrap_or(0) < vk_hub_proto::gitlab::LANES {
                 h.raw("<p class=\"sub\">Update this relay to add runners here.</p>");
             }
         }

@@ -898,8 +898,7 @@ mod tests {
     /// done once carried out. Neither is an update under way.
     #[test]
     fn a_restart_ends_runner_commands_from_the_relay_s_runners() {
-        let placement = crate::dispatch::Placement {
-            pool: "ci".into(),
+        let placement = vk_hub_proto::gitlab::RunnerPlacement {
             labels: vec![],
             envelope: crate::dispatch::Envelope {
                 mem_mib: 1024,

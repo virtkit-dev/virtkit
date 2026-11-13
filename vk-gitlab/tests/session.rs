@@ -19,7 +19,7 @@ use vk_gitlab::runners::{Change, Runners};
 use vk_gitlab::session::{self, Status};
 use vk_gitlab::update::Updater;
 use vk_hub_proto::gitlab::{
-    CONNECTION, Command, HubRelayMsg, Operation, PROTOCOL, RELAY_PROTOCOL, RelayMsg, RunnerState,
+    Command, HubRelayMsg, LANES, Operation, PROTOCOL, RELAY_PROTOCOL, RelayMsg, RunnerState,
     ServerState, ServerStatus,
 };
 use vk_hub_proto::{Channel, CommandAck, HubMsg, NodeMsg, Outcome, RefusalCode};
@@ -155,7 +155,7 @@ async fn a_session_reports_the_relay_and_takes_the_servers_status() {
     send(
         &mut ws,
         &HubMsg::Challenge {
-            version: CONNECTION,
+            version: LANES,
             versions: PROTOCOL,
             nonce: vk_hub_proto::to_hex(&nonce),
         },
@@ -170,7 +170,7 @@ async fn a_session_reports_the_relay_and_takes_the_servers_status() {
         &incarnation,
         RELAY_PROTOCOL,
         PROTOCOL,
-        CONNECTION,
+        LANES,
         Channel::Plaintext,
     );
     ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key)
@@ -178,8 +178,13 @@ async fn a_session_reports_the_relay_and_takes_the_servers_status() {
         .expect("the auth is signed by the relay's key");
     send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
 
-    let RelayMsg::Inventory(inventory) = next_msg(&mut ws).await else {
-        panic!("not the inventory");
+    let (raw, inventory) = loop {
+        let raw = next(&mut ws).await;
+        match serde_json::from_str(&raw).unwrap() {
+            RelayMsg::Heartbeat(_) => {}
+            RelayMsg::Inventory(inventory) => break (raw, inventory),
+            other => panic!("not the inventory: {other:?}"),
+        }
     };
     assert_eq!(inventory.server.url, "https://gitlab.example.com");
     assert_eq!(
@@ -189,9 +194,9 @@ async fn a_session_reports_the_relay_and_takes_the_servers_status() {
     assert_eq!(inventory.concurrent, 3);
     let runner = &inventory.runners[0];
     assert_eq!((runner.name.as_str(), runner.limit), ("ci", Some(2)));
-    assert_eq!(runner.placement.pool, "p1");
-    let json = serde_json::to_string(&inventory).unwrap();
-    assert!(!json.contains("SECRET"), "{json}");
+    assert!(!raw.contains("SECRET"), "{raw}");
+    // The config's `pool`, from before 0.111, is read and not reported.
+    assert!(!raw.contains("\"pool\""), "{raw}");
     let RelayMsg::Report(report) = next_msg(&mut ws).await else {
         panic!("not the report");
     };
@@ -312,7 +317,7 @@ async fn welcome(listener: &TcpListener) -> Ws {
     send(
         &mut ws,
         &HubMsg::Challenge {
-            version: CONNECTION,
+            version: LANES,
             versions: PROTOCOL,
             nonce: vk_hub_proto::to_hex(&[7u8; vk_hub_proto::CHALLENGE_LEN]),
         },
@@ -504,7 +509,7 @@ async fn the_hub_s_commands_are_answered_and_repeated_until_recorded() {
     send(
         &mut ws,
         &HubMsg::Challenge {
-            version: CONNECTION,
+            version: LANES,
             versions: PROTOCOL,
             nonce: vk_hub_proto::to_hex(&[7u8; vk_hub_proto::CHALLENGE_LEN]),
         },
@@ -672,8 +677,7 @@ fn add_runner(id: &str, name: &str, token: &str, expires_at: u64) -> HubRelayMsg
         op: Operation::AddRunner {
             name: name.into(),
             token: vk_hub_proto::gitlab::RunnerToken::new(token),
-            placement: vk_hub_proto::client::Placement {
-                pool: "big".into(),
+            placement: vk_hub_proto::gitlab::RunnerPlacement {
                 labels: vec!["large-memory".into()],
                 envelope: vk_hub_proto::job::Envelope {
                     mem_mib: 16384,
@@ -753,7 +757,7 @@ async fn runners_are_added_and_removed_on_the_hub_s_command() {
     assert_eq!(big.command, Some("a".repeat(32)));
     assert_eq!(big.runner_id, Some(support::gl::RUNNER_ID as u64));
     assert!(big.verified);
-    assert_eq!(big.placement.pool, "big");
+    assert_eq!(big.placement.labels, ["large-memory"]);
     assert_eq!(big.limit, Some(2));
     assert!(
         matches!(changes.try_recv(), Ok(Change::Start(cfg)) if cfg.name == "big"),

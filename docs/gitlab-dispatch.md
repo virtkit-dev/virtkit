@@ -142,8 +142,8 @@ lease ends earlier than the node does.
 
 ## Placement
 
-A runner in `vk-gitlab`'s configuration names its placement; every runner of one `vk-gitlab`
-takes jobs from the one GitLab server its `[gitlab] url` names:
+A runner in `vk-gitlab`'s configuration names what its jobs ask of a node; every runner of one
+`vk-gitlab` takes jobs from the one GitLab server its `[gitlab] url` names:
 
 ```toml
 [gitlab]
@@ -152,11 +152,15 @@ url = "https://gitlab.example.com"
 [[runners]]
 name = "ci"
 token_file = "/etc/vk-gitlab/runner-ci.token"   # glrt-…
-pool = "ci"
 labels = ["large-memory"]
 envelope = { mem = "16G", cpus = 8, disk = "16G" }
 request_concurrency = 1
 ```
+
+The runner's lane on the hub selects its pools and nodes
+([capacity arbitration](capacity-arbitration.md)). A legacy `pool` in a `[[runners]]` table
+is ignored since 0.111, with a startup warning to remove it. Accepting it lets unattended
+relay updates keep serving with an older config.
 
 A runner's `envelope` is what the hub sets aside on a node and counts there for each of its
 jobs. The node admits the job's guest and its services, each service VM at its own size, so
@@ -170,11 +174,12 @@ relay whose inventory lists more runners or a larger `request_concurrency`.
 
 GitLab's job response does not carry the job's tags, and GitLab only gives a runner jobs
 whose tags it has, so placement is per runner: one runner per class of work, with the tags
-of that class registered in GitLab and its pool and labels here. A pool is a set of nodes the
-hub's operator names (`vk-hub nodes pools <id> <a,b>`, or on the node's page); a label is one
-a node declares in its own configuration and reports in its inventory's `labels`, absent from
-an older node's. The placement stays in the daemon's configuration, which it reports to the
-hub; the hub sets the relay no ceiling on it.
+of that class registered in GitLab, its labels and envelope here, and its lane on the hub. A
+pool is a set of nodes the hub's operator names (`vk-hub nodes pools <id> <a,b>`, or on the
+node's page), which a lane selects; a label is one a node declares in its own configuration and
+reports in its inventory's `labels`, absent from an older node's. The labels and envelope stay
+in the daemon's configuration, which it reports to the hub; the hub sets the relay no ceiling
+on them.
 
 A node's concurrency ceiling (`vk-hub nodes ceiling`) and its own executor limit
 (`[executor.schedule] max_concurrency`, which the node reports) cap its placed work at the
@@ -329,13 +334,14 @@ reservations and jobs it holds — and no longer asked by vk-gitlab, which queue
 
 **Reservations.** `{runner, queue, request_id, placement, lease_secs, wait_secs}` →
 `{admission, reservation, node, envelope, lease_secs}`. The request joins the hub's
-[queue](#admission-and-reservations), whose offers filter the pool's nodes on labels, readiness
-and headroom. With `queue`, the hub answers 201 with a grant if one is ready at once, else 202
-`{ticket}`; without, it waits up to `wait_secs` (at least 5 seconds) for a grant, then answers
-503 `no_capacity`. A relay names its runner. A runner may have `request_concurrency` tickets
-waiting, offered or granted, a principal 256 unended, the hub 4096; past them, and while a
-relay's session is not connected, the hub answers 503 `unavailable`. A grant's `admission` is
-what its outcome reports on and its job's submission names.
+[queue](#admission-and-reservations), whose offers filter the nodes of the runner's lane, or of
+the pool an API key names, on labels, readiness and headroom. With `queue`, the hub answers 201
+with a grant if one is ready at once, else 202 `{ticket}`; without, it waits up to `wait_secs`
+(at least 5 seconds) for a grant, then answers 503 `no_capacity`. A relay names its runner. A
+runner may have `request_concurrency` tickets waiting, offered or granted, a principal 256
+unended, the hub 4096; past them, and while a relay's session is not connected, the hub answers
+503 `unavailable`. A grant's `admission` is what its outcome reports on and its job's submission
+names.
 
 `GET` on a ticket answers 202 while it waits and 201 with the grant, its `lease_secs` what is
 left of the lease, once a node accepted; 410 `reservation_gone` for a ticket that ended —

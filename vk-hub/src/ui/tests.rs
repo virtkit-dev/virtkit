@@ -9766,9 +9766,9 @@ async fn an_operator_issues_a_relay_token_from_the_adapters_page() {
 #[tokio::test(flavor = "multi_thread")]
 async fn relays_and_their_runners_follow_their_server() {
     use crate::store::RelayWrite;
-    use vk_hub_proto::client::Placement;
     use vk_hub_proto::gitlab::{
-        Heartbeat, Inventory, Report, Runner, RunnerLoad, RunnerReport, RunnerState, Server,
+        Heartbeat, Inventory, Report, Runner, RunnerLoad, RunnerPlacement, RunnerReport,
+        RunnerState, Server,
     };
     let (addr, hub, origin) = start_fleet().await;
     let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
@@ -9797,8 +9797,7 @@ async fn relays_and_their_runners_follow_their_server() {
             Runner {
                 name: "ci".into(),
                 runner_id: Some(42),
-                placement: Placement {
-                    pool: "ci".into(),
+                placement: RunnerPlacement {
                     labels: vec!["large".into()],
                     envelope: vk_hub_proto::job::Envelope {
                         mem_mib: 4096,
@@ -9814,8 +9813,7 @@ async fn relays_and_their_runners_follow_their_server() {
             Runner {
                 name: hostile.into(),
                 runner_id: None,
-                placement: Placement {
-                    pool: "ci".into(),
+                placement: RunnerPlacement {
                     labels: vec![],
                     envelope: vk_hub_proto::job::Envelope {
                         mem_mib: 1024,
@@ -10080,9 +10078,19 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
     assert!(!page.contains(&link) && page.contains(update), "{page}");
     let page = get(addr, "/gitlab", Some(&viewer)).await.body;
     assert!(!page.contains(update), "{page}");
+    // At 4 or 5 it takes runner commands, but reads an added runner only with a pool.
+    for version in [4, 5] {
+        assert!(
+            hub.db
+                .record_relay_session(&relay, "i", version, now, || true)
+                .unwrap()
+        );
+        let page = get(addr, "/gitlab", Some(&operator)).await.body;
+        assert!(!page.contains(&link) && page.contains(update), "{page}");
+    }
     assert!(
         hub.db
-            .record_relay_session(&relay, "i", 4, now, || true)
+            .record_relay_session(&relay, "i", vk_hub_proto::gitlab::LANES, now, || true)
             .unwrap()
     );
     let page = get(addr, "/gitlab", Some(&operator)).await.body;
@@ -10105,7 +10113,6 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
     let page = get(addr, &href, Some(&operator)).await.body;
     for want in [
         "<input id=\"runner-token\" type=\"password\" name=\"token\" autocomplete=\"off\"",
-        "name=\"pool\" autocomplete=\"off\" spellcheck=\"false\" value=\"default\"",
         "name=\"envelope\" autocomplete=\"off\" spellcheck=\"false\" \
          value=\"mem=4G,cpus=2,disk=16G\"",
         "name=\"limit\" autocomplete=\"off\" spellcheck=\"false\" value=\"\"",
@@ -10119,7 +10126,7 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
     // Refused with the hub's reason, the rest filled in again but never the token.
     let fields = |name: &str, envelope: &str| {
         format!(
-            "_csrf={csrf}&op=add-runner&token=glrt-secret&name={name}&pool=ci\
+            "_csrf={csrf}&op=add-runner&token=glrt-secret&name={name}\
              &labels=kvm%2C+big&envelope={envelope}&limit=2&request_concurrency=1"
         )
     };
@@ -10154,8 +10161,7 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
             name,
             vk_hub_proto::gitlab::RunnerToken::new("glrt-x"),
             crate::relays::RunnerSettings {
-                placement: vk_hub_proto::client::Placement {
-                    pool: "ci".into(),
+                placement: vk_hub_proto::gitlab::RunnerPlacement {
                     labels: vec![],
                     envelope: vk_hub_proto::job::Envelope {
                         mem_mib: 4096,
@@ -10265,14 +10271,8 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
         panic!("not an add: {added:?}");
     };
     assert_eq!(
-        (
-            name.as_str(),
-            token.expose(),
-            placement.pool.as_str(),
-            *limit,
-            *request_concurrency
-        ),
-        ("ci-1", "", "ci", Some(2), 1)
+        (name.as_str(), token.expose(), *limit, *request_concurrency),
+        ("ci-1", "", Some(2), 1)
     );
     assert_eq!(placement.labels, ["kvm", "big"]);
     assert_eq!(placement.envelope.mem_mib, 8 << 10);

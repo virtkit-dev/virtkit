@@ -62,6 +62,7 @@ use vk_hub_proto::dispatch::{
     OfferReply, Refusal, RunState,
 };
 use vk_hub_proto::egress::{EgressReport, HubEgress};
+use vk_hub_proto::gitlab::RunnerPlacement;
 use vk_hub_proto::job::{Envelope, FailureClass, JobResult, JobSpec};
 use vk_hub_proto::{DesiredState, JOBS, NodeState, Report, StorageRole};
 
@@ -1892,10 +1893,10 @@ pub fn events_summary(events: &[vk_hub_proto::job::JobEvent]) -> Option<String> 
 // ---------------------------------------------------------------------------------------------
 // Placement.
 
-/// Whether `a` and `b` have the same labels and envelope. Ignore the pool a relay may still
-/// report for its runner: the lane selects where its work goes.
-pub fn same_requirements(a: &Placement, b: &Placement) -> bool {
-    a.labels == b.labels && a.envelope == b.envelope
+/// Whether a relay's request matches its runner's labels and envelope.
+/// Ignore the request's pool: the runner's lane selects where work runs.
+pub fn same_requirements(runner: &RunnerPlacement, placement: &Placement) -> bool {
+    runner.labels == placement.labels && runner.envelope == placement.envelope
 }
 
 /// A node's room for `placement`'s envelope: how many it fits, `None` when it takes no

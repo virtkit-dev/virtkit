@@ -2093,10 +2093,10 @@ its hostname and ID, whether it is connected, when it was last heard from, the s
 bound to and what the hub makes of it (the instance's name once approved, else *pending*,
 *rejected* or *reports another server*), the URL, certificate key digest and version it reports
 of that server, its version, runners and `concurrent`, then the runners of relays bound to no
-server the hub has. Each runner shows GitLab's ID
-for it, its pool, labels and envelope, its `limit`, its state (*polling*, *waiting for
-capacity*, *server not approved*, *unhealthy*, *token refused*, and *token not verified* when
-`verify` failed), the job requests it has outstanding, the jobs it holds, and when GitLab last
+server the hub has. Each runner shows GitLab's ID for it, its labels and envelope, the nodes its
+lane's work can go to, its `limit`, its state (*polling*, *waiting for capacity*, *server not
+approved*, *unhealthy*, *token refused*, and *token not verified* when `verify` failed), the job
+requests it has outstanding, the jobs it holds, and when GitLab last
 answered it and with which HTTP status. What a relay said is shown as text. On top of the servers'
 page, *Pending* lists the GitLab servers waiting for an operator (`vk-hub gitlabs pending`), each
 relays report that no instance has, with the certificate key digest and version reported and the

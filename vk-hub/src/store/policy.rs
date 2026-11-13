@@ -275,8 +275,8 @@ pub(super) fn select_reported_pools(txn: &redb::WriteTransaction, now: u64) -> R
 }
 
 /// The pools each runner's relays last reported, by the runner's instance name and GitLab ID,
-/// read from the relay rows as a hub before 0.111 wrote them: `inventory.runners[].placement.pool`.
-/// A GitLab instance or relay row that does not read is skipped, saying so.
+/// read from pre-0.111 relay rows at `inventory.runners[].placement.pool`, which this hub
+/// no longer stores. Unreadable GitLab instance or relay rows are logged and skipped.
 fn reported_pools(
     txn: &redb::WriteTransaction,
 ) -> Result<BTreeMap<(String, u64), BTreeSet<String>>> {
@@ -780,7 +780,8 @@ mod tests {
         assert_eq!(note.shared.len(), 1, "{note:?}");
     }
 
-    /// Enroll relay `key` of gitlab `gl` reporting `runners`: name, GitLab ID and pool.
+    /// Enroll relay `key` of gitlab `gl` and store its report as a relay before 0.111 sent it:
+    /// `runners`, each with its name, GitLab ID and pool.
     fn reporting_relay(db: &Db, key: &str, runners: &[(&str, Option<u64>, &str)]) {
         use vk_hub_proto::gitlab::{Inventory, Runner, Server};
         let (token, _) = db
@@ -798,19 +799,6 @@ mod tests {
         else {
             panic!("not enrolled");
         };
-        let runners = runners
-            .iter()
-            .map(|&(name, id, pool)| {
-                let mut runner = Runner {
-                    name: name.into(),
-                    runner_id: id,
-                    verified: true,
-                    ..Runner::default()
-                };
-                runner.placement.pool = pool.into();
-                runner
-            })
-            .collect();
         let inventory = Inventory {
             hostname,
             concurrent: 4,
@@ -818,11 +806,24 @@ mod tests {
                 url: "https://gitlab.example.com".into(),
                 ..Server::default()
             },
-            runners,
+            runners: (runners.iter())
+                .map(|&(name, id, _)| Runner {
+                    name: name.into(),
+                    runner_id: id,
+                    verified: true,
+                    ..Runner::default()
+                })
+                .collect(),
             ..Inventory::default()
         };
         db.record_relay(&id, crate::store::RelayWrite::Inventory(inventory), 1)
             .unwrap();
+        // As a relay of before 0.111 reported it: each runner with its pool.
+        let mut row = serde_json::to_value(db.relay(&id).unwrap().unwrap()).unwrap();
+        for (i, &(_, _, pool)) in runners.iter().enumerate() {
+            row["inventory"]["runners"][i]["placement"]["pool"] = serde_json::json!(pool);
+        }
+        db.set_raw_relay(&id, &serde_json::to_vec(&row).unwrap());
     }
 
     /// On the first start of a hub whose lanes select pools, each runner lane selecting nothing

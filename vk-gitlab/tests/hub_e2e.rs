@@ -23,11 +23,9 @@ use vk_hub_proto::client::{AdmissionOutcome, CancelRequest, ErrorCode};
 use vk_hub_proto::job::JobSpec;
 use vk_peer::identity::Identity;
 
-fn p1() -> Placement {
-    Placement {
-        pool: "p1".to_owned(),
-        ..Default::default()
-    }
+/// A relay's placement: no pool, its runner's lane on the hub placing its work.
+fn placement() -> Placement {
+    Placement::default()
 }
 
 fn spec_for(h: &Harness, id: i64) -> JobSpec {
@@ -63,7 +61,7 @@ fn record(h: &Harness, id: i64, phase: Phase, hub_job: Option<String>) -> JobRec
         failure_reasons: vec![],
         debug_trace: false,
         timestamps: true,
-        placement: p1(),
+        placement: placement(),
         spec: (phase == Phase::Taken).then(|| spec_for(h, id)),
     }
 }
@@ -75,7 +73,7 @@ async fn submitted(h: &Harness, id: i64, reservation: Option<String>) -> String 
             request_id: request_id(id),
             runner: Some("ci".into()),
             admission: None,
-            placement: p1(),
+            placement: placement(),
             reservation,
             place_within: Duration::from_secs(1),
             gitlab_job: id,
@@ -102,13 +100,13 @@ fn records(path: &Path) -> Vec<JobRecord> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_ticket_releases_a_grant_whose_response_was_lost() {
     let h = Harness::unstarted(2, Via::Http).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     let (client, session) = support::gl::client(&h, HubRetry::default());
     let QueueAnswer::Ticket(ticket) = client
         .queue(
             "r1",
             &request_id(99),
-            &p1(),
+            &placement(),
             Duration::from_secs(10),
             Duration::ZERO,
         )
@@ -160,8 +158,7 @@ async fn prepared_state_reports_held_admissions_before_the_session() {
 async fn queued_runner_holds_no_slot_and_grant_is_claimed_and_reported() {
     const OTHER: &str = "glrt-other-token";
     let mut h = Harness::unstarted(1, Via::Http).await;
-    h.runners = runner_toml("r1", TOKEN, "")
-        + &runner_toml("r2", OTHER, "").replace("pool = \"p1\"", "pool = \"p2\"");
+    h.runners = runner_toml("r1", TOKEN, "") + &runner_toml("r2", OTHER, "");
     h.gl.push_job_for(OTHER, job_json(301));
     h.daemon = h.spawn_daemon();
     let fake_hub = h.http_hub.as_ref().unwrap();
@@ -179,7 +176,7 @@ async fn queued_runner_holds_no_slot_and_grant_is_claimed_and_reported() {
     })
     .await;
     assert_eq!(h.job_requests(), 0);
-    h.hub.set_slots("p2", 1);
+    h.hub.set_slots("r2", 1);
     let (job, _) = h.accepted_job(1).await;
     eventually("grant claim and job outcome", || {
         let requests = fake_hub.requests.lock().unwrap();
@@ -248,7 +245,7 @@ async fn shutdown_recovers_and_cancels_a_ticket_when_queue_answer_is_lost() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_gitlab_answer_reports_empty_and_releases_grant() {
     let h = Harness::start(1, Via::Http).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     let fake_hub = h.http_hub.as_ref().unwrap();
     eventually("empty outcome", || {
         fake_hub.requests.lock().unwrap().iter().any(|r| {
@@ -268,7 +265,7 @@ async fn hub_503s_are_retried_after_retry_after() {
     let h = Harness::start(2, Via::Http).await;
     let fake_hub = h.http_hub.as_ref().unwrap();
     fake_hub.fail_next(2, "/v1/reservations", 503, ErrorCode::Unavailable, Some(1));
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(30));
     let started = std::time::Instant::now();
     let (hub_id, _) = h.accepted_job(1).await;
@@ -318,7 +315,7 @@ async fn a_queue_request_with_no_answer_is_sent_again_under_its_id() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_daemon_resumes_a_running_job() {
     let mut h = Harness::start(2, Via::Http).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(31));
     let (hub_id, _) = h.accepted_job(1).await;
     let first = "first half\n";
@@ -385,7 +382,7 @@ async fn a_job_taken_but_not_submitted_is_submitted_with_the_same_request_id() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_taken_job_the_hub_already_has_is_attached_to() {
     let mut h = Harness::unstarted(2, Via::Http).await;
-    h.hub.set_slots("p1", 2);
+    h.hub.set_slots("r1", 2);
     // Submitted on its reservation before the daemon died, unrecorded.
     let reservation = "cd".repeat(16);
     let hub_id = submitted(&h, 37, Some(reservation.clone())).await;
@@ -421,7 +418,7 @@ async fn a_legacy_submission_is_replayed_without_a_runner_name() {
             request_id: request_id(47),
             runner: None,
             admission: None,
-            placement: p1(),
+            placement: placement(),
             reservation: None,
             place_within: Duration::from_secs(1),
             gitlab_job: 47,
@@ -461,7 +458,7 @@ async fn a_legacy_submission_is_replayed_without_a_runner_name() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lagging_trace_offset_is_corrected_by_gitlab() {
     let mut h = Harness::start(2, Via::Http).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(38));
     let (hub_id, _) = h.accepted_job(1).await;
     let (first, more, last) = ("first half\n", "more\n", "second half\n");
@@ -517,7 +514,7 @@ async fn a_committed_job_the_hub_lost_fails() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reported_jobs_are_settled_on_restart() {
     let mut h = Harness::unstarted(2, Via::Http).await;
-    h.hub.set_slots("p1", 2);
+    h.hub.set_slots("r1", 2);
     let done = submitted(&h, 41, None).await;
     h.hub.accept(&done);
     h.hub.finish(&done, None, None);
@@ -559,7 +556,7 @@ async fn reported_jobs_are_settled_on_restart() {
 async fn a_refused_runner_still_resumes_its_jobs() {
     let mut h = Harness::unstarted(2, Via::Http).await;
     *h.gl.verify_refused.lock().unwrap() = true;
-    h.hub.set_slots("p1", 2);
+    h.hub.set_slots("r1", 2);
     let hub_id = submitted(&h, 43, None).await;
     h.hub.accept(&hub_id);
     put(
@@ -582,7 +579,7 @@ async fn every_runners_resumed_jobs_come_before_any_request() {
     const OTHER: &str = "glrt-other-token";
     let mut h = Harness::unstarted(1, Via::Http).await;
     h.runners = runner_toml("r1", TOKEN, "") + &runner_toml("r2", OTHER, "");
-    h.hub.set_slots("p1", 5);
+    h.hub.set_slots("r1", 5);
     let first = submitted(&h, 45, None).await;
     let second = submitted(&h, 46, None).await;
     h.hub.accept(&first);
@@ -641,7 +638,7 @@ async fn a_submission_without_an_answer_is_canceled_on_restart() {
     let fake_hub = h.http_hub.as_ref().unwrap();
     // Unanswered past place_within: the hub may or may not have the job.
     fake_hub.fail_next(1000, "/v1/jobs", 503, ErrorCode::Unavailable, None);
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(49));
     let fin = h.final_update(49).await;
     assert_eq!(fin["failure_reason"], "runner_system_failure");
@@ -685,7 +682,7 @@ async fn a_submission_is_retried_until_place_within() {
     let fake_hub = h.http_hub.as_ref().unwrap();
     // More 503s than the other calls' five attempts, well within place_within.
     fake_hub.fail_next(6, "/v1/jobs", 503, ErrorCode::Unavailable, None);
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(33));
     let (hub_id, _) = h.accepted_job(1).await;
     assert!(fake_hub.requests_to("/v1/jobs") >= 7);
@@ -697,7 +694,7 @@ async fn a_submission_is_retried_until_place_within() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_jobs_hold_their_slots() {
     let mut h = Harness::start(2, Via::Http).await;
-    h.hub.set_slots("p1", 5);
+    h.hub.set_slots("r1", 5);
     h.gl.push_job(job_json(34));
     h.gl.push_job(job_json(35));
     // Taken one after the other, but submitted by tasks of their own, in either order.
@@ -740,7 +737,7 @@ async fn hub_requests_ride_the_sessions_connection_unsigned() {
     let fake_hub = h.http_hub.as_ref().unwrap();
     fake_hub.fail_next(1, "/v1/jobs", 503, ErrorCode::Unavailable, None);
     h.daemon = h.spawn_daemon();
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(50));
     let (hub_id, _) = h.accepted_job(1).await;
     h.hub.finish(&hub_id, None, None);
@@ -810,7 +807,7 @@ async fn an_outcome_the_hub_did_not_take_is_reported_again() {
         None,
     );
     h.daemon = h.spawn_daemon();
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     let fake_hub = h.http_hub.as_ref().unwrap();
     eventually("the first admission's outcome taken", || {
         first_admission(&h)
@@ -833,7 +830,7 @@ async fn an_outcome_the_hub_refuses_as_conflicting_is_dropped() {
         None,
     );
     h.daemon = h.spawn_daemon();
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     let fake_hub = h.http_hub.as_ref().unwrap();
     // Later admissions' outcomes are taken, and the refused one is not reported again.
     eventually("later admissions' outcomes taken", || {
@@ -859,7 +856,7 @@ async fn a_grant_whose_claim_failed_is_given_back() {
         None,
     );
     h.daemon = h.spawn_daemon();
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     let fake_hub = h.http_hub.as_ref().unwrap();
     eventually("the unclaimed grant returned", || {
         first_admission(&h)
@@ -879,7 +876,7 @@ async fn a_job_the_hub_refuses_leaves_its_admission_empty() {
     h.daemon = h.spawn_daemon();
     let fake_hub = h.http_hub.as_ref().unwrap();
     fake_hub.fail_next(1, "/v1/jobs", 403, ErrorCode::Forbidden, None);
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(40));
     assert_eq!(h.final_update(40).await["state"], "failed");
     let admission = first_admission(&h).unwrap();
@@ -896,7 +893,7 @@ async fn a_job_the_hub_refuses_leaves_its_admission_empty() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_relay_submits_under_the_admission_it_held() {
     let mut h = Harness::unstarted(2, Via::Http).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     let admission = "ad".repeat(16);
     // Claimed before the relay died, its job taken but not submitted.
     h.http_hub.as_ref().unwrap().hold_admission(&admission);
@@ -934,7 +931,7 @@ fn job_requests(h: &Harness, hub_id: &str, what: &str) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_settle_the_hub_did_not_take_is_retried() {
     let h = Harness::start(2, Via::Http).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(60));
     let (hub_id, _) = h.accepted_job(1).await;
     let fake_hub = h.http_hub.as_ref().unwrap();
@@ -957,7 +954,7 @@ async fn a_settle_the_hub_did_not_take_is_retried() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_settle_of_a_job_the_hub_does_not_have_is_not_retried() {
     let h = Harness::start(2, Via::Http).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(61));
     let (hub_id, _) = h.accepted_job(1).await;
     let fake_hub = h.http_hub.as_ref().unwrap();
@@ -973,7 +970,7 @@ async fn a_settle_of_a_job_the_hub_does_not_have_is_not_retried() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_malformed_settle_is_not_retried() {
     let h = Harness::start(2, Via::Http).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(58));
     let (hub_id, _) = h.accepted_job(1).await;
     let fake_hub = h.http_hub.as_ref().unwrap();
@@ -996,7 +993,7 @@ async fn a_malformed_settle_is_not_retried() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_settle_of_a_job_still_running_is_sent_again_until_it_ends() {
     let h = Harness::start(2, Via::Http).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(59));
     let (hub_id, _) = h.accepted_job(1).await;
     // GitLab ends the job; its node does not stop it within the settle wait.
@@ -1030,7 +1027,7 @@ async fn a_settle_of_a_job_still_running_is_sent_again_until_it_ends() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stopping_relay_leaves_an_unsettled_job_to_its_next_start() {
     let mut h = Harness::start(2, Via::Http).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(62));
     let (hub_id, _) = h.accepted_job(1).await;
     h.http_hub.as_ref().unwrap().fail_next_ending(
@@ -1084,7 +1081,7 @@ fn cancels_asking(h: &Harness, hub_id: &str, mode: CancelMode) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_graceful_cancel_the_hub_did_not_take_is_sent_again() {
     let h = Harness::start(2, Via::Http).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(63));
     let (hub_id, _) = h.accepted_job(1).await;
     let fake_hub = h.http_hub.as_ref().unwrap();
@@ -1138,7 +1135,7 @@ async fn a_graceful_cancel_the_hub_did_not_take_is_sent_again() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_immediate_cancel_replaces_a_graceful_one_not_taken() {
     let h = Harness::start(2, Via::Http).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(64));
     let (hub_id, _) = h.accepted_job(1).await;
     let fake_hub = h.http_hub.as_ref().unwrap();
@@ -1194,7 +1191,7 @@ async fn a_job_not_placed_in_time_is_canceled_until_the_hub_takes_it() {
     // Room for the cut cancels before the job's settle wait ends.
     h.options.hub.settle_wait = Duration::from_secs(10);
     h.daemon = h.spawn_daemon();
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.http_hub.as_ref().unwrap().fail_next_ending(
         8,
         "/v1/jobs/",
@@ -1234,7 +1231,7 @@ async fn an_immediate_cancel_the_hub_did_not_take_is_sent_again() {
     // Room for the cut cancels before the job's settle wait ends.
     h.options.hub.settle_wait = Duration::from_secs(10);
     h.daemon = h.spawn_daemon();
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(66));
     let (hub_id, _) = h.accepted_job(1).await;
     h.http_hub.as_ref().unwrap().fail_next_ending(
@@ -1269,7 +1266,7 @@ async fn an_immediate_cancel_the_hub_did_not_take_is_sent_again() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_of_a_job_the_hub_does_not_have_is_not_retried() {
     let h = Harness::start(2, Via::Http).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(67));
     let (hub_id, _) = h.accepted_job(1).await;
     h.http_hub.as_ref().unwrap().fail_next_ending(

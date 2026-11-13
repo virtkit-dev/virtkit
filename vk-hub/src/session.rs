@@ -60,19 +60,20 @@ const ACCESS_RETRY: Duration = Duration::from_secs(60);
 /// that stopped taking nodes' tokens tells no session.
 const ACCESS_RECHECK: Duration = Duration::from_secs(5 * 60);
 
-/// The versions of a relay's session over HTTP/1.1: every one but
-/// [`CONNECTION`](vk_hub_proto::gitlab::CONNECTION), which only HTTP/2 carries.
+/// The versions of a relay's session over HTTP/1.1: those below
+/// [`CONNECTION`](vk_hub_proto::gitlab::CONNECTION), which only HTTP/2 carries, as every later
+/// one.
 pub(crate) const RELAY_HTTP1: VersionRange = VersionRange {
     min: vk_hub_proto::gitlab::PROTOCOL.min,
     max: vk_hub_proto::gitlab::RUNNERS,
 };
 
-/// The version of a relay's session over its HTTP/2 connection: that one alone, so a relay there
+/// The versions of a relay's session over its HTTP/2 connection: those alone, so a relay there
 /// speaks version 5's notices instead of long polls, and one served unsigned has authenticated
 /// its connection.
 pub(crate) const RELAY_HTTP2: VersionRange = VersionRange {
     min: vk_hub_proto::gitlab::CONNECTION,
-    max: vk_hub_proto::gitlab::CONNECTION,
+    max: vk_hub_proto::gitlab::LANES,
 };
 
 /// What a node removed from the hub is told.

@@ -1,6 +1,6 @@
 //! The configuration file: a subset of gitlab-runner's `config.toml`, with the same key
-//! names where the setting is the same, plus each runner's placement on the fleet (the
-//! pool, node labels and envelope its jobs get; see `docs/gitlab-dispatch.md`).
+//! names where the setting is the same, plus each runner's node labels and envelope.
+//! The runner's lane on the hub selects where jobs run; see `docs/gitlab-dispatch.md`.
 //!
 //! ```toml
 //! concurrent = 8            # jobs at once, over all runners (at most 128)
@@ -14,7 +14,6 @@
 //! [[runners]]
 //! name = "ci"
 //! token_file = "/etc/vk-gitlab/runner-ci.token"
-//! pool = "ci"
 //! labels = ["large-memory"]
 //! envelope = { mem = "16G", cpus = 8, disk = "16G" }
 //! limit = 4                 # jobs at once for this runner (0 = no limit)
@@ -34,6 +33,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use vk_hub_proto::gitlab::RunnerPlacement;
 
 use crate::api::api_base_url;
 use crate::secret::Secret;
@@ -147,9 +147,10 @@ pub struct RunnerConfig {
     pub tls_cert_file: Option<PathBuf>,
     #[serde(rename = "tls-key-file", default)]
     pub tls_key_file: Option<PathBuf>,
-    /// The hub pool this runner's jobs go to. Default `default`.
-    #[serde(default = "default_pool")]
-    pub pool: String,
+    /// Legacy pool from before 0.111, accepted with a warning and ignored so old configs load.
+    /// The runner's lane on the hub selects where jobs run.
+    #[serde(default)]
+    pool: Option<String>,
     /// Labels a node must declare to take this runner's jobs; non-empty and distinct.
     #[serde(default)]
     pub labels: Vec<String>,
@@ -214,10 +215,6 @@ pub fn valid_name(name: &str) -> bool {
         && !name.starts_with('.')
 }
 
-fn default_pool() -> String {
-    "default".to_owned()
-}
-
 /// `envelope = { mem = "16G", cpus = 8, disk = "16G" }`: sizes as a number of bytes or with
 /// a `K`, `M`, `G` or `T` suffix (powers of 1024).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -272,7 +269,6 @@ impl std::fmt::Debug for RunnerConfig {
         f.debug_struct("RunnerConfig")
             .field("name", &self.name)
             .field("token", &self.resolved_token)
-            .field("pool", &self.pool)
             .finish_non_exhaustive()
     }
 }
@@ -283,7 +279,7 @@ impl RunnerConfig {
     pub fn from_hub(
         name: &str,
         token: &str,
-        placement: &crate::dispatch::Placement,
+        placement: &RunnerPlacement,
         limit: Option<u32>,
         request_concurrency: u32,
         hub: HubOrigin,
@@ -295,7 +291,7 @@ impl RunnerConfig {
             tls_ca_file: None,
             tls_cert_file: None,
             tls_key_file: None,
-            pool: placement.pool.clone(),
+            pool: None,
             labels: placement.labels.clone(),
             envelope: EnvelopeConfig {
                 mem: format!("{}M", placement.envelope.mem_mib),
@@ -330,8 +326,12 @@ impl RunnerConfig {
             bail!("{which}: request_concurrency exceeds the hub's admission limit");
         }
         self.envelope.envelope().with_context(|| which.to_owned())?;
-        if self.pool.is_empty() {
-            bail!("{which}: pool must not be empty");
+        if let Some(pool) = self.pool.take() {
+            log::warn!(
+                runner = self.name.as_str(),
+                pool = pool.as_str();
+                "`pool` is ignored since 0.111: the runner's lane on the hub selects where its jobs run; drop it from the config"
+            );
         }
         let mut labels = HashSet::new();
         for l in &self.labels {
@@ -353,10 +353,20 @@ impl RunnerConfig {
         &self.resolved_token
     }
 
-    /// Where this runner's jobs go on the fleet.
+    /// Node requirements for the hub's client API. Omits the pool: the runner's lane selects
+    /// where jobs run.
     pub fn placement(&self) -> crate::dispatch::Placement {
+        let RunnerPlacement { labels, envelope } = self.runner_placement();
         crate::dispatch::Placement {
-            pool: self.pool.clone(),
+            pool: String::new(),
+            labels,
+            envelope,
+        }
+    }
+
+    /// What this runner's jobs ask of a node, as the relay reports it.
+    pub fn runner_placement(&self) -> RunnerPlacement {
+        RunnerPlacement {
             labels: self.labels.clone(),
             // Validated at load.
             envelope: self.envelope.envelope().unwrap_or_default(),
@@ -566,7 +576,6 @@ mod tests {
         let r = &cfg.runners[0];
         assert_eq!(r.token().expose(), "glrt-t1_abcdefghijklmnop");
         assert_eq!(r.name, "abcdefghi");
-        assert_eq!(r.pool, "default");
         assert_eq!(r.request_concurrency(), 1);
         assert_eq!(r.output_limit_bytes(), 4 * 1024 * 1024);
         assert_eq!(r.final_update_retry_limit(), 10);
@@ -644,7 +653,9 @@ mod tests {
         );
         assert_eq!(cfg.runner_check_interval(r), Duration::from_secs(1));
         assert_eq!(r.output_limit_bytes(), 100 * 1024);
-        let p = r.placement();
+        // The pool of a config from before 0.111 is read and ignored.
+        assert!(r.pool.is_none());
+        let p = r.runner_placement();
         assert_eq!(p.labels, ["large-memory"]);
         assert_eq!(p.envelope.mem_mib, 16 * 1024);
         assert_eq!(p.envelope.cpus, 8);

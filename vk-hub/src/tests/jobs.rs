@@ -34,7 +34,7 @@ mod capacity;
 mod capacity_placement;
 mod capacity_recovery;
 mod handover;
-mod relay_conn;
+pub(super) mod relay_conn;
 
 const V3: VersionRange = VersionRange { min: 1, max: JOBS };
 const V2: VersionRange = VersionRange { min: 1, max: 2 };
@@ -128,9 +128,18 @@ fn envelope() -> Envelope {
     }
 }
 
+/// What an API key's job asks: pool `ci`, label `big`.
 fn placement() -> Placement {
     Placement {
         pool: "ci".into(),
+        labels: vec!["big".into()],
+        envelope: envelope(),
+    }
+}
+
+/// What the relay's runner asks of a node: label `big`, [`envelope`].
+fn runner_placement() -> vk_hub_proto::gitlab::RunnerPlacement {
+    vk_hub_proto::gitlab::RunnerPlacement {
         labels: vec!["big".into()],
         envelope: envelope(),
     }
@@ -208,7 +217,7 @@ fn enrolled_key(hub: &Hub) -> String {
         runners: vec![vk_hub_proto::gitlab::Runner {
             name: "test".into(),
             runner_id: Some(42),
-            placement: placement(),
+            placement: runner_placement(),
             limit: None,
             request_concurrency: 1,
             verified: true,

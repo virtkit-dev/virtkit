@@ -890,8 +890,9 @@ arriving after its reservation ended — the node lost, or its lease out — is 
 within a bound, and otherwise fails as `runner_system_failure`.
 
 **Placement.** GitLab's job response does not carry the job's tags, and tags already decide
-which runners may take a job, so a runner maps to one placement: a hub pool, node labels and
-an envelope, in `vk-gitlab`'s configuration, which it reports to the hub. An enrolled relay is
+which runners may take a job, so a runner maps to one placement: node labels and an envelope
+in `vk-gitlab`'s configuration, which it reports to the hub, and the pools and nodes its lane
+on the hub selects. An enrolled relay is
 trusted as a node is: it already holds the runner tokens and sees every job's secrets, so the
 hub sets it no ceiling; what it asks the operator is only what is new, a GitLab server or a
 project not yet approved ([GitLab relay enrollment](gitlab-relay-enrollment.md)). Services run

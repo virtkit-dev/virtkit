@@ -25,11 +25,9 @@ use vk_hub_proto::gitlab::ServerState;
 use vk_hub_proto::job::JobSpec;
 use vk_peer::identity::Identity;
 
-fn p1() -> Placement {
-    Placement {
-        pool: "p1".to_owned(),
-        ..Default::default()
-    }
+/// A relay's placement: no pool, its runner's lane on the hub placing its work.
+fn placement() -> Placement {
+    Placement::default()
 }
 
 /// What the hub's listener offers a relay over TLS.
@@ -74,7 +72,7 @@ impl Relay {
         let cfg = Config::parse(
             &format!(
                 "state_dir = \"{}\"\n[gitlab]\nurl = \"https://gitlab.example.com\"\n\
-                 [[runners]]\nname = \"r1\"\ntoken = \"glrt-x\"\npool = \"p1\"\n",
+                 [[runners]]\nname = \"r1\"\ntoken = \"glrt-x\"\n",
                 state.display()
             ),
             Path::new("/"),
@@ -103,10 +101,10 @@ impl Drop for Relay {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_session_and_requests_share_one_connection() {
     let dispatcher = FakeDispatcher::new();
-    dispatcher.set_slots("p1", 8);
+    dispatcher.set_slots("r1", 8);
     let hub = FakeHub::start_tls(dispatcher.clone(), RELAY_OR_HTTP1).await;
     let relay = Relay::start(enroll(&hub, &hub.url, "conn-shared"));
-    let placement = p1();
+    let placement = placement();
     // Sent before the session is up, answered once it is.
     let answers = within(
         "the capacity",
@@ -127,7 +125,7 @@ async fn the_session_and_requests_share_one_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_ticket_told_of_before_it_is_known_is_fetched_at_once() {
     let dispatcher = FakeDispatcher::new();
-    dispatcher.set_slots("p1", 1);
+    dispatcher.set_slots("r1", 1);
     let hub = FakeHub::start(dispatcher.clone()).await;
     let relay = Relay::start(enroll(&hub, &hub.url, "conn-early"));
     // Granted, and told of, before the relay has the ticket's answer.
@@ -137,7 +135,7 @@ async fn a_ticket_told_of_before_it_is_known_is_fetched_at_once() {
         relay.client.queue(
             "r1",
             &"1".repeat(32),
-            &p1(),
+            &placement(),
             Duration::from_secs(30),
             Duration::ZERO,
         ),
@@ -163,7 +161,7 @@ async fn a_ticket_told_of_before_it_is_known_is_fetched_at_once() {
         .queue(
             "r1",
             &"2".repeat(32),
-            &p1(),
+            &placement(),
             Duration::from_secs(30),
             Duration::ZERO,
         )
@@ -188,12 +186,14 @@ async fn a_ticket_told_of_before_it_is_known_is_fetched_at_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lost_connection_is_dialed_again_with_a_new_session() {
     let dispatcher = FakeDispatcher::new();
-    dispatcher.set_slots("p1", 1);
+    dispatcher.set_slots("r1", 1);
     let hub = FakeHub::start_tls(dispatcher.clone(), RELAY_OR_HTTP1).await;
     let relay = Relay::start(enroll(&hub, &hub.url, "conn-lost"));
     within(
         "the capacity",
-        relay.client.capacity("r1", &p1(), None, Duration::ZERO),
+        relay
+            .client
+            .capacity("r1", &placement(), None, Duration::ZERO),
     )
     .await
     .unwrap();
@@ -201,7 +201,9 @@ async fn a_lost_connection_is_dialed_again_with_a_new_session() {
     // A request while the relay redials waits for its new session.
     within(
         "the capacity",
-        relay.client.capacity("r1", &p1(), None, Duration::ZERO),
+        relay
+            .client
+            .capacity("r1", &placement(), None, Duration::ZERO),
     )
     .await
     .unwrap();
@@ -216,7 +218,9 @@ async fn a_lost_connection_is_dialed_again_with_a_new_session() {
     );
     within(
         "the capacity",
-        relay.client.capacity("r1", &p1(), None, Duration::ZERO),
+        relay
+            .client
+            .capacity("r1", &placement(), None, Duration::ZERO),
     )
     .await
     .unwrap();
@@ -228,7 +232,7 @@ async fn a_lost_connection_is_dialed_again_with_a_new_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_job_at_a_lower_revision_after_a_new_session_is_waited_on() {
     let dispatcher = FakeDispatcher::new();
-    dispatcher.set_slots("p1", 1);
+    dispatcher.set_slots("r1", 1);
     let hub = FakeHub::start(dispatcher.clone()).await;
     let relay = Relay::start(enroll(&hub, &hub.url, "conn-rewound"));
     let client = &relay.client;
@@ -238,7 +242,7 @@ async fn a_job_at_a_lower_revision_after_a_new_session_is_waited_on() {
             request_id: "1".repeat(32),
             runner: Some("r1".to_owned()),
             admission: None,
-            placement: p1(),
+            placement: placement(),
             reservation: None,
             place_within: Duration::from_secs(60),
             gitlab_job: 1,
@@ -362,7 +366,7 @@ async fn the_session_outlives_a_link_saturated_by_outputs_and_submissions() {
     const JOBS: i64 = 8;
     const OUTPUT: usize = 3 << 19;
     let dispatcher = FakeDispatcher::new();
-    dispatcher.set_slots("p1", 64);
+    dispatcher.set_slots("r1", 64);
     let hub = FakeHub::start(dispatcher.clone()).await;
     let upstream = hub.url.trim_start_matches("http://").parse().unwrap();
     // 4 MiB in flight takes 1.3 s of the session's 3 s silence limit.
@@ -375,7 +379,7 @@ async fn the_session_outlives_a_link_saturated_by_outputs_and_submissions() {
                 request_id: format!("{id:032x}"),
                 runner: Some("r1".to_owned()),
                 admission: None,
-                placement: p1(),
+                placement: placement(),
                 reservation: None,
                 place_within: Duration::from_secs(60),
                 gitlab_job: id,

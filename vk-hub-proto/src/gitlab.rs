@@ -46,11 +46,15 @@
 //! fields an older hub ignores. A runner command that fails is answered with a
 //! [`RunnerFailure`]'s code, never GitLab's text. Version [`CONNECTION`] carries the relay's
 //! session and its client API requests on one HTTP/2 connection, and adds the hub's notices
-//! [`HubRelayMsg::Ticket`] and [`HubRelayMsg::Job`], sent only in a session at it.
+//! [`HubRelayMsg::Ticket`] and [`HubRelayMsg::Job`], sent in sessions at it or later.
+//! Version [`LANES`] drops the pool from [`RunnerPlacement`], leaving labels and an envelope;
+//! the runner's lane on the hub selects where work runs. The hub ignores pools reported by
+//! older relays. [`Operation::AddRunner`] requires [`LANES`] or later because older relays
+//! require a pool in its placement.
 
 use serde::{Deserialize, Serialize};
 
-use crate::client::Placement;
+use crate::job::Envelope;
 use crate::{
     CommandAck, Outcome, RefusalCode, SHA256_LEN, UpdateProgress, VersionRange, display_safe, part,
     valid_id, valid_sha256,
@@ -67,13 +71,13 @@ pub const SESSION_PATH: &str = "/v1/gitlab/session";
 pub const ALPN: &[u8] = b"vk-relay/1";
 
 /// The protocol versions of a relay's session.
-pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 5 };
+pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 6 };
 
-/// The relay speaks version [`CONNECTION`] alone: it refuses an older hub rather than fall
-/// back to signed requests on connections of their own.
+/// The relay speaks version [`LANES`] alone: it refuses an older hub rather than fall back to
+/// signed requests on connections of their own, or to a pool of its own.
 pub const RELAY_PROTOCOL: VersionRange = VersionRange {
-    min: CONNECTION,
-    max: CONNECTION,
+    min: LANES,
+    max: LANES,
 };
 
 /// The version the hub takes new work from: admission-aware scheduling. A relay below it
@@ -84,14 +88,18 @@ pub const RELAY_WORK: u32 = 2;
 /// [`HubRelayMsg::Recorded`] are sent only in a session at it or later.
 pub const UPDATES: u32 = 3;
 
-/// The version that adds runners added on the hub: [`Operation::AddRunner`] and
-/// [`Operation::RemoveRunner`] are sent only in a session at it or later.
+/// The version that adds runners added on the hub: [`Operation::RemoveRunner`] is sent only
+/// in a session at it or later, [`Operation::AddRunner`] only at [`LANES`] or later.
 pub const RUNNERS: u32 = 4;
 
 /// The version that puts a relay's session and its client API requests on one HTTP/2
 /// connection: [`HubRelayMsg::Ticket`] and [`HubRelayMsg::Job`] are sent only in a session
-/// at it.
+/// at it or later.
 pub const CONNECTION: u32 = 5;
+
+/// The version whose runners carry no pool, their lanes on the hub placing their work:
+/// [`Operation::AddRunner`] is sent only in a session at it or later.
+pub const LANES: u32 = 6;
 
 /// The most runners an [`Inventory`], a [`Heartbeat`] or a [`Report`] keeps once made
 /// display-safe.
@@ -207,7 +215,17 @@ pub struct Server {
     pub version: Option<String>,
 }
 
-/// One of a relay's runners: a runner token, where its jobs go, and how many at once.
+/// What a runner's jobs ask of a node: the labels it must carry and the envelope each job
+/// takes. Where they go is the runner's lane on the hub. A relay below [`LANES`] also reports
+/// a `pool`, which is ignored.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerPlacement {
+    #[serde(default)]
+    pub labels: Vec<String>,
+    pub envelope: Envelope,
+}
+
+/// A relay's runner metadata, node requirements and concurrency settings; never its token.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Runner {
     /// Its name in the relay's config.
@@ -215,8 +233,8 @@ pub struct Runner {
     /// GitLab's ID for it, once `verify` gave it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_id: Option<u64>,
-    /// The pool, labels and envelope of each of its jobs.
-    pub placement: Placement,
+    /// The labels and envelope of each of its jobs.
+    pub placement: RunnerPlacement,
     /// How many of its jobs run at once, when limited: the runner's `limit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -281,7 +299,6 @@ impl Inventory {
             r.name = display_safe(&r.name);
             r.command = r.command.take().filter(|c| valid_id(c));
             r.request_concurrency = r.request_concurrency.max(1);
-            r.placement.pool = display_safe(&r.placement.pool);
             r.placement.labels.truncate(MAX_LABELS);
             for l in &mut r.placement.labels {
                 *l = display_safe(l);
@@ -419,14 +436,15 @@ pub enum Operation {
         signature: Option<String>,
     },
     /// Add a runner GitLab created, under `name`, with the settings a `[[runners]]` table
-    /// has. Version [`RUNNERS`].
+    /// has. Version [`RUNNERS`]; sent only at [`LANES`] or later, an older relay reading the
+    /// placement only with a pool.
     AddRunner {
         name: String,
         /// Its runner authentication token (`glrt-…`). Empty, and then absent from the JSON,
         /// only where the hub keeps the command once sent: it never stores the token.
         #[serde(default, skip_serializing_if = "RunnerToken::is_empty")]
         token: RunnerToken,
-        placement: Placement,
+        placement: RunnerPlacement,
         /// The runner's `limit`, when limited.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
@@ -458,7 +476,8 @@ impl Operation {
     pub fn min_version(&self) -> u32 {
         match self {
             Operation::Update { .. } => UPDATES,
-            Operation::AddRunner { .. } | Operation::RemoveRunner { .. } => RUNNERS,
+            Operation::AddRunner { .. } => LANES,
+            Operation::RemoveRunner { .. } => RUNNERS,
         }
     }
 
@@ -658,8 +677,7 @@ mod tests {
         Runner {
             name: "ci".into(),
             runner_id: Some(42),
-            placement: Placement {
-                pool: "ci".into(),
+            placement: RunnerPlacement {
                 labels: vec!["large-memory".into()],
                 envelope: Envelope {
                     mem_mib: 16384,
@@ -692,10 +710,16 @@ mod tests {
                 ..Inventory::default()
             }),
             &format!(
-                r#"{{"type":"inventory","version":"0.96.0","hostname":"ci-relay-1","system_id":"s_0123456789ab","concurrent":16,"server":{{"url":"https://gitlab.example.com","spki_sha256":"{}","version":"18.4.1"}},"runners":[{{"name":"ci","runner_id":42,"placement":{{"pool":"ci","labels":["large-memory"],"envelope":{{"mem_mib":16384,"cpus":8,"disk_bytes":17179869184}}}},"limit":8,"request_concurrency":2,"verified":true}}]}}"#,
+                r#"{{"type":"inventory","version":"0.96.0","hostname":"ci-relay-1","system_id":"s_0123456789ab","concurrent":16,"server":{{"url":"https://gitlab.example.com","spki_sha256":"{}","version":"18.4.1"}},"runners":[{{"name":"ci","runner_id":42,"placement":{{"labels":["large-memory"],"envelope":{{"mem_mib":16384,"cpus":8,"disk_bytes":17179869184}}}},"limit":8,"request_concurrency":2,"verified":true}}]}}"#,
                 "ab".repeat(32)
             ),
         );
+        // A relay below `LANES` reports a pool with each runner, which this reads past.
+        let older: Runner = serde_json::from_str(
+            r#"{"name":"ci","runner_id":42,"placement":{"pool":"ci","labels":["large-memory"],"envelope":{"mem_mib":16384,"cpus":8,"disk_bytes":17179869184}},"limit":8,"request_concurrency":2,"verified":true}"#,
+        )
+        .unwrap();
+        assert_eq!(older, runner());
         pinned(
             &RelayMsg::Heartbeat(Heartbeat {
                 runners: vec![RunnerLoad {
@@ -866,7 +890,7 @@ mod tests {
     /// The runner commands, and the inventory fields they add, keep their JSON.
     #[test]
     fn runner_messages_keep_their_json() {
-        let placement = r#"{"pool":"ci","labels":["large-memory"],"envelope":{"mem_mib":16384,"cpus":8,"disk_bytes":17179869184}}"#;
+        let placement = r#"{"labels":["large-memory"],"envelope":{"mem_mib":16384,"cpus":8,"disk_bytes":17179869184}}"#;
         pinned(
             &HubRelayMsg::Command(Command {
                 id: "c".into(),
@@ -956,18 +980,19 @@ mod tests {
         assert_eq!(update.without_token(), update);
     }
 
-    /// Runner commands need `runners` allowed and version 4; updates `update` and version 3.
+    /// Runner commands need `runners` allowed, a removal version 4 and an addition version 6;
+    /// updates `update` and version 3.
     #[test]
-    fn runner_commands_need_runners_allowed_and_version_4() {
+    fn runner_commands_need_runners_allowed_and_their_version() {
         let remove = Operation::RemoveRunner {
             name: "n".into(),
             runner_id: 1,
             command: "c".into(),
         };
-        for op in [add_runner("t"), remove] {
+        for (op, version) in [(add_runner("t"), LANES), (remove, RUNNERS)] {
             assert_eq!(
                 (op.allowed_by(), op.min_version()),
-                (ALLOW_RUNNERS, RUNNERS)
+                (ALLOW_RUNNERS, version)
             );
         }
         let update = Operation::Update {
@@ -1143,7 +1168,6 @@ mod tests {
     fn an_inventory_is_made_fit_to_show() {
         let mut r = runner();
         r.name = "ci\u{1b}".into();
-        r.placement.pool = "p\n".into();
         r.placement.labels = vec!["l\u{202e}".into(); MAX_LABELS + 1];
         let mut i = Inventory {
             version: "1\u{7}".into(),
@@ -1176,7 +1200,7 @@ mod tests {
         );
         assert_eq!(i.runners.len(), MAX_RUNNERS);
         let r = &i.runners[0];
-        assert_eq!((r.name.as_str(), r.placement.pool.as_str()), ("ci", "p"));
+        assert_eq!(r.name, "ci");
         assert_eq!(r.placement.labels, vec!["l".to_string(); MAX_LABELS]);
 
         let mut i = Inventory {
@@ -1255,18 +1279,22 @@ mod tests {
             runners: vec![load; MAX_RUNNERS],
         });
         assert!(serde_json::to_vec(&msg).unwrap().len() < crate::MAX_MESSAGE);
-        assert_eq!(PROTOCOL.negotiate(RELAY_PROTOCOL), Some(CONNECTION));
+        assert_eq!(PROTOCOL.negotiate(RELAY_PROTOCOL), Some(LANES));
         const { assert!(RELAY_PROTOCOL.min >= RELAY_WORK) };
-        // The relay refuses every hub from before the connection.
+        // The relay refuses hubs whose protocol predates `LANES`.
         assert_eq!(
             VersionRange {
                 min: 1,
-                max: RUNNERS
+                max: CONNECTION
             }
             .negotiate(RELAY_PROTOCOL),
             None
         );
         // The hub still meets a released relay at its highest version.
+        assert_eq!(
+            PROTOCOL.negotiate(VersionRange { min: 5, max: 5 }),
+            Some(CONNECTION)
+        );
         assert_eq!(
             PROTOCOL.negotiate(VersionRange { min: 2, max: 4 }),
             Some(RUNNERS)
