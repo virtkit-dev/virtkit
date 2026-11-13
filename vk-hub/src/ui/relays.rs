@@ -11,7 +11,7 @@ use anyhow::Result;
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use vk_hub_proto::Outcome;
-use vk_hub_proto::client::Placement;
+use vk_hub_proto::gitlab::RunnerPlacement;
 use vk_hub_proto::gitlab::{Operation, RunnerFailure, RunnerToken};
 
 use super::fleet::{self, FleetSite};
@@ -169,7 +169,6 @@ pub(super) async fn action(
 /// What the add-runner form was filled in with, but the token.
 struct RunnerFields {
     name: String,
-    pool: String,
     labels: String,
     envelope: String,
     limit: String,
@@ -181,7 +180,6 @@ impl Default for RunnerFields {
     fn default() -> Self {
         RunnerFields {
             name: String::new(),
-            pool: "default".into(),
             labels: String::new(),
             envelope: crate::DEFAULT_ENVELOPE.into(),
             limit: String::new(),
@@ -195,7 +193,6 @@ impl RunnerFields {
         let get = |name: &str| field(form, name).unwrap_or("").trim().to_string();
         RunnerFields {
             name: get("name"),
-            pool: get("pool"),
             labels: get("labels"),
             envelope: get("envelope"),
             limit: get("limit"),
@@ -216,8 +213,7 @@ impl RunnerFields {
             v => Some(whole("limit", v)?),
         };
         Ok(RunnerSettings {
-            placement: Placement {
-                pool: self.pool.clone(),
+            placement: RunnerPlacement {
                 labels: (self.labels.split(','))
                     .map(str::trim)
                     .filter(|l| !l.is_empty())
@@ -275,7 +271,7 @@ fn runner_form(
             .text(why)
             .raw(".</p>");
     }
-    if let Some(why) = ops::runners_refusal(&relay.row) {
+    if let Some(why) = ops::add_runner_refusal(&relay.row) {
         h.raw("<p class=\"message\">")
             .text(capitalized(&vk_hub_proto::display_safe(&why)))
             .raw(".</p>");
@@ -291,7 +287,6 @@ fn runner_form(
             .raw("<input id=\"runner-token\" type=\"password\" name=\"token\" ")
             .raw("autocomplete=\"off\" spellcheck=\"false\" required placeholder=\"glrt-…\">");
         input(&mut h, "Name", "name", &fields.name, "ci-1");
-        input(&mut h, "Pool", "pool", &fields.pool, "default");
         input(
             &mut h,
             "Labels",
@@ -320,7 +315,7 @@ fn runner_form(
             .raw("<code>_</code> and <code>.</code>. Separate labels with commas. The envelope ")
             .raw("is each job's VM: <code>mem=&lt;size&gt;,cpus=&lt;n&gt;,disk=&lt;size&gt;")
             .raw("</code>. The limit caps its jobs running at once. Its jobs run once a lane ")
-            .raw("maps the runner on <a href=\"")
+            .raw("maps the runner, and selects where they run, on <a href=\"")
             .raw(super::lanes::PATH)
             .raw("\">Lanes</a>.</p></section>");
     }

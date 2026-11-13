@@ -96,7 +96,7 @@ impl RunnerStatus {
             runner: Runner {
                 name: r.name.clone(),
                 runner_id: r.hub.as_ref().map(|h| h.runner_id),
-                placement: r.placement(),
+                placement: r.runner_placement(),
                 limit: (r.limit > 0).then(|| u32::try_from(r.limit).unwrap_or(u32::MAX)),
                 request_concurrency: u32::try_from(r.request_concurrency()).unwrap_or(u32::MAX),
                 verified: false,
@@ -619,7 +619,7 @@ mod tests {
         assert!(e.is::<VersionRefused>() && !e.is::<Permanent>(), "{e:#}");
         let message = e.to_string();
         assert!(
-            message.contains("relay protocol 5") && message.contains("upgrade vk-hub"),
+            message.contains("relay protocol 6") && message.contains("upgrade vk-hub"),
             "{message}"
         );
     }
@@ -654,7 +654,6 @@ mod tests {
             [[runners]]
             name = "ci"
             token = "glrt-x"
-            pool = "ci"
             envelope = { mem = "1G", cpus = 1, disk = "1G" }
         "#,
             std::path::Path::new("."),

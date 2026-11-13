@@ -17,7 +17,7 @@ type Session = vk_peer::session::Ws;
 
 /// One HTTP/2 connection to the hub, as a relay's.
 #[derive(Clone)]
-struct H2 {
+pub(in crate::tests) struct H2 {
     sender: hyper::client::conn::http2::SendRequest<H2Body>,
     authority: String,
 }
@@ -58,7 +58,7 @@ impl H2 {
     }
 
     /// `CONNECT` the relay session: its status, and the stream once answered 200.
-    async fn connect(&self) -> (u16, Option<hyper::upgrade::Upgraded>) {
+    pub(in crate::tests) async fn connect(&self) -> (u16, Option<hyper::upgrade::Upgraded>) {
         let mut req = hyper::Request::builder()
             .method("CONNECT")
             .uri(format!("https://{}{}", self.authority, gl::SESSION_PATH))
@@ -89,7 +89,10 @@ impl H2 {
 
 /// An HTTP/2 connection to `addr`: over TLS offering `alpn`, with the connection's exporter,
 /// or plain with prior knowledge.
-async fn dial_h2(addr: SocketAddr, tls: bool) -> (H2, Option<[u8; TLS_EXPORTER_LEN]>) {
+pub(in crate::tests) async fn dial_h2(
+    addr: SocketAddr,
+    tls: bool,
+) -> (H2, Option<[u8; TLS_EXPORTER_LEN]>) {
     let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
     let (io, exported): (Box<dyn server::Stream>, _) = if tls {
         let stream =

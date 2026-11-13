@@ -67,12 +67,12 @@ pub(crate) const RELAY_HTTP1: VersionRange = VersionRange {
     max: vk_hub_proto::gitlab::RUNNERS,
 };
 
-/// The version of a relay's session over its HTTP/2 connection: that one alone, so a relay there
+/// The versions of a relay's session over its HTTP/2 connection: those alone, so a relay there
 /// speaks version 5's notices instead of long polls, and one served unsigned has authenticated
 /// its connection.
 pub(crate) const RELAY_HTTP2: VersionRange = VersionRange {
     min: vk_hub_proto::gitlab::CONNECTION,
-    max: vk_hub_proto::gitlab::CONNECTION,
+    max: vk_hub_proto::gitlab::LANES,
 };
 
 /// What a node removed from the hub is told.

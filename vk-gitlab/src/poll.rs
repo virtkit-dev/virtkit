@@ -1026,7 +1026,6 @@ async fn request<D: Dispatcher>(shared: Arc<Shared<D>>, runner: Arc<Runner>, ver
     log::info!(
         runner = cfg.name.as_str(),
         token = cfg.token().short().as_str(),
-        pool = cfg.pool.as_str(),
         url = runner.server_url.as_str(),
         request_concurrency = cfg.request_concurrency();
         "Starting runner"

@@ -59,7 +59,6 @@ url = "https://gitlab.example.com"
 [[runners]]
 name = "ci"
 token_file = "/etc/vk-gitlab/runner-ci.token"   # glrt-…
-pool = "ci"
 labels = ["large-memory"]
 envelope = { mem = "16G", cpus = 8, disk = "16G" }
 limit = 8
@@ -78,11 +77,13 @@ what the hub may do to the relay ([Updates](#updates)).
   else; `verify` gives each runner's ID. A token that lists a runner's projects or creates
   runners (`manage_runner`, `create_runner`) can also edit runners or take other runners' jobs,
   which a host reading untrusted traces should not hold.
-- **Placement stays with the runner's token, and is reported.** A runner's pool, labels and
-  envelope go with the tags it was registered with in GitLab; keeping them beside the token
-  keeps one place to change a runner, and the hub needs no placement store, import or sync. The
-  hub shows them. That place is the relay's config, or the relay's runner files for a runner
-  [added on the hub](#runners-added-on-the-hub).
+- **What a runner's jobs ask of a node stays with its token, and is reported.** A runner's
+  labels and envelope go with the tags it was registered with in GitLab; keeping them beside the
+  token keeps one place to change a runner. The hub shows them. That place is the relay's
+  config, or the relay's runner files for a runner [added on the hub](#runners-added-on-the-hub).
+  Where the jobs run — the pools and nodes — is the runner's lane on the hub, the one place an
+  operator sets placement ([capacity arbitration](capacity-arbitration.md)); before 0.111 the
+  runner also named a pool, which a relay of then still reports and the hub ignores.
 
 ## What the relay reports
 
@@ -95,7 +96,8 @@ shares (`vk-peer`: hello, challenge, auth bound to the TLS connection), then sen
   the GitLab server: its URL, the SHA-256 of its TLS certificate's public key (what the operator
   checks when approving it), and its version when known (a runner token cannot ask GitLab for
   it, so usually absent); per runner its name, GitLab runner ID, placement, `limit`,
-  `request_concurrency` (version 2), whether `verify` passed. Never a token;
+  `request_concurrency` (version 2), whether `verify` passed; the placement is the labels and
+  envelope, a `pool` with them from a relay below version 6. Never a token;
 - **heartbeat**: per runner, job requests outstanding, jobs held, the admission of each
   (`request_admissions`, `job_admissions`; version 2), last GitLab answer;
 - **report**: each runner's state (`polling`, `waiting_capacity`, `server_pending`,
@@ -131,10 +133,11 @@ allow = ["update", "runners"]
 Such a relay needs `[gitlab] url` and runs with no runner at all, waiting for one.
 
 **Add.** *Add runner* on a relay's row (GitLab › Overview), or `vk-hub relays runners add <relay>
-<name> --token-file FILE [--pool P] [--label L]… [--envelope mem=16G,cpus=8,disk=16G] [--limit
-N] [--request-concurrency N]`. The form takes the `glrt-` token, a name, and the settings a
+<name> --token-file FILE [--label L]… [--envelope mem=16G,cpus=8,disk=16G] [--limit N]
+[--request-concurrency N]`. The form takes the `glrt-` token, a name, and the settings a
 `[[runners]]` table has, with the same defaults. The hub refuses, before sending anything, a
-relay that does not allow `runners` or speaks a protocol below 4, and a name it reports.
+relay that does not allow `runners` or speaks a protocol below 6 (one below it wants a pool
+with the runner), and a name it reports.
 
 1. The hub issues an `add_runner` command, as it issues an update. Its record holds the name and
    settings; the token is not part of what is stored, logged or shown, and stays in memory, with

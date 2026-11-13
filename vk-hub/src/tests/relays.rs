@@ -12,6 +12,9 @@ use crate::relays;
 use crate::session::RELAY_HTTP1;
 use crate::store::TokenKind;
 
+/// A relay's session on its HTTP/2 connection, as a relay of this release holds it.
+type H2Session = vk_peer::session::Ws;
+
 fn relay_token(hub: &Hub) -> String {
     hub.db
         .create_token_for(
@@ -118,13 +121,86 @@ async fn open_relay_at(
     receive(ws).await
 }
 
-async fn tell(ws: &mut Client, msg: &RelayMsg) {
+/// A relay's session over HTTP/1.1 at version [`RELAY_HTTP1`]'s highest, or over an HTTP/2
+/// connection at [`gl::LANES`], as a relay of this release opens it.
+trait RelayWs:
+    SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error>
+    + StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+    + Unpin
+{
+}
+
+impl<S> RelayWs for S where
+    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin
+{
+}
+
+/// Hello, challenge and auth as a relay at [`gl::LANES`] on an HTTP/2 connection to the plain
+/// listener at `addr`: what the hub answered, and the session.
+async fn open_relay_h2(addr: SocketAddr, id: &str, key: &Ed25519KeyPair) -> (HubMsg, H2Session) {
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    let (h2, _) = super::jobs::relay_conn::dial_h2(addr, false).await;
+    let (status, upgraded) = h2.connect().await;
+    assert_eq!(status, 200);
+    let io: Box<dyn vk_peer::session::Io> =
+        Box::new(hyper_util::rt::TokioIo::new(upgraded.unwrap()));
+    let mut ws = WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+    let ours = vk_hub_proto::VersionRange {
+        min: gl::LANES,
+        max: gl::LANES,
+    };
+    let incarnation = "1".repeat(32);
+    let hello = serde_json::to_string(&hello(id, &incarnation, ours)).unwrap();
+    ws.send(Message::text(hello)).await.unwrap();
+    let HubMsg::Challenge {
+        version,
+        versions,
+        nonce,
+    } = hub_msg(&mut ws).await
+    else {
+        panic!("expected a challenge");
+    };
+    assert_eq!(version, gl::LANES);
+    let nonce = vk_hub_proto::from_hex(&nonce).unwrap();
+    let signature = key.sign(&vk_hub_proto::auth_message(
+        &nonce,
+        id,
+        &incarnation,
+        ours,
+        versions,
+        version,
+        vk_hub_proto::Channel::Plaintext,
+    ));
+    let auth = NodeMsg::Auth {
+        signature: vk_hub_proto::to_hex(signature.as_ref()),
+    };
+    ws.send(Message::text(serde_json::to_string(&auth).unwrap()))
+        .await
+        .unwrap();
+    (hub_msg(&mut ws).await, ws)
+}
+
+/// The next message of the handshake on `ws`.
+async fn hub_msg(ws: &mut impl RelayWs) -> HubMsg {
+    loop {
+        match ws.next().await.unwrap().unwrap() {
+            Message::Text(t) => return serde_json::from_str(t.as_str()).unwrap(),
+            Message::Ping(_) | Message::Pong(_) => {}
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+}
+
+async fn tell(ws: &mut impl RelayWs, msg: &RelayMsg) {
     ws.send(Message::text(serde_json::to_string(msg).unwrap()))
         .await
         .unwrap();
 }
 
-async fn hear(ws: &mut Client) -> HubRelayMsg {
+async fn hear(ws: &mut impl RelayWs) -> HubRelayMsg {
     loop {
         match tokio::time::timeout(Duration::from_secs(10), ws.next())
             .await
@@ -607,8 +683,7 @@ async fn a_relay_is_sent_its_runner_commands_and_the_hub_keeps_no_token() {
     let id = enrolled_relay(addr, &hub, &key).await;
     let url = "https://gitlab.example.com";
     let settings = relays::RunnerSettings {
-        placement: vk_hub_proto::client::Placement {
-            pool: "default".into(),
+        placement: vk_hub_proto::gitlab::RunnerPlacement {
             labels: vec!["big".into()],
             envelope: vk_hub_proto::job::Envelope {
                 mem_mib: 4096,
@@ -656,13 +731,13 @@ async fn a_relay_is_sent_its_runner_commands_and_the_hub_keeps_no_token() {
     assert!(err_of(add("big")).contains("cannot take runners"));
 
     // One whose [hub] allow lacks runners neither; nor a name the relay could not use.
-    let mut ws = dial_relay(addr).await;
+    let mut old = dial_relay(addr).await;
     assert!(matches!(
-        open_relay(&mut ws, &id, &key).await,
+        open_relay(&mut old, &id, &key).await,
         HubMsg::Welcome { .. }
     ));
-    tell(&mut ws, &RelayMsg::Inventory(inventory(url))).await;
-    assert_eq!(hear(&mut ws).await, status(ServerState::Pending, None));
+    tell(&mut old, &RelayMsg::Inventory(inventory(url))).await;
+    assert_eq!(hear(&mut old).await, status(ServerState::Pending, None));
     eventually(|| {
         hub.db
             .relay(&id)
@@ -672,6 +747,20 @@ async fn a_relay_is_sent_its_runner_commands_and_the_hub_keeps_no_token() {
     .await;
     assert!(err_of(add("big")).contains("lacks runners"));
     assert!(err_of(add("../big")).contains("a runner name is"));
+    // One at version 4, allowing runners, reads an added runner only with a pool: none added.
+    tell(&mut old, &RelayMsg::Inventory(allowing(vec![]))).await;
+    tell(&mut old, &RelayMsg::Report(Report::default())).await;
+    eventually(|| {
+        hub.db
+            .relay(&id)
+            .unwrap()
+            .is_some_and(|r| r.inventory.is_some_and(|i| !i.allow.is_empty()))
+    })
+    .await;
+    assert!(err_of(add("big")).contains("update it to add runners"));
+    drop(old);
+    let (welcome, mut ws) = open_relay_h2(addr, &id, &key).await;
+    assert!(matches!(welcome, HubMsg::Welcome { .. }), "{welcome:?}");
     let config = gl::Runner {
         name: "cfg".into(),
         runner_id: Some(7),
@@ -684,12 +773,13 @@ async fn a_relay_is_sent_its_runner_commands_and_the_hub_keeps_no_token() {
         &RelayMsg::Inventory(allowing(vec![config.clone()])),
     )
     .await;
+    assert_eq!(hear(&mut ws).await, status(ServerState::Pending, None));
     tell(&mut ws, &RelayMsg::Report(Report::default())).await;
     eventually(|| {
         hub.db
             .relay(&id)
             .unwrap()
-            .is_some_and(|r| r.report.is_some() && r.inventory.is_some_and(|i| !i.allow.is_empty()))
+            .is_some_and(|r| r.report.is_some() && r.protocol == Some(gl::LANES))
     })
     .await;
     assert!(err_of(add("cfg")).contains("has a runner named cfg already"));
@@ -796,11 +886,9 @@ async fn a_relay_is_sent_its_runner_commands_and_the_hub_keeps_no_token() {
     // A restart loses the token of an add the relay never answered: the next session's first
     // report fails it, and does not send it; the relay answering it after all is believed.
     hub.runner_tokens.forget(&pending.id);
-    let mut ws = dial_relay(addr).await;
-    assert!(matches!(
-        open_relay(&mut ws, &id, &key).await,
-        HubMsg::Welcome { .. }
-    ));
+    drop(ws);
+    let (welcome, mut ws) = open_relay_h2(addr, &id, &key).await;
+    assert!(matches!(welcome, HubMsg::Welcome { .. }), "{welcome:?}");
     tell(&mut ws, &RelayMsg::Inventory(allowing(vec![]))).await;
     assert_eq!(
         hear(&mut ws).await,

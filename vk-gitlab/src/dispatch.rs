@@ -284,7 +284,7 @@ mod fake {
     struct Inner {
         slots: HashMap<String, u32>,
         capacity_revision: u64,
-        /// Reservation ID → pool.
+        /// Reservation ID → runner.
         reservations: HashMap<String, String>,
         next_id: u64,
         jobs: Vec<FakeJob>,
@@ -302,18 +302,21 @@ mod fake {
     }
 
     impl Inner {
-        fn fits(&self, pool: &str) -> u32 {
-            let reserved = self.reservations.values().filter(|p| *p == pool).count();
+        /// `runner`'s room: its slots less its reservations and unfinished jobs, as the hub
+        /// grants a runner's lane.
+        fn fits(&self, runner: &str) -> u32 {
+            let reserved = self.reservations.values().filter(|r| *r == runner).count();
             let running = self
                 .jobs
                 .iter()
                 .filter(|j| {
-                    j.submission.placement.pool == pool && j.view.state != HubJobState::Finished
+                    j.submission.runner.as_deref() == Some(runner)
+                        && j.view.state != HubJobState::Finished
                 })
                 .count();
             let used = u32::try_from(reserved + running).unwrap_or(u32::MAX);
             self.slots
-                .get(pool)
+                .get(runner)
                 .copied()
                 .unwrap_or(0)
                 .saturating_sub(used)
@@ -399,9 +402,9 @@ mod fake {
             }
         }
 
-        /// How many envelopes `pool` has, reservations and unfinished jobs included.
-        pub fn set_slots(&self, pool: &str, slots: u32) {
-            self.change(|i| i.slots.insert(pool.to_owned(), slots));
+        /// How many envelopes `runner` may hold, reservations and unfinished jobs included.
+        pub fn set_slots(&self, runner: &str, slots: u32) {
+            self.change(|i| i.slots.insert(runner.to_owned(), slots));
         }
 
         /// Makes the next submissions fail with `err`.
@@ -591,10 +594,10 @@ mod fake {
             wait: Duration,
         ) -> DispatchResult<Capacity> {
             self.lock().runners.push(runner.to_owned());
-            let pool = placement.pool.clone();
+            let _ = placement;
             let answer = |i: &mut Inner| Capacity {
                 revision: i.capacity_revision,
-                fits: i.fits(&pool),
+                fits: i.fits(runner),
             };
             Ok(self
                 .poll(
@@ -619,12 +622,12 @@ mod fake {
         ) -> DispatchResult<Reservation> {
             self.lock().runners.push(runner.to_owned());
             let id = self.change(|i| {
-                if i.fits(&placement.pool) == 0 {
+                if i.fits(runner) == 0 {
                     return None;
                 }
                 i.next_id += 1;
                 let id = format!("{:032x}", i.next_id);
-                i.reservations.insert(id.clone(), placement.pool.clone());
+                i.reservations.insert(id.clone(), runner.to_owned());
                 i.calls.push(FakeCall::Reserve(id.clone()));
                 Some(id)
             });

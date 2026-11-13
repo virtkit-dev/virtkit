@@ -357,7 +357,7 @@ async fn session(
 ) {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
-    use vk_hub_proto::gitlab::{CONNECTION, HubRelayMsg};
+    use vk_hub_proto::gitlab::{HubRelayMsg, LANES};
     use vk_hub_proto::{HubMsg, NodeMsg, RefusalCode, VersionRange};
 
     async fn text(ws: &mut Ws) -> Option<String> {
@@ -387,12 +387,12 @@ async fn session(
         return;
     };
     let offered = VersionRange {
-        min: CONNECTION,
-        max: CONNECTION,
+        min: LANES,
+        max: LANES,
     };
     let nonce = [9u8; vk_hub_proto::CHALLENGE_LEN];
     let challenge = HubMsg::Challenge {
-        version: CONNECTION,
+        version: LANES,
         versions: offered,
         nonce: vk_hub_proto::to_hex(&nonce),
     };
@@ -410,7 +410,7 @@ async fn session(
         &incarnation,
         versions,
         offered,
-        CONNECTION,
+        LANES,
         match &exported {
             Some(e) => vk_hub_proto::Channel::Tls(e),
             None => vk_hub_proto::Channel::Plaintext,

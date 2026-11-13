@@ -31,6 +31,16 @@ All notable changes to virtkit will be documented in this file.
 - **The hub logs pool changes.** Its journal records who put a node in which pools or took it
   out of every pool, as it does a quarantine or a ceiling; the audit log already did.
 
+### Removed
+
+- **A GitLab runner no longer names a pool.** Its lane on the hub selects where its work runs,
+  so `vk-gitlab`'s `[[runners]]` tables, `vk-hub relays runners add` (no `--pool`), the
+  add-runner form, the relay's report and the Relays and Runners pages carry labels and an
+  envelope alone. A `pool` left in a `vk-gitlab` config is read and ignored, with a warning at
+  start, so a relay the hub updates keeps serving. The relay protocol is now version 6: a hub
+  takes a relay of version 5, ignoring the pool it reports, but adds runners from the hub only
+  to one at 6; a `vk-gitlab` of this release needs a hub of it.
+
 ## [0.110.2] - 2026-11-11
 
 ### Fixed

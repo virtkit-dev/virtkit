@@ -96,9 +96,12 @@ pub const MAX_WAIT_SECS: u32 = 60;
 pub const MAX_OUTPUT_READ: usize = 1 << 20;
 
 /// Where a producer wants work to run: its pool, labels each node must carry, and the
-/// envelope one job takes.
+/// envelope one job takes. An API key names the pool, or a node as `#node#<node ID>`; a relay
+/// names none — its runner's lane on the hub selects where its work goes — and the hub ignores
+/// one it names.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Placement {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pool: String,
     #[serde(default)]
     pub labels: Vec<String>,
@@ -649,6 +652,14 @@ mod tests {
         .unwrap();
         assert_eq!(request.after, None);
         assert!(request.placement.labels.is_empty());
+        // A relay's placement names no pool, and writes none.
+        let request: CapacityRequest = serde_json::from_value(json!({
+            "placement": {"envelope": {"mem_mib": 1, "cpus": 1, "disk_bytes": 1}},
+        }))
+        .unwrap();
+        assert!(request.placement.pool.is_empty());
+        let wire = serde_json::to_value(&request.placement).unwrap();
+        assert!(wire.get("pool").is_none(), "{wire}");
         let state: JobState = serde_json::from_value(json!("suspended")).unwrap();
         assert_eq!(state, JobState::Other);
         let hello: ClientHello = serde_json::from_value(json!({

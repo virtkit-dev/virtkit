@@ -887,7 +887,7 @@ enum RelayRunnersCmd {
     ///
     /// Needs `runners` in the relay's `[hub] allow`. The relay checks the token with GitLab
     /// and keeps it; the hub does not. Its jobs are placed once a lane maps the runner's
-    /// GitLab ID.
+    /// GitLab ID and selects the pools and nodes they run on.
     Add {
         /// The relay's ID, as `vk-hub relays` lists it
         relay: String,
@@ -896,9 +896,6 @@ enum RelayRunnersCmd {
         /// A file holding the runner authentication token (`glrt-…`), or - for stdin
         #[arg(long, value_name = "FILE")]
         token_file: std::path::PathBuf,
-        /// The pool its jobs are placed in
-        #[arg(long, default_value = "default")]
-        pool: String,
         /// A label its jobs' nodes must have; repeat for several
         #[arg(long = "label", value_name = "LABEL")]
         labels: Vec<String>,
@@ -3040,7 +3037,6 @@ fn relays_blocking(client: &admin::Client, cmd: Option<RelaysCmd>) -> Result<()>
             relay,
             name,
             token_file,
-            pool,
             labels,
             envelope,
             limit,
@@ -3048,11 +3044,7 @@ fn relays_blocking(client: &admin::Client, cmd: Option<RelaysCmd>) -> Result<()>
         }) => {
             let token = read_runner_token(&token_file)?;
             let settings = relays::RunnerSettings {
-                placement: vk_hub_proto::client::Placement {
-                    pool,
-                    labels,
-                    envelope,
-                },
+                placement: vk_hub_proto::gitlab::RunnerPlacement { labels, envelope },
                 limit,
                 request_concurrency,
             };
@@ -3240,14 +3232,14 @@ fn render_relay_state(
         .runners
         .iter()
         .map(|x| {
-            let mut placement = x.placement.pool.clone();
-            if !x.placement.labels.is_empty() {
-                placement.push_str(&format!(" [{}]", x.placement.labels.join(", ")));
-            }
             [
                 x.name.clone(),
                 x.runner_id.map_or("-".to_string(), |id| id.to_string()),
-                placement,
+                if x.placement.labels.is_empty() {
+                    "-".to_string()
+                } else {
+                    x.placement.labels.join(", ")
+                },
                 store::envelope_text(x.placement.envelope),
                 x.limit.map_or("-".to_string(), |l| l.to_string()),
                 if x.verified {
@@ -3265,7 +3257,7 @@ fn render_relay_state(
         &[
             "RUNNER",
             "GITLAB ID",
-            "POOL",
+            "LABELS",
             "ENVELOPE",
             "LIMIT",
             "STATE",

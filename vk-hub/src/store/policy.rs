@@ -272,7 +272,8 @@ pub(super) fn select_reported_pools(txn: &redb::WriteTransaction, now: u64) -> R
 }
 
 /// The pool each runner's relay last reported, by the runner's instance name and GitLab ID,
-/// read from the relay rows as a hub before 0.111 wrote them: `inventory.runners[].placement.pool`.
+/// read from the relay rows as a hub before 0.111 wrote them, from relays of then:
+/// `inventory.runners[].placement.pool`, which this hub's rows and relays no longer carry.
 fn reported_pools(txn: &redb::WriteTransaction) -> Result<BTreeMap<(String, u64), String>> {
     let gitlabs = txn.open_table(super::gitlabs::GITLABS)?;
     let mut names: BTreeMap<String, String> = BTreeMap::new();
@@ -769,15 +770,11 @@ mod tests {
             { "runner": { "gitlab": "other", "id": 1 } },
             { "default": true }
         ]});
-        let runner = |name: &str, id: Option<u64>, pool: &str| {
-            let mut runner = Runner {
-                name: name.into(),
-                runner_id: id,
-                verified: true,
-                ..Runner::default()
-            };
-            runner.placement.pool = pool.into();
-            runner
+        let runner = |name: &str, id: Option<u64>| Runner {
+            name: name.into(),
+            runner_id: id,
+            verified: true,
+            ..Runner::default()
         };
         let (db, bytes, path, _dir) = reopened(stored, |db| {
             db.add_gitlab("gl", "https://gitlab.example.com", "u", 1)
@@ -804,15 +801,21 @@ mod tests {
                     ..Server::default()
                 },
                 runners: vec![
-                    runner("ci", Some(42), "ci"),
-                    runner("big", Some(43), "big"),
-                    runner("new", None, "ci"),
-                    runner("odd", Some(44), "no pool"),
+                    runner("ci", Some(42)),
+                    runner("big", Some(43)),
+                    runner("new", None),
+                    runner("odd", Some(44)),
                 ],
                 ..Inventory::default()
             };
             db.record_relay(&id, crate::store::RelayWrite::Inventory(inventory), 1)
                 .unwrap();
+            // As a relay of before 0.111 reported it: each runner with its pool.
+            let mut row = serde_json::to_value(db.relay(&id).unwrap().unwrap()).unwrap();
+            for (i, pool) in ["ci", "big", "ci", "no pool"].into_iter().enumerate() {
+                row["inventory"]["runners"][i]["placement"]["pool"] = serde_json::json!(pool);
+            }
+            db.set_raw_relay(&id, &serde_json::to_vec(&row).unwrap());
         });
         let policy = db.capacity_policy().unwrap();
         assert_eq!(policy.runner("gl", 42).unwrap().pools, ["ci"]);

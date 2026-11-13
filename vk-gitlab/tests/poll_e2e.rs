@@ -63,7 +63,7 @@ both!(
 
 async fn job_runs_and_reports(via: Via) {
     let h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(5));
     let (hub_id, sub) = within("a submitted job", h.hub.wait_for_job(1)).await;
     // Reserved before the job was requested, submitted on that reservation.
@@ -78,7 +78,7 @@ async fn job_runs_and_reports(via: Via) {
         !runners.is_empty() && runners.iter().all(|r| r == "r1"),
         "{runners:?}"
     );
-    assert_eq!(sub.placement.pool, "p1");
+    assert!(sub.placement.pool.is_empty());
     assert_eq!(sub.placement.labels, ["big"]);
     assert_eq!(sub.placement.envelope.mem_mib, 8192);
     assert_eq!(sub.request_id.len(), 32);
@@ -121,7 +121,7 @@ async fn no_capacity_no_requests(via: Via) {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(h.fake.requests_to("/api/v4/jobs/request").is_empty());
     assert!(h.hub.calls().is_empty(), "no reservation without capacity");
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     eventually("a job request once capacity appears", || {
         !h.fake.requests_to("/api/v4/jobs/request").is_empty()
     })
@@ -134,7 +134,7 @@ async fn empty_answers_give_the_reservation_back(via: Via) {
     let h = Harness::start(2, via).await;
     // Past a third of the lease: 300 ms in process, the hub's 1 s minimum over HTTP.
     *h.gl.request_delay.lock().unwrap() = Some(Duration::from_millis(400));
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     eventually("three job requests", || h.job_requests() >= 3).await;
     // Each request had its own reservation, renewed while the request was out, and released
     // once GitLab answered with nothing.
@@ -158,7 +158,7 @@ async fn reservation_lost_during_the_request(via: Via) {
     let h = Harness::start(2, via).await;
     *h.gl.request_delay.lock().unwrap() = Some(Duration::from_millis(600));
     h.gl.push_job(job_json(6));
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     eventually("a reservation", || !h.hub.reservations().is_empty()).await;
     let r = h.hub.reservations()[0].clone();
     h.hub.drop_reservation(&r);
@@ -189,7 +189,7 @@ async fn reservation_lost_during_the_request(via: Via) {
 
 async fn gitlab_cancel_is_graceful_and_reported(via: Via) {
     let h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(7));
     let (hub_id, _) = h.accepted_job(1).await;
     h.hub.push_output(&hub_id, b"working\n");
@@ -219,7 +219,7 @@ async fn gitlab_cancel_is_graceful_and_reported(via: Via) {
 
 async fn gitlab_abort_cancels_now_and_writes_nothing_more(via: Via) {
     let h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(8));
     let (hub_id, _) = h.accepted_job(1).await;
     h.gl.set_status(8, "canceled");
@@ -250,7 +250,7 @@ fn cancels(h: &Harness, hub_id: &str) -> usize {
 
 async fn a_cancel_refused_as_malformed_is_not_sent_again(via: Via) {
     let h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(41));
     let (hub_id, _) = h.accepted_job(1).await;
     h.hub
@@ -280,7 +280,7 @@ async fn a_cancel_refused_as_malformed_is_not_sent_again(via: Via) {
 
 async fn an_immediate_cancel_replaces_a_graceful_one_mid_call(via: Via) {
     let h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(42));
     let (hub_id, _) = h.accepted_job(1).await;
     h.hub.hold_cancels(true);
@@ -308,7 +308,7 @@ async fn an_immediate_cancel_replaces_a_graceful_one_mid_call(via: Via) {
 
 async fn a_graceful_cancel_not_taken_ends_with_the_job(via: Via) {
     let h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(43));
     let (hub_id, _) = h.accepted_job(1).await;
     h.hub.refuse_cancels(
@@ -332,7 +332,7 @@ async fn a_graceful_cancel_not_taken_ends_with_the_job(via: Via) {
 
 async fn failure_classes_reach_gitlab_mapped(via: Via) {
     let h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(9));
     let (hub_id, _) = h.accepted_job(1).await;
     h.hub
@@ -347,7 +347,7 @@ async fn failure_classes_reach_gitlab_mapped(via: Via) {
 
 async fn unsupported_jobs_fail_before_submission(via: Via) {
     let h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     let mut job = job_json(10);
     job["image"] =
         serde_json::json!({"name": "alpine", "executor_opts": {"docker": {"blammo": 1}}});
@@ -394,7 +394,7 @@ async fn unsupported_jobs_fail_before_submission(via: Via) {
 
 async fn a_job_the_hub_refuses_is_a_system_failure(via: Via) {
     let h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.hub
         .refuse_submit(DispatchError::new(ErrorKind::TooLarge, "spec over 512 KiB"));
     h.gl.push_job(job_json(13));
@@ -411,7 +411,7 @@ async fn a_job_the_hub_refuses_is_a_system_failure(via: Via) {
 
 async fn a_job_not_placed_in_time_is_failed_uncommitted(via: Via) {
     let h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(14));
     let (hub_id, _) = within("a submitted job", h.hub.wait_for_job(1)).await;
     h.hub.finish(&hub_id, Some(FailureClass::NoCapacity), None);
@@ -426,7 +426,7 @@ async fn a_job_not_placed_in_time_is_failed_uncommitted(via: Via) {
 
 async fn concurrent_bounds_running_jobs(via: Via) {
     let h = Harness::start(1, via).await;
-    h.hub.set_slots("p1", 5);
+    h.hub.set_slots("r1", 5);
     h.gl.push_job(job_json(15));
     h.gl.push_job(job_json(16));
     let (first, _) = h.accepted_job(1).await;
@@ -446,7 +446,7 @@ async fn concurrent_bounds_running_jobs(via: Via) {
 
 async fn shutdown_abort_interrupts_running_jobs(via: Via) {
     let mut h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(17));
     let (hub_id, _) = h.accepted_job(1).await;
     h.daemon.stop_handle().abort();
@@ -471,7 +471,8 @@ async fn an_idle_runner_leaves_the_slot_to_another(via: Via) {
         runner_toml("r1", TOKEN, "") + &runner_toml("r2", "glrt-other-token", ""),
     )
     .await;
-    h.hub.set_slots("p1", 5);
+    h.hub.set_slots("r1", 5);
+    h.hub.set_slots("r2", 5);
     h.gl.push_job_for("glrt-other-token", job_json(20));
     let (hub_id, sub) = h.accepted_job(1).await;
     assert_eq!(sub.gitlab_job, 20);
@@ -487,7 +488,7 @@ async fn limit_bounds_a_runners_jobs(via: Via) {
         runner_toml("r1", TOKEN, "limit = 1\nrequest_concurrency = 2\n"),
     )
     .await;
-    h.hub.set_slots("p1", 5);
+    h.hub.set_slots("r1", 5);
     h.gl.push_job(job_json(21));
     h.gl.push_job(job_json(22));
     let (first, _) = h.accepted_job(1).await;
@@ -514,7 +515,7 @@ async fn failing_renewals_do_not_stretch_the_lease(via: Via) {
     h.hub
         .refuse_renew(Some(DispatchError::new(ErrorKind::Unavailable, "hub down")));
     h.gl.push_job(job_json(23));
-    h.hub.set_slots("p1", 2);
+    h.hub.set_slots("r1", 2);
     let (hub_id, sub) = within("a submitted job", h.hub.wait_for_job(1)).await;
     assert_eq!(
         sub.reservation, None,
@@ -530,7 +531,7 @@ async fn failing_renewals_do_not_stretch_the_lease(via: Via) {
 
 async fn stop_lets_a_running_job_finish(via: Via) {
     let mut h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(24));
     let (hub_id, _) = h.accepted_job(1).await;
     h.daemon.stop_handle().stop();
@@ -553,7 +554,7 @@ async fn stop_lets_a_running_job_finish(via: Via) {
 /// An update ends job requests while the running job continues; `stopping()` stays false.
 async fn requests_end_for_an_update_while_jobs_run_on(via: Via) {
     let mut h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(25));
     let (hub_id, _) = h.accepted_job(1).await;
     let handle = h.daemon.stop_handle();
@@ -583,7 +584,7 @@ async fn an_unhealthy_runner_backs_off(via: Via) {
     )
     .await;
     h.gl.forbidden.lock().unwrap().insert(TOKEN.to_owned());
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     eventually("two refused requests", || h.job_requests() >= 2).await;
     // Disabled for at least the initial 30 s backoff.
     tokio::time::sleep(Duration::from_millis(3000)).await;
@@ -602,7 +603,7 @@ async fn second_request_gap(via: Via, strict: bool) -> Duration {
     let h = Harness::start_with(5, via, runner_toml("r1", TOKEN, extra)).await;
     h.gl.push_job(job_json(25));
     h.gl.push_job(job_json(26));
-    h.hub.set_slots("p1", 5);
+    h.hub.set_slots("r1", 5);
     eventually("the first request", || h.job_requests() >= 1).await;
     let first = Instant::now();
     eventually("the second request", || h.job_requests() >= 2).await;
@@ -622,7 +623,7 @@ async fn strict_check_interval_paces_requests_after_a_job(via: Via) {
 
 async fn output_the_hub_lost_fails_the_job(via: Via) {
     let h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(27));
     let (hub_id, _) = h.accepted_job(1).await;
     h.hub.push_output(&hub_id, b"0123456789\n");
@@ -644,7 +645,7 @@ async fn output_the_hub_lost_fails_the_job(via: Via) {
 
 async fn abort_reports_a_job_the_hub_never_ends(via: Via) {
     let mut h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(28));
     let (hub_id, _) = h.accepted_job(1).await;
     h.daemon.stop_handle().abort();
@@ -664,7 +665,7 @@ async fn a_runner_not_verified_asks_for_no_job_until_a_verify_succeeds(via: Via)
     let mut h = Harness::unstarted(2, via).await;
     *h.gl.verify_failures.lock().unwrap() = 1;
     h.daemon = h.spawn_daemon();
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     let status = h.daemon.status.clone().unwrap();
     // The hub would refuse it: neither GitLab nor the hub is asked.
     eventually("the runner reported unverified", || {
@@ -690,7 +691,7 @@ async fn a_running_jobs_view_poll_outlives_the_tick(via: Via) {
     let mut h = Harness::unstarted(2, via).await;
     h.options.hub.wait = Duration::from_secs(5);
     h.daemon = h.spawn_daemon();
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(40));
     let (hub_id, _) = h.accepted_job(1).await;
     let reads = h.hub.view_reads(&hub_id);
@@ -707,7 +708,7 @@ async fn gitlab_is_asked_only_while_the_hub_approves_its_server(via: Via) {
     let mut h = Harness::unstarted(2, via).await;
     h.server = ServerState::Pending;
     h.daemon = h.spawn_daemon();
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     let status = h.daemon.status.clone().unwrap();
     eventually("verified", || {
         status
@@ -746,7 +747,7 @@ async fn gitlab_is_asked_only_while_the_hub_approves_its_server(via: Via) {
 
 async fn a_job_of_a_project_not_approved_fails_pointing_at_the_hub(via: Via) {
     let h = Harness::start(2, via).await;
-    h.hub.set_slots("p1", 2);
+    h.hub.set_slots("r1", 2);
     let page = "https://ui.example.com:8444/gitlab/gl/projects/12";
     for (id, kind, url, said) in [
         (
@@ -818,10 +819,9 @@ async fn a_runner_added_on_the_hub_runs_and_goes_once_removed_and_drained(via: V
     let mut h = Harness::unstarted(2, via).await;
     h.runners = "[hub]\nallow = [\"runners\"]\n".to_owned();
     h.daemon = h.spawn_daemon();
-    h.hub.set_slots("p1", 1);
+    h.hub.set_slots("r1", 1);
     let added_by = "c".repeat(32);
-    let placement = vk_gitlab::dispatch::Placement {
-        pool: "p1".into(),
+    let placement = vk_hub_proto::gitlab::RunnerPlacement {
         labels: vec!["big".into()],
         envelope: vk_gitlab::dispatch::Envelope {
             mem_mib: 8192,

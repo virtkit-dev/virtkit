@@ -16,10 +16,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use vk_hub_proto::gitlab::{MAX_RUNNERS, RunnerFailure, RunnerToken};
+use vk_hub_proto::gitlab::{MAX_RUNNERS, RunnerFailure, RunnerPlacement, RunnerToken};
 
 use crate::config::{Config, HubOrigin, RunnerConfig, valid_name};
-use crate::dispatch::Placement;
 use crate::secret::Secret;
 use crate::session::{RunnerStatus, Status};
 use crate::state::StateFile;
@@ -44,7 +43,8 @@ struct RunnerFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     limit: Option<u32>,
     request_concurrency: u32,
-    placement: Placement,
+    /// A file from before 0.111 also holds a `pool`, read past.
+    placement: RunnerPlacement,
 }
 
 impl RunnerFile {
@@ -58,7 +58,7 @@ impl RunnerFile {
             removed: hub.removed,
             limit: (r.limit > 0).then(|| u32::try_from(r.limit).unwrap_or(u32::MAX)),
             request_concurrency: u32::try_from(r.request_concurrency()).unwrap_or(u32::MAX),
-            placement: r.placement(),
+            placement: r.runner_placement(),
         })
     }
 
@@ -282,7 +282,7 @@ impl Runners {
         command: &str,
         name: &str,
         token: &RunnerToken,
-        placement: &Placement,
+        placement: &RunnerPlacement,
         limit: Option<u32>,
         request_concurrency: u32,
     ) -> Result<u64, RunnerFailure> {
@@ -479,8 +479,7 @@ mod tests {
         RunnerConfig::from_hub(
             name,
             "glrt-secret",
-            &Placement {
-                pool: "ci".into(),
+            &RunnerPlacement {
                 labels: vec!["big".into()],
                 envelope: crate::dispatch::Envelope {
                     mem_mib: 2048,

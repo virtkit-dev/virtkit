@@ -284,15 +284,15 @@ pub struct Harness {
     pub daemon: Daemon,
 }
 
-/// A `[[runners]]` table on pool `p1`; `extra` is appended to it.
+/// A `[[runners]]` table with label `big`; `extra` is appended to it.
 pub fn runner_toml(name: &str, token: &str, extra: &str) -> String {
     format!(
-        "[[runners]]\nname = \"{name}\"\ntoken = \"{token}\"\npool = \"p1\"\nlabels = [\"big\"]\nenvelope = {{ mem = \"8G\", cpus = 4, disk = \"10G\" }}\n{extra}"
+        "[[runners]]\nname = \"{name}\"\ntoken = \"{token}\"\nlabels = [\"big\"]\nenvelope = {{ mem = \"8G\", cpus = 4, disk = \"10G\" }}\n{extra}"
     )
 }
 
 impl Harness {
-    /// One runner, `r1`, on pool `p1`.
+    /// One runner, `r1`.
     pub async fn start(concurrent: usize, via: Via) -> Harness {
         Self::start_with(concurrent, via, runner_toml("r1", TOKEN, "")).await
     }
