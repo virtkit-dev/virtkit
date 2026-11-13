@@ -3790,7 +3790,7 @@ pub(crate) fn human_duration(d: Duration) -> String {
 }
 
 /// The columns of `vk-hub nodes`, and of the web UI's nodes table.
-pub(crate) const NODE_COLUMNS: [&str; 17] = [
+pub(crate) const NODE_COLUMNS: [&str; 18] = [
     "ID",
     "NAME",
     "REACH",
@@ -3799,6 +3799,7 @@ pub(crate) const NODE_COLUMNS: [&str; 17] = [
     "CEILING",
     "CONC",
     "SYNC",
+    "POOLS",
     "LAST SEEN",
     "VK",
     "CPUS",
@@ -3812,7 +3813,7 @@ pub(crate) const NODE_COLUMNS: [&str; 17] = [
 
 /// One node's cells under [`NODE_COLUMNS`]: what it is, and for what the hub steers, what it
 /// wants beside what the node last reported. A node only monitored has no steering to show.
-pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 17] {
+pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 18] {
     let gib = |mib: u64| format!("{}G", mib / 1024);
     let dash = || "-".to_string();
     let count = |n: Option<u32>| n.map_or_else(dash, |c| c.to_string());
@@ -3836,6 +3837,7 @@ pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 17] {
         ceiling,
         count(concurrency.and_then(|c| c.effective)),
         sync,
+        pools_cell(&n.pools),
         match n.last_seen {
             Some(t) => format!("{} ago", human_duration(ago(now, t))),
             None => "never".to_string(),
@@ -3936,12 +3938,26 @@ fn steering_cells(n: &ops::NodeView) -> [String; 4] {
     [state, acquire, ceiling, sync]
 }
 
-/// What a node says it cannot do: sentences, not cells.
+/// Maximum number of pools listed in full.
+const POOLS_SHOWN: usize = 4;
+
+/// List up to [`POOLS_SHOWN`] pools by name; beyond that, show the first three and count
+/// the rest to limit the cell's width.
+fn pools_cell(pools: &[String]) -> String {
+    let shown = POOLS_SHOWN - 1;
+    match pools.len() {
+        0 => "-".to_string(),
+        n if n <= POOLS_SHOWN => pools.join(", "),
+        n => {
+            let first: Vec<&str> = pools.iter().take(shown).map(String::as_str).collect();
+            format!("{}, +{}", first.join(", "), n - shown)
+        }
+    }
+}
+
+/// What the table leaves out of a node, and what it cannot do: sentences, not cells.
 fn node_notes(n: &ops::NodeView) -> Vec<String> {
     let mut placement = Vec::new();
-    if !n.pools.is_empty() {
-        placement.push(format!("{}: in pools {}", n.hostname, n.pools.join(", ")));
-    }
     if !n.labels.is_empty() {
         placement.push(format!("{}: labels {}", n.hostname, n.labels.join(", ")));
     }
@@ -4366,7 +4382,7 @@ fn render_registry(
 
 /// `vk-hub nodes`' table, with each node's notes under it.
 fn render_nodes(nodes: &[ops::NodeView], now: u64) -> String {
-    let rows: Vec<[String; 17]> = nodes.iter().map(|n| node_cells(n, now)).collect();
+    let rows: Vec<[String; 18]> = nodes.iter().map(|n| node_cells(n, now)).collect();
     let mut out = table(&NODE_COLUMNS, &rows);
     for n in nodes {
         for note in node_notes(n) {

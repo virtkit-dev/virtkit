@@ -292,10 +292,12 @@ The hub stores heartbeats and reports at most once per half heartbeat, holding b
 and storing it at the next ping. Heartbeats are written without an fsync, one a minute made
 durable; an inventory is made durable at most once a heartbeat. Each of an inventory's lists
 (filesystems, memory nodes, checks, runner names) is cut to 64 entries. `vk-hub nodes` lists
-ID, NAME, REACH, STATE, ACQUIRE, CEILING, CONC, SYNC, LAST SEEN, VK, CPUS, RAM, ADMITTED, VCPUS
-(committed of the budget), VMS, ADDRESS (the IP its latest session came from, as the hub saw
-it) and USER (the account `vk node run` runs as, from its inventory); under the table, a node that takes hub settings says how many
-of its settings come from the hub and from its config file, and each of the hub's it refused.
+ID, NAME, REACH, STATE, ACQUIRE, CEILING, CONC, SYNC, POOLS (`-` in none; past four, the first
+three and a count), LAST SEEN, VK, CPUS, RAM, ADMITTED, VCPUS (committed of the budget), VMS,
+ADDRESS (the IP its latest session came from, as the hub saw it) and USER (the account
+`vk node run` runs as, from its inventory); under the table, a node that takes hub settings
+says how many of its settings come from the hub and from its config file, and each of the hub's
+it refused.
 
 The node redials a lost session with a backoff doubling from 1 to 60 seconds, plus up to a
 quarter of jitter, reset by a session that lasted a minute. Superseded three times in a row, it
@@ -1444,7 +1446,8 @@ not refused by a later rejection; queued and running jobs stay as they are.
 
 **Pools and labels.** `vk-hub nodes pools <id> <pool,…|none>`, or an operator on the node's
 web page, sets the pools a node is in, at most 256, audited. Labels come from the node's
-inventory. `vk-hub nodes` lists each node's pools and labels under the table.
+inventory. `vk-hub nodes` lists each node's pools in its POOLS column and its labels
+under the table.
 
 **The client API** is served on the node listener under `/v1/capacity`, `/v1/reservations` and
 `/v1/jobs`, over HTTP/1.1, and over a relay's HTTP/2 connection. The key, a relay's signed

@@ -2656,6 +2656,16 @@ fn sync_compares_the_applied_state_not_only_its_generation() {
     assert_eq!(steering_cells(&view(other))[3], "differs");
 }
 
+/// More than four pools are abbreviated to three names and a count.
+#[test]
+fn the_pools_cell_counts_past_four() {
+    let pools = |n: usize| (1..=n).map(|i| format!("p{i}")).collect::<Vec<_>>();
+    assert_eq!(pools_cell(&pools(0)), "-");
+    assert_eq!(pools_cell(&pools(4)), "p1, p2, p3, p4");
+    assert_eq!(pools_cell(&pools(5)), "p1, p2, p3, +2");
+    assert_eq!(pools_cell(&pools(256)), "p1, p2, p3, +253");
+}
+
 /// A node running its own gitlab-runner says so under `vk-hub nodes` once, on a hub that places
 /// jobs, in place of the refusal it causes.
 #[test]
@@ -2672,6 +2682,8 @@ fn a_node_s_own_runner_is_noted_on_a_hub_that_places_jobs() {
         }),
         last_refusal: Some("runner".into()),
         placed: Some(0),
+        // Its pools go in the table, not a note.
+        pools: vec!["ci".into()],
         ..ops::NodeView::default()
     };
     assert_eq!(
@@ -2754,6 +2766,7 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
             pending_commands: 1,
             address: Some("192.0.2.7".parse().unwrap()),
             user: Some("gitlab-runner".into()),
+            pools: vec!["ci".into(), "gpu".into()],
             ..ops::NodeView::default()
         },
         ops::NodeView {
@@ -2785,6 +2798,7 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
         "ci-1: cannot comply: stopping acquisition: external"
     );
     assert_eq!(lines[5], "ci-1: cannot set its concurrency: bad mem");
+    assert!(!table.contains("in pools"), "{table}");
     let placed_only = ops::NodeView {
         hostname: "ci-4".into(),
         report: Some(Report {
@@ -2808,6 +2822,7 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
         ("CEILING", "4 (node: 6)"),
         ("CONC", "6"),
         ("SYNC", "behind (2<3)"),
+        ("POOLS", "ci, gpu"),
         ("LAST SEEN", "5s ago"),
         ("ADMITTED", "8G/400G"),
         ("VMS", "-"),
@@ -2822,6 +2837,7 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
         ("ACQUIRE", "run"),
         ("CEILING", "-"),
         ("SYNC", "-"),
+        ("POOLS", "-"),
         ("LAST SEEN", "never"),
     ] {
         assert_eq!(cell(header, b, column), want, "{column}\n{table}");

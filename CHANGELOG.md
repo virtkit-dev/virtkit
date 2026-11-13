@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **The nodes table shows each node's pools.** `vk-hub nodes` and the web UI's nodes table
+  gain a POOLS column (`-` for a node in no pool).
+
 ## [0.110.2] - 2026-11-11
 
 ### Fixed

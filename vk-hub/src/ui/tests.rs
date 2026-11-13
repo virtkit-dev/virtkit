@@ -3164,6 +3164,13 @@ async fn an_operator_steers_a_node_from_its_page() {
     );
     let pools = || hub.db.node(&node).unwrap().unwrap().pools;
     assert_eq!(pools(), ["ci", "gpu"]);
+    // The nodes table shows them in its POOLS column.
+    let table = Events::open(addr, "/events/nodes", &cookie)
+        .await
+        .next()
+        .await
+        .unwrap();
+    assert!(table.contains("<td>ci, gpu</td>"), "{table}");
     // A new ID, so the browser takes the new value rather than preserve the old input.
     let fragment = next_with(&mut live, "<p class=\"now\">In pools ci, gpu</p>").await;
     assert!(fragment.contains(&editor("ci, gpu")), "{fragment}");
