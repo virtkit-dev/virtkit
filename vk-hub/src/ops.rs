@@ -227,12 +227,24 @@ fn tools_note(hub: &Hub, id: &str, row: &NodeRow) -> Result<Option<String>> {
     ))
 }
 
-/// Replace node `id`'s pools as `actor`. Notify the hub's watchers only on change.
-/// Return whether the pools changed.
+/// Replace node `id`'s pools as `actor`. Log even if unchanged; notify the hub's watchers
+/// only on change. Return whether the pools changed.
 pub fn set_pools(hub: &Hub, actor: &str, id: &str, pools: &[String]) -> Result<bool> {
     let changed = hub.db.set_pools(id, pools, actor, crate::now_secs())?;
+    let what = if pools.is_empty() {
+        "took it out of every pool".to_string()
+    } else {
+        // Sorted and deduplicated as the store keeps and audits them.
+        let mut sorted = pools.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        format!("put it in pools {}", sorted.join(", "))
+    };
     if changed {
+        eprintln!("vk-hub: node {id}: {actor} {what}");
         hub.changed(id);
+    } else {
+        eprintln!("vk-hub: node {id}: {actor} {what}: already so");
     }
     Ok(changed)
 }
