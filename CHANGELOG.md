@@ -9,6 +9,10 @@ All notable changes to virtkit will be documented in this file.
 - **The nodes table shows each node's pools.** `vk-hub nodes` and the web UI's nodes table
   gain a POOLS column (`-` for a node in no pool).
 
+- **The hub warns when changes leave runner lanes without nodes.** `vk-hub nodes pools`
+  and node pages name the affected runner lanes, and the hub logs them. Lane edits that do
+  so warn before confirmation.
+
 ### Changed
 
 - **A lane selects the pools and nodes its runner's work runs on.** The relay's pool no

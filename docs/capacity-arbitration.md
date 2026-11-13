@@ -64,9 +64,11 @@ there â€” class, weight, max slots, where its work runs, projects and branches â
 the hub sees without a lane, add a lane for an API key, unmap or remove one, and keep or release
 headroom. *Where its work runs* lists each pool with its member nodes, then each node with
 its pools. Below, the resolved nodes follow the checkbox selection, shown in red when empty.
-Saving an empty runner selection asks for confirmation with a warning that it gets no work.
+Saving an empty runner selection warns before confirmation that it gets no work;
+so does a lane edit that leaves a runner lane without a node.
 The lanes table, runner rows on server pages and project pages also show resolved nodes,
-in red when none.
+in red when none. Changing a node's pools (`vk-hub nodes pools`, or the node's page)
+warns of runner lanes left without a node, and the hub logs them.
 Each edit saves the whole policy against the digest the page showed, asked first what changes.
 The whole policy can also be replaced as JSON there; the probe and backoff settings are changed
 with `capacity-policy set` only. A policy held since its conversion lists the placement rules

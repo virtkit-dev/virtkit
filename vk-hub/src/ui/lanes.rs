@@ -147,21 +147,13 @@ pub(super) fn runs_on(h: &mut Html, lane: &Lane, nodes: &[KnownNode]) {
     }
 }
 
-/// A relay runner the hub has heard of, by its approved instance's name and GitLab ID.
-struct KnownRunner {
-    gitlab: String,
-    id: u64,
-    /// Its name in the relay's config.
-    name: String,
-}
-
 /// What the hub knows besides the policy, named on the page and offered by its pickers.
 #[derive(Default)]
 struct Known {
     gitlabs: usize,
     /// Each relay's ID and display-safe hostname.
     relays: Vec<(String, String)>,
-    runners: Vec<KnownRunner>,
+    runners: Vec<crate::relays::ReportedRunner>,
     /// Each API key's principal ID and name.
     keys: Vec<(String, String)>,
     nodes: Vec<KnownNode>,
@@ -171,27 +163,11 @@ struct Known {
 impl Known {
     /// Reads the database: call off the runtime.
     fn read(hub: &Hub) -> Result<Self> {
-        let mut runners = Vec::new();
         let views = crate::relays::views(hub)?;
         let relays = (views.iter())
             .map(|r| (r.id.clone(), vk_hub_proto::display_safe(&r.row.hostname)))
             .collect();
-        for relay in views {
-            let Some(gitlab) = relay.server.as_ref().and_then(|s| s.name.clone()) else {
-                continue;
-            };
-            for runner in relay.row.inventory.iter().flat_map(|i| &i.runners) {
-                if let Some(id) = runner.runner_id {
-                    runners.push(KnownRunner {
-                        gitlab: gitlab.clone(),
-                        id,
-                        name: vk_hub_proto::display_safe(&runner.name),
-                    });
-                }
-            }
-        }
-        runners.sort_by(|a, b| (&a.gitlab, a.id).cmp(&(&b.gitlab, b.id)));
-        runners.dedup_by(|a, b| (&a.gitlab, a.id) == (&b.gitlab, b.id));
+        let runners = crate::relays::reported_runners(&views);
         Ok(Known {
             gitlabs: hub.db.gitlabs()?.len(),
             relays,
@@ -215,16 +191,7 @@ impl Known {
     fn label(&self, id: &LaneId) -> String {
         match id {
             LaneId::Runner { gitlab, id } => {
-                let mut label = format!("Runner {id}");
-                if let Some(r) = (self.runners.iter()).find(|r| &r.gitlab == gitlab && r.id == *id)
-                {
-                    label.push(' ');
-                    label.push_str(&r.name);
-                }
-                if self.gitlabs > 1 {
-                    label.push_str(&format!(" ({gitlab})"));
-                }
-                label
+                crate::relays::runner_lane_label(&self.runners, self.gitlabs, gitlab, *id)
             }
             LaneId::Key(principal) => {
                 let name = (self.keys.iter())
@@ -1188,13 +1155,20 @@ pub(super) async fn action(
         _ => return Ok(refused_page(&auth, StatusCode::BAD_REQUEST, "no such edit")),
     };
     let hub = ui.hub.clone();
+    // Confirmation answers need no inventory: the question already showed the warnings.
+    let answer = field(&form, "confirm") == Some("yes");
     let read = blocking(move || {
-        Ok(hub
-            .db
-            .capacity_policy()
-            .and_then(|policy| Ok((policy, hub.db.capacity_conversion()?))))
+        Ok(hub.db.capacity_policy().and_then(|policy| {
+            let note = hub.db.capacity_conversion()?;
+            let known = if answer {
+                Known::default()
+            } else {
+                Known::read(&hub)?
+            };
+            Ok((policy, note, known))
+        }))
     });
-    let (current, note) = match read.await? {
+    let (current, note, known) = match read.await? {
         Ok(read) => read,
         Err(e) => {
             let why = format!("{e:#}");
@@ -1207,7 +1181,6 @@ pub(super) async fn action(
     }
     let held = note.as_ref().is_some_and(ConversionNote::held);
     // An answer carries the policy its question proposed.
-    let answer = field(&form, "confirm") == Some("yes");
     let proposed = if answer {
         serde_json::from_str::<Policy>(field(&form, "policy").unwrap_or(""))
             .context("not a capacity policy")
@@ -1235,15 +1208,38 @@ pub(super) async fn action(
     for change in changes {
         detail.raw("<li>").text(change).raw("</li>");
     }
-    // Warn that an empty runner selection gets no work before confirming the save.
-    if op == SAVE
-        && let Some(lane) = field(&form, "lane").and_then(parse_lane)
-        && proposed.lane(&lane).is_some_and(Lane::selects_nothing)
+    // Before confirmation, warn of empty runner selections and lanes left without nodes.
+    let edited = (op == SAVE)
+        .then(|| field(&form, "lane").and_then(parse_lane))
+        .flatten();
+    if let Some(lane) = &edited
+        && proposed.lane(lane).is_some_and(Lane::selects_nothing)
     {
         detail.raw(
             "<li class=\"bad\">This lane selects no pool or node: its runner gets no work \
                     until it does.</li>",
         );
+    }
+    // Warn for a runner lane with no matching node if it is new, previously had a node,
+    // or is the edited lane with a changed selection. Empty edited selections are warned
+    // above; confirmation answers need no repeated warnings.
+    for lane in proposed.lanes.iter().filter(|_| !answer) {
+        let Some(id) = lane.id().filter(|id| matches!(id, LaneId::Runner { .. })) else {
+            continue;
+        };
+        let is_edited = edited.as_ref() == Some(&id);
+        if is_edited && lane.selects_nothing() {
+            continue;
+        }
+        let brought_about = current.lane(&id).is_none_or(|was| {
+            !resolved(was, &known.nodes).is_empty() || (is_edited && was.pools != lane.pools)
+        });
+        if brought_about && resolved(lane, &known.nodes).is_empty() {
+            detail
+                .raw("<li class=\"bad\">No node can take the work of ")
+                .text(known.label(&id))
+                .raw(".</li>");
+        }
     }
     detail.raw("</ul>");
     let ask = actions::Ask {

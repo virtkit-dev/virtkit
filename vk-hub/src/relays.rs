@@ -663,6 +663,58 @@ pub fn views(hub: &Hub) -> Result<Vec<RelayView>> {
     Ok(views)
 }
 
+/// A runner a relay reports, by its approved instance's name and GitLab ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportedRunner {
+    pub gitlab: String,
+    pub id: u64,
+    /// Its name in the relay's config, display-safe.
+    pub name: String,
+}
+
+/// Runners reported in `views` with a GitLab ID under an approved instance, sorted and
+/// deduplicated by instance and ID. The first relay reporting each supplies its name.
+pub fn reported_runners(views: &[RelayView]) -> Vec<ReportedRunner> {
+    let mut runners = Vec::new();
+    for relay in views {
+        let Some(gitlab) = relay.server.as_ref().and_then(|s| s.name.as_ref()) else {
+            continue;
+        };
+        for runner in relay.row.inventory.iter().flat_map(|i| &i.runners) {
+            if let Some(id) = runner.runner_id {
+                runners.push(ReportedRunner {
+                    gitlab: gitlab.clone(),
+                    id,
+                    name: vk_hub_proto::display_safe(&runner.name),
+                });
+            }
+        }
+    }
+    // Stable sorting preserves the first report's name through deduplication.
+    runners.sort_by(|a, b| (&a.gitlab, a.id).cmp(&(&b.gitlab, b.id)));
+    runners.dedup_by(|a, b| (&a.gitlab, a.id) == (&b.gitlab, b.id));
+    runners
+}
+
+/// Page label for runner `id` of `gitlab`, e.g. "Runner 42 app-main".
+/// Include the name from `runners` when reported and the instance when `gitlabs` exceeds one.
+pub fn runner_lane_label(
+    runners: &[ReportedRunner],
+    gitlabs: usize,
+    gitlab: &str,
+    id: u64,
+) -> String {
+    let mut label = format!("Runner {id}");
+    if let Some(r) = (runners.iter()).find(|r| r.gitlab == gitlab && r.id == id) {
+        label.push(' ');
+        label.push_str(&r.name);
+    }
+    if gitlabs > 1 {
+        label.push_str(&format!(" ({gitlab})"));
+    }
+    label
+}
+
 /// Relay `id`; `None` when there is none.
 pub fn detail(hub: &Hub, id: &str) -> Result<Option<RelayView>> {
     Ok(hub

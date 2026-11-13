@@ -227,9 +227,57 @@ fn tools_note(hub: &Hub, id: &str, row: &NodeRow) -> Result<Option<String>> {
     ))
 }
 
-/// Replace node `id`'s pools as `actor`. Log even if unchanged; notify the hub's watchers
-/// only on change. Return whether the pools changed.
-pub fn set_pools(hub: &Hub, actor: &str, id: &str, pools: &[String]) -> Result<bool> {
+/// The result of changing a node's pools.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolsChange {
+    /// Whether the node's pools changed.
+    pub changed: bool,
+    /// Runner lanes that lost their last matching node, using page labels.
+    #[serde(default)]
+    pub lanes_without_node: Vec<String>,
+}
+
+/// Capacity-policy runner lanes whose selections match no enrolled node.
+/// Reads the database: call off the runtime.
+fn nodeless_runner_lanes(hub: &Hub) -> Result<Vec<(String, u64)>> {
+    let nodes = hub.db.nodes()?;
+    let policy = hub.db.capacity_policy()?;
+    let mut lanes: Vec<_> = (policy.lanes.iter())
+        .filter(|lane| {
+            !nodes
+                .iter()
+                .any(|(id, row)| lane.allows_node(id, &row.pools))
+        })
+        .filter_map(|lane| match lane.id()? {
+            crate::policy::LaneId::Runner { gitlab, id } => Some((gitlab, id)),
+            _ => None,
+        })
+        .collect();
+    lanes.sort();
+    Ok(lanes)
+}
+
+/// Runner lanes now without a node, excluding those already without one in `before`.
+/// Return page labels in instance and ID order. Reads the database: call off the runtime.
+fn lanes_left_without_node(hub: &Hub, before: &[(String, u64)]) -> Result<Vec<String>> {
+    let left: Vec<_> = (nodeless_runner_lanes(hub)?.into_iter())
+        .filter(|lane| !before.contains(lane))
+        .collect();
+    if left.is_empty() {
+        return Ok(Vec::new());
+    }
+    let runners = crate::relays::reported_runners(&crate::relays::views(hub)?);
+    let gitlabs = hub.db.gitlabs()?.len();
+    Ok((left.iter())
+        .map(|(gitlab, id)| crate::relays::runner_lane_label(&runners, gitlabs, gitlab, *id))
+        .collect())
+}
+
+/// Replace node `id`'s pools as `actor`, logging even if unchanged. On change, notify watchers
+/// and return and log runner lanes that lost their last matching node. Warnings are advisory:
+/// errors computing them are logged and leave the list empty.
+pub fn set_pools(hub: &Hub, actor: &str, id: &str, pools: &[String]) -> Result<PoolsChange> {
+    let before = nodeless_runner_lanes(hub);
     let changed = hub.db.set_pools(id, pools, actor, crate::now_secs())?;
     let what = if pools.is_empty() {
         "took it out of every pool".to_string()
@@ -240,13 +288,29 @@ pub fn set_pools(hub: &Hub, actor: &str, id: &str, pools: &[String]) -> Result<b
         sorted.dedup();
         format!("put it in pools {}", sorted.join(", "))
     };
-    if changed {
-        eprintln!("vk-hub: node {id}: {actor} {what}");
-        hub.changed(id);
-    } else {
+    if !changed {
         eprintln!("vk-hub: node {id}: {actor} {what}: already so");
+        return Ok(PoolsChange::default());
     }
-    Ok(changed)
+    eprintln!("vk-hub: node {id}: {actor} {what}");
+    hub.changed(id);
+    let lanes_without_node = match before.and_then(|before| lanes_left_without_node(hub, &before)) {
+        Ok(lanes) => lanes,
+        Err(e) => {
+            eprintln!("vk-hub: node {id}: cannot tell which runner lanes are left no node: {e:#}");
+            Vec::new()
+        }
+    };
+    if !lanes_without_node.is_empty() {
+        eprintln!(
+            "vk-hub: node {id}: warning: no node can take the work of {}",
+            lanes_without_node.join("; ")
+        );
+    }
+    Ok(PoolsChange {
+        changed: true,
+        lanes_without_node,
+    })
 }
 
 /// Cap node `id`'s concurrency at `ceiling`, or lift the cap with `None`, as `actor`.

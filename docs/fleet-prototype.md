@@ -1445,7 +1445,8 @@ the refusal — before the gate, so a retry counts once and a relay recovering a
 not refused by a later rejection; queued and running jobs stay as they are.
 
 **Pools and labels.** `vk-hub nodes pools <id> <pool,…|none>`, or an operator on the node's
-web page, sets the pools a node is in, at most 256, audited. Labels come from the node's
+web page, sets the pools a node is in, at most 256, audited and logged; both warn of runner
+lanes left without a node. Labels come from the node's
 inventory. `vk-hub nodes` lists each node's pools in its POOLS column and its labels
 under the table.
 

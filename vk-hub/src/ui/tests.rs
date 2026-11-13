@@ -3204,6 +3204,26 @@ async fn an_operator_steers_a_node_from_its_page() {
     assert_eq!(reply.status, 400, "{}", reply.body);
     assert!(reply.body.contains("at most 256 pools"), "{}", reply.body);
     assert_eq!(pools(), ["ci", "gpu"]);
+    // Warn when a pool change leaves a runner lane without a node.
+    let mut policy = hub.db.capacity_policy().unwrap();
+    policy.lanes.push(crate::policy::Lane {
+        pools: vec!["gpu".into()],
+        ..crate::policy::Lane::new(&crate::policy::LaneId::Runner {
+            gitlab: "gl".into(),
+            id: 9,
+        })
+    });
+    hub.db
+        .set_capacity_policy(&policy, "u", crate::now_secs())
+        .unwrap();
+    let reply = steer(format!("_csrf={csrf}&op=pools&pools=ci"), true).await;
+    assert!(
+        reply
+            .body
+            .contains("Now in pools ci. No node can take the work of Runner 9."),
+        "{}",
+        reply.body
+    );
     let reply = steer(format!("_csrf={csrf}&op=pools&pools="), false).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
     assert!(pools().is_empty());
@@ -13422,7 +13442,8 @@ async fn operators_edit_lanes_from_their_page() {
             && question.body.contains(
                 "<li class=\"bad\">This lane selects no pool or node: its runner gets no work \
                  until it does.</li>"
-            ),
+            )
+            && !question.body.contains("No node can take"),
         "{}",
         question.body
     );
@@ -13431,9 +13452,18 @@ async fn operators_edit_lanes_from_their_page() {
         "class=normal&weight=3&max_slots=&pools=ci&pools=&projects=listed&project=42\
          &branches.42=main",
     );
+    // Selecting an empty pool warns before confirmation.
+    let question = post_action(addr, &origin, &operator, "/lanes", &mapped, false).await;
+    assert!(
+        !question.body.contains("selects no pool")
+            && question
+                .body
+                .contains("<li class=\"bad\">No node can take the work of Runner 7.</li>"),
+        "{}",
+        question.body
+    );
     let reply = lanes_confirmed(addr, &origin, &operator, &mapped, &["lanes: runner gl/7"]).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert!(!reply.body.contains("selects no pool"), "{}", reply.body);
     let lane = Lane {
         weight: 3,
         pools: vec!["ci".into()],
@@ -13524,15 +13554,36 @@ async fn operators_edit_lanes_from_their_page() {
     );
     let reply = post_action(addr, &origin, &operator, "/lanes", &refused, false).await;
     assert_eq!(reply.status, 400, "{}", reply.body);
+    // Warn for a new runner lane without nodes, but not the default API-key lane.
     let mut whole = policy.clone();
     whole.lanes.push(lane);
+    (whole.lanes.iter_mut())
+        .find(|l| l.id() == Some(LaneId::Default))
+        .unwrap()
+        .pools = vec!["ci".into()];
     let json = serde_json::to_string_pretty(&whole).unwrap();
     let replace = format!(
         "_csrf={csrf}&op=replace&expected={}&policy={}",
         policy.digest().unwrap(),
         enc(&json)
     );
-    let reply = lanes_confirmed(addr, &origin, &operator, &replace, &["lanes: runner gl/7"]).await;
+    let question = post_action(addr, &origin, &operator, "/lanes", &replace, false).await;
+    assert!(
+        question
+            .body
+            .contains("<li class=\"bad\">No node can take the work of Runner 7.</li>")
+            && !question.body.contains("work of Other API keys"),
+        "{}",
+        question.body
+    );
+    let reply = lanes_confirmed(
+        addr,
+        &origin,
+        &operator,
+        &replace,
+        &["lanes: other API keys, runner gl/7"],
+    )
+    .await;
     assert_eq!(reply.status, 303, "{}", reply.body);
     assert_eq!(hub.db.capacity_policy().unwrap(), whole);
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;

@@ -415,7 +415,7 @@ enum Call {
     RevokeAccount {
         email: String,
     },
-    /// Put a node in pools, replacing the ones it was in.
+    /// Replace a node's pools. Returns [`ops::PoolsChange`]; earlier hubs return a change flag.
     SetPools {
         id: String,
         pools: Vec<String>,
@@ -1923,12 +1923,13 @@ impl Client {
         })
     }
 
-    /// Whether the node's pools changed.
-    pub fn set_pools(&self, id: &str, pools: Vec<String>) -> Result<bool> {
-        self.call(Call::SetPools {
+    /// Whether the pools changed and which runner lanes lost their last matching node.
+    /// Earlier hubs return only the change flag.
+    pub fn set_pools(&self, id: &str, pools: Vec<String>) -> Result<ops::PoolsChange> {
+        pools_change(self.call(Call::SetPools {
             id: id.to_string(),
             pools,
-        })
+        })?)
     }
 
     pub fn create_key(&self, name: &str, policy: KeyPolicy, ttl: Duration) -> Result<CreatedKey> {
@@ -2011,10 +2012,41 @@ impl Client {
     }
 }
 
+/// Decode [`Call::SetPools`], accepting earlier hubs' boolean change flag.
+fn pools_change(reply: serde_json::Value) -> Result<ops::PoolsChange> {
+    Ok(match reply {
+        serde_json::Value::Bool(changed) => ops::PoolsChange {
+            changed,
+            ..ops::PoolsChange::default()
+        },
+        reply => serde_json::from_value(reply)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::Db;
+
+    /// The client accepts current and earlier pool-change responses.
+    #[test]
+    fn a_pool_change_s_answer_reads_from_either_hub() {
+        let now = serde_json::json!({"changed": true, "lanes_without_node": ["Runner 7"]});
+        assert_eq!(
+            pools_change(now).unwrap(),
+            ops::PoolsChange {
+                changed: true,
+                lanes_without_node: vec!["Runner 7".into()],
+            }
+        );
+        assert_eq!(
+            pools_change(serde_json::json!(false)).unwrap(),
+            ops::PoolsChange::default()
+        );
+        let earlier = pools_change(serde_json::json!(true)).unwrap();
+        assert!(earlier.changed && earlier.lanes_without_node.is_empty());
+        assert!(pools_change(serde_json::json!("yes")).is_err());
+    }
 
     #[test]
     fn an_upload_path_crosses_whole() {
@@ -2644,8 +2676,14 @@ mod tests {
             panic!("expected an enrollment");
         };
         let set = format!(r#"{{"op":"set-pools","id":"{id}","pools":["ci","big"]}}"#);
-        assert_eq!(call(&set).unwrap(), true);
-        assert_eq!(call(&set).unwrap(), false);
+        assert_eq!(
+            call(&set).unwrap(),
+            serde_json::json!({"changed": true, "lanes_without_node": []})
+        );
+        assert_eq!(
+            call(&set).unwrap(),
+            serde_json::json!({"changed": false, "lanes_without_node": []})
+        );
         assert_eq!(hub.db.node(&id).unwrap().unwrap().pools, ["big", "ci"]);
         let bad = format!(r#"{{"op":"set-pools","id":"{id}","pools":["no pool"]}}"#);
         assert!(call(&bad).is_err());
