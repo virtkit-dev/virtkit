@@ -4311,7 +4311,6 @@ dependencies = [
  "hyper-util",
  "jemallocator",
  "libc",
- "oci-client",
  "rand",
  "redb",
  "reqwest",
