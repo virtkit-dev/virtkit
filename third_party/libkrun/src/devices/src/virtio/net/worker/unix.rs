@@ -706,8 +706,8 @@ mod tests {
     fn received(vq: &VirtQueue, mem: &GuestMemoryMmap) -> (Vec<(u32, u32)>, Vec<u8>) {
         let mut used = Vec::new();
         let mut bytes = Vec::new();
-        for i in 0..vq.used.idx.get() as usize {
-            let elem = vq.used.ring[i].get();
+        for slot in vq.used.ring.iter().take(vq.used.idx.get() as usize) {
+            let elem = slot.get();
             used.push((elem.id, elem.len));
             let addr = GuestAddress(BUF_BASE * (elem.id as u64 + 1));
             let mut buf = vec![0u8; elem.len as usize];
@@ -1076,11 +1076,9 @@ mod tests {
         let mut queue = vq.create_queue();
         // One chain of four buffers, then a lone one.
         post_buffers(&vq, 5);
-        for i in 0..3 {
-            vq.dtable[i]
-                .flags
-                .set(VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT);
-            vq.dtable[i].next.set(i as u16 + 1);
+        for (i, desc) in vq.dtable.iter().enumerate().take(3) {
+            desc.flags.set(VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT);
+            desc.next.set(i as u16 + 1);
         }
         vq.avail.ring[1].set(4);
         vq.avail.idx.set(2);

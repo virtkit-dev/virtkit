@@ -1257,8 +1257,8 @@ pub(crate) mod tests {
 
         // Let's create two simple descriptor chains.
 
-        for j in 0..5 {
-            vq.dtable[j].set(
+        for (j, desc) in vq.dtable.iter().enumerate().take(5) {
+            desc.set(
                 0x1000 * (j + 1) as u64,
                 0x1000,
                 VIRTQ_DESC_F_NEXT,

@@ -27,6 +27,8 @@ All notable changes to virtkit will be documented in this file.
 - **The hub logs who changes a node's pools**, including the assigned pools or removal
   from every pool, as it does for quarantine and concurrency ceiling changes.
 
+- Rust toolchain upgraded to 1.100.0.
+
 ### Removed
 
 - **A GitLab runner no longer names a pool**; its lane on the hub selects where its work runs.
