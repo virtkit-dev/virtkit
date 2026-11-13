@@ -2672,6 +2672,7 @@ fn a_node_s_own_runner_is_noted_on_a_hub_that_places_jobs() {
         }),
         last_refusal: Some("runner".into()),
         placed: Some(0),
+        pools: vec!["ci".into()],
         ..ops::NodeView::default()
     };
     assert_eq!(
@@ -2754,6 +2755,7 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
             pending_commands: 1,
             address: Some("192.0.2.7".parse().unwrap()),
             user: Some("gitlab-runner".into()),
+            pools: vec!["ci".into(), "gpu".into()],
             ..ops::NodeView::default()
         },
         ops::NodeView {
@@ -2808,6 +2810,7 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
         ("CEILING", "4 (node: 6)"),
         ("CONC", "6"),
         ("SYNC", "behind (2<3)"),
+        ("POOLS", "ci, gpu"),
         ("LAST SEEN", "5s ago"),
         ("ADMITTED", "8G/400G"),
         ("VMS", "-"),
@@ -2822,6 +2825,7 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
         ("ACQUIRE", "run"),
         ("CEILING", "-"),
         ("SYNC", "-"),
+        ("POOLS", "-"),
         ("LAST SEEN", "never"),
     ] {
         assert_eq!(cell(header, b, column), want, "{column}\n{table}");
