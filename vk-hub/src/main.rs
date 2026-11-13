@@ -1850,7 +1850,7 @@ async fn run(cli: Cli) -> Result<()> {
                                     }
                                     bail!(
                                         "{} uses placement rules that do not convert to lanes: \
-                                         set each lane's nodes in a policy of version {}",
+                                         set each lane's pools in a policy of version {}",
                                         file.display(),
                                         crate::policy::VERSION
                                     );

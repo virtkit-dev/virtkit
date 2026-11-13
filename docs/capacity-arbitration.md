@@ -17,8 +17,12 @@ its lane and held to its settings.
   - `weight` (positive, default 1) and `max_slots` (positive; absent is unbounded): the slots
     it holds at once — room offered, granted or claimed, its jobs, and finished admissions not
     yet settled. Checked when room is granted; a job already on its slot is not checked again.
-  - `nodes`: node IDs and pool names its work may use — a node listed, or in a pool listed.
-    Absent, any node. It is the only placement setting, applied when room is granted.
+  - `pools`: where its work runs — pool names, and nodes as `#node#<node ID>`, each node being
+    the only member of that implicit pool. The lane may use the union of their members: a node
+    in a pool listed, or listed itself, whether or not it is in any pool. It is the only
+    placement setting, applied when room is granted. A runner lane selecting none gets no work,
+    and says so; an API key lane selecting none leaves each job to the pool it names, and
+    selecting some holds its jobs to those among them.
   - `projects` (runner lanes only): `{gitlab, id, branches?}`, on the runner's own GitLab.
     Absent, any project; `[]`, none. With `branches` (globs), a job of that project must be a
     branch pipeline of a matching branch. A production lane must list its projects, each with
@@ -35,8 +39,9 @@ A minimal policy, for project 7 of instance `gl`, its normal runner 42 and produ
   "version": 2,
   "lanes": [
     { "runner": { "gitlab": "gl", "id": 42 }, "class": "normal", "weight": 3,
+      "pools": ["ci", "#node#0123456789abcdef0123456789abcdef"],
       "projects": [{ "gitlab": "gl", "id": 7 }] },
-    { "runner": { "gitlab": "gl", "id": 43 }, "class": "production", "nodes": ["trusted"],
+    { "runner": { "gitlab": "gl", "id": 43 }, "class": "production", "pools": ["trusted"],
       "projects": [{ "gitlab": "gl", "id": 7, "branches": ["main", "release/**"] }] },
     { "key": "ci-bot", "max_slots": 2 },
     { "default": true }
@@ -46,14 +51,22 @@ A minimal policy, for project 7 of instance `gl`, its normal runner 42 and produ
 
 The hub rejects unknown fields at any depth, invalid names or IDs, a source named twice, and
 policies exceeding these bounds: 32769 lanes, 64 headroom entries; 16384 projects per lane,
-1024 branches per project, 256 nodes and pools per lane.
+1024 branches per project, 256 pools and nodes per lane. A pool's name never starts with `#`:
+`#node#` is reserved for nodes, and a node ID that lost the prefix is refused rather than read
+as a pool. A policy from before 0.111 lists `nodes`, node IDs and pool names: the hub reads it
+as `pools`, a node ID as `#node#<node ID>`, and writes `pools`.
 
 ## Setting it
 
 In the hub's web UI, *Lanes* (`/lanes`; `/capacity` redirects there) lists each lane with the
 slots it holds and the work it has waiting, and the production headroom. Operators edit a lane
-there — class, weight, max slots, nodes, projects and branches — map a runner the hub sees
-without a lane, add a lane for an API key, unmap or remove one, and keep or release headroom.
+there — class, weight, max slots, where its work runs, projects and branches — map a runner
+the hub sees without a lane, add a lane for an API key, unmap or remove one, and keep or release
+headroom. *Where its work runs* is one list: each pool with its member nodes, then each node
+with the pools it is in; under it, the nodes the ticked boxes resolve to, red when none, which
+follows the boxes as they are ticked. Saving a runner lane that selects nothing is asked with
+what it means. The lanes table, a runner's row on its server's page and a project's page show
+the nodes a lane's work can go to, red when none.
 Each edit saves the whole policy against the digest the page showed, asked first what changes.
 The whole policy can also be replaced as JSON there; the probe and backoff settings are changed
 with `capacity-policy set` only. A policy held since its conversion lists the placement rules
@@ -96,17 +109,27 @@ runner and client mappings, project placement rules) once, keeps the original be
 rollback, rewrites the scheduling identity of claimed admissions and unfinished jobs to their
 lane, and audits the conversion with both digests:
 
-- Each mapped runner becomes a lane with its class and nodes and pools, its tenant's weight, cap
-  (as `max_slots`) and projects on the runner's GitLab; an empty list stays empty. A production
-  runner's lane keeps only projects with production branches, as their `branches`.
+- Each mapped runner becomes a lane with its class, its nodes and pools as `pools`, its
+  tenant's weight, cap (as `max_slots`) and projects on the runner's GitLab; an empty list stays
+  empty. A production runner's lane keeps only projects with production branches, as their
+  `branches`.
 - Each mapped API key becomes a lane with its tenant's weight and cap; the fallback tenant's
   settings become the default lane. Tenants no runner or key used disappear.
 - Lanes converted from one tenant each get its whole weight and cap, so together they get more
   than before. `show` and the page list those lanes until they are next changed.
-- A placement rule applying to every job a runner lane can take narrows the lane's nodes. Any
+- A placement rule applying to every job a runner lane can take narrows the lane's pools. Any
   other rule cannot be expressed on a lane: the converted policy is then held — it grants no new
   capacity, running work continues — and `show` and the page list each rule with its lane.
-  Set the lanes' nodes and set the policy, changed or not, to activate it.
+  Set the lanes' pools and set the policy, changed or not, to activate it.
+
+Before 0.111, a runner carried a pool from its relay's configuration, and a lane's `nodes` only
+narrowed it. On its first start, a hub of 0.111 or later has each runner lane that selects
+nothing select the pool its relay last reported for the runner, so what ran where goes on
+running there; it audits the rewrite, with both digests and the lanes given a pool, and logs it.
+A runner lane whose relay reported no pool is left selecting nothing — the hub says so at each
+start — and gets no work until an operator selects some. A lane with `nodes` keeps them, read as
+`pools`, which no longer narrows the runner's pool: a node it listed is now reachable whether or
+not it is in that pool. The rewrite happens once: a lane emptied afterwards stays empty.
 
 A job recorded before capacity arbitration, without a scheduling identity, is charged to the
 default lane until it finishes. `capacity-policy set` also accepts the earlier format for this
@@ -181,10 +204,10 @@ How the hub orders waiting requests and queued jobs is in
   production work: normal work must leave the fleet that much room for it, or all the room left
   when already short.
 
-A lane given `nodes` has its room granted only on a node listed or in a pool listed, the least
-loaded of those first; other nodes are never used for it, even idle. Without `nodes`, it may
-use any node. Confinement follows the runner ID its relay reports — no trust boundary beyond the
-relay.
+A lane's room is granted only on the nodes its `pools` resolve to, the least loaded of those
+first; other nodes are never used for it, even idle, and a runner lane selecting nothing is
+granted none. An API key lane selecting nothing leaves each job to the pool it names. Placement
+follows the runner ID its relay reports — no trust boundary beyond the relay.
 
 ## Reading the runners
 
@@ -211,6 +234,7 @@ none):
 | `production headroom` | the room left is headroom kept for production |
 | `awaiting relay reconciliation` | its relay's session has not yet listed what it holds |
 | `its lane's allowed nodes` | nodes have room, none its lane may use |
+| `its lane selects no pool or node` | its runner's lane selects nothing: no node may take it |
 | `no longer allowed by its lane` | a queued job, held until allowed again or its deadline |
 | `its relay's inventory is unknown`, `its runner is not in its relay's inventory` | a queued job submitted without an admission |
 

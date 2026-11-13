@@ -1,5 +1,7 @@
 // vk-hub web UI: a button with `data-check="all"` or `data-check="none"` checks or unchecks
-// every checkbox of its fieldset, such as the nodes a rollout updates. A `data-dismiss`
+// every checkbox of its fieldset, such as the nodes a rollout updates. In a
+// `<fieldset data-runs-on>`, a lane's selection of pools and nodes, its `#runs-on` line
+// follows the boxes ticked: the union of each ticked box's `data-nodes`. A `data-dismiss`
 // button, such as a question's Cancel, empties `#flash`; every message swapped into `#flash`
 // gets one, as the flash stays pinned to the window until dismissed. An opened
 // `<details data-keep>` stays open across live updates. Listening on the document, it serves
@@ -28,6 +30,39 @@
   }
   document.addEventListener("htmx:oobAfterSwap", closable);
   document.addEventListener("htmx:afterSwap", closable);
+
+  // The nodes a lane's ticked pools and nodes resolve to, as the server lists them on load.
+  function runsOn(fieldset) {
+    var line = fieldset.querySelector("#runs-on");
+    var out = line === null ? null : line.querySelector("span");
+    if (out === null) {
+      return;
+    }
+    var boxes = fieldset.querySelectorAll("input[type=checkbox][data-nodes]");
+    var seen = {};
+    var names = [];
+    for (var i = 0; i < boxes.length; i++) {
+      if (!boxes[i].checked) {
+        continue;
+      }
+      var members = boxes[i].getAttribute("data-nodes").split("\n");
+      for (var j = 0; j < members.length; j++) {
+        if (members[j] !== "" && !Object.prototype.hasOwnProperty.call(seen, members[j])) {
+          seen[members[j]] = true;
+          names.push(members[j]);
+        }
+      }
+    }
+    // A pool typed in resolves on the server: until saved, it adds no node here.
+    out.textContent = names.length === 0 ? "no node" : names.join(", ");
+    line.className = names.length === 0 ? "bad" : "";
+  }
+  document.addEventListener("change", function (e) {
+    var fieldset = e.target instanceof Element ? e.target.closest("fieldset[data-runs-on]") : null;
+    if (fieldset !== null) {
+      runsOn(fieldset);
+    }
+  });
 
   document.addEventListener("click", function (e) {
     var dismiss = e.target instanceof Element ? e.target.closest("[data-dismiss]") : null;

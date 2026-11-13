@@ -79,17 +79,16 @@ pub(super) async fn wait_reason(hub: &Hub, reason: &str) {
 /// Waits for the reason the hub gives for not granting the waiting request of runner
 /// `runner_id` of GitLab instance `gl`.
 async fn wait_reason_of(hub: &Hub, runner_id: u64, reason: &str) {
+    let mut last = None;
     for _ in 0..1500 {
-        let snapshot = crate::jobs::arbitration_snapshot(hub).unwrap();
-        if snapshot
-            .get(&("gl".to_string(), runner_id))
-            .is_some_and(|v| v.reason == Some(reason))
-        {
+        let mut snapshot = crate::jobs::arbitration_snapshot(hub).unwrap();
+        last = snapshot.remove(&("gl".to_string(), runner_id));
+        if last.as_ref().is_some_and(|v| v.reason == Some(reason)) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("the request never waited for {reason:?}");
+    panic!("the request never waited for {reason:?}: last {last:?}");
 }
 
 /// Give `key`'s relay a second runner, `name` with GitLab runner ID `runner_id`, with a lane
@@ -123,6 +122,7 @@ pub(super) fn add_runner(
     policy.lanes.push(crate::policy::Lane {
         class,
         projects,
+        pools: vec!["ci".into()],
         ..crate::policy::Lane::new(&crate::policy::LaneId::Runner {
             gitlab: "gl".into(),
             id: runner_id,

@@ -9873,7 +9873,7 @@ async fn relays_and_their_runners_follow_their_server() {
          <th>state</th><th class=\"num\">jobs</th><th>last GitLab answer</th></tr></thead>",
         // Its server not approved: neither mapped nor unmapped.
         "<tr class=\"runner\"><td><strong>ci</strong><br><span class=\"sub\">GitLab ID 42</span>\
-         </td><td>config</td><td>-</td><td>pool ci · large · 4096 MiB",
+         </td><td>config</td><td>-</td><td>large · 4096 MiB",
         "<td><span class=\"badge warn\">server not approved</span></td><td class=\"num\">3 / 4</td><td><time",
         " · HTTP 204</td>",
         // The scheduler's view, folded.
@@ -9904,7 +9904,7 @@ async fn relays_and_their_runners_follow_their_server() {
     assert!(
         event.contains(
             "GitLab ID 42</span></td><td>config</td><td><span class=\"badge warn\">No lane: \
-             its jobs are refused</span></td><td>pool"
+             its jobs are refused</span></td><td>large · 4096 MiB"
         ),
         "{event}"
     );
@@ -9956,7 +9956,7 @@ async fn relays_and_their_runners_follow_their_server() {
     assert!(
         event.contains(
             "GitLab ID 42</span></td><td>config</td><td><a href=\"/lanes\">weight 2</a></td>\
-             <td>pool ci"
+             <td>large · 4096 MiB, 2 CPUs, 1 GiB disk · runs on <span class=\"bad\">no node</span>"
         ),
         "{event}"
     );
@@ -13362,9 +13362,9 @@ async fn operators_edit_lanes_from_their_page() {
     assert!(
         page.contains(
             "<tr><td>Other API keys</td><td>normal</td><td class=\"num\">1</td>\
-             <td class=\"num\">-</td><td>any node</td><td>-</td><td class=\"num\">0</td>\
-             <td class=\"num\">0</td><td class=\"actions\"><a href=\"/lanes?edit=default\">Edit\
-             </a></td></tr>"
+             <td class=\"num\">-</td><td>any node of the job&#39;s pool</td><td>-</td>\
+             <td class=\"num\">0</td><td class=\"num\">0</td><td class=\"actions\">\
+             <a href=\"/lanes?edit=default\">Edit</a></td></tr>"
         ),
         "{page}"
     );
@@ -13374,6 +13374,14 @@ async fn operators_edit_lanes_from_their_page() {
     assert!(edit.contains("<h1>Runner 7</h1>"), "{edit}");
     assert!(edit.contains("No lane yet"), "{edit}");
     assert!(edit.contains("name=\"branches.42\""), "{edit}");
+    // One list of where its work runs, resolving to no node while none is enrolled.
+    assert!(
+        edit.contains("<fieldset class=\"pick\" data-runs-on><legend>Where its work runs</legend>")
+            && edit.contains(
+                "<p id=\"runs-on\" class=\"bad\">Its work can go to: <span>no node</span></p>"
+            ),
+        "{edit}"
+    );
     let digest = hub.db.capacity_policy().unwrap().digest().unwrap();
     let save = |expected: &str, rest: &str| {
         format!("_csrf={csrf}&op=save&expected={expected}&lane=runner%2Fgl%2F7&{rest}")
@@ -13385,14 +13393,32 @@ async fn operators_edit_lanes_from_their_page() {
     );
     let reply = post_action(addr, &origin, &operator, "/lanes", &invalid, false).await;
     assert_eq!(reply.status, 400, "{}", reply.body);
-    let mapped = save(
+    // Selecting no pool or node is asked with what it means; selecting one, without.
+    let empty = save(
         &digest,
         "class=normal&weight=3&max_slots=&projects=listed&project=42&branches.42=main",
     );
+    let question = post_action(addr, &origin, &operator, "/lanes", &empty, false).await;
+    assert!(
+        question.body.contains("<h1>Confirm</h1>")
+            && question.body.contains(
+                "<li class=\"bad\">This lane selects no pool or node: its runner gets no work \
+                 until it does.</li>"
+            ),
+        "{}",
+        question.body
+    );
+    let mapped = save(
+        &digest,
+        "class=normal&weight=3&max_slots=&pools=ci&pools=&projects=listed&project=42\
+         &branches.42=main",
+    );
     let reply = lanes_confirmed(addr, &origin, &operator, &mapped, &["lanes: runner gl/7"]).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
+    assert!(!reply.body.contains("selects no pool"), "{}", reply.body);
     let lane = Lane {
         weight: 3,
+        pools: vec!["ci".into()],
         projects: Some(vec![LaneProject {
             gitlab: "gl".into(),
             id: 42,
@@ -13419,15 +13445,29 @@ async fn operators_edit_lanes_from_their_page() {
     assert!(
         page.contains(
             "<tr><td>Runner 7</td><td>normal</td><td class=\"num\">3</td><td class=\"num\">-\
-             </td><td>any node</td><td>acme/web · main</td>"
+             </td><td><span class=\"bad\">no node</span></td><td>acme/web · main</td>"
         ),
         "{page}"
+    );
+    // Its selection stays ticked, as a pool no node is in yet.
+    let edit = get(addr, "/lanes?edit=runner%2Fgl%2F7", Some(&operator))
+        .await
+        .body;
+    assert!(
+        edit.contains(
+            "<label><input type=\"checkbox\" name=\"pools\" value=\"ci\" data-nodes=\"\" \
+             checked> ci <span class=\"sub\">no node</span></label>"
+        ),
+        "{edit}"
     );
     let project_page = get(addr, "/gitlab/gl/projects/42", Some(&operator))
         .await
         .body;
     assert!(
-        project_page.contains("<td>Runner 7</td><td>normal</td><td>main</td><td>any node</td>"),
+        project_page.contains(
+            "<td>Runner 7</td><td>normal</td><td>main</td><td><span class=\"bad\">no node\
+             </span></td>"
+        ),
         "{project_page}"
     );
     // Production headroom, kept and released.

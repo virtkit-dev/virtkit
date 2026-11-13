@@ -1464,7 +1464,9 @@ database: for a reservation, the grant only, so a request that got no reservatio
 afresh; for a job, the job or the gate's refusal.
 
 **Placement.** A node takes placed work while its session is at version 3 and has sent its
-`held`, it is connected, in the pool, carries every label, reports itself ready and has at least
+`held`, it is connected, its runner's lane selects it or one of its pools (an API key's job, in
+the pool the job names, which may be a node's `#node#<node ID>`), it carries every label,
+reports itself ready and has at least
 the CPUs the envelope asks, does not report a gitlab-runner of its own ([one kind of
 host](#placed-jobs-on-the-node)), and while it holds less placed work than its cap: the smaller
 of the ceiling the operator set it and the node's own `max_concurrency`, if either is set —

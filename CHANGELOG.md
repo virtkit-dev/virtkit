@@ -11,6 +11,23 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **A lane decides where its runner's work runs.** A lane of the capacity policy selects
+  `pools`: pool names, and nodes as `#node#<node ID>`, each node being the only member of its
+  own implicit pool; its work goes to the union of their members, so a node outside every pool
+  can be selected as such. The pool a runner's relay configures no longer takes part. A runner
+  lane selecting nothing gets no work, its requests and jobs waiting for `its lane selects no
+  pool or node`; an API key lane selecting nothing leaves each job to the pool it names, which
+  may now be a node's `#node#<node ID>`. A policy's `nodes` is read as `pools`. On its first
+  start, the hub has each runner lane selecting nothing select the pool its relay last
+  reported, audited and logged, so nothing moves; a runner whose relay reported no pool stays
+  without work until its lane selects some. Pool names cannot start with `#`.
+
+- **The lane form lists where its work runs in one place.** Pools with their member nodes,
+  then nodes with the pools they are in, and under them the nodes the ticked boxes resolve to,
+  red when none, following each tick. Saving a runner lane that selects nothing is confirmed
+  knowing it gets no work. The Lanes table, a runner's row on its GitLab page and a project's
+  page show the nodes a lane's work can go to, not the runner's pool.
+
 - **The hub logs pool changes.** Its journal records who put a node in which pools or took it
   out of every pool, as it does a quarantine or a ceiling; the audit log already did.
 

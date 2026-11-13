@@ -44,6 +44,10 @@ pub(super) fn delisted(
 /// Why a request or queued job waits: nodes have room, but none its lane may use.
 const LANE_NODES: &str = "its lane's allowed nodes";
 
+/// Why a request or queued job waits: its runner's lane selects no pool or node, so no node
+/// may take it.
+const LANE_EMPTY: &str = "its lane selects no pool or node";
+
 /// Why work waits while the policy converted to lanes awaits an operator's activation.
 const HELD: &str = "capacity policy awaiting activation";
 
@@ -919,7 +923,7 @@ fn refresh(state: &mut State, policy: &crate::policy::Policy, relays: &Relays<'_
                     if runners.next().is_some()
                         || !runner.verified
                         || runner.runner_id != Some(runner_id)
-                        || runner.placement != ticket.placement
+                        || !same_requirements(&runner.placement, &ticket.placement)
                     {
                         return None;
                     }
@@ -1062,6 +1066,10 @@ fn arbitrate(
                     .is_some_and(|key| loads.probing.contains(key))
             {
                 blocked(state, id, "runner already probing");
+                continue;
+            }
+            if lane.selects_nothing() {
+                blocked(state, id, LANE_EMPTY);
                 continue;
             }
             let admission = (&ticket.placement, ticket.identity.class);
@@ -1242,7 +1250,9 @@ fn arbitrate(
                     Err(why) => {
                         // With all nodes full, keep the previous reason while the lane's nodes
                         // still exclude a node.
-                        let ruled_out = if fits.is_empty() {
+                        let ruled_out = if lane.is_some_and(crate::policy::Lane::selects_nothing) {
+                            Some(LANE_EMPTY)
+                        } else if fits.is_empty() {
                             previous.filter(|&p| p == LANE_NODES && !excluded.is_empty())
                         } else {
                             (fits.iter().all(|(node, _)| excluded.contains(node)))

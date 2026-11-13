@@ -103,11 +103,12 @@ EOF
   hub gitlabs add e2e "$GL_URL" >>"$LOGS/hub-cli.log" 2>&1 || die "vk-hub gitlabs add failed"
   hub gitlabs projects approve e2e "$GL_PROJECT_ID:$GL_PROJECT_PATH" >>"$LOGS/hub-cli.log" 2>&1 ||
     die "vk-hub gitlabs projects approve failed"
-  # The runner's capacity lane: an unmapped runner gets no work.
+  # The runner's capacity lane, selecting the node's pool: an unmapped runner, or one whose
+  # lane selects nothing, gets no work.
   local policy_digest
   policy_digest=$(hub capacity-policy show 2>&1 >/dev/null | sed -n 's/^Policy digest: //p')
-  printf '{"version": 2, "lanes": [{"runner": {"gitlab": "e2e", "id": %s}}]}\n' "$GL_RUNNER_ID" \
-    >"$RUN/hub/policy.json"
+  printf '{"version": 2, "lanes": [{"runner": {"gitlab": "e2e", "id": %s}, "pools": ["e2e"]}]}\n' \
+    "$GL_RUNNER_ID" >"$RUN/hub/policy.json"
   hub capacity-policy set --expected "$policy_digest" "$RUN/hub/policy.json" >>"$LOGS/hub-cli.log" 2>&1 ||
     die "vk-hub capacity-policy set failed (see $LOGS/hub-cli.log)"
   log "hub: https://127.0.0.1:$HUB_PORT"

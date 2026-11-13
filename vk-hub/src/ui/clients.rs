@@ -1191,14 +1191,14 @@ fn runners_table(h: &mut Html, shown: &Shown, r: &RelayView, now: u64, steer: bo
                 h.raw("-");
             }
         }
-        h.raw("</td><td>pool ").node(&p.pool);
+        h.raw("</td><td>");
         if !p.labels.is_empty() {
-            h.raw(" · ").node(&p.labels.join(", "));
+            h.node(&p.labels.join(", ")).raw(" · ");
         }
-        h.raw(" · ").text(crate::store::envelope_text(p.envelope));
-        if let Some(m) = mapping.filter(|m| m.confined()) {
-            h.raw(" · only ")
-                .text(super::lanes::may_use_text(m, &shown.nodes));
+        h.text(crate::store::envelope_text(p.envelope));
+        if let Some(m) = mapping {
+            h.raw(" · runs on ");
+            super::lanes::runs_on(h, m, &shown.nodes);
         }
         h.raw("</td><td>");
         if !runner.verified {

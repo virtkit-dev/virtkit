@@ -1892,6 +1892,13 @@ pub fn events_summary(events: &[vk_hub_proto::job::JobEvent]) -> Option<String> 
 // ---------------------------------------------------------------------------------------------
 // Placement.
 
+/// Whether `a` and `b` ask the same of a node: the labels and the envelope. A pool is not
+/// asked of a node by a relay's work, whose lane selects where it goes; the one its relay may
+/// still report for the runner is not compared.
+pub fn same_requirements(a: &Placement, b: &Placement) -> bool {
+    a.labels == b.labels && a.envelope == b.envelope
+}
+
 /// A node's room for `placement`'s envelope: how many it fits, `None` when it takes no
 /// placed work now.
 /// `placed` counts work as [`placed`] does; `extra` is additional work not in the heartbeat.
@@ -1908,7 +1915,8 @@ fn room(
     if !link.held || hub.reach(node) != Reach::Connected {
         return None;
     }
-    if !row.pools.contains(&placement.pool) {
+    // A relay's work names no pool: its lane selects where it goes ([`lane_exclusions`]).
+    if !placement.pool.is_empty() && !crate::policy::node_in(node, &row.pools, &placement.pool) {
         return None;
     }
     let inventory = row.inventory.as_ref()?;
@@ -4388,13 +4396,14 @@ pub fn enforces_rules(hub: &Hub, row: &NodeRow) -> bool {
     !hub.db.egress_rules_on() || row.inventory.as_ref().is_some_and(|i| i.egress_rules)
 }
 
-/// Nodes `lane` may not use: none when the policy lacks it or it names no nodes.
+/// Nodes `lane` may not use: none when the policy lacks it, or it is an API key lane selecting
+/// nothing; every node for a runner lane selecting nothing.
 fn lane_exclusions(
     policy: &crate::policy::Policy,
     lane: &crate::policy::LaneId,
     nodes: &[(String, NodeRow)],
 ) -> HashSet<String> {
-    let Some(lane) = policy.lane(lane).filter(|l| l.confined()) else {
+    let Some(lane) = policy.lane(lane).filter(|l| l.selects()) else {
         return HashSet::new();
     };
     nodes
@@ -5886,16 +5895,17 @@ mod tests {
         };
         let mut policy = crate::policy::Policy::default();
         policy.lanes.push(Lane {
-            nodes: Some(vec!["trusted".into()]),
+            pools: vec!["trusted".into()],
             ..Lane::new(&lane)
         });
         let mut job = sent("n1", 1, None);
-        job.row.scheduling = Some(crate::store::SchedulingIdentity {
+        let identity = crate::store::SchedulingIdentity {
             lane,
             class: crate::policy::Class::Normal,
             gitlab: Some("gl".into()),
             runner_id: Some(42),
-        });
+        };
+        job.row.scheduling = Some(identity.clone());
         let trusted = NodeRow {
             pools: vec!["trusted".into()],
             ..NodeRow::default()
@@ -5910,10 +5920,19 @@ mod tests {
         );
         job.row.scheduling = None;
         assert!(job_exclusions(&policy, &job, &nodes).is_empty());
-        policy.lanes[0].nodes = Some(vec!["trusted".into()]);
+        policy.lanes[0].pools = vec!["trusted".into()];
         assert_eq!(
             job_exclusions(&policy, &job, &nodes),
             HashSet::from(["n2".to_string()])
+        );
+        // The default lane selecting nothing leaves every node; a runner lane, none.
+        policy.lanes[0].pools = Vec::new();
+        assert!(job_exclusions(&policy, &job, &nodes).is_empty());
+        job.row.scheduling = Some(identity);
+        policy.lanes[1].pools = Vec::new();
+        assert_eq!(
+            job_exclusions(&policy, &job, &nodes),
+            HashSet::from(["n1".to_string(), "n2".to_string()])
         );
     }
 

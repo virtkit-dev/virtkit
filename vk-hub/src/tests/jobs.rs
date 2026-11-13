@@ -256,6 +256,8 @@ fn enrolled_key(hub: &Hub) -> String {
                     })
                     .collect(),
             ),
+            // Where [`new_node`] puts every node.
+            pools: vec!["ci".into()],
             ..crate::policy::Lane::new(&crate::policy::LaneId::Runner {
                 gitlab: "gl".into(),
                 id: 42,

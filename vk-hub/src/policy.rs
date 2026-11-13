@@ -1,7 +1,7 @@
 //! Durable capacity arbitration policy: one lane per input — a relay runner, an API key, or
-//! the default lane of API keys no lane names — with its weight, slot limit, the nodes it may
-//! use and the projects it may run, and the scheduler settings. Relay runners are identified by
-//! GitLab instance and runner ID, never by name.
+//! the default lane of API keys no lane names — with its weight, slot limit, the pools and
+//! nodes it may use and the projects it may run, and the scheduler settings. Relay runners are
+//! identified by GitLab instance and runner ID, never by name.
 
 use std::collections::BTreeSet;
 
@@ -21,8 +21,49 @@ const MAX_LANES: usize = 2 * 16384 + 1;
 const MAX_HEADROOMS: usize = 64;
 const MAX_PROJECTS: usize = 16384;
 const MAX_BRANCHES: usize = 1024;
-/// The most nodes and pools one lane names.
-const MAX_NODES: usize = 256;
+/// The most pools and nodes one lane selects.
+const MAX_POOLS: usize = 256;
+
+/// The prefix of the pool every node is implicitly the only member of: `#node#<node ID>`,
+/// which a lane or a job selects as it does a pool. `#` is outside a pool's name
+/// ([`crate::store::valid_name`]), so an operator's pool never collides with one, and a copy
+/// that loses the prefix is refused rather than read as a pool.
+pub const NODE_POOL_PREFIX: &str = "#node#";
+
+/// Node `id`'s implicit pool.
+pub fn node_pool(id: &str) -> String {
+    format!("{NODE_POOL_PREFIX}{id}")
+}
+
+/// The node whose implicit pool `target` is, if it is one.
+pub fn node_of_pool(target: &str) -> Option<&str> {
+    target
+        .strip_prefix(NODE_POOL_PREFIX)
+        .filter(|id| vk_hub_proto::valid_id(id))
+}
+
+/// Whether `target` names a pool or a node's implicit pool.
+pub fn valid_target(target: &str) -> bool {
+    node_of_pool(target).is_some() || crate::store::valid_name(target)
+}
+
+/// Whether node `id`, in `pools`, is a member of `target`.
+pub fn node_in(id: &str, pools: &[String], target: &str) -> bool {
+    match node_of_pool(target) {
+        Some(node) => node == id,
+        None => pools.iter().any(|p| p == target),
+    }
+}
+
+/// `target` as a lane selects it: a node ID as that node's implicit pool, anything else as
+/// given.
+fn as_target(target: &str) -> String {
+    if vk_hub_proto::valid_id(target) {
+        node_pool(target)
+    } else {
+        target.to_owned()
+    }
+}
 /// The longest branch pattern and API key principal, in bytes.
 const MAX_TEXT: usize = 255;
 /// The longest backoff or busy timeout.
@@ -95,7 +136,7 @@ pub struct LaneProject {
 /// One input's share of the fleet, and what it may run where. Exactly one of `runner`, `key`
 /// and `default` names its source.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "LaneWire")]
 pub struct Lane {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner: Option<RunnerRef>,
@@ -111,10 +152,11 @@ pub struct Lane {
     /// The most slots it holds at once; unbounded when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_slots: Option<u32>,
-    /// Node IDs and pool names its work may go to: a node listed, or in a pool listed. Any node
-    /// when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nodes: Option<Vec<String>>,
+    /// Where its work may go: pools, and nodes as their implicit pools ([`node_pool`]), the
+    /// union of whose members it may use. A runner lane selecting none gets no work; an API key
+    /// lane selecting none leaves each job to the pool it names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<String>,
     /// Runner lanes only: the projects its jobs may be of; any when absent, none when empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projects: Option<Vec<LaneProject>>,
@@ -124,8 +166,55 @@ fn one() -> u32 {
     1
 }
 
+/// A lane as a policy file writes it: [`Lane`], plus `nodes` as policies before 0.111 listed
+/// node IDs and pool names, read into `pools`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaneWire {
+    #[serde(default)]
+    runner: Option<RunnerRef>,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    default: bool,
+    #[serde(default)]
+    class: Class,
+    #[serde(default = "one")]
+    weight: u32,
+    #[serde(default)]
+    max_slots: Option<u32>,
+    #[serde(default)]
+    pools: Vec<String>,
+    #[serde(default)]
+    nodes: Option<Vec<String>>,
+    #[serde(default)]
+    projects: Option<Vec<LaneProject>>,
+}
+
+impl From<LaneWire> for Lane {
+    fn from(w: LaneWire) -> Self {
+        let mut pools = w.pools;
+        for target in w.nodes.into_iter().flatten() {
+            let target = as_target(&target);
+            if !pools.contains(&target) {
+                pools.push(target);
+            }
+        }
+        Lane {
+            runner: w.runner,
+            key: w.key,
+            default: w.default,
+            class: w.class,
+            weight: w.weight,
+            max_slots: w.max_slots,
+            pools,
+            projects: w.projects,
+        }
+    }
+}
+
 impl Lane {
-    /// A lane of `id`, weight 1, any node, any project.
+    /// A lane of `id`, weight 1, selecting no pool or node, any project.
     pub fn new(id: &LaneId) -> Self {
         let (runner, key, default) = match id {
             LaneId::Runner { gitlab, id } => (
@@ -146,7 +235,7 @@ impl Lane {
             class: Class::Normal,
             weight: 1,
             max_slots: None,
-            nodes: None,
+            pools: Vec::new(),
             projects: None,
         }
     }
@@ -166,20 +255,18 @@ impl Lane {
 
     /// Whether its work may go to `node`, in `pools`.
     pub fn allows_node(&self, node: &str, pools: &[String]) -> bool {
-        self.nodes.as_ref().is_none_or(|targets| {
-            targets.iter().any(|t| {
-                if vk_hub_proto::valid_id(t) {
-                    t == node
-                } else {
-                    pools.contains(t)
-                }
-            })
-        })
+        !self.selects() || self.pools.iter().any(|t| node_in(node, pools, t))
     }
 
-    /// Whether it limits its work to some nodes.
-    pub fn confined(&self) -> bool {
-        self.nodes.is_some()
+    /// Whether its selection decides where its work goes: a runner lane's always does; an API
+    /// key lane's once it selects something, its jobs otherwise going by the pool each names.
+    pub fn selects(&self) -> bool {
+        self.runner.is_some() || !self.pools.is_empty()
+    }
+
+    /// Whether it is a runner lane selecting no pool or node: its work waits.
+    pub fn selects_nothing(&self) -> bool {
+        self.runner.is_some() && self.pools.is_empty()
     }
 
     /// Project `id` of instance `gitlab`, as it lists it; `Ok(None)` when it lists every
@@ -423,7 +510,7 @@ impl Policy {
         for (i, headroom) in self.headroom.iter().enumerate() {
             let p = &headroom.placement;
             if !(1..=MAX_HEADROOM_SLOTS).contains(&headroom.slots)
-                || !crate::store::valid_name(&p.pool)
+                || !valid_target(&p.pool)
                 || p.labels.len() > 32
                 || p.labels.iter().any(|l| !crate::store::valid_name(l))
                 || !(1..=MAX_MEM_MIB).contains(&p.envelope.mem_mib)
@@ -485,18 +572,16 @@ fn validate_lane(lane: &Lane, id: &LaneId) -> Result<()> {
             bail!("only a runner's lane lists projects");
         }
     }
-    if let Some(nodes) = &lane.nodes {
-        if nodes.is_empty() || nodes.len() > MAX_NODES {
-            bail!("nodes must name 1 to {MAX_NODES} nodes or pools; omit it for any node");
+    if lane.pools.len() > MAX_POOLS {
+        bail!("pools selects at most {MAX_POOLS} pools and nodes");
+    }
+    let mut seen = BTreeSet::new();
+    for t in &lane.pools {
+        if !valid_target(t) {
+            bail!("invalid pool {t:?}: a pool's name, or a node as `{NODE_POOL_PREFIX}<node ID>`");
         }
-        let mut seen = BTreeSet::new();
-        for n in nodes {
-            if !vk_hub_proto::valid_id(n) && !crate::store::valid_name(n) {
-                bail!("invalid node ID or pool name {n:?}");
-            }
-            if !seen.insert(n) {
-                bail!("{n:?} listed twice");
-            }
+        if !seen.insert(t) {
+            bail!("{t:?} selected twice");
         }
     }
     if let Some(projects) = &lane.projects {
@@ -572,29 +657,67 @@ mod tests {
         }
     }
 
-    /// A lane given nodes may use a node listed or in a pool listed; without, any node.
+    /// A lane may use the members of the pools it selects, a node selected being the only
+    /// member of its implicit pool; a runner lane selecting none may use no node, an API key
+    /// lane any.
     #[test]
-    fn a_lane_may_use_its_nodes_and_its_pools_nodes() {
+    fn a_lane_may_use_the_members_of_the_pools_and_nodes_it_selects() {
         let mut lane = runner(1);
-        assert!(!lane.confined() && lane.allows_node(NODE, &[]));
-        lane.nodes = Some(vec![NODE.into(), "trusted".into()]);
+        assert!(lane.selects() && lane.selects_nothing());
+        assert!(!lane.allows_node(NODE, &["ci".into()]));
+        with(vec![lane.clone()]).validate().unwrap();
+        lane.pools = vec![node_pool(NODE), "trusted".into()];
+        assert!(!lane.selects_nothing());
         let trusted = ["ci".to_string(), "trusted".to_string()];
+        // The node outside any pool, and any node in the pool.
         assert!(lane.allows_node(NODE, &[]));
         assert!(lane.allows_node("b", &trusted));
         assert!(!lane.allows_node("b", &["ci".into()]));
-        // A node ID never names a pool.
-        assert!(!lane.allows_node("c", &[NODE.into()]));
+        // A node's implicit pool is not a pool a node can be put in.
+        assert!(!lane.allows_node("c", &[node_pool(NODE)]));
         with(vec![lane.clone()]).validate().unwrap();
-        for (nodes, why) in [
-            (vec![], "omit it for any node"),
-            (vec!["not an id".to_owned()], "invalid node ID or pool name"),
-            (vec!["a".into(), "a".into()], "\"a\" listed twice"),
-            (vec![NODE.to_owned(); MAX_NODES + 1], "1 to 256"),
+        let mut key = Lane::new(&LaneId::Key("k".into()));
+        assert!(!key.selects() && key.allows_node("b", &[]));
+        key.pools = vec!["trusted".into()];
+        assert!(key.selects() && !key.selects_nothing());
+        assert!(key.allows_node("b", &trusted) && !key.allows_node("b", &[]));
+        for (pools, why) in [
+            (vec!["not a name".to_owned()], "invalid pool \"not a name\""),
+            (vec!["#node#xyz".to_owned()], "invalid pool"),
+            (vec!["#ci".to_owned()], "invalid pool"),
+            (vec![" ci".to_owned()], "invalid pool"),
+            (vec!["a".into(), "a".into()], "\"a\" selected twice"),
+            (vec![node_pool(NODE); MAX_POOLS + 1], "at most 256"),
         ] {
-            lane.nodes = Some(nodes);
+            lane.pools = pools;
             let err = with(vec![lane.clone()]).validate().unwrap_err().to_string();
             assert!(err.contains("runner gl/1") && err.contains(why), "{err}");
         }
+    }
+
+    /// A policy of before 0.111 lists `nodes`, node IDs and pool names: read as the pools they
+    /// select, a node as its implicit pool, and written as `pools`.
+    #[test]
+    fn a_lane_s_nodes_are_read_as_pools() {
+        let json = format!(
+            r#"{{"version":2,"lanes":[{{"runner":{{"gitlab":"gl","id":1}},"nodes":["{NODE}","trusted"],"pools":["ci"]}}]}}"#
+        );
+        let policy: Policy = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            policy.lanes[0].pools,
+            ["ci".to_owned(), node_pool(NODE), "trusted".to_owned()]
+        );
+        let written = serde_json::to_string(&policy).unwrap();
+        assert!(!written.contains("nodes"), "{written}");
+        let pools = format!(r##""pools":["ci","#node#{NODE}","trusted"]"##);
+        assert!(written.contains(&pools), "{written}");
+        let node = node_pool(NODE);
+        assert_eq!(node_of_pool(&node), Some(NODE));
+        assert_eq!(node_of_pool("#node#"), None);
+        assert_eq!(node_of_pool("ci"), None);
+        assert!(valid_target(&node) && valid_target("ci") && !valid_target("#ci"));
+        assert!(node_in(NODE, &[], &node) && !node_in("b", &[], &node));
+        assert!(node_in("b", &["ci".into()], "ci") && !node_in("b", &[], "ci"));
     }
 
     #[test]
@@ -764,6 +887,8 @@ mod tests {
         policy.validate().unwrap();
         let json = serde_json::to_string(&policy).unwrap();
         assert!(json.contains(r#""lanes":[{"default":true,"class":"normal","weight":1}]"#));
+        let unknown = r#"{"version":2,"lanes":[{"default":true,"nodse":[]}]}"#;
+        assert!(serde_json::from_str::<Policy>(unknown).is_err());
         assert_eq!(serde_json::from_str::<Policy>(&json).unwrap(), policy);
         let Parsed::Current(parsed) = parse(json.as_bytes()).unwrap() else {
             panic!("read as the earlier format");

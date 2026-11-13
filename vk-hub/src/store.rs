@@ -1097,6 +1097,8 @@ impl Db {
         egress::share_history(&txn).context("gathering the history's egress reports")?;
         policy::convert_stored(&txn, crate::now_secs())
             .context("converting the capacity policy to lanes")?;
+        policy::select_reported_pools(&txn, crate::now_secs())
+            .context("having the capacity policy's lanes select pools")?;
         txn.commit().context("initializing the hub database")?;
         let spec_dicts = packed::SpecDicts::load(&db).context("loading the job spec dictionary")?;
         let db = Db {
