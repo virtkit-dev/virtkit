@@ -9,6 +9,11 @@ All notable changes to virtkit will be documented in this file.
 - **The nodes table shows each node's pools.** `vk-hub nodes` and the web UI's nodes table
   gain a POOLS column (`-` in none).
 
+### Changed
+
+- **The hub logs pool changes.** Its journal records who put a node in which pools or took it
+  out of every pool, as it does a quarantine or a ceiling; the audit log already did.
+
 ## [0.110.2] - 2026-11-11
 
 ### Fixed

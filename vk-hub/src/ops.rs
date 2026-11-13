@@ -231,8 +231,19 @@ fn tools_note(hub: &Hub, id: &str, row: &NodeRow) -> Result<Option<String>> {
 /// Return whether the pools changed.
 pub fn set_pools(hub: &Hub, actor: &str, id: &str, pools: &[String]) -> Result<bool> {
     let changed = hub.db.set_pools(id, pools, actor, crate::now_secs())?;
+    let what = if pools.is_empty() {
+        "took it out of every pool".to_string()
+    } else {
+        let mut pools = pools.to_vec();
+        pools.sort();
+        pools.dedup();
+        format!("put it in pools {}", pools.join(", "))
+    };
     if changed {
+        eprintln!("vk-hub: node {id}: {actor} {what}");
         hub.changed(id);
+    } else {
+        eprintln!("vk-hub: node {id}: {actor} {what}: already so");
     }
     Ok(changed)
 }
