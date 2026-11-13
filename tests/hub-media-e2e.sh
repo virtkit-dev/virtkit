@@ -164,7 +164,7 @@ for want in '"org.virtkit.retention":"keep"' '"org.virtkit.media.build":"26100.1
   grep -qF "$want" <<<"$manifest" || fail "the medium's manifest lacks $want"
 done
 [ -z "$(find "$WORK/store/uploads" -maxdepth 1 -type f)" ] || fail "the registry kept staging files"
-[ -z "$(find "$WORK/hub" -size +1M -type f -not -name '*.redb')" ] || fail "the hub kept a copy"
+[ -z "$(find "$WORK/hub" -size +1M -type f -not -name hub.db)" ] || fail "the hub kept a copy"
 
 got=$(hub media add "$WORK/media/virtio-win.iso" --under build-cache --no-approve \
   --license open-source) ||
