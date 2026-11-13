@@ -43,7 +43,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use log::{debug, info, warn};
 use russh::keys::PublicKey;
-use russh::server::{Auth, ChannelOpenHandle, Config, Handle, Handler, Msg, Session};
+use russh::server::{
+    Auth, ChannelOpenHandle, Config, Handle, Handler, Msg, Session, VerifiedPublicKey,
+};
 use russh::{Channel, ChannelId, ChannelOpenFailure, Sig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -271,13 +273,17 @@ impl ServerHandler {
 impl Handler for ServerHandler {
     type Error = russh::Error;
 
-    async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        key: VerifiedPublicKey<'_>,
+    ) -> Result<Auth, Self::Error> {
         // Compare key material only: PublicKey's PartialEq includes comments,
         // which OpenSSH key lines may carry but wire keys omit.
         if self
             .authorized
             .iter()
-            .any(|k| k.key_data() == key.key_data())
+            .any(|k| k.key_data() == key.public_key.key_data())
         {
             // Honor a forced run-as user (the VM logs VS Code in as `dev`);
             // otherwise run as whoever the client asked to be.
