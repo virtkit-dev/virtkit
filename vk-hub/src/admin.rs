@@ -415,7 +415,8 @@ enum Call {
     RevokeAccount {
         email: String,
     },
-    /// Put a node in pools, replacing the ones it was in.
+    /// Put a node in pools, replacing the ones it was in: an [`ops::PoolsChange`], or whether
+    /// the pools changed from an earlier hub.
     SetPools {
         id: String,
         pools: Vec<String>,
@@ -1923,11 +1924,19 @@ impl Client {
         })
     }
 
-    /// Whether the node's pools changed.
-    pub fn set_pools(&self, id: &str, pools: Vec<String>) -> Result<bool> {
-        self.call(Call::SetPools {
+    /// Whether the node's pools changed, and the runner lanes the change leaves no node to
+    /// take their work; an earlier hub answers only the former.
+    pub fn set_pools(&self, id: &str, pools: Vec<String>) -> Result<ops::PoolsChange> {
+        let reply: serde_json::Value = self.call(Call::SetPools {
             id: id.to_string(),
             pools,
+        })?;
+        Ok(match reply {
+            serde_json::Value::Bool(changed) => ops::PoolsChange {
+                changed,
+                ..ops::PoolsChange::default()
+            },
+            reply => serde_json::from_value(reply)?,
         })
     }
 
@@ -2644,8 +2653,14 @@ mod tests {
             panic!("expected an enrollment");
         };
         let set = format!(r#"{{"op":"set-pools","id":"{id}","pools":["ci","big"]}}"#);
-        assert_eq!(call(&set).unwrap(), true);
-        assert_eq!(call(&set).unwrap(), false);
+        assert_eq!(
+            call(&set).unwrap(),
+            serde_json::json!({"changed": true, "lanes_without_node": []})
+        );
+        assert_eq!(
+            call(&set).unwrap(),
+            serde_json::json!({"changed": false, "lanes_without_node": []})
+        );
         assert_eq!(hub.db.node(&id).unwrap().unwrap().pools, ["big", "ci"]);
         let bad = format!(r#"{{"op":"set-pools","id":"{id}","pools":["no pool"]}}"#);
         assert!(call(&bad).is_err());

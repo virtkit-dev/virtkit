@@ -1189,12 +1189,13 @@ pub(super) async fn action(
     };
     let hub = ui.hub.clone();
     let read = blocking(move || {
+        let known = Known::read(&hub)?;
         Ok(hub
             .db
             .capacity_policy()
-            .and_then(|policy| Ok((policy, hub.db.capacity_conversion()?))))
+            .and_then(|policy| Ok((policy, hub.db.capacity_conversion()?, known))))
     });
-    let (current, note) = match read.await? {
+    let (current, note, known) = match read.await? {
         Ok(read) => read,
         Err(e) => {
             let why = format!("{e:#}");
@@ -1235,15 +1236,32 @@ pub(super) async fn action(
     for change in changes {
         detail.raw("<li>").text(change).raw("</li>");
     }
-    // Saving a runner lane that selects nothing is confirmed knowing what it means.
-    if op == SAVE
-        && let Some(lane) = field(&form, "lane").and_then(parse_lane)
-        && proposed.lane(&lane).is_some_and(Lane::selects_nothing)
+    // Saving a runner lane that selects nothing is confirmed knowing what it means, as is a
+    // change leaving a runner lane no node to take its work.
+    let edited = (op == SAVE)
+        .then(|| field(&form, "lane").and_then(parse_lane))
+        .flatten();
+    if let Some(lane) = &edited
+        && proposed.lane(lane).is_some_and(Lane::selects_nothing)
     {
         detail.raw(
             "<li class=\"bad\">This lane selects no pool or node: its runner gets no work \
                     until it does.</li>",
         );
+    }
+    for lane in &proposed.lanes {
+        let Some(id) = lane.id().filter(|id| matches!(id, LaneId::Runner { .. })) else {
+            continue;
+        };
+        let had_node = current
+            .lane(&id)
+            .is_some_and(|l| !resolved(l, &known.nodes).is_empty());
+        if resolved(lane, &known.nodes).is_empty() && (had_node || edited.as_ref() == Some(&id)) {
+            detail
+                .raw("<li class=\"bad\">No node can take the work of ")
+                .text(known.label(&id))
+                .raw(".</li>");
+        }
     }
     detail.raw("</ul>");
     let ask = actions::Ask {

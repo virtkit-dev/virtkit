@@ -325,6 +325,35 @@ async fn a_lane_s_work_goes_to_the_members_of_the_pools_and_nodes_it_selects() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A change of a node's pools names the runner lanes it leaves no node to take the work of.
+#[tokio::test]
+async fn a_pool_change_names_the_lanes_it_leaves_without_a_node() {
+    let dir = scratch("placement-pools-warn");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let key = jobs_key(&hub);
+    ready_relay(&hub, &key);
+    let node = ready_node(addr, &hub, 16384).await;
+    // Runner 42's lane selects `ci`, the other's the node itself.
+    add_runner(&hub, &key, "other", 43, crate::policy::Class::Normal);
+    let mut policy = hub.db.capacity_policy().unwrap();
+    lane_42(&mut policy).pools = vec!["ci".into()];
+    (policy.lanes.iter_mut())
+        .find(|l| l.runner.as_ref().is_some_and(|r| r.id == 43))
+        .unwrap()
+        .pools = vec![crate::policy::node_pool(&node.id)];
+    hub.db
+        .set_capacity_policy(&policy, "u", now_secs())
+        .unwrap();
+    let change = crate::ops::set_pools(&hub, "u", &node.id, &["big".into()]).unwrap();
+    assert!(change.changed);
+    assert_eq!(change.lanes_without_node, ["runner gl/42 test"]);
+    let change = crate::ops::set_pools(&hub, "u", &node.id, &["big".into()]).unwrap();
+    assert_eq!(change, crate::ops::PoolsChange::default());
+    let change = crate::ops::set_pools(&hub, "u", &node.id, &["ci".into()]).unwrap();
+    assert!(change.changed && change.lanes_without_node.is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// A runner lane selecting nothing gets no work, its requests and queued jobs saying so, until
 /// it selects something.
 #[tokio::test]

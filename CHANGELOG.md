@@ -31,6 +31,10 @@ All notable changes to virtkit will be documented in this file.
 - **The hub logs pool changes.** Its journal records who put a node in which pools or took it
   out of every pool, as it does a quarantine or a ceiling; the audit log already did.
 
+- **The hub warns when a change leaves a runner lane no node.** `vk-hub nodes pools` and a
+  node's page name each runner lane whose work no node can take after the change, and the hub
+  logs them; saving a lane that would resolve to no node is asked with that warning.
+
 ### Removed
 
 - **A GitLab runner no longer names a pool.** Its lane on the hub selects where its work runs,

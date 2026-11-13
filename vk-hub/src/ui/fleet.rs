@@ -733,15 +733,22 @@ pub(super) async fn node_action(
                 ops::set_ceiling(&hub, &principal, &node, ceiling).map(desired)
             }
             Steer::Acquisition(a) => ops::set_acquisition(&hub, &principal, &node, a).map(desired),
-            Steer::Pools(pools) => ops::set_pools(&hub, &principal, &node, &pools).map(|changed| {
-                if !changed {
+            Steer::Pools(pools) => ops::set_pools(&hub, &principal, &node, &pools).map(|change| {
+                if !change.changed {
                     return "Nothing changed: it was already set that way.".to_string();
                 }
-                if pools.is_empty() {
+                let mut said = if pools.is_empty() {
                     "Taken out of every pool.".to_string()
                 } else {
                     format!("Now in pools {}.", pools.join(", "))
+                };
+                if !change.lanes_without_node.is_empty() {
+                    said.push_str(&format!(
+                        " No node can take the work of {}.",
+                        change.lanes_without_node.join("; ")
+                    ));
                 }
+                said
             }),
             Steer::Tools(sha256) => match ops::tools(&hub, &principal, &node, Some(&sha256)) {
                 Ok(c) => Ok(format!(

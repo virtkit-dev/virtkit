@@ -1236,6 +1236,8 @@ enum NodesCmd {
         images: bool,
     },
     /// Put the node in the pools placed jobs name, replacing those it was in, or `none`
+    ///
+    /// Warns of each runner lane the change leaves no node to take the work of.
     Pools {
         id: String,
         /// Pool names separated by commas, or `none`
@@ -1530,10 +1532,13 @@ async fn run(cli: Cli) -> Result<()> {
                             .filter(|p| !p.is_empty())
                             .collect(),
                     };
-                    let changed =
+                    let change =
                         tokio::task::spawn_blocking(move || client.set_pools(&id, pools)).await??;
-                    if !changed {
+                    if !change.changed {
                         eprintln!("vk-hub: already so; nothing changed");
+                    }
+                    for lane in &change.lanes_without_node {
+                        eprintln!("vk-hub: warning: no node can take the work of {lane}");
                     }
                     Ok(())
                 }

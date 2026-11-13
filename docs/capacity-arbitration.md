@@ -64,9 +64,11 @@ there â€” class, weight, max slots, where its work runs, projects and branches â
 the hub sees without a lane, add a lane for an API key, unmap or remove one, and keep or release
 headroom. *Where its work runs* is one list: each pool with its member nodes, then each node
 with the pools it is in; under it, the nodes the ticked boxes resolve to, red when none, which
-follows the boxes as they are ticked. Saving a runner lane that selects nothing is asked with
-what it means. The lanes table, a runner's row on its server's page and a project's page show
-the nodes a lane's work can go to, red when none.
+follows the boxes as they are ticked. Saving a runner lane that selects nothing, or a change
+that leaves a runner lane no node to take its work, is asked with what it means. The lanes
+table, a runner's row on its server's page and a project's page show the nodes a lane's work
+can go to, red when none. A change of a node's pools (`vk-hub nodes pools`, or the node's page)
+that leaves a runner lane no node warns of it, and the hub logs it.
 Each edit saves the whole policy against the digest the page showed, asked first what changes.
 The whole policy can also be replaced as JSON there; the probe and backoff settings are changed
 with `capacity-policy set` only. A policy held since its conversion lists the placement rules

@@ -13413,9 +13413,18 @@ async fn operators_edit_lanes_from_their_page() {
         "class=normal&weight=3&max_slots=&pools=ci&pools=&projects=listed&project=42\
          &branches.42=main",
     );
+    // A pool no node is in: asked knowing no node can take the lane's work.
+    let question = post_action(addr, &origin, &operator, "/lanes", &mapped, false).await;
+    assert!(
+        !question.body.contains("selects no pool")
+            && question
+                .body
+                .contains("<li class=\"bad\">No node can take the work of Runner 7.</li>"),
+        "{}",
+        question.body
+    );
     let reply = lanes_confirmed(addr, &origin, &operator, &mapped, &["lanes: runner gl/7"]).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    assert!(!reply.body.contains("selects no pool"), "{}", reply.body);
     let lane = Lane {
         weight: 3,
         pools: vec!["ci".into()],

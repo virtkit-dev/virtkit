@@ -227,9 +227,56 @@ fn tools_note(hub: &Hub, id: &str, row: &NodeRow) -> Result<Option<String>> {
     ))
 }
 
-/// Replace node `id`'s pools as `actor`. Notify the hub's watchers only on change.
-/// Return whether the pools changed.
-pub fn set_pools(hub: &Hub, actor: &str, id: &str, pools: &[String]) -> Result<bool> {
+/// What a change of a node's pools came to.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolsChange {
+    /// Whether the node's pools changed.
+    pub changed: bool,
+    /// After a change, the runner lanes whose work no node can take ([`lanes_without_node`]).
+    #[serde(default)]
+    pub lanes_without_node: Vec<String>,
+}
+
+/// The runner lanes of `policy` whose work no node can take: the pools and nodes each selects
+/// resolve to no enrolled node. Each as `runner <gitlab>/<id> <name>`, the name as the runner's
+/// relay last reported it, sorted. Reads the database: call off the runtime.
+pub fn lanes_without_node(hub: &Hub, policy: &crate::policy::Policy) -> Result<Vec<String>> {
+    let nodes = hub.db.nodes()?;
+    let mut names = std::collections::BTreeMap::new();
+    for relay in crate::relays::views(hub)? {
+        let Some(gitlab) = relay.server.as_ref().and_then(|s| s.name.clone()) else {
+            continue;
+        };
+        for runner in relay.row.inventory.iter().flat_map(|i| &i.runners) {
+            if let Some(id) = runner.runner_id {
+                names
+                    .entry((gitlab.clone(), id))
+                    .or_insert_with(|| vk_hub_proto::display_safe(&runner.name));
+            }
+        }
+    }
+    let mut lanes: Vec<String> = (policy.lanes.iter())
+        .filter_map(|lane| match lane.id()? {
+            crate::policy::LaneId::Runner { gitlab, id } => Some((lane, gitlab, id)),
+            _ => None,
+        })
+        .filter(|(lane, _, _)| {
+            !nodes
+                .iter()
+                .any(|(id, row)| lane.allows_node(id, &row.pools))
+        })
+        .map(|(_, gitlab, id)| match names.get(&(gitlab.clone(), id)) {
+            Some(name) => format!("runner {gitlab}/{id} {name}"),
+            None => format!("runner {gitlab}/{id}"),
+        })
+        .collect();
+    lanes.sort();
+    Ok(lanes)
+}
+
+/// Replace node `id`'s pools as `actor`. Notify the hub's watchers only on change, and say
+/// which runner lanes the change leaves no node to take their work, logged too.
+pub fn set_pools(hub: &Hub, actor: &str, id: &str, pools: &[String]) -> Result<PoolsChange> {
     let changed = hub.db.set_pools(id, pools, actor, crate::now_secs())?;
     let what = if pools.is_empty() {
         "took it out of every pool".to_string()
@@ -239,13 +286,23 @@ pub fn set_pools(hub: &Hub, actor: &str, id: &str, pools: &[String]) -> Result<b
         pools.dedup();
         format!("put it in pools {}", pools.join(", "))
     };
-    if changed {
-        eprintln!("vk-hub: node {id}: {actor} {what}");
-        hub.changed(id);
-    } else {
+    if !changed {
         eprintln!("vk-hub: node {id}: {actor} {what}: already so");
+        return Ok(PoolsChange::default());
     }
-    Ok(changed)
+    eprintln!("vk-hub: node {id}: {actor} {what}");
+    hub.changed(id);
+    let lanes_without_node = lanes_without_node(hub, &hub.db.capacity_policy()?)?;
+    if !lanes_without_node.is_empty() {
+        eprintln!(
+            "vk-hub: warning: no node can take the work of {}",
+            lanes_without_node.join("; ")
+        );
+    }
+    Ok(PoolsChange {
+        changed,
+        lanes_without_node,
+    })
 }
 
 /// Cap node `id`'s concurrency at `ceiling`, or lift the cap with `None`, as `actor`.
