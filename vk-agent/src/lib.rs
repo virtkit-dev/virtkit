@@ -1,6 +1,7 @@
 //! Guest-only agent code: PID 1 bring-up (`init`), the block-device mount syscalls
 //! (`diskmount`), a CI job's archives (`archive`), fs freeze/thaw (`fsfreeze`), VM shutdown
-//! (`poweroff`), the writable layer's high-water mark (`fsmark`), the guest's peak memory demand
+//! (`poweroff`), dropping the kernel's caches for the host (`dropcaches`), the writable
+//! layer's high-water mark (`fsmark`), the guest's peak memory demand
 //! (`memmark`), the OOM kills the guest kernel made (`oomkills`), whether a CI job has its
 //! gitlab-runner (`tools`), the line the marks publish (`mark`), the run's environment for login
 //! shells (`runenv`), guest statistics in atop's
@@ -14,6 +15,7 @@ pub mod atop;
 pub mod button;
 pub mod ctlfs;
 pub mod diskmount;
+pub mod dropcaches;
 pub mod fsfreeze;
 pub mod fsmark;
 pub mod guestbuild;

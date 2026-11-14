@@ -288,6 +288,12 @@ fn main() {
         let rest: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(vk_agent::fsfreeze::trim_main(&rest));
     }
+    // Guest cache reclamation (no socket), for the host to run when shares hold too many
+    // VMM descriptors: `vk-agent drop-caches dentries|all`.
+    if std::env::args().nth(1).as_deref() == Some("drop-caches") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(vk_agent::dropcaches::main(&rest));
+    }
     // The writable layer's high-water mark (no socket): the host runs `vk-agent fsmark` in the
     // guest at the end of a job to read how full the overlay tmpfs its writes land on ever got
     // — guest RAM, which no host counter sees.
