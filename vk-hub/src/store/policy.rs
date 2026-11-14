@@ -202,6 +202,54 @@ pub(super) fn convert_stored(txn: &redb::WriteTransaction, now: u64) -> Result<(
     Ok(())
 }
 
+/// Remove stored headroom labels in preparation for their removal in 0.112, preserving
+/// each entry's pool and auditing and logging the removal. Run at every open, before other
+/// policy conversions, to handle policies an older hub writes after rollback. Leave
+/// non-JSON rows and entries without nonempty label arrays unchanged.
+pub(super) fn drop_headroom_labels(txn: &redb::WriteTransaction, now: u64) -> Result<()> {
+    let mut table = txn.open_table(CAPACITY_POLICY)?;
+    let Some(bytes) = table.get("policy")?.map(|row| row.value().to_vec()) else {
+        return Ok(());
+    };
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(());
+    };
+    let mut dropped = Vec::new();
+    let entries = value.get_mut("headroom").and_then(|h| h.as_array_mut());
+    for entry in entries.into_iter().flatten() {
+        let Some(placement) = entry.get_mut("placement").and_then(|p| p.as_object_mut()) else {
+            continue;
+        };
+        let labels = match placement.get("labels").and_then(|l| l.as_array()) {
+            Some(labels) if !labels.is_empty() => labels
+                .iter()
+                .map(|l| l.as_str().map_or_else(|| l.to_string(), str::to_owned))
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => continue,
+        };
+        placement.remove("labels");
+        let pool = placement.get("pool").and_then(|p| p.as_str()).unwrap_or("");
+        dropped.push(vk_hub_proto::display_safe(&format!(
+            "pool {pool:?}: {labels}"
+        )));
+    }
+    if dropped.is_empty() {
+        return Ok(());
+    }
+    let encoded = serde_json::to_vec(&value).context("encoding the capacity policy")?;
+    table.insert("policy", encoded.as_slice())?;
+    let event = format!(
+        "dropped node labels, no longer supported, from capacity policy {} headroom, kept on \
+         its pools: {}",
+        crate::store::short(&digest_bytes(&bytes)),
+        listed(&dropped)
+    );
+    append_audit(txn, None, "hub", &event, now)?;
+    eprintln!("vk-hub: warning: {event}");
+    Ok(())
+}
+
 /// Marks the pool-selection migration checked, even with no policy or an unreadable one.
 const POOLS_SELECTED: &str = "pools.selected";
 
@@ -778,6 +826,39 @@ mod tests {
             .unwrap();
         let note = db.capacity_conversion().unwrap().unwrap();
         assert_eq!(note.shared.len(), 1, "{note:?}");
+    }
+
+    #[test]
+    fn stored_headroom_labels_are_dropped_and_audited_at_open() {
+        let mut stored = serde_json::to_value(Policy::default()).unwrap();
+        let envelope = serde_json::json!({ "mem_mib": 1024, "cpus": 1, "disk_bytes": 0 });
+        stored["headroom"] = serde_json::json!([
+            { "placement": { "pool": "ci", "labels": ["big"], "envelope": envelope }, "slots": 2 },
+            { "placement": { "pool": "web", "labels": [], "envelope": envelope }, "slots": 1 },
+        ]);
+        let (db, bytes, path, _dir) = reopened(stored, |_| {});
+        let policy = db.capacity_policy().unwrap();
+        let pools: Vec<_> = policy
+            .headroom
+            .iter()
+            .map(|h| (h.placement.pool.as_str(), h.slots))
+            .collect();
+        assert_eq!(pools, [("ci", 2), ("web", 1)]);
+        assert!(!db.capacity_policy_raw().contains("big"));
+        let audits = db.audits(None, 10).unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|a| a.event.contains("dropped node labels")
+                    && a.event.contains(r#"pool "ci": big"#)
+                    && a.event.contains(crate::store::short(&digest_bytes(&bytes)))),
+            "{audits:?}"
+        );
+        // Once dropped, a reopen leaves the policy and the audit log alone.
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.capacity_policy().unwrap(), policy);
+        assert_eq!(db.audits(None, 10).unwrap().len(), audits.len());
     }
 
     /// Enroll relay `key` of gitlab `gl` and store its report as a relay before 0.111 sent it:

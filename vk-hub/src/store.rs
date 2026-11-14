@@ -1095,6 +1095,8 @@ impl Db {
         approvals::migrate_bound_keys(&txn, crate::now_secs())
             .context("converting the API keys bound to GitLab instances")?;
         egress::share_history(&txn).context("gathering the history's egress reports")?;
+        policy::drop_headroom_labels(&txn, crate::now_secs())
+            .context("dropping node labels from the capacity policy's headroom")?;
         policy::convert_stored(&txn, crate::now_secs())
             .context("converting the capacity policy to lanes")?;
         policy::select_reported_pools(&txn, crate::now_secs())
