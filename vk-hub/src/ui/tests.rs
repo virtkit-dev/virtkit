@@ -10044,8 +10044,9 @@ async fn relays_and_their_runners_follow_their_server() {
 
 /// An operator adds a runner to a relay that takes runners from GitLab's Overview: a form with
 /// the CLI's defaults, refused with the hub's reason and never sending the token back. The
-/// relay's row tells how its last runner command went, an added runner with no lane says its
-/// jobs are refused and links to adding one, and a runner added on the hub is removed once
+/// relay's row shows its last runner command while pending or failed, or after adding a runner
+/// still present without a lane. The completed add warns that jobs are refused and links to
+/// adding a lane. A runner added on the hub is removed once
 /// asked. A viewer has no link nor button and is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_operator_adds_and_removes_a_relay_s_runners() {
@@ -10295,18 +10296,15 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
     assert_eq!(placement.envelope.mem_mib, 8 << 10);
     assert!(hub.runner_tokens.holds(&added.command.id));
 
-    // Done, with no lane: the row says its jobs are refused, and links an operator to a lane.
+    // A completed add stays hidden until the relay reports the runner. Without a lane, its
+    // row warns that jobs are refused and links an operator to adding a lane.
     let ack = CommandAck {
         id: added.command.id.clone(),
         outcome: Outcome::Done,
     };
     assert!(hub.db.record_relay_ack(&relay, &ack, now).unwrap());
-    hub.clients_changed();
-    next_with(
-        &mut live,
-        "Add runner <strong>ci-1</strong>: <span class=\"badge ok\">done",
-    )
-    .await;
+    let page = get(addr, "/gitlab", Some(&operator)).await.body;
+    assert!(!page.contains("Add runner <strong>ci-1</strong>"), "{page}");
     let hubbed = Runner {
         name: "ci-1".into(),
         runner_id: Some(42),
@@ -10353,6 +10351,37 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
         assert!(page.contains(want), "{want}: {page}");
     }
     assert!(!page.contains("name=\"name\" value=\"cfg\""), "{page}");
+    // Both pages hide the completed add once the runner has a lane or leaves the relay.
+    let add = "Add runner <strong>ci-1</strong>";
+    let unmapped = hub.db.capacity_policy().unwrap();
+    let mut mapped = unmapped.clone();
+    mapped.lanes.push(crate::policy::Lane {
+        projects: Some(Vec::new()),
+        ..crate::policy::Lane::new(&crate::policy::LaneId::Runner {
+            gitlab: "gl".into(),
+            id: 42,
+        })
+    });
+    hub.db.set_capacity_policy(&mapped, "u", now).unwrap();
+    for path in ["/gitlab", "/gitlab/gl"] {
+        let page = get(addr, path, Some(&operator)).await.body;
+        assert!(!page.contains(add), "{path}: {page}");
+    }
+    hub.db.set_capacity_policy(&unmapped, "u", now).unwrap();
+    let mut gone = inventory.clone();
+    gone.runners.truncate(1);
+    hub.db
+        .record_relay(&relay, RelayWrite::Inventory(gone), now)
+        .unwrap();
+    for path in ["/gitlab", "/gitlab/gl"] {
+        let page = get(addr, path, Some(&operator)).await.body;
+        assert!(!page.contains(add), "{path}: {page}");
+    }
+    hub.db
+        .record_relay(&relay, RelayWrite::Inventory(inventory.clone()), now)
+        .unwrap();
+    let page = get(addr, "/gitlab", Some(&operator)).await.body;
+    assert!(page.contains(&want), "{page}");
     // The Overview's Add runner leads there.
     let overview = get(addr, "/gitlab", Some(&operator)).await.body;
     assert!(
@@ -10445,6 +10474,17 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
         ),
         "{page}"
     );
+
+    // Neither page shows the completed removal.
+    let ack = CommandAck {
+        id: removal.command.id.clone(),
+        outcome: Outcome::Done,
+    };
+    assert!(hub.db.record_relay_ack(&relay, &ack, now).unwrap());
+    for path in ["/gitlab", "/gitlab/gl"] {
+        let page = get(addr, path, Some(&operator)).await.body;
+        assert!(!page.contains("Remove runner <strong>"), "{path}: {page}");
+    }
 
     // A relay no longer taking runners: no Add runner; an operator is told what lets it.
     inventory.allow = vec![];

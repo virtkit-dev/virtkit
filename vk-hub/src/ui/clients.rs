@@ -882,8 +882,9 @@ fn bound(relays: &[RelayView], url: &str) -> bool {
 
 /// Each relay, linking to it on its server's page: its reach, the GitLab server it is bound to
 /// and what the hub makes of it, what it reports of that server, its version and runners, and
-/// how its last runner command went. With `steer`, Add runner on one that takes them, leading
-/// to its server's page when it has one, and the button removing it.
+/// its last runner command while pending or failed, or after adding a runner still present
+/// without a lane. With `steer`, Add runner on one that takes them, leading to its server's
+/// page when it has one, and the button removing it.
 fn relays_table(h: &mut Html, shown: &Shown, now: u64, steer: bool) {
     let relays = &shown.relays;
     h.raw("<table class=\"grid\"><thead><tr><th>relay</th><th>state</th><th>last heard</th>")
@@ -986,8 +987,9 @@ fn relays_table(h: &mut Html, shown: &Shown, now: u64, steer: bool) {
     h.raw("</tbody></table>");
 }
 
-/// How runner command `c` of relay `r` went, or that it is under way. An added runner
-/// that maps to no lane says so, linking to adding one for an operator.
+/// Runner command `c` of relay `r` while it is under way or failed. Once done it is shown only
+/// for an added runner the relay still has and that maps to no lane, saying so and linking an
+/// operator to adding one.
 fn runner_command(
     h: &mut Html,
     shown: &Shown,
@@ -999,20 +1001,32 @@ fn runner_command(
     let Some((what, name)) = super::relays::runner_command_what(c) else {
         return;
     };
+    let state = super::relays::runner_command_state(c, now);
+    let added = |runner: &vk_hub_proto::gitlab::Runner| {
+        runner.command.as_deref() == Some(c.command.id.as_str())
+    };
+    let kept = (r.row.inventory.as_ref()).is_some_and(|i| i.runners.iter().any(added));
+    let unmapped = match state {
+        Some(Ok(())) if kept && matches!(c.command.op, Operation::AddRunner { .. }) => {
+            shown.unmapped(r, c.runner_id)
+        }
+        _ => None,
+    };
+    if state == Some(Ok(())) && unmapped.is_none() {
+        return;
+    }
     h.raw("<div class=\"sub\">")
         .raw(what)
         .raw(" <strong>")
         .node(name)
         .raw("</strong>: ");
-    match super::relays::runner_command_state(c, now) {
+    match state {
         None => {
             h.raw("<span class=\"badge busy\">pending</span>");
         }
         Some(Ok(())) => {
             h.raw("<span class=\"badge ok\">done</span>");
-            if matches!(c.command.op, Operation::AddRunner { .. })
-                && let Some(href) = shown.unmapped(r, c.runner_id)
-            {
+            if let Some(href) = unmapped {
                 h.raw(" ");
                 lane_notice(h, steer.then_some(href.as_str()));
             }
@@ -1053,7 +1067,8 @@ fn server_status(h: &mut Html, s: &ServerStatus) {
 }
 
 /// Each of `relays` with its runners: a heading with the relay's name, version, connection,
-/// runner count and last runner command, then its runners.
+/// runner count and last runner command while pending or failed, or after adding a runner
+/// still present without a lane, then its runners.
 /// With `steer`, the link adding a runner to a relay that takes them, or what lets it.
 fn relay_blocks(h: &mut Html, shown: &Shown, relays: &[&RelayView], now: u64, steer: bool) {
     for r in relays {

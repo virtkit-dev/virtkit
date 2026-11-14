@@ -524,7 +524,8 @@ async fn settle_lost_commands(
     .await??;
     if settled {
         hub.changed(&relay.id);
-        // GitLab's Overview shows a runner command's outcome; `/updates` an update's.
+        // GitLab's Overview keeps pending or failed runner commands and missing-lane warnings;
+        // `/updates` shows update outcomes.
         hub.clients_changed();
         hub.touch();
     }
@@ -558,8 +559,8 @@ async fn acknowledge(ws: &mut Ws, hub: &Hub, relay: &Peer, ack: CommandAck) -> R
             .await??;
     if news {
         hub.changed(&relay.id);
-        // A command's outcome: GitLab's Overview shows a runner command's, `/updates` an
-        // update's.
+        // GitLab's Overview keeps pending or failed runner commands and missing-lane warnings;
+        // `/updates` shows update outcomes.
         hub.clients_changed();
         hub.touch();
     }

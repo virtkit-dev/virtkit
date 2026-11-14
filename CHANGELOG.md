@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **The GitLab pages hide completed runner commands unless the added runner still needs a
+  lane.** Pending and failed commands remain visible. A completed add stays visible only
+  while the relay still has that runner without a lane.
+
 ### Removed
 
 - **Node labels no longer control placement; use pools and lanes.** Unmatched labels left
