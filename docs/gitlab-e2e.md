@@ -2,7 +2,7 @@
 
 `tests/gitlab-e2e.sh` tests `vk-gitlab` against a real GitLab CE and fleet on one host: GitLab
 in a vk microVM, then `vk-hub` (TLS, with a CA made for the run), a `vk-registry` for caches,
-one `vk node run` enrolled in pool `e2e` with label `e2e`, and `vk-gitlab run`, enrolled as a
+one `vk node run` enrolled in pool `e2e`, and `vk-gitlab run`, enrolled as a
 relay with `vk-gitlab join`. The hub approves the GitLab server as `e2e` and the test project
 beforehand. The registry joins the hub with `[hub] tokens = true`, and the node gives each job
 its own registry token (`guest_credential = "job"`);

@@ -169,7 +169,6 @@ pub(super) async fn action(
 /// What the add-runner form was filled in with, but the token.
 struct RunnerFields {
     name: String,
-    labels: String,
     envelope: String,
     limit: String,
     request_concurrency: String,
@@ -180,7 +179,6 @@ impl Default for RunnerFields {
     fn default() -> Self {
         RunnerFields {
             name: String::new(),
-            labels: String::new(),
             envelope: crate::DEFAULT_ENVELOPE.into(),
             limit: String::new(),
             request_concurrency: "1".into(),
@@ -193,7 +191,6 @@ impl RunnerFields {
         let get = |name: &str| field(form, name).unwrap_or("").trim().to_string();
         RunnerFields {
             name: get("name"),
-            labels: get("labels"),
             envelope: get("envelope"),
             limit: get("limit"),
             request_concurrency: get("request_concurrency"),
@@ -213,14 +210,7 @@ impl RunnerFields {
             v => Some(whole("limit", v)?),
         };
         Ok(RunnerSettings {
-            placement: RunnerPlacement {
-                labels: (self.labels.split(','))
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-                envelope,
-            },
+            placement: RunnerPlacement { envelope },
             limit,
             request_concurrency: whole("request concurrency", &self.request_concurrency)?,
         })
@@ -289,13 +279,6 @@ fn runner_form(
         input(&mut h, "Name", "name", &fields.name, "ci-1");
         input(
             &mut h,
-            "Labels",
-            "labels",
-            &fields.labels,
-            "none, or kvm, big",
-        );
-        input(
-            &mut h,
             "Envelope",
             "envelope",
             &fields.envelope,
@@ -312,7 +295,7 @@ fn runner_form(
         h.raw("<button class=\"primary\">Add runner</button></form>")
             .raw("<p class=\"sub\">Create the runner in GitLab first, then paste its token ")
             .raw("(<code>glrt-…</code>). The name is letters, digits, <code>-</code>, ")
-            .raw("<code>_</code> and <code>.</code>. Separate labels with commas. The envelope ")
+            .raw("<code>_</code> and <code>.</code>. The envelope ")
             .raw("is each job's VM: <code>mem=&lt;size&gt;,cpus=&lt;n&gt;,disk=&lt;size&gt;")
             .raw("</code>. The limit caps its jobs running at once. Its jobs run once a lane ")
             .raw("maps the runner, and selects where they run, on <a href=\"")

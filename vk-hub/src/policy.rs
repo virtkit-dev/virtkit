@@ -40,6 +40,9 @@ const MAX_DISK_BYTES: u64 = 1 << 50;
 /// operator pools. Bare node IDs are rejected.
 pub const NODE_POOL_PREFIX: &str = "#node#";
 
+/// Why a placement naming node labels is refused: pools select nodes since 0.112.
+pub const LABELS_UNSUPPORTED: &str = "labels are no longer supported: select nodes with pools";
+
 /// Node `id`'s implicit pool.
 pub fn node_pool(id: &str) -> String {
     format!("{NODE_POOL_PREFIX}{id}")
@@ -326,6 +329,7 @@ fn deserialize_placement<'de, D: serde::Deserializer<'de>>(
     #[serde(deny_unknown_fields)]
     struct StrictPlacement {
         pool: String,
+        /// Written empty by hubs before 0.112; refused unless empty.
         #[serde(default)]
         labels: Vec<String>,
         envelope: StrictEnvelope,
@@ -338,9 +342,12 @@ fn deserialize_placement<'de, D: serde::Deserializer<'de>>(
         disk_bytes: u64,
     }
     let p = StrictPlacement::deserialize(deserializer)?;
+    if !p.labels.is_empty() {
+        return Err(serde::de::Error::custom(LABELS_UNSUPPORTED));
+    }
     Ok(Placement {
         pool: p.pool,
-        labels: p.labels,
+        legacy_labels: Vec::new(),
         envelope: vk_hub_proto::job::Envelope {
             mem_mib: p.envelope.mem_mib,
             cpus: p.envelope.cpus,
@@ -510,17 +517,22 @@ impl Policy {
         }
         for (i, headroom) in self.headroom.iter().enumerate() {
             let p = &headroom.placement;
+            if !p.legacy_labels.is_empty() {
+                bail!(
+                    "invalid headroom #{} (pool {:?}): {LABELS_UNSUPPORTED}",
+                    i + 1,
+                    p.pool
+                );
+            }
             if !(1..=MAX_HEADROOM_SLOTS).contains(&headroom.slots)
                 || !valid_target(&p.pool)
-                || p.labels.len() > 32
-                || p.labels.iter().any(|l| !crate::store::valid_name(l))
                 || !(1..=MAX_MEM_MIB).contains(&p.envelope.mem_mib)
                 || !(1..=MAX_CPUS).contains(&p.envelope.cpus)
                 || p.envelope.disk_bytes > MAX_DISK_BYTES
             {
                 bail!(
                     "invalid headroom #{} (pool {:?}): slots must be 1 to {MAX_HEADROOM_SLOTS}, \
-                     with a valid pool and labels, and an envelope of 1 to {MAX_MEM_MIB} MiB, \
+                     with a valid pool, and an envelope of 1 to {MAX_MEM_MIB} MiB, \
                      1 to {MAX_CPUS} cpus and at most {MAX_DISK_BYTES} disk bytes",
                     i + 1,
                     p.pool
@@ -755,6 +767,19 @@ mod tests {
         };
         headroom(&node_pool(NODE)).validate().unwrap();
         assert!(headroom(NODE).validate().is_err());
+        // A headroom naming labels is refused; one with none, as earlier hubs wrote it, is read.
+        let err =
+            serde_json::from_value::<Policy>(serde_json::json!({ "version": 2, "headroom": [{
+            "placement": { "pool": "ci", "labels": ["big"],
+                           "envelope": { "mem_mib": 1, "cpus": 1, "disk_bytes": 0 } },
+            "slots": 1 }] }))
+            .unwrap_err();
+        assert!(err.to_string().contains(LABELS_UNSUPPORTED), "{err}");
+        // Nonempty labels are also refused in policies built in this process.
+        let mut labelled = headroom(&node_pool(NODE));
+        labelled.headroom[0].placement.legacy_labels = vec!["big".into()];
+        let err = labelled.validate().unwrap_err();
+        assert!(err.to_string().contains(LABELS_UNSUPPORTED), "{err}");
     }
 
     #[test]
@@ -864,7 +889,7 @@ mod tests {
         let headroom = |slots, mem_mib| Headroom {
             placement: Placement {
                 pool: "ci".into(),
-                labels: vec![],
+                legacy_labels: vec![],
                 envelope: vk_hub_proto::job::Envelope {
                     mem_mib,
                     cpus: 1,

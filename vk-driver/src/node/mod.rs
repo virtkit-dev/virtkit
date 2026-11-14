@@ -454,7 +454,9 @@ pub async fn run(cfg: Config) -> Result<()> {
     update::note_installed(&dir)?;
     reap_inherited();
     let enrollment = read_enrollment(&dir).map_err(not_enrolled)?;
-    inventory::labels(&cfg)?;
+    if let Some(why) = inventory::legacy_labels_warning(&cfg) {
+        say!("warning: {why}");
+    }
     let local_runner = ci_user::local_runner(&cfg);
     // A host that says it runs no runner but does would take the hub's jobs beside its own
     // and let a reset clear that runner's jobs: refused outright rather than half-trusted.

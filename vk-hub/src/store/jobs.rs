@@ -1883,7 +1883,7 @@ mod tests {
             admission: None,
             placement: Placement {
                 pool: "ci".into(),
-                labels: vec![],
+                legacy_labels: vec![],
                 envelope: Envelope::default(),
             },
             title: "gitlab job 7".into(),
@@ -1938,6 +1938,11 @@ mod tests {
         json.as_object_mut().unwrap().remove("admission");
         let older: JobRow = serde_json::from_value(json).unwrap();
         assert_eq!(older.scheduling, None);
+        // A job a hub before 0.112 stored with labels still decodes.
+        let mut json = serde_json::to_value(&job).unwrap();
+        json["placement"]["labels"] = serde_json::json!(["big"]);
+        let labelled: JobRow = serde_json::from_value(json).unwrap();
+        assert_eq!(labelled.placement.legacy_labels, ["big"]);
         assert_eq!(older.admission, None);
         assert_eq!(older.key, job.key);
     }

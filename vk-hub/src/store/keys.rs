@@ -33,7 +33,7 @@ pub const MAX_KEY_TTL: Duration = Duration::from_secs(365 * 86_400);
 /// until the oldest that no longer work are removed with a revoke.
 const MAX_KEYS: usize = 256;
 
-/// The longest a key's, pool's or label's name may be.
+/// The longest a key's or pool's name may be.
 pub const MAX_NAME: usize = 64;
 
 /// The pool a key may name to place work in any pool.
@@ -274,7 +274,7 @@ pub fn envelope_text(e: Envelope) -> String {
     format!("{mem}, {cpus}, {disk}")
 }
 
-/// Whether `s` may name a key, a pool or a label: 1 to [`MAX_NAME`] of ASCII letters, digits,
+/// Whether `s` may name a key or a pool: 1 to [`MAX_NAME`] of ASCII letters, digits,
 /// `.`, `_` and `-`, starting with a letter or digit.
 pub fn valid_name(s: &str) -> bool {
     s.len() <= MAX_NAME
@@ -636,7 +636,7 @@ mod tests {
         let principal = db.api_key(&key, 100).unwrap().unwrap();
         let mut placement = Placement {
             pool: "ci".into(),
-            labels: vec![],
+            legacy_labels: vec![],
             envelope: Envelope {
                 mem_mib: 8192,
                 cpus: 4,

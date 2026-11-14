@@ -26,10 +26,10 @@ use tokio::time::Instant;
 use vk_hub_proto::client::{
     AUTHORIZATION, CAPACITY_PATH, CLIENTS_PATH, CancelRequest, CapacityRequest, ClientError,
     ClientHello, ErrorCode, INSTANCE_HEADER, JOBS_PATH, JobState, JobSubmission,
-    MAX_CLIENT_RUNNER_LABELS, MAX_CLIENT_RUNNERS, MAX_INSTANCE_LEN, MAX_OUTPUT_READ, MAX_WAIT_SECS,
-    OUTPUT_COMPLETE_HEADER, OUTPUT_LENGTH_HEADER, OUTPUT_OFFSET_HEADER, OutcomeRequest, Placement,
-    RELAY_HEADER, RESERVATIONS_PATH, RenewRequest, ReservationGrant, ReservationRequest,
-    ReservationTicket, valid_instance,
+    MAX_CLIENT_RUNNERS, MAX_INSTANCE_LEN, MAX_OUTPUT_READ, MAX_WAIT_SECS, OUTPUT_COMPLETE_HEADER,
+    OUTPUT_LENGTH_HEADER, OUTPUT_OFFSET_HEADER, OutcomeRequest, Placement, RELAY_HEADER,
+    RESERVATIONS_PATH, RenewRequest, ReservationGrant, ReservationRequest, ReservationTicket,
+    valid_instance,
 };
 use vk_hub_proto::job::{JobSpec, MAX_JOB_SPEC};
 use vk_hub_proto::{PUBLIC_KEY_LEN, SIGNATURE_LEN, from_hex_lower};
@@ -38,7 +38,6 @@ use crate::jobs::{self, OutputError};
 use crate::server::{Body, Exported, Hub, full};
 use crate::store::{
     ApiPrincipal, Gate, GateJob, JobRow, PrincipalKind, Refusal, RequestRow, Scope, Submitted,
-    valid_name,
 };
 
 /// The largest non-job request body: a placement and a few numbers.
@@ -49,9 +48,6 @@ const MAX_JOB_BODY: usize = MAX_JOB_SPEC + MAX_BODY;
 
 /// How long a body may take to arrive.
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The most labels a placement names.
-const MAX_LABELS: usize = 32;
 
 /// What a client is told to wait after no node accepted its unqueued reservation.
 const NO_CAPACITY_RETRY_SECS: u32 = 5;
@@ -506,20 +502,19 @@ fn parse_json<T: serde::de::DeserializeOwned + serde::Serialize>(
 }
 
 /// Refuse malformed placements or those outside `principal`'s policy. Discard a relay's
-/// pool: its runner's lane selects where its work goes.
+/// pool and labels: its runner's lane selects where its work goes. Refuse an API key's
+/// labels rather than run its work on nodes it did not ask for.
 fn check_placement(placement: &mut Placement, principal: &ApiPrincipal) -> Result<(), ApiError> {
     if principal.is_relay() {
         placement.pool.clear();
+        placement.legacy_labels.clear();
+    } else if !placement.legacy_labels.is_empty() {
+        return Err(ApiError::invalid(crate::policy::LABELS_UNSUPPORTED));
     } else if !crate::policy::valid_target(&placement.pool) {
         return Err(ApiError::invalid(format!(
             "{:?} is not a pool's name, or a node as `{}<node ID>`",
             placement.pool,
             crate::policy::NODE_POOL_PREFIX
-        )));
-    }
-    if placement.labels.len() > MAX_LABELS || placement.labels.iter().any(|l| !valid_name(l)) {
-        return Err(ApiError::invalid(format!(
-            "a placement names at most {MAX_LABELS} labels, each a name"
         )));
     }
     let e = placement.envelope;
@@ -828,15 +823,9 @@ async fn hello(
             "the hello's instance is not the one {INSTANCE_HEADER} names"
         )));
     }
-    if hello.runners.len() > MAX_CLIENT_RUNNERS
-        || hello
-            .runners
-            .iter()
-            .any(|r| r.labels.len() > MAX_CLIENT_RUNNER_LABELS)
-    {
+    if hello.runners.len() > MAX_CLIENT_RUNNERS {
         return Err(ApiError::invalid(format!(
-            "a hello lists at most {MAX_CLIENT_RUNNERS} runners, each with at most \
-             {MAX_CLIENT_RUNNER_LABELS} labels"
+            "a hello lists at most {MAX_CLIENT_RUNNERS} runners"
         )));
     }
     crate::clients::hello(hub, principal, hello).await?;

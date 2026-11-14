@@ -1,6 +1,6 @@
 //! The configuration file: a subset of gitlab-runner's `config.toml`, with the same key
-//! names where the setting is the same, plus each runner's node labels and envelope.
-//! The runner's lane on the hub selects where jobs run; see `docs/gitlab-dispatch.md`.
+//! names where the setting is the same, plus each runner's envelope. The runner's lane on
+//! the hub selects where jobs run; see `docs/gitlab-dispatch.md`.
 //!
 //! ```toml
 //! concurrent = 8            # jobs at once, over all runners (at most 128)
@@ -14,7 +14,6 @@
 //! [[runners]]
 //! name = "ci"
 //! token_file = "/etc/vk-gitlab/runner-ci.token"
-//! labels = ["large-memory"]
 //! envelope = { mem = "16G", cpus = 8, disk = "16G" }
 //! limit = 4                 # jobs at once for this runner (0 = no limit)
 //! request_concurrency = 1   # job requests queued or in flight at once (at most 128)
@@ -151,9 +150,10 @@ pub struct RunnerConfig {
     /// The runner's lane on the hub selects where jobs run.
     #[serde(default)]
     pool: Option<String>,
-    /// Labels a node must declare to take this runner's jobs; non-empty and distinct.
+    /// Pre-0.112 node labels, ignored with a warning so old configs load. The runner's
+    /// lane on the hub selects where jobs run.
     #[serde(default)]
-    pub labels: Vec<String>,
+    labels: Option<Vec<String>>,
     /// What each job of this runner reserves on a node. Default 4G memory, 2 CPUs, 16G
     /// disk.
     #[serde(default)]
@@ -292,7 +292,7 @@ impl RunnerConfig {
             tls_cert_file: None,
             tls_key_file: None,
             pool: None,
-            labels: placement.labels.clone(),
+            labels: None,
             envelope: EnvelopeConfig {
                 mem: format!("{}M", placement.envelope.mem_mib),
                 cpus: placement.envelope.cpus,
@@ -333,14 +333,12 @@ impl RunnerConfig {
                 "`pool` is ignored since 0.111: the runner's lane on the hub selects where its jobs run; drop it from the config"
             );
         }
-        let mut labels = HashSet::new();
-        for l in &self.labels {
-            if l.trim().is_empty() {
-                bail!("{which}: labels must not be empty");
-            }
-            if !labels.insert(l.as_str()) {
-                bail!("{which}: label {l:?} is listed twice");
-            }
+        if let Some(labels) = self.labels.take() {
+            log::warn!(
+                runner = self.name.as_str(),
+                labels = labels.join(",").as_str();
+                "`labels` is ignored since 0.112: the runner's lane on the hub selects where its jobs run; drop it from the config"
+            );
         }
         if !valid_name(&self.name) {
             bail!("{which}: a runner name is letters, digits, `-`, `_` and `.`");
@@ -356,10 +354,10 @@ impl RunnerConfig {
     /// Node requirements for the hub's client API. Omits the pool: the runner's lane selects
     /// where jobs run.
     pub fn placement(&self) -> crate::dispatch::Placement {
-        let RunnerPlacement { labels, envelope } = self.runner_placement();
+        let RunnerPlacement { envelope } = self.runner_placement();
         crate::dispatch::Placement {
             pool: String::new(),
-            labels,
+            legacy_labels: Vec::new(),
             envelope,
         }
     }
@@ -367,7 +365,6 @@ impl RunnerConfig {
     /// What this runner's jobs ask of a node, as the relay reports it.
     pub fn runner_placement(&self) -> RunnerPlacement {
         RunnerPlacement {
-            labels: self.labels.clone(),
             // Validated at load.
             envelope: self.envelope.envelope().unwrap_or_default(),
         }
@@ -653,13 +650,67 @@ mod tests {
         );
         assert_eq!(cfg.runner_check_interval(r), Duration::from_secs(1));
         assert_eq!(r.output_limit_bytes(), 100 * 1024);
-        // The pool of a config from before 0.111 is read and ignored.
+        // Ignore legacy pools (before 0.111) and labels (before 0.112).
         assert!(r.pool.is_none());
+        assert!(r.labels.is_none());
         let p = r.runner_placement();
-        assert_eq!(p.labels, ["large-memory"]);
+        assert!(r.placement().legacy_labels.is_empty());
         assert_eq!(p.envelope.mem_mib, 16 * 1024);
         assert_eq!(p.envelope.cpus, 8);
         assert_eq!(p.envelope.disk_bytes, 512 << 20);
+    }
+
+    /// Warnings logged by this binary's tests, as `<runner>: <message>`.
+    static WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    struct Capture;
+
+    impl log::Log for Capture {
+        fn enabled(&self, m: &log::Metadata<'_>) -> bool {
+            m.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                let runner = record.key_values().get("runner".into());
+                let runner = runner.map(|v| v.to_string()).unwrap_or_default();
+                let line = format!("{runner}: {}", record.args());
+                WARNINGS.lock().unwrap().push(line);
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn legacy_labels_are_ignored_with_a_warning() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            // Should another test's logger come first, the assertion below says so.
+            let _ = log::set_logger(&Capture);
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        let cfg = parse(
+            r#"
+            [gitlab]
+            url = "https://gitlab.example.com"
+            [[runners]]
+            name = "labelled-legacy"
+            token = "glrt-x"
+            labels = ["kvm", "big"]
+            "#,
+        )
+        .unwrap();
+        let r = &cfg.runners[0];
+        assert!(r.labels.is_none());
+        assert!(r.placement().legacy_labels.is_empty());
+        let warnings = WARNINGS.lock().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("labelled-legacy: `labels` is ignored")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
@@ -722,14 +773,6 @@ mod tests {
             (
                 "[gitlab]\nurl = \"https://g\"\n[[runners]]\ntoken = \"a\"\ntls-cert-file = \"c\"\n",
                 "go together",
-            ),
-            (
-                "[gitlab]\nurl = \"https://g\"\n[[runners]]\ntoken = \"a\"\nlabels = [\"\"]\n",
-                "labels must not be empty",
-            ),
-            (
-                "[gitlab]\nurl = \"https://g\"\n[[runners]]\ntoken = \"a\"\nlabels = [\"x\", \"x\"]\n",
-                "listed twice",
             ),
         ] {
             let err = format!("{:#}", parse(text).unwrap_err());

@@ -12,7 +12,7 @@
 //!
 //! **Placement.** A node takes placed work once its version-3 session has sent its `held`,
 //! while it is connected, among the nodes its lane selects (an API key's job also in the pool
-//! it names), carries its labels and reports itself ready. Its room is what its last heartbeat left — the admission ledger's budget less what
+//! it names) and reports itself ready. Its room is what its last heartbeat left — the admission ledger's budget less what
 //! it has committed, or the memory available, and the jobs filesystem's free space — less
 //! what the hub has asked of it since: reservations and jobs accepted after the ledger was
 //! read for that heartbeat, offers and starts not yet answered. Offers and starts go to the least loaded node first ([`load`]),
@@ -1893,10 +1893,10 @@ pub fn events_summary(events: &[vk_hub_proto::job::JobEvent]) -> Option<String> 
 // ---------------------------------------------------------------------------------------------
 // Placement.
 
-/// Whether a relay's request matches its runner's labels and envelope.
-/// Ignore the request's pool: the runner's lane selects where work runs.
+/// Whether a relay's request matches its runner's envelope. Ignore the request's pool and
+/// labels: the runner's lane selects where work runs.
 pub fn same_requirements(runner: &RunnerPlacement, placement: &Placement) -> bool {
-    runner.labels == placement.labels && runner.envelope == placement.envelope
+    runner.envelope == placement.envelope
 }
 
 /// A node's room for `placement`'s envelope: how many it fits, `None` when it takes no
@@ -1924,13 +1924,6 @@ fn room(
         return None;
     }
     if !caches_builds_as_required(hub, row) {
-        return None;
-    }
-    if !placement
-        .labels
-        .iter()
-        .all(|l| inventory.labels.contains(l))
-    {
         return None;
     }
     let report = row.report.as_ref();
@@ -3734,6 +3727,13 @@ fn limit_recovered_admissions(
     removed
 }
 
+/// Drop pre-0.112 labels from a recovered admission so it matches a submitted job
+/// whose labels the hub also discards.
+fn recovered_placement(mut placement: Placement) -> Placement {
+    placement.legacy_labels.clear();
+    placement
+}
+
 /// Pick the hub's jobs back up after a restart: a job no node had accepted ends lost; one
 /// running carries on, its output as stored. Output no job may read again goes.
 pub async fn recover(hub: &Hub) -> Result<()> {
@@ -3777,7 +3777,7 @@ pub async fn recover(hub: &Hub) -> Result<()> {
                     request_id: format!("recovered/{id}"),
                     digest: String::new(),
                     identity,
-                    placement: admission.placement,
+                    placement: recovered_placement(admission.placement),
                     lease_secs: 0,
                     created: now,
                     polled: now,
@@ -5306,6 +5306,28 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(job_lane(&row), crate::policy::LaneId::Default);
+    }
+
+    /// An admission a hub before 0.112 stored for a labelled runner matches the job its relay
+    /// then submits, whose labels the hub discards.
+    #[test]
+    fn a_recovered_admission_loses_its_legacy_labels() {
+        let stored: crate::store::StoredAdmission = serde_json::from_value(serde_json::json!({
+            "principal": "relay",
+            "identity": { "lane": "default", "class": "normal" },
+            "runner": "runner",
+            "placement": { "labels": ["big"],
+                           "envelope": { "mem_mib": 1024, "cpus": 1, "disk_bytes": 0 } },
+            "probe": false,
+            "reservation": "reservation",
+        }))
+        .unwrap();
+        assert_eq!(stored.placement.legacy_labels, ["big"]);
+        let submitted = Placement {
+            legacy_labels: Vec::new(),
+            ..stored.placement.clone()
+        };
+        assert_eq!(recovered_placement(stored.placement), submitted);
     }
 
     #[test]

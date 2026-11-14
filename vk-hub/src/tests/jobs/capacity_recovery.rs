@@ -84,7 +84,10 @@ async fn a_claimed_admission_keeps_its_lane_and_class_across_a_restart_and_chang
     let path = format!("/v1/reservations/{reservation}/claim");
     let reply = api(addr, "POST", &path, Some(&key), None).await;
     assert_eq!(reply.status, 204, "{reply:?}");
-    assert!(db.admission(&ticket).unwrap().is_some());
+    // As a hub before 0.112 stored it for a runner with labels.
+    let mut stored = db.admission(&ticket).unwrap().unwrap();
+    stored.placement.legacy_labels = vec!["big".into()];
+    db.put_admission(&ticket, &stored).unwrap();
 
     // Its lane is now production; a new hub holds no ticket or node lease of the old one.
     let lane = lane_42(&mut policy);
@@ -116,9 +119,11 @@ async fn a_claimed_admission_keeps_its_lane_and_class_across_a_restart_and_chang
     )
     .await;
     assert_eq!(reply.status, 202, "{reply:?}");
-    // A job on it keeps the identity it was admitted under.
+    // A job on it keeps the identity it was admitted under, and matches it with the labels
+    // its relay still sends.
     let mut body = job_body(3, None, 30);
     body["admission"] = json!(ticket);
+    body["placement"]["labels"] = json!(["big"]);
     body["spec"]["sources"]["ref"] = json!("main");
     body["spec"]["sources"]["refspecs"] = json!(["+refs/heads/main:refs/remotes/origin/main"]);
     let reply = api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await;

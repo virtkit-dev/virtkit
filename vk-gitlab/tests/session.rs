@@ -678,7 +678,6 @@ fn add_runner(id: &str, name: &str, token: &str, expires_at: u64) -> HubRelayMsg
             name: name.into(),
             token: vk_hub_proto::gitlab::RunnerToken::new(token),
             placement: vk_hub_proto::gitlab::RunnerPlacement {
-                labels: vec!["large-memory".into()],
                 envelope: vk_hub_proto::job::Envelope {
                     mem_mib: 16384,
                     cpus: 8,
@@ -757,7 +756,6 @@ async fn runners_are_added_and_removed_on_the_hub_s_command() {
     assert_eq!(big.command, Some("a".repeat(32)));
     assert_eq!(big.runner_id, Some(support::gl::RUNNER_ID as u64));
     assert!(big.verified);
-    assert_eq!(big.placement.labels, ["large-memory"]);
     assert_eq!(big.limit, Some(2));
     assert!(
         matches!(changes.try_recv(), Ok(Change::Start(cfg)) if cfg.name == "big"),

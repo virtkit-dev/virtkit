@@ -794,10 +794,6 @@ pub struct Inventory {
     pub versions: Versions,
     /// `None` when no gitlab-runner configuration could be read.
     pub runner: Option<Runner>,
-    /// The labels the node's configuration declares, which a job's placement may require
-    /// ([`client::Placement::labels`]). Older inventories omit labels and default to none.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub labels: Vec<String>,
     /// The base URL of the node's `[registry]` (`https://host[:port]`), which the hub matches
     /// against the URLs bound to its registries to mint a job's token for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1705,7 +1701,6 @@ mod tests {
                 concurrent: Some(8),
                 runners: vec!["ci-7".into()],
             }),
-            labels: Vec::new(),
             registry: None,
             job_tokens: false,
             registry_areas: false,
@@ -2685,14 +2680,12 @@ mod tests {
             },
             too_large,
         );
+        // Ignore configured labels reported by nodes before 0.112.
         let mut labelled = serde_json::to_value(inventory()).unwrap();
         labelled["labels"] = json!(["large-memory"]);
-        pinned(
-            &Inventory {
-                labels: vec!["large-memory".into()],
-                ..inventory()
-            },
-            labelled,
+        assert_eq!(
+            serde_json::from_value::<Inventory>(labelled).unwrap(),
+            inventory()
         );
         let mut versions = serde_json::to_value(&inventory().versions).unwrap();
         versions["vk_sha256"] = json!("cd".repeat(SHA256_LEN));

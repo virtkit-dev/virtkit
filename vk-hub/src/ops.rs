@@ -66,9 +66,6 @@ pub struct NodeView {
     /// The pools placed jobs may name it by.
     #[serde(default)]
     pub pools: Vec<String>,
-    /// The labels it declares.
-    #[serde(default)]
-    pub labels: Vec<String>,
     /// Why it refused the hub's latest offer of a reservation, while it accepts none.
     #[serde(default)]
     pub last_refusal: Option<String>,
@@ -186,7 +183,6 @@ fn node_view_among(
             .pending_commands(&id, crate::now_secs())
             .map_or(0, |c| c.len()),
         pools: row.pools.clone(),
-        labels: inventory.map(|i| i.labels.clone()).unwrap_or_default(),
         last_refusal: crate::jobs::last_refusal(hub, &id),
         tools: inventory.and_then(|i| i.versions.tools.clone()),
         placed: crate::jobs::accepting(hub)

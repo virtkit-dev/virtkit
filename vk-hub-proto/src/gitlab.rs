@@ -47,10 +47,12 @@
 //! [`RunnerFailure`]'s code, never GitLab's text. Version [`CONNECTION`] carries the relay's
 //! session and its client API requests on one HTTP/2 connection, and adds the hub's notices
 //! [`HubRelayMsg::Ticket`] and [`HubRelayMsg::Job`], sent in sessions at it or later.
-//! Version [`LANES`] drops the pool from [`RunnerPlacement`], leaving labels and an envelope;
-//! the runner's lane on the hub selects where work runs. The hub ignores pools reported by
-//! older relays. [`Operation::AddRunner`] requires [`LANES`] or later because older relays
-//! require a pool in its placement.
+//! Version [`LANES`] drops the pool from [`RunnerPlacement`]; the runner's lane on the hub
+//! selects where work runs. The hub ignores pools reported by older relays.
+//! [`Operation::AddRunner`] requires [`LANES`] or later because older relays require a pool
+//! in its placement. Since 0.112 a placement carries no labels either, with no version
+//! change: the hub ignores labels an older relay reports, and an older relay reads a
+//! placement without them as one with none.
 
 use serde::{Deserialize, Serialize};
 
@@ -104,9 +106,6 @@ pub const LANES: u32 = 6;
 /// The most runners an [`Inventory`], a [`Heartbeat`] or a [`Report`] keeps once made
 /// display-safe.
 pub const MAX_RUNNERS: usize = 64;
-
-/// The most labels a runner's placement keeps once made display-safe.
-pub const MAX_LABELS: usize = 32;
 
 /// The most admission IDs a runner's heartbeat keeps in each of its two lists once made
 /// display-safe.
@@ -215,13 +214,11 @@ pub struct Server {
     pub version: Option<String>,
 }
 
-/// What a runner's jobs ask of a node: the labels it must carry and the envelope each job
-/// takes. Where they go is the runner's lane on the hub. A relay below [`LANES`] also reports
-/// a `pool`, which is ignored.
+/// What a runner's jobs ask of a node: the envelope each job takes. Where they go is the
+/// runner's lane on the hub. A relay below [`LANES`] also reports a `pool`, and one before
+/// 0.112 `labels`; both are ignored.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunnerPlacement {
-    #[serde(default)]
-    pub labels: Vec<String>,
     pub envelope: Envelope,
 }
 
@@ -233,7 +230,7 @@ pub struct Runner {
     /// GitLab's ID for it, once `verify` gave it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_id: Option<u64>,
-    /// The labels and envelope of each of its jobs.
+    /// The envelope of each of its jobs.
     pub placement: RunnerPlacement,
     /// How many of its jobs run at once, when limited: the runner's `limit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -280,9 +277,8 @@ impl RunnerSource {
 
 impl Inventory {
     /// Apply [`display_safe`] to strings, drop the server's SPKI digest unless
-    /// [`valid_sha256`], truncate runners to [`MAX_RUNNERS`] and their labels to
-    /// [`MAX_LABELS`], `allow` to [`MAX_ALLOW`], drop a runner's `command` unless [`valid_id`],
-    /// and raise a `request_concurrency` of 0 to 1.
+    /// [`valid_sha256`], truncate runners to [`MAX_RUNNERS`], `allow` to [`MAX_ALLOW`], drop
+    /// a runner's `command` unless [`valid_id`], and raise a `request_concurrency` of 0 to 1.
     pub fn make_display_safe(&mut self) {
         for s in [&mut self.version, &mut self.hostname, &mut self.system_id] {
             *s = display_safe(s);
@@ -299,10 +295,6 @@ impl Inventory {
             r.name = display_safe(&r.name);
             r.command = r.command.take().filter(|c| valid_id(c));
             r.request_concurrency = r.request_concurrency.max(1);
-            r.placement.labels.truncate(MAX_LABELS);
-            for l in &mut r.placement.labels {
-                *l = display_safe(l);
-            }
         }
     }
 }
@@ -678,7 +670,6 @@ mod tests {
             name: "ci".into(),
             runner_id: Some(42),
             placement: RunnerPlacement {
-                labels: vec!["large-memory".into()],
                 envelope: Envelope {
                     mem_mib: 16384,
                     cpus: 8,
@@ -710,11 +701,11 @@ mod tests {
                 ..Inventory::default()
             }),
             &format!(
-                r#"{{"type":"inventory","version":"0.96.0","hostname":"ci-relay-1","system_id":"s_0123456789ab","concurrent":16,"server":{{"url":"https://gitlab.example.com","spki_sha256":"{}","version":"18.4.1"}},"runners":[{{"name":"ci","runner_id":42,"placement":{{"labels":["large-memory"],"envelope":{{"mem_mib":16384,"cpus":8,"disk_bytes":17179869184}}}},"limit":8,"request_concurrency":2,"verified":true}}]}}"#,
+                r#"{{"type":"inventory","version":"0.96.0","hostname":"ci-relay-1","system_id":"s_0123456789ab","concurrent":16,"server":{{"url":"https://gitlab.example.com","spki_sha256":"{}","version":"18.4.1"}},"runners":[{{"name":"ci","runner_id":42,"placement":{{"envelope":{{"mem_mib":16384,"cpus":8,"disk_bytes":17179869184}}}},"limit":8,"request_concurrency":2,"verified":true}}]}}"#,
                 "ab".repeat(32)
             ),
         );
-        // A relay below `LANES` reports a pool with each runner, which this reads past.
+        // Ignore runner pools from relays below `LANES` and labels from before 0.112.
         let older: Runner = serde_json::from_str(
             r#"{"name":"ci","runner_id":42,"placement":{"pool":"ci","labels":["large-memory"],"envelope":{"mem_mib":16384,"cpus":8,"disk_bytes":17179869184}},"limit":8,"request_concurrency":2,"verified":true}"#,
         )
@@ -890,7 +881,7 @@ mod tests {
     /// The runner commands, and the inventory fields they add, keep their JSON.
     #[test]
     fn runner_messages_keep_their_json() {
-        let placement = r#"{"labels":["large-memory"],"envelope":{"mem_mib":16384,"cpus":8,"disk_bytes":17179869184}}"#;
+        let placement = r#"{"envelope":{"mem_mib":16384,"cpus":8,"disk_bytes":17179869184}}"#;
         pinned(
             &HubRelayMsg::Command(Command {
                 id: "c".into(),
@@ -926,6 +917,12 @@ mod tests {
                 ..
             }
         ));
+        // Ignore labels in commands stored by hubs before 0.112.
+        let older: Operation = serde_json::from_str(
+            r#"{"kind":"add_runner","name":"big","placement":{"labels":["kvm"],"envelope":{"mem_mib":16384,"cpus":8,"disk_bytes":17179869184}},"limit":4,"request_concurrency":2}"#,
+        )
+        .unwrap();
+        assert_eq!(older, add_runner(""));
         let hub = Runner {
             source: RunnerSource::Hub,
             command: Some("c".into()),
@@ -1168,7 +1165,6 @@ mod tests {
     fn an_inventory_is_made_fit_to_show() {
         let mut r = runner();
         r.name = "ci\u{1b}".into();
-        r.placement.labels = vec!["l\u{202e}".into(); MAX_LABELS + 1];
         let mut i = Inventory {
             version: "1\u{7}".into(),
             hostname: "h\u{200b}".into(),
@@ -1201,7 +1197,6 @@ mod tests {
         assert_eq!(i.runners.len(), MAX_RUNNERS);
         let r = &i.runners[0];
         assert_eq!(r.name, "ci");
-        assert_eq!(r.placement.labels, vec!["l".to_string(); MAX_LABELS]);
 
         let mut i = Inventory {
             runners: vec![

@@ -559,14 +559,20 @@ pub struct Node {
     /// Whether an update needs a signature by a configured or pinned release key. Defaults
     /// to true when any key exists. With keys, a supplied signature is always checked.
     pub require_signed: Option<bool>,
-    /// Labels for job placement: a `vk-gitlab` runner requires nodes with all its labels.
-    /// At most 32 labels, each 1–64 ASCII letters, digits or `-_.:/=` characters.
-    pub labels: Vec<String>,
+    /// Pre-0.112 placement labels, ignored so old configs load. `vk node run` warns to
+    /// remove them; the hub selects nodes with pools.
+    #[serde(skip_serializing)]
+    pub labels: Option<Vec<String>>,
 }
 
 impl Node {
+    /// Whether this serializes like the default; `labels` is never written.
     fn is_default(&self) -> bool {
-        *self == Node::default()
+        *self
+            == Node {
+                labels: self.labels.clone(),
+                ..Node::default()
+            }
     }
 
     /// How often workloads' memory is measured, at least a second.

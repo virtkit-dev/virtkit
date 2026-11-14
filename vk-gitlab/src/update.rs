@@ -899,7 +899,6 @@ mod tests {
     #[test]
     fn a_restart_ends_runner_commands_from_the_relay_s_runners() {
         let placement = vk_hub_proto::gitlab::RunnerPlacement {
-            labels: vec![],
             envelope: crate::dispatch::Envelope {
                 mem_mib: 1024,
                 cpus: 1,
