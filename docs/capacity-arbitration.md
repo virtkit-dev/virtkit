@@ -208,7 +208,7 @@ How the hub orders waiting requests and queued jobs is in
   error backs the runner off from `backoff_initial_secs` (default 1), doubling up to
   `backoff_max_secs` (default 60), each wait ±25%, never past the maximum.
 - Each `headroom` entry keeps `slots` envelopes of its placement (pool, which may be a node's
-  `#node#<node ID>`, labels, envelope) for production work: normal work must leave the fleet
+  `#node#<node ID>`, envelope) for production work: normal work must leave the fleet
   that much room for it, or all the room left when already short.
 
 A lane's room is granted only on the nodes its `pools` resolve to, the least loaded of those

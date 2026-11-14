@@ -1883,7 +1883,7 @@ mod tests {
             admission: None,
             placement: Placement {
                 pool: "ci".into(),
-                labels: vec![],
+                legacy_labels: vec![],
                 envelope: Envelope::default(),
             },
             title: "gitlab job 7".into(),

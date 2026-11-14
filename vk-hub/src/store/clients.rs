@@ -8,9 +8,7 @@ use std::collections::HashSet;
 use anyhow::{Context, Result};
 use redb::{Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use vk_hub_proto::client::{
-    ClientHello, ClientRunner, MAX_CLIENT_RUNNER_LABELS, MAX_CLIENT_RUNNERS,
-};
+use vk_hub_proto::client::{ClientHello, ClientRunner, MAX_CLIENT_RUNNERS};
 use vk_hub_proto::display_safe;
 
 use super::keys::{API_KEYS, KeyRow};
@@ -90,12 +88,6 @@ impl ClientRow {
                 name: display_safe(&r.name),
                 url: display_safe(&clean_url(&r.url)),
                 pool: display_safe(&r.pool),
-                labels: r
-                    .labels
-                    .iter()
-                    .take(MAX_CLIENT_RUNNER_LABELS)
-                    .map(|l| display_safe(l))
-                    .collect(),
                 limit: r.limit,
             })
             .collect();
@@ -349,7 +341,6 @@ mod tests {
                 name: "docker".into(),
                 url: "https://gitlab.example.com".into(),
                 pool: "ci".into(),
-                labels: vec![],
                 limit: None,
             }],
         }
@@ -431,7 +422,6 @@ mod tests {
         h.hostname = "ci\u{1b}[2J-1\u{202e}".into();
         h.runners[0].url = "https://user:pass@gitlab.example.com/g?private_token=t#f".into();
         h.runners[0].name = "x".repeat(1000);
-        h.runners[0].labels = vec!["l".into(); 100];
         h.runners = std::iter::repeat_n(h.runners[0].clone(), 100).collect();
         db.record_client(&k, "gitlab", "s_1", Some(&h), 100, Durability::Immediate)
             .unwrap();
@@ -439,8 +429,28 @@ mod tests {
         assert_eq!(row.hostname, "ci[2J-1");
         assert_eq!(row.runners.len(), vk_hub_proto::client::MAX_CLIENT_RUNNERS);
         assert_eq!(row.runners[0].name.len(), vk_hub_proto::MAX_DISPLAY);
-        assert_eq!(row.runners[0].labels.len(), MAX_CLIENT_RUNNER_LABELS);
         assert_eq!(row.runners[0].url, "https://gitlab.example.com/g");
+    }
+
+    /// Rows stored before 0.112 still load with runner labels.
+    #[test]
+    fn a_row_with_runner_labels_still_reads() {
+        let db = Db::open_memory().unwrap();
+        let k = key(&db, "gitlab", 100);
+        db.record_client(
+            &k,
+            "gitlab",
+            "s_1",
+            Some(&hello("s_1")),
+            100,
+            Durability::Immediate,
+        )
+        .unwrap();
+        let row = db.clients().unwrap().remove(0).1;
+        let mut older = serde_json::to_value(&row).unwrap();
+        older["runners"][0]["labels"] = serde_json::json!(["large-memory"]);
+        let older: ClientRow = decode(&serde_json::to_vec(&older).unwrap()).unwrap();
+        assert_eq!(older, row);
     }
 
     #[test]

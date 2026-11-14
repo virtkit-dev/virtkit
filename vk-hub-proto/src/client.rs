@@ -78,9 +78,6 @@ pub const MAX_INSTANCE_LEN: usize = 64;
 /// The most runners one [`ClientHello`] lists.
 pub const MAX_CLIENT_RUNNERS: usize = 64;
 
-/// The most labels one [`ClientRunner`] lists.
-pub const MAX_CLIENT_RUNNER_LABELS: usize = 32;
-
 /// On an output answer: the offset of its first byte.
 pub const OUTPUT_OFFSET_HEADER: &str = "vk-output-offset";
 /// On an output answer, and a 416 for an offset past the end: the output's length so far.
@@ -95,16 +92,17 @@ pub const MAX_WAIT_SECS: u32 = 60;
 /// The most bytes one output answer carries.
 pub const MAX_OUTPUT_READ: usize = 1 << 20;
 
-/// Where a producer wants work to run: its pool, labels each node must carry, and the
-/// envelope one job takes. An API key names a pool or a node as `#node#<node ID>`.
-/// A relay omits the pool because its runner's lane selects where work runs; the hub ignores
-/// any pool it supplies.
+/// Where a producer wants work to run: its pool and the envelope one job takes. An API key
+/// names a pool or a node as `#node#<node ID>`. A relay omits the pool because its runner's
+/// lane selects where work runs; the hub ignores any pool it supplies.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Placement {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pool: String,
-    #[serde(default)]
-    pub labels: Vec<String>,
+    /// Node labels, unsupported since 0.112: pools select nodes. Retained so the hub can
+    /// reject an API key's labels; relay labels are ignored.
+    #[serde(rename = "labels", default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_labels: Vec<String>,
     pub envelope: Envelope,
 }
 
@@ -293,16 +291,13 @@ pub struct ClientHello {
 }
 
 /// One runner a [`ClientHello`] reports: where the instance takes jobs from and the pool it
-/// sends them to. Never a credential.
+/// sends them to. Never a credential. Labels an older client lists are ignored.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientRunner {
     pub name: String,
     /// The server it takes jobs from, without credentials, query or fragment.
     pub url: String,
     pub pool: String,
-    /// At most [`MAX_CLIENT_RUNNER_LABELS`]; a hello with more is refused.
-    #[serde(default)]
-    pub labels: Vec<String>,
     /// How many of its jobs run at once, when limited: the runner's `limit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -413,7 +408,7 @@ mod tests {
     fn placement() -> Placement {
         Placement {
             pool: "ci".into(),
-            labels: vec!["large-memory".into()],
+            legacy_labels: vec![],
             envelope: Envelope {
                 mem_mib: 16384,
                 cpus: 8,
@@ -433,7 +428,6 @@ mod tests {
                 name: "docker".into(),
                 url: "https://gitlab.example.com".into(),
                 pool: "ci".into(),
-                labels: vec!["large-memory".into()],
                 limit: Some(2),
             }],
         }
@@ -543,7 +537,6 @@ mod tests {
                 "request_id": "1".repeat(32),
                 "placement": {
                     "pool": "ci",
-                    "labels": ["large-memory"],
                     "envelope": {"mem_mib": 16384, "cpus": 8, "disk_bytes": 16u64 << 30},
                 },
                 "lease_secs": 90,
@@ -607,7 +600,6 @@ mod tests {
                     "name": "docker",
                     "url": "https://gitlab.example.com",
                     "pool": "ci",
-                    "labels": ["large-memory"],
                     "limit": 2,
                 }],
             })
@@ -651,7 +643,14 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(request.after, None);
-        assert!(request.placement.labels.is_empty());
+        assert!(request.placement.legacy_labels.is_empty());
+        // An older producer's labels are read, for the hub to refuse or ignore.
+        let request: CapacityRequest = serde_json::from_value(json!({
+            "placement": {"pool": "ci", "labels": ["big"],
+                          "envelope": {"mem_mib": 1, "cpus": 1, "disk_bytes": 1}},
+        }))
+        .unwrap();
+        assert_eq!(request.placement.legacy_labels, ["big"]);
         // A relay's placement names no pool, and writes none.
         let request: CapacityRequest = serde_json::from_value(json!({
             "placement": {"envelope": {"mem_mib": 1, "cpus": 1, "disk_bytes": 1}},
@@ -671,11 +670,12 @@ mod tests {
         .unwrap();
         assert_eq!(hello.concurrent, None);
         assert!(hello.runners.is_empty());
+        // Ignore older clients' runner labels.
         let runner: ClientRunner = serde_json::from_value(json!({
             "name": "docker", "url": "https://gitlab.example.com", "pool": "ci",
+            "labels": ["large-memory"],
         }))
         .unwrap();
-        assert!(runner.labels.is_empty());
         assert_eq!(runner.limit, None);
     }
 

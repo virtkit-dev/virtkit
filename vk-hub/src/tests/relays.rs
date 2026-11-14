@@ -689,10 +689,7 @@ async fn a_relay_reporting_a_pool_keeps_its_session_but_is_added_no_runner() {
     let runner = gl::Runner {
         name: "ci".into(),
         runner_id: Some(42),
-        placement: gl::RunnerPlacement {
-            labels: vec!["big".into()],
-            ..gl::RunnerPlacement::default()
-        },
+        placement: gl::RunnerPlacement::default(),
         request_concurrency: 1,
         verified: true,
         ..gl::Runner::default()
@@ -704,6 +701,8 @@ async fn a_relay_reporting_a_pool_keeps_its_session_but_is_added_no_runner() {
     });
     let mut json = serde_json::to_value(&inventory).unwrap();
     json["runners"][0]["placement"]["pool"] = serde_json::json!("ci");
+    // Ignore labels reported by relays before 0.112.
+    json["runners"][0]["placement"]["labels"] = serde_json::json!(["big"]);
     ws.send(Message::text(json.to_string())).await.unwrap();
     assert_eq!(hear(&mut ws).await, status(ServerState::Pending, None));
     tell(&mut ws, &RelayMsg::Report(Report::default())).await;
@@ -719,7 +718,6 @@ async fn a_relay_reporting_a_pool_keeps_its_session_but_is_added_no_runner() {
     assert_eq!(row.inventory.unwrap().runners, [runner]);
     let settings = relays::RunnerSettings {
         placement: gl::RunnerPlacement {
-            labels: vec![],
             envelope: vk_hub_proto::job::Envelope {
                 mem_mib: 4096,
                 cpus: 2,
@@ -760,7 +758,6 @@ async fn a_relay_is_sent_its_runner_commands_and_the_hub_keeps_no_token() {
     let url = "https://gitlab.example.com";
     let settings = relays::RunnerSettings {
         placement: vk_hub_proto::gitlab::RunnerPlacement {
-            labels: vec!["big".into()],
             envelope: vk_hub_proto::job::Envelope {
                 mem_mib: 4096,
                 cpus: 2,

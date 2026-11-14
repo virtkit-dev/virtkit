@@ -1192,9 +1192,6 @@ fn runners_table(h: &mut Html, shown: &Shown, r: &RelayView, now: u64, steer: bo
             }
         }
         h.raw("</td><td>");
-        if !p.labels.is_empty() {
-            h.node(&p.labels.join(", ")).raw(" · ");
-        }
         h.text(crate::store::envelope_text(p.envelope));
         if let Some(m) = mapping {
             h.raw(" · runs on ");
@@ -2528,7 +2525,6 @@ mod tests {
                 name: "docker".into(),
                 url: "https://gitlab.example.com".into(),
                 pool: "ci".into(),
-                labels: vec![],
                 limit: None,
             },
             // The hub strips credentials before storage. If any reach the renderer,
@@ -2537,7 +2533,6 @@ mod tests {
                 name: "shell".into(),
                 url: "https://user:pass@gitlab.example.com".into(),
                 pool: "ci".into(),
-                labels: vec![],
                 limit: None,
             },
         ];

@@ -3398,10 +3398,6 @@ fn display_safe_inventory(mut inventory: Inventory) -> Inventory {
     if let Some(runner) = inventory.runner.as_mut() {
         runner.runners.truncate(MAX_INVENTORY_ITEMS);
     }
-    inventory.labels.truncate(MAX_INVENTORY_ITEMS);
-    for label in &mut inventory.labels {
-        clean(label);
-    }
     clean(&mut inventory.hostname);
     clean_opt(&mut inventory.hardware.cpu_model);
     clean_opt(&mut inventory.registry);

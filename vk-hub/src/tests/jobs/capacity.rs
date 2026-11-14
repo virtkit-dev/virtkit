@@ -1063,12 +1063,11 @@ async fn normal_work_leaves_an_overlapping_entry_its_room() {
         crate::policy::Class::Production,
     );
     ready_relay(&hub, &key);
-    // The node fits four requests, or one of a whole node's memory, labelled or not.
+    // The node fits four requests, or one of a whole node's memory.
     let mut whole = placement();
-    whole.labels.clear();
     whole.envelope.mem_mib = 16384;
     let mut disjoint = placement();
-    disjoint.labels = vec!["not-present".into()];
+    disjoint.pool = "elsewhere".into();
     // The requests' own entry would leave room to spare, and the disjoint one has no room
     // anywhere to keep; a normal request would take the whole node's.
     headroom(&hub, vec![(placement(), 1), (whole, 1), (disjoint, 1)]);

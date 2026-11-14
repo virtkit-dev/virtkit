@@ -284,9 +284,9 @@ and guest kernel versions and a hash of the effective configuration; and the git
 configuration read, its `concurrent` and its runner names. The heartbeat carries admission
 (memory committed and budget, jobs running and waiting), the runner concurrency last asked
 for, memory available, free bytes and inodes per filesystem, each VM's memory, and the host's
-1-minute load average (absent when unreadable or omitted by an older node). Inventory
-also carries the labels the node declares in `[node] labels`, which placed jobs can require;
-older nodes send none.
+1-minute load average (absent when unreadable or omitted by an older node). The hub ignores
+`[node] labels` reported by nodes before 0.112. Since 0.112, nodes ignore this setting and
+warn at startup to remove it.
 
 The hub stores heartbeats and reports at most once per half heartbeat, holding back the latest
 and storing it at the next ping. Heartbeats are written without an fsync, one a minute made
@@ -1444,11 +1444,9 @@ one recorded. A submission whose `request_id` was seen is answered as it was fir
 the refusal — before the gate, so a retry counts once and a relay recovering an accepted job is
 not refused by a later rejection; queued and running jobs stay as they are.
 
-**Pools and labels.** `vk-hub nodes pools <id> <pool,…|none>`, or an operator on the node's
-web page, sets the pools a node is in, at most 256, audited and logged; both warn of runner
-lanes left without a node. Labels come from the node's
-inventory. `vk-hub nodes` lists each node's pools in its POOLS column and its labels
-under the table.
+**Pools.** `vk-hub nodes pools <id> <pool,…|none>`, or an operator on the node's web page,
+sets the pools a node is in, at most 256, audited and logged; both warn of runner lanes left
+without a node. `vk-hub nodes` lists each node's pools in its POOLS column.
 
 **The client API** is served on the node listener under `/v1/capacity`, `/v1/reservations` and
 `/v1/jobs`, over HTTP/1.1, and over a relay's HTTP/2 connection. The key, a relay's signed
@@ -1470,7 +1468,7 @@ afresh; for a job, the job or the gate's refusal.
 **Placement.** A node takes placed work while its session is at version 3 and has sent its
 `held`, it is connected, its runner's lane selects it or one of its pools (an API key's job, in
 the pool the job names, which may be a node's `#node#<node ID>`, and among its lane's selection
-if any), it carries every label,
+if any),
 reports itself ready and has at least the CPUs the envelope asks, does not report a
 gitlab-runner of its own ([one kind of host](#placed-jobs-on-the-node)), and while it holds less
 placed work than its cap: the smaller of the ceiling the operator set it and the node's own
@@ -2094,7 +2092,7 @@ its hostname and ID, whether it is connected, when it was last heard from, the s
 bound to and what the hub makes of it (the instance's name once approved, else *pending*,
 *rejected* or *reports another server*), the URL, certificate key digest and version it reports
 of that server, its version, runners and `concurrent`, then the runners of relays bound to no
-server the hub has. Each runner shows GitLab's ID for it, its labels and envelope, the nodes its
+server the hub has. Each runner shows GitLab's ID for it, its envelope, the nodes its
 lane's work can go to, its `limit`, its state (*polling*, *waiting for capacity*, *server not
 approved*, *unhealthy*, *token refused*, and *token not verified* when `verify` failed), the job
 requests it has outstanding, the jobs it holds, and when GitLab last

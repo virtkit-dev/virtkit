@@ -128,19 +128,18 @@ fn envelope() -> Envelope {
     }
 }
 
-/// What an API key's job asks: pool `ci`, label `big`.
+/// What an API key's job asks: pool `ci`.
 fn placement() -> Placement {
     Placement {
         pool: "ci".into(),
-        labels: vec!["big".into()],
+        legacy_labels: vec![],
         envelope: envelope(),
     }
 }
 
-/// What the relay's runner asks of a node: label `big`, [`envelope`].
+/// What the relay's runner asks of a node: [`envelope`].
 fn runner_placement() -> vk_hub_proto::gitlab::RunnerPlacement {
     vk_hub_proto::gitlab::RunnerPlacement {
-        labels: vec!["big".into()],
         envelope: envelope(),
     }
 }
@@ -663,7 +662,6 @@ async fn connect_beating(
             cpus: 8,
             ..Hardware::default()
         },
-        labels: vec!["big".into()],
         ..Inventory::default()
     };
     send(&mut ws, &NodeMsg::Inventory(inventory)).await;
@@ -756,7 +754,7 @@ fn heard(hub: &Hub, id: &str) -> bool {
     hub.db
         .node(id)
         .unwrap()
-        .is_some_and(|r| r.heartbeat.is_some() && r.inventory.is_some_and(|i| !i.labels.is_empty()))
+        .is_some_and(|r| r.heartbeat.is_some() && r.inventory.is_some_and(|i| i.hardware.cpus > 0))
 }
 
 /// Why `gl` runner `runner_id`'s request waits after a placement pass.
@@ -1138,6 +1136,63 @@ async fn a_granted_reservation_replays_after_its_runner_is_unverified() {
         (201, grant),
         "{again:?}"
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A pre-0.112 relay's stored and requested labels do not prevent placement on a node
+/// without labels.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_s_legacy_labels_are_ignored() {
+    let dir = scratch("legacy-labels");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let id = relay_id(&key);
+    let mut row = serde_json::to_value(hub.db.relay(id).unwrap().unwrap()).unwrap();
+    row["inventory"]["runners"][0]["placement"]["labels"] = json!(["big"]);
+    hub.db.set_raw_relay(id, &serde_json::to_vec(&row).unwrap());
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let mut body = relay_reservation_body(1, 5);
+    body["placement"]["labels"] = json!(["big"]);
+    let k = key.clone();
+    let ask =
+        tokio::spawn(
+            async move { api(addr, "POST", "/v1/reservations", Some(&k), Some(body)).await },
+        );
+    let HubJobMsg::Offer { reservation, .. } = node.job().await else {
+        panic!("expected an offer");
+    };
+    node.send(NodeJobMsg::OfferReply {
+        reservation,
+        reply: OfferReply::Accepted { lease_secs: 90 },
+    });
+    let resp = ask.await.unwrap();
+    assert_eq!(resp.status, 201, "{resp:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An API key's placement naming labels is refused rather than placed without them.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_api_key_s_labels_are_refused() {
+    let dir = scratch("api-key-labels");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = plain_key(&hub);
+    let mut labelled = serde_json::to_value(placement()).unwrap();
+    labelled["labels"] = json!(["big"]);
+    let mut reservation = reservation_body(1, 0);
+    reservation["placement"] = labelled.clone();
+    for (path, body) in [
+        ("/v1/capacity", json!({ "placement": labelled })),
+        ("/v1/reservations", reservation),
+    ] {
+        let resp = api(addr, "POST", path, Some(&key), Some(body)).await;
+        assert_eq!(
+            (resp.status, resp.code()),
+            (400, ErrorCode::Invalid),
+            "{resp:?}"
+        );
+        let error: vk_hub_proto::client::ClientError = resp.json();
+        assert_eq!(error.error, crate::policy::LABELS_UNSUPPORTED, "{path}");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -3981,7 +4036,7 @@ async fn capacity_revisions_are_kept_for_a_bounded_number_of_placements() {
     let dir = scratch("capacity-cap");
     let (_, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
     let asked = |i: usize| Placement {
-        labels: vec![format!("l{i}")],
+        pool: format!("p{i}"),
         ..placement()
     };
     let first = crate::jobs::capacity(&hub, &asked(0)).await.unwrap();

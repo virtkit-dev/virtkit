@@ -813,7 +813,7 @@ Job {
 }
 ```
 
-Placement filters on labels and capabilities, scores on headroom and locality (such as a node
+Placement filters on pools and capabilities, scores on headroom and locality (such as a node
 still holding the image a job builds), then takes a reservation on the chosen node. A compose
 group runs whole on one node. Inputs are packaged explicitly; nothing refers to a submitter's
 local paths. A job whose node disconnects is not rerun until its first run is known to be over,
@@ -890,7 +890,7 @@ arriving after its reservation ended — the node lost, or its lease out — is 
 within a bound, and otherwise fails as `runner_system_failure`.
 
 **Placement.** GitLab's job response does not carry the job's tags, and tags already decide
-which runners may take a job, so a runner maps to one placement: node labels and an envelope
+which runners may take a job, so a runner maps to one placement: an envelope
 in `vk-gitlab`'s configuration, which it reports to the hub, and the pools and nodes its lane
 on the hub selects. An enrolled relay is
 trusted as a node is: it already holds the runner tokens and sees every job's secrets, so the
@@ -1184,7 +1184,7 @@ carry IDs of their own, node-local policy stays authoritative and the protocol i
 5. **A node job API** that runs a placed workload for the hub: durable job and stage
    identity, ordered output resumable from an offset, cancellation, exit codes that keep
    build failures apart from system failures, and cleanup when the lease lapses.
-6. **GitLab jobs.** The hub's client API with pools and labels, and `vk-gitlab` as an enrolled
+6. **GitLab jobs.** The hub's client API with pools, and `vk-gitlab` as an enrolled
    relay;
    nodes run GitLab jobs' stages themselves. Nodes move over one at a time, each draining its
    local gitlab-runner; a fleet runs both kinds of node meanwhile, and no node runs both.

@@ -37,9 +37,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_tungstenite::tungstenite::Message;
 use vk_hub_proto::gitlab::{
-    ALLOW_RUNNERS, ALLOW_UPDATE, Command, HubRelayMsg, LANES, MAX_ADMISSIONS, MAX_LABELS,
-    MAX_RUNNERS, Operation, RUNNERS, RelayMsg, Report, Runner, RunnerPlacement, RunnerSource,
-    RunnerToken, ServerState, ServerStatus,
+    ALLOW_RUNNERS, ALLOW_UPDATE, Command, HubRelayMsg, LANES, MAX_ADMISSIONS, MAX_RUNNERS,
+    Operation, RUNNERS, RelayMsg, Report, Runner, RunnerPlacement, RunnerSource, RunnerToken,
+    ServerState, ServerStatus,
 };
 use vk_hub_proto::{CommandAck, HubMsg, Outcome, RefusalCode};
 
@@ -903,21 +903,7 @@ pub fn check_runner(name: &str, token: &RunnerToken, settings: &RunnerSettings) 
     if t.is_empty() || t.chars().any(|c| c.is_whitespace() || c.is_control()) {
         bail!("the runner token is empty or has spaces in it");
     }
-    let p = &settings.placement;
-    let printable = |s: &str| vk_hub_proto::display_safe(s) == s;
-    if p.labels.len() > MAX_LABELS {
-        bail!("a runner has at most {MAX_LABELS} labels");
-    }
-    let mut labels = HashSet::new();
-    for l in &p.labels {
-        if l.trim().is_empty() || !printable(l) {
-            bail!("labels must be printable and not empty");
-        }
-        if !labels.insert(l.as_str()) {
-            bail!("label {l:?} is listed twice");
-        }
-    }
-    let e = p.envelope;
+    let e = settings.placement.envelope;
     if e.mem_mib == 0 || e.cpus == 0 || e.disk_bytes == 0 {
         bail!("the envelope's mem (at least 1M), cpus and disk must be set");
     }

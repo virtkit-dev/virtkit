@@ -12,7 +12,7 @@
 //!
 //! **Placement.** A node takes placed work once its version-3 session has sent its `held`,
 //! while it is connected, among the nodes its lane selects (an API key's job also in the pool
-//! it names), carries its labels and reports itself ready. Its room is what its last heartbeat left — the admission ledger's budget less what
+//! it names) and reports itself ready. Its room is what its last heartbeat left — the admission ledger's budget less what
 //! it has committed, or the memory available, and the jobs filesystem's free space — less
 //! what the hub has asked of it since: reservations and jobs accepted after the ledger was
 //! read for that heartbeat, offers and starts not yet answered. Offers and starts go to the least loaded node first ([`load`]),
@@ -1893,10 +1893,10 @@ pub fn events_summary(events: &[vk_hub_proto::job::JobEvent]) -> Option<String> 
 // ---------------------------------------------------------------------------------------------
 // Placement.
 
-/// Whether a relay's request matches its runner's labels and envelope.
-/// Ignore the request's pool: the runner's lane selects where work runs.
+/// Whether a relay's request matches its runner's envelope. Ignore the request's pool and
+/// labels: the runner's lane selects where work runs.
 pub fn same_requirements(runner: &RunnerPlacement, placement: &Placement) -> bool {
-    runner.labels == placement.labels && runner.envelope == placement.envelope
+    runner.envelope == placement.envelope
 }
 
 /// A node's room for `placement`'s envelope: how many it fits, `None` when it takes no
@@ -1924,13 +1924,6 @@ fn room(
         return None;
     }
     if !caches_builds_as_required(hub, row) {
-        return None;
-    }
-    if !placement
-        .labels
-        .iter()
-        .all(|l| inventory.labels.contains(l))
-    {
         return None;
     }
     let report = row.report.as_ref();

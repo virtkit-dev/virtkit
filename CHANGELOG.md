@@ -4,6 +4,16 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- **Node labels no longer control placement; use pools and lanes.** Unmatched labels left
+  runner jobs waiting with only "no fitting node" as an explanation. Node and runner config
+  labels are now ignored, with a startup warning to remove them. The `--label` option of
+  `vk-hub relays runners add`, the add-runner form's Labels field, and labels in runner and
+  headroom tables are removed. Older relays and nodes can update in any order: the hub ignores
+  their labels. API key requests and new headroom entries with labels are rejected. On
+  upgrade, existing headroom entries keep their pools; label removal is audited.
+
 ## [0.111.0] - 2026-11-13
 
 ### Added

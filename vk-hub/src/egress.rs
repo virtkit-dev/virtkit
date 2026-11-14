@@ -1024,7 +1024,7 @@ pub(crate) mod testing {
             admission: None,
             placement: Placement {
                 pool: "ci".into(),
-                labels: vec![],
+                legacy_labels: vec![],
                 envelope: vk_hub_proto::job::Envelope::default(),
             },
             title: format!("GitLab job {n} of acme/web (build)"),

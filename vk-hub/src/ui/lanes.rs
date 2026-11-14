@@ -662,7 +662,7 @@ fn headroom_section(h: &mut Html, policy: &Policy, auth: &Auth, digest: &str, st
     if policy.headroom.is_empty() {
         h.raw("<p class=\"empty\">None. Normal work may take all the room.</p>");
     } else {
-        h.raw("<table class=\"grid\"><thead><tr><th>pool</th><th>labels</th>")
+        h.raw("<table class=\"grid\"><thead><tr><th>pool</th>")
             .raw("<th>envelope</th><th class=\"num\">slots</th>");
         if steer {
             h.raw("<th></th>");
@@ -672,12 +672,6 @@ fn headroom_section(h: &mut Html, policy: &Policy, auth: &Auth, digest: &str, st
             let p = &entry.placement;
             h.raw("<tr><td>")
                 .text(&p.pool)
-                .raw("</td><td>")
-                .text(if p.labels.is_empty() {
-                    "-".to_owned()
-                } else {
-                    p.labels.join(", ")
-                })
                 .raw("</td><td>")
                 .text(crate::store::envelope_text(p.envelope))
                 .raw("</td><td class=\"num\">")
@@ -698,8 +692,7 @@ fn headroom_section(h: &mut Html, policy: &Policy, auth: &Auth, digest: &str, st
         edit_form(h, auth, ADD_HEADROOM, digest);
         h.raw("<label>Slots <input type=\"number\" name=\"slots\" min=\"1\" value=\"1\" ")
             .raw("required></label><label>Pool <input name=\"pool\" required></label>")
-            .raw("<label>Labels <input name=\"labels\" placeholder=\"comma-separated\">")
-            .raw("</label><label>Memory <input type=\"number\" name=\"mem_mib\" min=\"1\" ")
+            .raw("<label>Memory <input type=\"number\" name=\"mem_mib\" min=\"1\" ")
             .raw("required> MiB</label><label>CPUs <input type=\"number\" name=\"cpus\" ")
             .raw("min=\"1\" required></label><label>Disk <input type=\"number\" ")
             .raw("name=\"disk_gib\" min=\"0\" value=\"0\" required> GiB</label>")
@@ -1090,12 +1083,7 @@ fn propose(current: &Policy, op: &str, form: &[(String, String)], held: bool) ->
             let headroom = Headroom {
                 placement: Placement {
                     pool: value("pool").trim().to_owned(),
-                    labels: (value("labels").split([',', ' ']))
-                        .filter(|l| !l.is_empty())
-                        .map(str::to_owned)
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect(),
+                    legacy_labels: Vec::new(),
                     envelope: Envelope {
                         mem_mib: number(value("mem_mib"), "the memory")?,
                         cpus: number(value("cpus"), "the CPUs")?,

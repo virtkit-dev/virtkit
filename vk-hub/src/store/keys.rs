@@ -636,7 +636,7 @@ mod tests {
         let principal = db.api_key(&key, 100).unwrap().unwrap();
         let mut placement = Placement {
             pool: "ci".into(),
-            labels: vec![],
+            legacy_labels: vec![],
             envelope: Envelope {
                 mem_mib: 8192,
                 cpus: 4,

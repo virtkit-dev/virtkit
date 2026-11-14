@@ -480,7 +480,6 @@ mod tests {
             name,
             "glrt-secret",
             &RunnerPlacement {
-                labels: vec!["big".into()],
                 envelope: crate::dispatch::Envelope {
                     mem_mib: 2048,
                     cpus: 2,
@@ -542,17 +541,20 @@ mod tests {
         std::fs::remove_dir_all(&state).unwrap();
     }
 
-    /// A runner file from before 0.111, its placement with a pool, loads with the pool dropped.
+    /// Runner files load without legacy pools (before 0.111) or labels (before 0.112).
     #[test]
-    fn an_earlier_runner_file_with_a_pool_loads() {
+    fn an_earlier_runner_file_with_a_pool_and_labels_loads() {
         let state = temp();
         let cfg = config(&state, "");
         let r = hub_runner("big", false);
         write(&state, &r).unwrap();
         let path = file(&state, "big");
         let text = std::fs::read_to_string(&path).unwrap();
-        let text = text.replace("[placement]\n", "[placement]\npool = \"ci\"\n");
-        assert!(text.contains("pool = \"ci\""), "{text}");
+        let text = text.replace(
+            "[placement.envelope]\n",
+            "[placement]\npool = \"ci\"\nlabels = [\"big\"]\n\n[placement.envelope]\n",
+        );
+        assert!(text.contains("labels = [\"big\"]"), "{text}");
         std::fs::write(&path, text).unwrap();
         let loaded = load(&cfg).unwrap();
         assert_eq!(loaded.len(), 1);

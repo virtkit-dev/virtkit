@@ -85,8 +85,6 @@ pub fn inventory(cfg: &Config) -> Inventory {
             tools: super::tools::installed(cfg),
         },
         runner: runner_config(cfg),
-        // Checked when `vk node run` starts; one gone wrong since is left out.
-        labels: labels(cfg).unwrap_or_default(),
         registry: registry_url(cfg),
         user: crate::hostpolicy::self_passwd().ok().map(|(name, _)| name),
         // This node uses a job's registry token wherever the hub sends one: its caches and,
@@ -162,32 +160,15 @@ pub fn registry_url(cfg: &Config) -> Option<String> {
     Some(cfg.registry.as_ref()?.base_url()?.0)
 }
 
-/// Maximum label count and length.
-const MAX_LABELS: usize = 32;
-const MAX_LABEL: usize = 64;
-
-/// Validate `[node] labels` as short words the hub can store and print unchanged.
-pub fn labels(cfg: &Config) -> anyhow::Result<Vec<String>> {
-    let labels = &cfg.node.labels;
-    if labels.len() > MAX_LABELS {
-        anyhow::bail!("[node] labels: at most {MAX_LABELS} labels");
-    }
-    for label in labels {
-        let ok = (1..=MAX_LABEL).contains(&label.len())
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.:/=".contains(&b));
-        if !ok {
-            anyhow::bail!(
-                "[node] labels: {:?} is not 1 to {MAX_LABEL} of ASCII letters, digits and -_.:/=",
-                vk_hub_proto::display_safe(label)
-            );
-        }
-    }
-    let mut out = labels.clone();
-    out.sort();
-    out.dedup();
-    Ok(out)
+/// Warn about `[node] labels`, ignored since 0.112.
+pub fn legacy_labels_warning(cfg: &Config) -> Option<String> {
+    cfg.node.labels.as_ref().map(|labels| {
+        format!(
+            "[node] labels is ignored since 0.112: the hub selects nodes with pools; remove it \
+             from the config ({})",
+            vk_hub_proto::display_safe(&labels.join(", "))
+        )
+    })
 }
 
 /// What the heartbeat keeps from one reading to the next.
@@ -528,23 +509,15 @@ mod tests {
     }
 
     #[test]
-    fn labels_are_checked_and_kept_sorted() {
+    fn legacy_labels_load_and_earn_a_warning() {
         let cfg = |toml: &str| -> Config { toml::from_str(toml).unwrap() };
-        assert_eq!(
-            labels(&cfg(
-                "[node]\nlabels = [\"large-memory\", \"gpu\", \"gpu\"]\n"
-            ))
-            .unwrap(),
-            vec!["gpu".to_string(), "large-memory".to_string()]
-        );
-        for bad in ["\"\"", "\"two words\"", "\"tab\\t\"", "\"é\""] {
-            assert!(
-                labels(&cfg(&format!("[node]\nlabels = [{bad}]\n"))).is_err(),
-                "{bad}"
-            );
-        }
-        let many: Vec<String> = (0..33).map(|i| format!("\"l{i}\"")).collect();
-        assert!(labels(&cfg(&format!("[node]\nlabels = [{}]\n", many.join(",")))).is_err());
+        let labelled = cfg("[node]\nlabels = [\"performance-bench-microvm\"]\n");
+        let warning = legacy_labels_warning(&labelled).unwrap();
+        assert!(warning.contains("performance-bench-microvm"), "{warning}");
+        // Ignored: neither printed with the config nor part of its hash.
+        assert!(!toml::to_string(&labelled).unwrap().contains("labels"));
+        assert_eq!(config_hash(&labelled), config_hash(&cfg("")));
+        assert_eq!(legacy_labels_warning(&cfg("")), None);
     }
 
     #[test]

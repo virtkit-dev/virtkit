@@ -129,7 +129,6 @@ node_up() {
     printf '[executor]\natop = false\n\n'
     # The node sizes a job's VM by its own template, not by the envelope (4G otherwise).
     printf '[executor.vm]\ncpus = 2\nmem = "1G"\n\n'
-    printf '[node]\nlabels = ["e2e"]\n'
     if [ -n "${REG_PORT:-}" ]; then
       printf '\n[registry]\nrepo = "127.0.0.1:%s/vk"\ninsecure = true\n' "$REG_PORT"
       [ "$E2E_TOKENS" = 0 ] || printf 'guest_credential = "job"\n'
@@ -161,7 +160,6 @@ url = "$GL_URL"
 [[runners]]
 name = "e2e"
 token_file = "$RUN/runner.token"
-labels = ["e2e"]
 envelope = { mem = "1G", cpus = 1, disk = "4G" }
 EOF
   hub token create --kind gitlab 2>>"$LOGS/hub-cli.log" |

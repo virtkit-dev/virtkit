@@ -896,9 +896,6 @@ enum RelayRunnersCmd {
         /// A file holding the runner authentication token (`glrt-…`), or - for stdin
         #[arg(long, value_name = "FILE")]
         token_file: std::path::PathBuf,
-        /// A label its jobs' nodes must have; repeat for several
-        #[arg(long = "label", value_name = "LABEL")]
-        labels: Vec<String>,
         /// Each job's VM: mem=<size>,cpus=<n>,disk=<size>, any of them (default
         /// mem=4G,cpus=2,disk=16G)
         #[arg(long, value_name = "SPEC", default_value = DEFAULT_ENVELOPE, value_parser = parse_envelope)]
@@ -3050,14 +3047,13 @@ fn relays_blocking(client: &admin::Client, cmd: Option<RelaysCmd>) -> Result<()>
             relay,
             name,
             token_file,
-            labels,
             envelope,
             limit,
             request_concurrency,
         }) => {
             let token = read_runner_token(&token_file)?;
             let settings = relays::RunnerSettings {
-                placement: vk_hub_proto::gitlab::RunnerPlacement { labels, envelope },
+                placement: vk_hub_proto::gitlab::RunnerPlacement { envelope },
                 limit,
                 request_concurrency,
             };
@@ -3241,18 +3237,13 @@ fn render_relay_state(
                 format!("{} held, {} asking", x.jobs, x.requests)
             })
     };
-    let rows: Vec<[String; 8]> = i
+    let rows: Vec<[String; 7]> = i
         .runners
         .iter()
         .map(|x| {
             [
                 x.name.clone(),
                 x.runner_id.map_or("-".to_string(), |id| id.to_string()),
-                if x.placement.labels.is_empty() {
-                    "-".to_string()
-                } else {
-                    x.placement.labels.join(", ")
-                },
                 store::envelope_text(x.placement.envelope),
                 x.limit.map_or("-".to_string(), |l| l.to_string()),
                 if x.verified {
@@ -3270,7 +3261,6 @@ fn render_relay_state(
         &[
             "RUNNER",
             "GITLAB ID",
-            "LABELS",
             "ENVELOPE",
             "LIMIT",
             "STATE",
@@ -3970,9 +3960,6 @@ fn pools_cell(pools: &[String]) -> String {
 /// What the table leaves out of a node, and what it cannot do: sentences, not cells.
 fn node_notes(n: &ops::NodeView) -> Vec<String> {
     let mut placement = Vec::new();
-    if !n.labels.is_empty() {
-        placement.push(format!("{}: labels {}", n.hostname, n.labels.join(", ")));
-    }
     // On a hub that places jobs, a runner of the node's own, which says why it refuses them.
     let own_runner = (n.report.as_ref())
         .and_then(|r| r.placed.as_ref())

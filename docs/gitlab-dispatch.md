@@ -85,7 +85,7 @@ monitoring:
   heartbeat listing every request it holds. A job submitted without an admission waits on its
   lane's `max_slots` too.
 - **Production headroom.** The capacity policy accepts at most 64 `headroom` entries. Each
-  reserves `slots` envelopes of its placement (pool, labels, envelope) for production work.
+  reserves `slots` envelopes of its placement (pool, envelope) for production work.
   Normal work must leave the fleet that much room, or all remaining room if already short.
   Entries are checked independently; identical placements use their greatest slot count.
   An entry with no room on a node does not block work there.
@@ -152,15 +152,14 @@ url = "https://gitlab.example.com"
 [[runners]]
 name = "ci"
 token_file = "/etc/vk-gitlab/runner-ci.token"   # glrt-…
-labels = ["large-memory"]
 envelope = { mem = "16G", cpus = 8, disk = "16G" }
 request_concurrency = 1
 ```
 
 The runner's lane on the hub selects its pools and nodes
 ([capacity arbitration](capacity-arbitration.md)). A legacy `pool` in a `[[runners]]` table
-is ignored since 0.111, with a startup warning to remove it. Accepting it lets unattended
-relay updates keep serving with an older config.
+is ignored since 0.111, and legacy `labels` since 0.112, each with a startup warning to remove
+it. Accepting them lets unattended relay updates keep serving with an older config.
 
 A runner's `envelope` is what the hub sets aside on a node and counts there for each of its
 jobs. The node admits the job's guest and its services, each service VM at its own size, so
@@ -174,12 +173,15 @@ relay whose inventory lists more runners or a larger `request_concurrency`.
 
 GitLab's job response does not carry the job's tags, and GitLab only gives a runner jobs
 whose tags it has, so placement is per runner: one runner per class of work, with the tags
-of that class registered in GitLab, its labels and envelope here, and its lane on the hub. A
-pool is a set of nodes the hub's operator names (`vk-hub nodes pools <id> <a,b>`, or on the
-node's page), which a lane selects; a label is one a node declares in its own configuration and
-reports in its inventory's `labels`, absent from an older node's. The labels and envelope stay
-in the daemon's configuration, which it reports to the hub; the hub sets the relay no ceiling
-on them.
+of that class registered in GitLab, its envelope here, and its lane on the hub. A pool is a
+set of nodes the hub's operator names (`vk-hub nodes pools <id> <a,b>`, or on the node's page),
+which a lane selects. The envelope stays in the daemon's configuration, which it reports to the
+hub; the hub sets the relay no ceiling on it.
+
+Since 0.112, pools select nodes without labels. The hub ignores labels reported or requested
+by older relays and reported by older nodes. It rejects labels in API key placements and new
+`headroom` entries. At startup, it removes stored headroom labels, preserving each entry's
+pool and auditing the removal.
 
 A node's concurrency ceiling (`vk-hub nodes ceiling`) and its own executor limit
 (`[executor.schedule] max_concurrency`, which the node reports) cap its placed work at the
@@ -335,7 +337,7 @@ reservations and jobs it holds — and no longer asked by vk-gitlab, which queue
 **Reservations.** `{runner, queue, request_id, placement, lease_secs, wait_secs}` →
 `{admission, reservation, node, envelope, lease_secs}`. The request joins the hub's
 [queue](#admission-and-reservations), whose offers filter the nodes of the runner's lane, or of
-the pool an API key names, on labels, readiness and headroom. With `queue`, the hub answers 201
+the pool an API key names, on readiness and headroom. With `queue`, the hub answers 201
 with a grant if one is ready at once, else 202 `{ticket}`; without, it waits up to `wait_secs`
 (at least 5 seconds) for a grant, then answers 503 `no_capacity`. A relay names its runner. A
 runner may have `request_concurrency` tickets waiting, offered or granted, a principal 256

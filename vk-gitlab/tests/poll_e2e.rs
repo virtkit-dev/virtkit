@@ -79,7 +79,7 @@ async fn job_runs_and_reports(via: Via) {
         "{runners:?}"
     );
     assert!(sub.placement.pool.is_empty());
-    assert_eq!(sub.placement.labels, ["big"]);
+    assert!(sub.placement.legacy_labels.is_empty());
     assert_eq!(sub.placement.envelope.mem_mib, 8192);
     assert_eq!(sub.request_id.len(), 32);
     let JobSpec::GitlabCi(spec) = &sub.spec;
@@ -822,7 +822,6 @@ async fn a_runner_added_on_the_hub_runs_and_goes_once_removed_and_drained(via: V
     h.hub.set_slots("r1", 1);
     let added_by = "c".repeat(32);
     let placement = vk_hub_proto::gitlab::RunnerPlacement {
-        labels: vec!["big".into()],
         envelope: vk_gitlab::dispatch::Envelope {
             mem_mib: 8192,
             cpus: 4,

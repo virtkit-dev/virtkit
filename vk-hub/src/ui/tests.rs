@@ -4110,7 +4110,7 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         admission: None,
         placement: Placement {
             pool: "ci".into(),
-            labels: vec![],
+            legacy_labels: vec![],
             envelope: Envelope::default(),
         },
         title: format!("GitLab job {n} of {project} (build)"),
@@ -4595,7 +4595,6 @@ async fn api_keys_and_their_clients_are_shown_live() {
         name: name.into(),
         url: url.into(),
         pool: "ci".into(),
-        labels: vec![],
         limit: None,
     };
     let hello = ClientHello {
@@ -5024,7 +5023,7 @@ pub(super) fn history_job(n: u64, project: &str) -> crate::store::JobRow {
         admission: None,
         placement: Placement {
             pool: "ci".into(),
-            labels: vec![],
+            legacy_labels: vec![],
             envelope: vk_hub_proto::job::Envelope::default(),
         },
         title: format!("GitLab job {n} of {project} (build)"),
@@ -9818,7 +9817,6 @@ async fn relays_and_their_runners_follow_their_server() {
                 name: "ci".into(),
                 runner_id: Some(42),
                 placement: RunnerPlacement {
-                    labels: vec!["large".into()],
                     envelope: vk_hub_proto::job::Envelope {
                         mem_mib: 4096,
                         cpus: 2,
@@ -9834,7 +9832,6 @@ async fn relays_and_their_runners_follow_their_server() {
                 name: hostile.into(),
                 runner_id: None,
                 placement: RunnerPlacement {
-                    labels: vec![],
                     envelope: vk_hub_proto::job::Envelope {
                         mem_mib: 1024,
                         cpus: 1,
@@ -9898,7 +9895,7 @@ async fn relays_and_their_runners_follow_their_server() {
          <th>state</th><th class=\"num\">jobs</th><th>last GitLab answer</th></tr></thead>",
         // Its server not approved: neither mapped nor unmapped.
         "<tr class=\"runner\"><td><strong>ci</strong><br><span class=\"sub\">GitLab ID 42</span>\
-         </td><td>config</td><td>-</td><td>large · 4096 MiB",
+         </td><td>config</td><td>-</td><td>4096 MiB",
         "<td><span class=\"badge warn\">server not approved</span></td><td class=\"num\">3 / 4</td><td><time",
         " · HTTP 204</td>",
         // The scheduler's view, folded.
@@ -9929,7 +9926,7 @@ async fn relays_and_their_runners_follow_their_server() {
     assert!(
         event.contains(
             "GitLab ID 42</span></td><td>config</td><td><span class=\"badge warn\">No lane: \
-             its jobs are refused</span></td><td>large · 4096 MiB"
+             its jobs are refused</span></td><td>4096 MiB"
         ),
         "{event}"
     );
@@ -9981,7 +9978,7 @@ async fn relays_and_their_runners_follow_their_server() {
     assert!(
         event.contains(
             "GitLab ID 42</span></td><td>config</td><td><a href=\"/lanes\">weight 2</a></td>\
-             <td>large · 4096 MiB, 2 CPUs, 1 GiB disk · runs on <span class=\"bad\">no node</span>"
+             <td>4096 MiB, 2 CPUs, 1 GiB disk · runs on <span class=\"bad\">no node</span>"
         ),
         "{event}"
     );
@@ -10143,7 +10140,8 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
         assert!(page.contains(want), "{want}: {page}");
     }
 
-    // Refused with the hub's reason, the rest filled in again but never the token.
+    // Refused with the hub's reason, the rest filled in again but never the token. Labels a
+    // form from before 0.112 posts are ignored.
     let fields = |name: &str, envelope: &str| {
         format!(
             "_csrf={csrf}&op=add-runner&token=glrt-secret&name={name}\
@@ -10165,9 +10163,10 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
     ] {
         let reply = post_action(addr, &origin, &operator, &action, &form, false).await;
         assert_eq!(reply.status, status, "{want}: {}", reply.body);
-        for want in [want, "value=\"kvm, big\"", "name=\"token\""] {
+        for want in [want, "value=\"2\"", "name=\"token\""] {
             assert!(reply.body.contains(want), "{want}: {}", reply.body);
         }
+        assert!(!reply.body.contains("kvm"), "{}", reply.body);
         assert!(!reply.body.contains("glrt-secret"), "{}", reply.body);
     }
     assert!(hub.db.relay_commands(&relay).unwrap().is_empty());
@@ -10182,7 +10181,6 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
             vk_hub_proto::gitlab::RunnerToken::new("glrt-x"),
             crate::relays::RunnerSettings {
                 placement: vk_hub_proto::gitlab::RunnerPlacement {
-                    labels: vec![],
                     envelope: vk_hub_proto::job::Envelope {
                         mem_mib: 4096,
                         cpus: 2,
@@ -10294,7 +10292,6 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
         (name.as_str(), token.expose(), *limit, *request_concurrency),
         ("ci-1", "", Some(2), 1)
     );
-    assert_eq!(placement.labels, ["kvm", "big"]);
     assert_eq!(placement.envelope.mem_mib, 8 << 10);
     assert!(hub.runner_tokens.holds(&added.command.id));
 
@@ -13521,7 +13518,7 @@ async fn operators_edit_lanes_from_their_page() {
     // Production headroom, kept and released.
     let digest = policy.digest().unwrap();
     let keep = format!(
-        "_csrf={csrf}&op=add&expected={digest}&slots=1&pool=ci&labels=&mem_mib=1024&cpus=2\
+        "_csrf={csrf}&op=add&expected={digest}&slots=1&pool=ci&mem_mib=1024&cpus=2\
          &disk_gib=0"
     );
     let reply = lanes_confirmed(addr, &origin, &operator, &keep, &["settings: headroom"]).await;

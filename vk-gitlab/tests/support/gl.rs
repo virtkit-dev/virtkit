@@ -284,10 +284,10 @@ pub struct Harness {
     pub daemon: Daemon,
 }
 
-/// A `[[runners]]` table with label `big`; `extra` is appended to it.
+/// A `[[runners]]` table; `extra` is appended to it.
 pub fn runner_toml(name: &str, token: &str, extra: &str) -> String {
     format!(
-        "[[runners]]\nname = \"{name}\"\ntoken = \"{token}\"\nlabels = [\"big\"]\nenvelope = {{ mem = \"8G\", cpus = 4, disk = \"10G\" }}\n{extra}"
+        "[[runners]]\nname = \"{name}\"\ntoken = \"{token}\"\nenvelope = {{ mem = \"8G\", cpus = 4, disk = \"10G\" }}\n{extra}"
     )
 }
 
