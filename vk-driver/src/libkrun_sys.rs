@@ -173,6 +173,15 @@ fn path_str(path: &Path) -> Result<&str> {
         .with_context(|| format!("{} is not valid UTF-8", path.display()))
 }
 
+/// The agent's exec socket is the first listening port in every spec that has one.
+/// Other listeners, such as `--ssh`, follow it.
+fn agent_socket(ports: &[crate::vmm::VsockPort]) -> Option<&Path> {
+    ports
+        .iter()
+        .find(|vp| vp.listen)
+        .map(|vp| vp.socket.as_path())
+}
+
 /// Boot `spec` under libkrun in this process, resuming `spec.restore_from` only when `restore`.
 /// Returns only if setup fails; once the guest runs, libkrun ends the process with its exit
 /// code.
@@ -391,6 +400,15 @@ fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>, restore: bool) -> Result<()> {
         POWER_BUTTON_GRACE
     };
     press_power_button_on_sigterm(handle, grace)?;
+    // UEFI (Windows) guests have neither vk-agent nor Linux's caches.
+    // Watcher failure must not prevent boot; it only leaves descriptor pressure unhandled.
+    if !spec.shares.is_empty()
+        && !spec.hyperv
+        && let Some(agent) = agent_socket(&spec.vsock_ports)
+        && let Err(e) = crate::fdpressure::watch(agent)
+    {
+        eprintln!("virtkit: not watching the descriptors the guest's shares hold: {e:#}");
+    }
 
     // Blocks until the guest powers off or resets; libkrun `_exit`s with its code. It returns
     // only when the event loop fails, which must not read as a clean power-off.
@@ -826,9 +844,26 @@ fn wait_for(pid: i32) -> Wait {
 #[cfg(test)]
 mod tests {
     use super::{
-        KRUN_EXIT_GUEST_RESET, KernelFormat, Wait, console_cmdline, detect_kernel_format,
-        disk_letter, mem_mib, reboots,
+        KRUN_EXIT_GUEST_RESET, KernelFormat, Wait, agent_socket, console_cmdline,
+        detect_kernel_format, disk_letter, mem_mib, reboots,
     };
+    use crate::vmm::VsockPort;
+
+    #[test]
+    fn the_agent_is_behind_the_first_listening_port() {
+        let base = std::path::Path::new("/run/vm/vsock.sock");
+        assert_eq!(agent_socket(&[]), None);
+        assert_eq!(agent_socket(&[VsockPort::bridge(base, 1024)]), None);
+        let ports = [
+            VsockPort::bridge(base, 1024),
+            VsockPort::exec(base, 4444),
+            VsockPort::exec(base, 2222),
+        ];
+        assert_eq!(
+            agent_socket(&ports),
+            Some(std::path::Path::new("/run/vm/vsock.sock_4444"))
+        );
+    }
 
     #[test]
     fn the_keeper_reboots_on_a_guest_or_a_hard_reset_only() {

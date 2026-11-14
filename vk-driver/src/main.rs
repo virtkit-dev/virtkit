@@ -46,6 +46,7 @@ mod exec;
 mod executor;
 mod ext4;
 mod ext4_read;
+mod fdpressure;
 mod files;
 mod fullvm;
 mod gc;

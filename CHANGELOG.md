@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Long-lived Linux VMs reclaim cached shared files before reaching the host's descriptor
+  limit.** Those files can accumulate until further opens fail with "Too many open files".
+  vk asks the guest to drop caches, at the cost of rebuilding them on later access.
+  This requires a reachable guest agent and does not guarantee a limit on open files.
+
 ## [0.111.0] - 2026-11-13
 
 ### Added

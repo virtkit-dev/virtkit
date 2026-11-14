@@ -2545,7 +2545,8 @@ async fn build_and_boot(
         vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, SSH_AGENT_VSOCK_PORT));
     }
     // --ssh, host→guest: an exec-style per-port listener libkrun keeps at
-    // `<vsock.sock>_2222`, so the connect address is `vsock-auto://<vsock.sock>:2222`.
+    // `<vsock.sock>_2222`, so the connect address is `vsock-auto://<vsock.sock>:2222`. It
+    // stays after the exec channel, which the VMM takes to be the first listening port.
     if args.ssh {
         vsock_ports.push(crate::vmm::VsockPort::exec(&vsock, SSH_VSOCK_PORT));
     }
