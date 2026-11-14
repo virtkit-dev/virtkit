@@ -501,6 +501,15 @@ An idle share costs one wakeup per 10s. Covered by
 `a_stall_the_recovery_does_not_clear_is_warned_once` and
 `describe_names_masks_pending_bits_and_routes`.
 
+### virtio-fs held-inode count
+
+`src/devices/src/virtio/fs/linux/passthrough.rs` + `src/libkrun/src/api/{device_builders.rs,
+mod.rs}` — `fs_held_inodes()` counts inodes looked up and not forgotten across all shares
+in the process, plus each share's root. Each holds an `O_PATH` fd. The guest forgets an inode
+when it leaves its dentry and inode caches, so a long-lived guest with spare memory can
+exhaust `RLIMIT_NOFILE`. The count lets virtkit request cache drops before that.
+Covered by `held_inodes_follow_lookups_forgets_and_teardown`.
+
 ### Not carried from the 1.19 tree
 
 - Initrd placement below 4 GiB: upstream in 2.0.

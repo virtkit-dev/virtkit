@@ -35,6 +35,9 @@ use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualE
 pub use devices::virtio::passthrough::CachePolicy as FsCachePolicy;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::passthrough::PermissionSemantics;
+// Local patch, see VENDOR.md.
+#[cfg(all(target_os = "linux", not(any(feature = "tee", feature = "aws-nitro"))))]
+pub use devices::virtio::passthrough::held_inodes as fs_held_inodes;
 use devices::virtio::{PortDescription, VirtioDevice, VirtioShmRegion, VmmExitObserver, port_io};
 #[cfg(feature = "input")]
 use krun_input;

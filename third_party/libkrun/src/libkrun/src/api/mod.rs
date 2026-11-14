@@ -44,6 +44,8 @@ pub use device_builders::PciDeviceManager;
 pub use device_builders::RngDevice;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
 pub use device_builders::VhostUserDevice;
+#[cfg(all(target_os = "linux", not(any(feature = "tee", feature = "aws-nitro"))))]
+pub use device_builders::fs_held_inodes;
 pub use device_builders::{
     AttachContext, AttachDevice, DeviceManager, DeviceRequirements, MmioDeviceManager,
     ResolvedShmRegion, TsiFlags, VsockDevice,

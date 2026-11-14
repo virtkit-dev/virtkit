@@ -52,6 +52,36 @@ struct InodeData {
     refcount: AtomicU64,
 }
 
+/// Live `InodeData` across every share of this process; see [`held_inodes`].
+static HELD_INODES: AtomicU64 = AtomicU64::new(0);
+
+/// How many descriptors this process keeps open for inodes its guests have looked up and
+/// not forgotten, plus one for each share's root. A guest forgets an inode only when it drops
+/// it from its own caches, so on a guest with memory to spare the count keeps growing, towards
+/// `RLIMIT_NOFILE`. The descriptors of open files and directories are not included.
+pub fn held_inodes() -> u64 {
+    HELD_INODES.load(Ordering::Relaxed)
+}
+
+impl InodeData {
+    fn new(inode: Inode, file: File, dev: u64, mnt_id: u64, refcount: u64) -> Self {
+        HELD_INODES.fetch_add(1, Ordering::Relaxed);
+        InodeData {
+            inode,
+            file,
+            dev,
+            mnt_id,
+            refcount: AtomicU64::new(refcount),
+        }
+    }
+}
+
+impl Drop for InodeData {
+    fn drop(&mut self) {
+        HELD_INODES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 struct HandleData {
     inode: Inode,
     file: RwLock<File>,
@@ -1032,13 +1062,7 @@ impl FileSystem for PassthroughFs {
                 dev: st.st_dev,
                 mnt_id,
             },
-            Arc::new(InodeData {
-                inode: fuse::ROOT_ID,
-                file: f,
-                dev: st.st_dev,
-                mnt_id,
-                refcount: AtomicU64::new(2),
-            }),
+            Arc::new(InodeData::new(fuse::ROOT_ID, f, st.st_dev, mnt_id, 2)),
         );
 
         let mut opts = FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO;
@@ -1184,13 +1208,7 @@ impl FileSystem for PassthroughFs {
                     dev: st.st_dev,
                     mnt_id,
                 },
-                Arc::new(InodeData {
-                    inode,
-                    file: f,
-                    dev: st.st_dev,
-                    mnt_id,
-                    refcount: AtomicU64::new(1),
-                }),
+                Arc::new(InodeData::new(inode, f, st.st_dev, mnt_id, 1)),
             );
 
             inode
@@ -2603,6 +2621,64 @@ mod tests {
         // init() registers the root inode that lookup() traverses from.
         fs.init(FsOptions::empty()).unwrap();
         (fs, root_dir)
+    }
+
+    /// Looks up `count` new files of the share's root, `prefix` keeping their names apart.
+    fn lookup_new_files(fs: &PassthroughFs, root: &str, prefix: &str, count: u64) -> Vec<Inode> {
+        (0..count)
+            .map(|i| {
+                let name = format!("{prefix}{i}");
+                std::fs::write(std::path::Path::new(root).join(&name), b"").unwrap();
+                let entry = fs
+                    .lookup(ctx(), fuse::ROOT_ID, &CString::new(name).unwrap())
+                    .unwrap();
+                entry.inode
+            })
+            .collect()
+    }
+
+    /// The count is the process's, and other tests add and drop a few inodes concurrently:
+    /// `a` and `b` are equal up to that drift.
+    fn assert_held(a: u64, b: u64, what: &str) {
+        const OTHERS: u64 = 50;
+        assert!(a.abs_diff(b) <= OTHERS, "{what}: {a} vs {b}");
+    }
+
+    // Few enough files to stay well under a soft RLIMIT_NOFILE of 1024.
+    const HELD_FILES: u64 = 200;
+
+    /// An inode is counted once from its first lookup until the guest has forgotten every
+    /// lookup of it, or the share is torn down. One test, as two moving the count by
+    /// `HELD_FILES` at once would be each other's drift.
+    #[test]
+    fn held_inodes_follow_lookups_forgets_and_teardown() {
+        let (fs, root) = rooted_fs(Duration::ZERO);
+        let before = held_inodes();
+        let inodes = lookup_new_files(&fs, &root, "f", HELD_FILES);
+        let held = held_inodes();
+        assert_held(held, before + HELD_FILES, "after the lookups");
+
+        // A second lookup of a known inode holds no new descriptor.
+        for i in 0..HELD_FILES {
+            let name = CString::new(format!("f{i}")).unwrap();
+            fs.lookup(ctx(), fuse::ROOT_ID, &name).unwrap();
+        }
+        assert_held(held_inodes(), held, "after looking each up again");
+
+        // Forgetting one of the two lookups keeps the inode.
+        fs.batch_forget(ctx(), inodes.iter().map(|&i| (i, 1)).collect());
+        assert_held(held_inodes(), held, "after forgetting one lookup of two");
+
+        fs.batch_forget(ctx(), inodes.into_iter().map(|i| (i, 1)).collect());
+        assert_held(held_inodes() + HELD_FILES, held, "after forgetting both");
+
+        // Tearing the share down releases the inodes its guest never forgot.
+        lookup_new_files(&fs, &root, "g", HELD_FILES);
+        let held = held_inodes();
+        fs.destroy();
+        assert_held(held_inodes() + HELD_FILES, held, "after destroy");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
