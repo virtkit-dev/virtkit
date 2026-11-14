@@ -10295,18 +10295,15 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
     assert_eq!(placement.envelope.mem_mib, 8 << 10);
     assert!(hub.runner_tokens.holds(&added.command.id));
 
-    // Done, with no lane: the row says its jobs are refused, and links an operator to a lane.
+    // Done, before the relay reports the runner: nothing to say yet. Once it does, with no
+    // lane: the row says its jobs are refused, and links an operator to a lane.
     let ack = CommandAck {
         id: added.command.id.clone(),
         outcome: Outcome::Done,
     };
     assert!(hub.db.record_relay_ack(&relay, &ack, now).unwrap());
-    hub.clients_changed();
-    next_with(
-        &mut live,
-        "Add runner <strong>ci-1</strong>: <span class=\"badge ok\">done",
-    )
-    .await;
+    let page = get(addr, "/gitlab", Some(&operator)).await.body;
+    assert!(!page.contains("Add runner <strong>ci-1</strong>"), "{page}");
     let hubbed = Runner {
         name: "ci-1".into(),
         runner_id: Some(42),
@@ -10445,6 +10442,17 @@ async fn an_operator_adds_and_removes_a_relay_s_runners() {
         ),
         "{page}"
     );
+
+    // Done, with nothing left to do: neither page shows it any more.
+    let ack = CommandAck {
+        id: removal.command.id.clone(),
+        outcome: Outcome::Done,
+    };
+    assert!(hub.db.record_relay_ack(&relay, &ack, now).unwrap());
+    for path in ["/gitlab", "/gitlab/gl"] {
+        let page = get(addr, path, Some(&operator)).await.body;
+        assert!(!page.contains("Remove runner <strong>"), "{path}: {page}");
+    }
 
     // A relay no longer taking runners: no Add runner; an operator is told what lets it.
     inventory.allow = vec![];

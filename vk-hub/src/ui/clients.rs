@@ -986,8 +986,9 @@ fn relays_table(h: &mut Html, shown: &Shown, now: u64, steer: bool) {
     h.raw("</tbody></table>");
 }
 
-/// How runner command `c` of relay `r` went, or that it is under way. An added runner
-/// that maps to no lane says so, linking to adding one for an operator.
+/// Runner command `c` of relay `r` while it is under way or failed. Once done it is shown only
+/// for an added runner that maps to no lane, saying so and linking an operator to adding one:
+/// otherwise the runner table tells the rest.
 fn runner_command(
     h: &mut Html,
     shown: &Shown,
@@ -999,20 +1000,28 @@ fn runner_command(
     let Some((what, name)) = super::relays::runner_command_what(c) else {
         return;
     };
+    let state = super::relays::runner_command_state(c, now);
+    let unmapped = match state {
+        Some(Ok(())) if matches!(c.command.op, Operation::AddRunner { .. }) => {
+            shown.unmapped(r, c.runner_id)
+        }
+        _ => None,
+    };
+    if state == Some(Ok(())) && unmapped.is_none() {
+        return;
+    }
     h.raw("<div class=\"sub\">")
         .raw(what)
         .raw(" <strong>")
         .node(name)
         .raw("</strong>: ");
-    match super::relays::runner_command_state(c, now) {
+    match state {
         None => {
             h.raw("<span class=\"badge busy\">pending</span>");
         }
         Some(Ok(())) => {
             h.raw("<span class=\"badge ok\">done</span>");
-            if matches!(c.command.op, Operation::AddRunner { .. })
-                && let Some(href) = shown.unmapped(r, c.runner_id)
-            {
+            if let Some(href) = unmapped {
                 h.raw(" ");
                 lane_notice(h, steer.then_some(href.as_str()));
             }

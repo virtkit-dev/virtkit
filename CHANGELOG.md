@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **The GitLab pages no longer show a relay's last runner command once it is done.** A
+  pending or failed command still shows, and so does an added runner that has no lane yet.
+
 ### Removed
 
 - **Node labels no longer control placement; use pools and lanes.** Unmatched labels left
