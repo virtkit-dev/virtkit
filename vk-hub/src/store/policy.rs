@@ -122,7 +122,8 @@ fn policy_audit(before: &Policy, after: &Policy, from: &str, to: &str) -> String
     event
 }
 
-/// The row of the policy stored before the conversion to lanes, kept as it was for a rollback.
+/// The policy before conversion to lanes, kept for rollback.
+/// From 0.112, headroom node labels are removed before this backup is made.
 const V1_BACKUP: &str = "policy.v1.bak";
 /// The row of the [`ConversionNote`] left by that conversion.
 const CONVERSION: &str = "conversion";
@@ -198,6 +199,76 @@ pub(super) fn convert_stored(txn: &redb::WriteTransaction, now: u64) -> Result<(
     append_audit(txn, None, "hub", &event, now)?;
     for warning in converted.warnings() {
         eprintln!("vk-hub: capacity policy conversion: {warning}");
+    }
+    Ok(())
+}
+
+/// Remove stored headroom node labels, preserving each entry's pool. Audit the rewrite and
+/// each entry's labels separately. Run on every open to catch labels written after rollback,
+/// before other policy conversions so they and the backup receive headroom without labels.
+///
+/// Keep duplicate placements. Leave non-JSON rows, other policy versions and non-array
+/// labels unchanged.
+pub(super) fn drop_headroom_labels(txn: &redb::WriteTransaction, now: u64) -> Result<()> {
+    let mut table = txn.open_table(CAPACITY_POLICY)?;
+    let Some(bytes) = table.get("policy")?.map(|row| row.value().to_vec()) else {
+        return Ok(());
+    };
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(());
+    };
+    // The earlier tenant format has no version and uses the same headroom format.
+    let version = value.get("version");
+    if version.is_some_and(|v| v.as_u64() != Some(crate::policy::VERSION.into())) {
+        return Ok(());
+    }
+    let mut dropped = Vec::new();
+    let entries = value.get_mut("headroom").and_then(|h| h.as_array_mut());
+    for entry in entries.into_iter().flatten() {
+        let Some(placement) = entry.get_mut("placement").and_then(|p| p.as_object_mut()) else {
+            continue;
+        };
+        let labels = match placement.get("labels").and_then(|l| l.as_array()) {
+            Some(labels) if !labels.is_empty() => labels
+                .iter()
+                .map(|l| l.as_str().map_or_else(|| l.to_string(), str::to_owned))
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => continue,
+        };
+        placement.remove("labels");
+        let pool = placement.get("pool").and_then(|p| p.as_str()).unwrap_or("");
+        dropped.push(format!("pool {pool:?}: dropped node labels {labels}"));
+    }
+    if dropped.is_empty() {
+        return Ok(());
+    }
+    // Use the hub's policy encoding so the stored and displayed digests agree.
+    let (encoded, to) = match serde_json::from_value::<Policy>(value.clone()) {
+        Ok(policy) => (encode(&policy)?, policy.digest()?),
+        Err(_) => {
+            let encoded = serde_json::to_vec(&value).context("encoding the capacity policy")?;
+            let to = digest_bytes(&encoded);
+            (encoded, to)
+        }
+    };
+    table.insert("policy", encoded.as_slice())?;
+    let to = crate::store::short(&to);
+    let mut events = vec![format!(
+        "rewrote capacity policy {} as {to}: dropped node labels, no longer supported, from {} \
+         headroom entries",
+        crate::store::short(&digest_bytes(&bytes)),
+        dropped.len()
+    )];
+    // Audit each entry separately: one entry's labels can fill an audit event's length limit.
+    events.extend(
+        dropped
+            .iter()
+            .map(|entry| format!("capacity policy {to} headroom on {entry}")),
+    );
+    for event in &events {
+        append_audit(txn, None, "hub", event, now)?;
+        eprintln!("vk-hub: {}", vk_hub_proto::display_safe(event));
     }
     Ok(())
 }
@@ -778,6 +849,174 @@ mod tests {
             .unwrap();
         let note = db.capacity_conversion().unwrap().unwrap();
         assert_eq!(note.shared.len(), 1, "{note:?}");
+    }
+
+    /// A headroom entry as stored, on `pool` with `labels` (omitted when null).
+    fn stored_headroom(pool: &str, labels: serde_json::Value, slots: u32) -> serde_json::Value {
+        let mut placement = serde_json::json!({
+            "pool": pool,
+            "envelope": { "mem_mib": 1024, "cpus": 1, "disk_bytes": 0 },
+        });
+        if !labels.is_null() {
+            placement["labels"] = labels;
+        }
+        serde_json::json!({ "placement": placement, "slots": slots })
+    }
+
+    /// The default policy as stored, with `headroom`.
+    fn stored_with_headroom(headroom: Vec<serde_json::Value>) -> serde_json::Value {
+        let mut stored = serde_json::to_value(Policy::default()).unwrap();
+        stored["headroom"] = headroom.into();
+        stored
+    }
+
+    fn label_audits(db: &Db) -> Vec<String> {
+        let audits = db.audits(None, 100).unwrap();
+        let events = audits.into_iter().map(|a| a.event);
+        events
+            .filter(|e| e.contains("dropped node labels"))
+            .collect()
+    }
+
+    fn headroom_pools(policy: &Policy) -> Vec<(&str, u32)> {
+        let headroom = policy.headroom.iter();
+        headroom
+            .map(|h| (h.placement.pool.as_str(), h.slots))
+            .collect()
+    }
+
+    #[test]
+    fn stored_headroom_labels_are_dropped_and_audited_at_open() {
+        let stored = stored_with_headroom(vec![
+            stored_headroom("ci", serde_json::json!(["big", "ssd"]), 2),
+            stored_headroom("web", serde_json::json!([]), 1),
+            stored_headroom("db", serde_json::Value::Null, 3),
+        ]);
+        let (db, bytes, path, _dir) = reopened(stored, |_| {});
+        let policy = db.capacity_policy().unwrap();
+        assert_eq!(headroom_pools(&policy), [("ci", 2), ("web", 1), ("db", 3)]);
+        let raw = db.capacity_policy_raw();
+        assert!(!raw.contains("big"), "{raw}");
+        let audits = label_audits(&db);
+        let from = digest_bytes(&bytes);
+        let rewrote = format!(
+            "rewrote capacity policy {} as {}",
+            crate::store::short(&from),
+            crate::store::short(&policy.digest().unwrap())
+        );
+        assert!(
+            audits
+                .iter()
+                .any(|e| e.contains(&rewrote) && e.contains("from 1 headroom entries")),
+            "{audits:?}"
+        );
+        assert!(
+            audits
+                .iter()
+                .any(|e| e.contains(r#"pool "ci": dropped node labels big, ssd"#)),
+            "{audits:?}"
+        );
+        assert_eq!(audits.len(), 2, "{audits:?}");
+        // Once dropped, a reopen leaves the policy and the audit log alone.
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.capacity_policy().unwrap(), policy);
+        assert_eq!(label_audits(&db), audits);
+        // A hub rolled back writes labels again: the next open drops and audits them again.
+        db.set_raw_capacity_policy(&bytes);
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.capacity_policy().unwrap(), policy);
+        assert_eq!(label_audits(&db).len(), 4);
+    }
+
+    #[test]
+    fn headroom_labels_of_an_earlier_policy_are_dropped_before_it_converts() {
+        let v1 = serde_json::json!({
+            "tenants": { "fallback": { "weight": 1 } },
+            "headroom": [stored_headroom("ci", serde_json::json!(["big"]), 2)],
+        });
+        let (db, _, _, _dir) = reopened(v1, |_| {});
+        let policy = db.capacity_policy().unwrap();
+        assert_eq!(headroom_pools(&policy), [("ci", 2)]);
+        let backup = String::from_utf8(db.capacity_policy_backup().unwrap()).unwrap();
+        assert!(!backup.contains("big"), "{backup}");
+        assert_eq!(label_audits(&db).len(), 2);
+    }
+
+    #[test]
+    fn entries_alike_but_for_their_labels_are_all_kept() {
+        let stored = stored_with_headroom(vec![
+            stored_headroom("ci", serde_json::json!(["big"]), 2),
+            stored_headroom("ci", serde_json::json!(["small"]), 3),
+        ]);
+        let (db, _, _, _dir) = reopened(stored, |_| {});
+        let policy = db.capacity_policy().unwrap();
+        assert_eq!(headroom_pools(&policy), [("ci", 2), ("ci", 3)]);
+        assert_eq!(label_audits(&db).len(), 3);
+    }
+
+    #[test]
+    fn each_entry_s_labels_have_an_audit_row_of_their_own() {
+        let labels = |entry: usize| -> Vec<String> {
+            (0..32).map(|i| format!("e{entry}-label-{i:02}")).collect()
+        };
+        let stored = stored_with_headroom(
+            (0..30)
+                .map(|entry| stored_headroom("ci", labels(entry).into(), 1))
+                .collect(),
+        );
+        let (db, _, _, _dir) = reopened(stored, |_| {});
+        let audits = label_audits(&db);
+        assert_eq!(audits.len(), 31, "{audits:?}");
+        for entry in 0..30 {
+            let first = format!("dropped node labels e{entry}-label-00, e{entry}-label-01");
+            assert!(audits.iter().any(|e| e.contains(&first)), "{entry}");
+        }
+    }
+
+    #[test]
+    fn only_arrays_of_labels_are_dropped_and_the_rest_of_the_row_is_kept() {
+        let mut odd = stored_headroom("ci", serde_json::json!([1, "big"]), 2);
+        odd["later-field"] = serde_json::json!("kept");
+        let stored = stored_with_headroom(vec![
+            odd,
+            stored_headroom("web", serde_json::json!("not-an-array"), 1),
+        ]);
+        let (db, _, _, _dir) = reopened(stored, |_| {});
+        let raw = db.capacity_policy_raw();
+        assert!(
+            raw.contains("later-field") && raw.contains("not-an-array") && !raw.contains("big"),
+            "{raw}"
+        );
+        let audits = label_audits(&db);
+        assert!(
+            audits
+                .iter()
+                .any(|e| e.contains(r#"pool "ci": dropped node labels 1, big"#)),
+            "{audits:?}"
+        );
+        assert_eq!(audits.len(), 2, "{audits:?}");
+    }
+
+    #[test]
+    fn a_row_this_hub_does_not_read_keeps_its_headroom_labels() {
+        let mut later =
+            stored_with_headroom(vec![stored_headroom("ci", serde_json::json!(["big"]), 2)]);
+        for version in [
+            serde_json::json!(crate::policy::VERSION + 1),
+            serde_json::json!(crate::policy::VERSION - 1),
+            serde_json::json!(crate::policy::VERSION.to_string()),
+        ] {
+            later["version"] = version;
+            let (db, _, _, _dir) = reopened(later.clone(), |_| {});
+            assert!(db.capacity_policy_raw().contains("big"));
+            assert!(label_audits(&db).is_empty());
+        }
+
+        let (db, bytes, _, _dir) = reopened(serde_json::json!("not a policy"), |_| {});
+        assert_eq!(db.capacity_policy_raw().as_bytes(), bytes);
+        assert!(label_audits(&db).is_empty());
     }
 
     /// Enroll relay `key` of gitlab `gl` and store its report as a relay before 0.111 sent it:
