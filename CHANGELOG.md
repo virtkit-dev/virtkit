@@ -4,6 +4,10 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Update the guest kernel to Linux 6.18.63 LTS.
+
 ### Fixed
 
 - **The registry accepts larger task-rs cache snapshots.** The limits are now
