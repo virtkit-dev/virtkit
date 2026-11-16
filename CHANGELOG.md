@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.112.1] - 2026-11-16
+
 ### Changed
 
 - Update the guest kernel to Linux 6.18.63 LTS.
@@ -5573,7 +5575,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.112.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.112.1...HEAD
+[0.112.1]: https://github.com/virtkit-dev/virtkit/compare/v0.112.0...v0.112.1
 [0.112.0]: https://github.com/virtkit-dev/virtkit/compare/v0.111.0...v0.112.0
 [0.111.0]: https://github.com/virtkit-dev/virtkit/compare/v0.110.2...v0.111.0
 [0.110.2]: https://github.com/virtkit-dev/virtkit/compare/v0.110.1...v0.110.2
