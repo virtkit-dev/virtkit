@@ -7,7 +7,7 @@
 #   /sbin/init            -> systemd (PID 1 once the entrypoint execs it)
 #   /boot/vmlinuz-<ver>   -> the Debian kernel (virtkit reads it host-side to boot)
 #   /lib/modules/<ver>/   -> the matching modules for the preinit initramfs
-FROM debian:bookworm
+FROM debian:trixie
 
 RUN set -eux; \
     apt-get update; \

@@ -14,7 +14,7 @@
 #   /lib/modules/<ver>/   -> the matching modules (virtkit seeds the preinit initramfs
 #                            with virtio_pci/virtio_blk/ext4/vsock from here, so the
 #                            modular kernel can reach its rootfs+vsock)
-FROM debian:bookworm
+FROM debian:trixie
 
 RUN set -eux; \
     apt-get update; \

@@ -2,7 +2,7 @@
 # =====================================================================================
 # The executable definition of "done" for `vk run --init image --kernel image`.
 # =====================================================================================
-# Boot a stock Debian Bookworm image — its OWN systemd under its OWN (modular) kernel —
+# Boot a stock Debian Trixie image with its own systemd and modular kernel
 # on the libkrun backend, and confirm systemd took over PID 1 inside the microVM.
 #
 # What carries it: a preinit initramfs with vk-agent + the image's virtio_pci/virtio_blk/

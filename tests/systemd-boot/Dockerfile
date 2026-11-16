@@ -1,6 +1,6 @@
-# Target: a STOCK Debian Bookworm image that boots its OWN systemd under its
-# OWN kernel on the libkrun backend. Nothing virtkit-specific is baked in — vk-agent is
-# injected at boot from a virtkit-built preinit initramfs, not from this image.
+# Stock Debian Trixie image booting its own systemd and kernel on libkrun.
+# Nothing virtkit-specific is baked in: vk-agent is injected at boot from a
+# virtkit-built preinit initramfs, not from this image.
 #
 # The image ships:
 #   /sbin/init            -> systemd (PID 1 after the preinit hands off)
@@ -8,7 +8,7 @@
 #   /lib/modules/<ver>/   -> the matching modules (virtkit seeds the preinit initramfs
 #                            with virtio_pci/virtio_blk/ext4/vsock from here, so the
 #                            modular kernel can reach its rootfs+vsock)
-FROM debian:bookworm
+FROM debian:trixie
 
 RUN set -eux; \
     apt-get update; \
