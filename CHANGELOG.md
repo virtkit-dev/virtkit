@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The registry accepts larger task-rs cache snapshots.** The limits are now
+  65,536 digests and 16 MiB per manifest. With one blob per roughly 1 MiB
+  uncompressed chunk, snapshots of about 64 GiB fit; those above about 4 GiB
+  previously failed with `MANIFEST_INVALID` "over 4096 referenced digests".
+  A job's `registry.vk` retries manifest uploads up to 16 MiB. Update the nodes
+  and the registries where caches are saved.
+
 ## [0.112.0] - 2026-11-14
 
 ### Changed

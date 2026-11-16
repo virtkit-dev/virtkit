@@ -2969,15 +2969,19 @@ impl Store {
 /// `blobs` as it always was by `tags` and `manifests`.
 const REPO_SUBDIRS: &[&str] = &["tags", "manifests", "blobs"];
 
-/// Ceiling on a manifest `PUT` body. An OCI manifest is kilobytes — the OCI spec suggests
-/// 4 MiB as an upper bound — and every digest inside one costs authorization work under
-/// the store lock, so this is a limit on that work as much as on memory.
-const MAX_MANIFEST_BYTES: usize = 4 << 20;
+/// Maximum manifest `PUT` body size. Bounds memory and per-digest authorization work
+/// under the store lock. Fits [`MAX_MANIFEST_REFERENCES`] layer descriptors of about
+/// 160 bytes each.
+const MAX_MANIFEST_BYTES: usize = 16 << 20;
 
-/// Ceiling on the distinct digests one manifest may reference. Real images have tens of
-/// layers; this is far above that, and it is what bounds the `stat`s a single `PUT` can
-/// ask for (references × repositories the caller may read).
-const MAX_MANIFEST_REFERENCES: usize = 4096;
+/// Maximum distinct digest references per manifest, including the config. Bounds `stat`
+/// work per `PUT` (references × readable repositories). Images have tens of layers;
+/// task-rs's content-defined cache uses one blob per roughly 1 MiB uncompressed chunk.
+/// This allows snapshots of about 64 GiB, twice the required 32 GiB.
+const MAX_MANIFEST_REFERENCES: usize = 65536;
+
+/// Ceiling on the tags of one `POST /vk/manifests/exists`.
+const MAX_EXISTS_TAGS: usize = 4096;
 
 /// The layer media type of a file stored as one blob under a single-layer manifest — what
 /// `/upload` and `/dav/files/` write, and what `vk registry pull` refuses: a raw file is for
@@ -4379,7 +4383,7 @@ where
 /// mirror says what it holds, and never relays.
 pub const EXISTS_PATH: &str = "/vk/manifests/exists";
 
-/// Longest `POST /vk/manifests/exists` body read: [`MAX_MANIFEST_REFERENCES`] tags of the
+/// Longest `POST /vk/manifests/exists` body read: [`MAX_EXISTS_TAGS`] tags of the
 /// longest valid reference, with JSON around them, is well under this.
 const MAX_EXISTS_BODY: usize = 1 << 20;
 
@@ -4429,13 +4433,13 @@ async fn manifests_exist(
             ));
         }
     };
-    // The same bound a manifest's references have: the work is a `stat` per tag under
-    // the store lock, which is not something one caller gets an unbounded amount of.
-    if ask.tags.len() > MAX_MANIFEST_REFERENCES {
+    // Bounded: the work is a `stat` per tag under the store lock, which is not something
+    // one caller gets an unbounded amount of.
+    if ask.tags.len() > MAX_EXISTS_TAGS {
         return Ok(error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "UNSUPPORTED",
-            &format!("more than {MAX_MANIFEST_REFERENCES} tags"),
+            &format!("more than {MAX_EXISTS_TAGS} tags"),
         ));
     }
     let tags: Vec<&str> = ask.tags.iter().map(String::as_str).collect();
@@ -10310,6 +10314,55 @@ mod tests {
     /// The authorization a manifest `PUT` runs costs a `stat` per (referenced digest,
     /// readable repository) pair, under the store lock, so the reference count is capped:
     /// one write-scoped caller must not be able to ask for unbounded work.
+    /// A cache snapshot manifest as task-rs writes it, its config, index and chunks taking
+    /// the whole reference cap, fits under the byte cap and passes the count check.
+    #[test]
+    fn a_snapshot_manifest_at_the_reference_cap_is_accepted_for_its_size() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-snapcap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let principal = accounts::Principal::Session(accounts::User {
+            id: "https://issuer\u{1f}sub-1".to_string(),
+            oidc_issuer: "https://issuer".to_string(),
+            oidc_subject: "sub-1".to_string(),
+            email: None,
+            display_name: None,
+            is_admin: false,
+            created_at: SystemTime::UNIX_EPOCH,
+            last_login_at: SystemTime::UNIX_EPOCH,
+        });
+        let authz = Authz::Accounts(&principal);
+
+        // Digest 0 is the config, 1 the index, the rest chunks: all distinct.
+        let mut layers = vec![format!(
+            r#"{{"mediaType":"application/vnd.wallix.cas.index.v2+zstd","digest":"sha256:{:064x}","size":67108864}}"#,
+            1
+        )];
+        layers.extend((2..MAX_MANIFEST_REFERENCES).map(|i| {
+            format!(
+                r#"{{"mediaType":"application/vnd.wallix.cas.chunk.v1+zstd","digest":"sha256:{i:064x}","size":4194304}}"#
+            )
+        }));
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/vnd.wallix.cas.v2","config":{{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:{:064x}","size":2}},"layers":[{}],"annotations":{{"org.opencontainers.image.created":"2026-11-16T00:00:00Z"}}}}"#,
+            0,
+            layers.join(",")
+        );
+        assert!(
+            manifest.len() < MAX_MANIFEST_BYTES,
+            "{} bytes",
+            manifest.len()
+        );
+        // Past the count check, refused only because the store holds none of it.
+        assert!(matches!(
+            authorize_and_mount_manifest_blobs(&authz, &store, "team-a/app", manifest.as_bytes())
+                .unwrap(),
+            Mount::Unreadable(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_manifest_referencing_too_many_digests_is_refused() {
         let dir = std::env::temp_dir().join(format!("vk-regserve-memcap-{}", std::process::id()));

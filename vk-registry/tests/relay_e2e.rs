@@ -1422,12 +1422,12 @@ async fn a_relayed_manifest_that_is_not_a_json_object_is_not_cached() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A relayed manifest is held to the 4 MiB a pushed one is (`MAX_MANIFEST_BYTES`): one byte
+/// A relayed manifest is held to the 16 MiB a pushed one is (`MAX_MANIFEST_BYTES`): one byte
 /// over is neither cached nor served, though it is otherwise a valid JSON object, and the
 /// error is attributed to the upstream (502).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_relayed_manifest_over_the_cap_is_not_cached() {
-    const MAX_MANIFEST_BYTES: usize = 4 << 20;
+    const MAX_MANIFEST_BYTES: usize = 16 << 20;
     let mut manifest = br#"{"schemaVersion":2}"#.to_vec();
     manifest.resize(MAX_MANIFEST_BYTES + 1, b' ');
     let hex: String = <sha2::Sha256 as sha2::Digest>::digest(&manifest)

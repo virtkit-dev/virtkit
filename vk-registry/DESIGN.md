@@ -95,8 +95,9 @@ An upload is bound to the repository that opened it. Finishing an upload recompu
 digest and rejects a mismatch, so a caller cannot claim content it did not send or finish
 an authorized upload in a different repository.
 
-Manifest uploads are limited to 4 MiB and 4,096 distinct digest references. These limits
-bound both memory use and the authorization work performed while the store lock is held.
+Manifest uploads are limited to 16 MiB and 65,536 distinct digest references. At task-rs's
+1 MiB average chunk size, this allows cache snapshots of about 64 GiB uncompressed. The
+limits bound memory use and authorization work under the store lock.
 
 Only recognized OCI and Docker manifest media types are served as such. Parameters are
 removed and matching is case-insensitive. Unrecognized types are served as

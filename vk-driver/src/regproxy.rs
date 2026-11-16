@@ -732,9 +732,10 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     out.body(body).map_err(Into::into)
 }
 
-/// The most of a guest's request body held to be sent again: an OCI manifest's 4 MiB, which
-/// registries cap manifests at, and far more than a listing's query or a small file.
-const MAX_HELD: usize = 4 << 20;
+/// Maximum guest request body buffered for retries. Matches vk-registry's 16 MiB
+/// manifest cap, including cache snapshots with one layer per chunk, and leaves ample
+/// room for a listing query or small file.
+const MAX_HELD: usize = 16 << 20;
 
 /// An upstream request with its whole body held for safe retries, or a single attempt
 /// with an optional streamed body.
