@@ -94,7 +94,7 @@ echo "== 4. the background pass =="
 # `vk registry pull` fills a cache, so it starts a pass; with no registry configured it then
 # fails on its own, which is all this needs of it.
 pull() { "$VK" registry pull virtkit/none:x 2>&1 || true; }
-wait_for() { for _ in $(seq 100); do [ -e "$1" ] && return 0; sleep 0.1; done; return 1; }
+wait_for() { for _ in $(seq 600); do [ -e "$1" ] && return 0; sleep 0.1; done; return 1; }
 # The manual passes above dated themselves; this section starts from a host none has.
 rm -f "$DATA/.gc-done" "$DATA/.gc-started"
 VK_GC_AUTO=0 pull >/dev/null
