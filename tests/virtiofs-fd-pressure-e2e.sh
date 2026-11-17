@@ -73,8 +73,9 @@ vmm_pid() {
   for comm in /proc/[0-9]*/comm; do
     p=${comm%/comm}
     case $(cat "$comm" 2>/dev/null) in vk:*) ;; *) continue ;; esac
-    # Not `grep -q`: leaving early on a long listing fails `ls`, and the pipeline with it.
-    if ls -l "$p/fd" 2>/dev/null | grep -F -- "-> $work/share" >/dev/null; then echo "${p#/proc/}"; return; fi
+    # Ignore `ls` failures from descriptors closed during a trim or `grep -q` exiting early.
+    # Only the match determines success.
+    if { ls -l "$p/fd" 2>/dev/null || true; } | grep -qF -- "-> $work/share"; then echo "${p#/proc/}"; return; fi
   done
 }
 fds() { ls "/proc/$1/fd" 2>/dev/null | wc -l; }
