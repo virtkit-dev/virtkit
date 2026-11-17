@@ -106,7 +106,7 @@ cell_is "$m" STATE 'draining*' || fail "managed drained while its runner was sti
 in_node managed rm /tmp/runner-hold
 wait_for 60 cell_is "$m" STATE drained || fail "managed did not drain: $(node_cell "$m" STATE)"
 runner_down || fail "a drained node's runner still runs"
-audit_says "$m" '\(drain\): done' || fail "the audit log misses the drain finishing"
+wait_for 30 audit_says "$m" '\(drain\): done' || fail "the audit log misses the drain finishing"
 hub nodes undrain "$m"
 wait_for 60 cell_is "$m" STATE ready || fail "managed is not ready once undrained"
 wait_for 30 runner_up || fail "the managed node did not start its runner once undrained"

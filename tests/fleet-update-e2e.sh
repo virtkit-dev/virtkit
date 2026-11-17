@@ -95,7 +95,7 @@ in_node b touch /root/fail-validate
 hub nodes update "$b" --release "$rel"
 wait_for 300 cell_is "$b" STATE "ready, update to $next rolled back" ||
   { hub_audit "$b"; fail "b was not rolled back: $(node_cell "$b" STATE)"; }
-audit_says "$b" "$update: failed: rolled back: validation failed" ||
+wait_for 30 audit_says "$b" "$update: failed: rolled back: validation failed" ||
   { hub_audit "$b"; fail "the audit log does not say why b was rolled back"; }
 wait_for 30 cell_is "$b" VK "$old" || fail "b reports vk $(node_cell "$b" VK) once rolled back"
 on b "$old" "$old_sha"
