@@ -27,8 +27,9 @@
 //! whose kernel was built without `CONFIG_PSI` falls back to a `MemAvailable` gate rather
 //! than trimming ungated.
 
+use std::ffi::CStr;
 use std::io;
-use std::path::Path;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -61,11 +62,8 @@ const REPORT_FREED_MIB: u64 = 32;
 /// How long after memory came free single-page reporting stays on.
 const REPORT_WINDOW: Duration = Duration::from_secs(30);
 
-/// The cgroup2 hierarchy the floor mode's reclaim knob lives in. Mounted only for that mode:
-/// an `auto` guest on the pinned kernel never takes this path, and mounting cgroup2 in every
-/// guest would change what an in-guest container runtime finds under `/sys/fs/cgroup`.
-const CGROUP2: &str = "/sys/fs/cgroup";
-const MEMORY_RECLAIM: &str = "/sys/fs/cgroup/memory.reclaim";
+/// The root cgroup's reclaim knob on [`Cgroup2`]'s detached mount.
+const MEMORY_RECLAIM: &CStr = c"memory.reclaim";
 
 const PRESSURE_FILE: &str = "/proc/pressure/memory";
 
@@ -400,19 +398,117 @@ fn mount(target: &str, fstype: &str) -> io::Result<()> {
     )
 }
 
-/// Mount cgroup2 for floor-mode reclaim; accept an existing mount from the image or a prior
-/// trimmer.
-fn mount_cgroup2() -> io::Result<()> {
-    std::fs::create_dir_all(CGROUP2)?;
-    match mount(CGROUP2, "cgroup2") {
-        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => Ok(()),
-        other => other,
+/// A detached cgroup2 mount (`fsopen` and `fsmount`) leaves `/sys/fs/cgroup` unchanged for
+/// the guest's init and container runtimes.
+struct Cgroup2 {
+    /// The root cgroup's open `memory.reclaim` covers the whole hierarchy, including dying
+    /// memcgs.
+    reclaim: std::fs::File,
+    /// Try `swappiness=` (Linux 6.11 and later) until a write returns `EINVAL`.
+    swappiness: std::cell::Cell<bool>,
+}
+
+impl Cgroup2 {
+    /// Mount in a new cgroup namespace. In the initial namespace, omitting `nsdelegate` or
+    /// `memory_recursiveprot` would clear those options for the whole hierarchy.
+    /// The new namespace starts at the caller's cgroup, so verify it is the hierarchy root.
+    /// Returns `Err` without memcg or the mount API introduced in Linux 5.2.
+    fn open() -> Result<Self> {
+        const FSOPEN_CLOEXEC: libc::c_long = 1;
+        const FSCONFIG_CMD_CREATE: libc::c_long = 6;
+        const FSMOUNT_CLOEXEC: libc::c_long = 1;
+        let fd = |rc: libc::c_long, what: &str| -> Result<OwnedFd> {
+            if rc < 0 {
+                return Err(io::Error::last_os_error()).context(what.to_owned());
+            }
+            let rc = libc::c_int::try_from(rc).context("descriptor out of range")?;
+            // SAFETY: a fresh descriptor the kernel just returned, owned by nobody else.
+            Ok(unsafe { OwnedFd::from_raw_fd(rc) })
+        };
+        // SAFETY: plain syscall on a single-threaded process.
+        if unsafe { libc::unshare(libc::CLONE_NEWCGROUP) } != 0 {
+            return Err(io::Error::last_os_error()).context("unshare(CLONE_NEWCGROUP)");
+        }
+        // SAFETY: the filesystem name is a NUL-terminated string literal.
+        let fsfd = fd(
+            unsafe { libc::syscall(libc::SYS_fsopen, c"cgroup2".as_ptr(), FSOPEN_CLOEXEC) },
+            "fsopen(cgroup2)",
+        )?;
+        let null = std::ptr::null::<libc::c_char>();
+        // SAFETY: FSCONFIG_CMD_CREATE requires a null key and value.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_fsconfig,
+                fsfd.as_raw_fd(),
+                FSCONFIG_CMD_CREATE,
+                null,
+                null,
+                0,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error())
+                .context("fsconfig(cgroup2, FSCONFIG_CMD_CREATE)");
+        }
+        // SAFETY: fsfd owns the configured filesystem context. The flags are scalar arguments.
+        let root = fd(
+            unsafe { libc::syscall(libc::SYS_fsmount, fsfd.as_raw_fd(), FSMOUNT_CLOEXEC, 0) },
+            "fsmount(cgroup2)",
+        )?;
+        // Only the real root cgroup lacks `cgroup.type`.
+        match openat(&root, c"cgroup.type", libc::O_RDONLY) {
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+            Ok(_) => bail!("this process is not in the root cgroup"),
+            Err(e) => return Err(e).context("probing cgroup.type"),
+        }
+        let reclaim = openat(&root, MEMORY_RECLAIM, libc::O_WRONLY)
+            .context("opening the root cgroup's memory.reclaim (no memcg?)")?;
+        Ok(Cgroup2 {
+            reclaim: reclaim.into(),
+            swappiness: std::cell::Cell::new(true),
+        })
     }
+
+    /// Ask the root cgroup to trim `mib` MiB of file cache. `swappiness=0` spares anonymous
+    /// pages in guests with swap. If the kernel rejects the key, retry with the byte count
+    /// alone and use that form for later requests. Treat `EAGAIN` as success because the
+    /// kernel may have reclaimed some pages even though it fell short of the target.
+    fn reclaim(&self, mib: u64) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let bytes = mib.saturating_mul(1024 * 1024);
+        loop {
+            let swappiness = self.swappiness.get();
+            let req = if swappiness {
+                format!("{bytes} swappiness=0")
+            } else {
+                bytes.to_string()
+            };
+            return match self.reclaim.write_at(req.as_bytes(), 0) {
+                Err(e) if swappiness && e.raw_os_error() == Some(libc::EINVAL) => {
+                    self.swappiness.set(false);
+                    continue;
+                }
+                Err(e) if e.raw_os_error() != Some(libc::EAGAIN) => Err(e),
+                _ => Ok(()),
+            };
+        }
+    }
+}
+
+/// `openat` below `dir`, close-on-exec.
+fn openat(dir: &OwnedFd, rel: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    // SAFETY: a valid directory fd and a NUL-terminated relative path.
+    let rc = unsafe { libc::openat(dir.as_raw_fd(), rel.as_ptr(), flags | libc::O_CLOEXEC) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a fresh descriptor the kernel just returned, owned by nobody else.
+    Ok(unsafe { OwnedFd::from_raw_fd(rc) })
 }
 
 enum Mode {
     Age(Mglru),
-    Floor(u64),
+    Floor(u64, Cgroup2),
 }
 
 fn run(req: vk_core::reclaim::Request) -> Result<()> {
@@ -430,7 +526,7 @@ fn run(req: vk_core::reclaim::Request) -> Result<()> {
                     "vk-agent reclaim: no multi-gen LRU control ({e:#}); trimming to a {} MiB floor",
                     req.floor_mib
                 );
-                Mode::Floor(req.floor_mib)
+                Mode::Floor(req.floor_mib, Cgroup2::open()?)
             }
         }
     } else {
@@ -438,14 +534,8 @@ fn run(req: vk_core::reclaim::Request) -> Result<()> {
             "vk-agent reclaim: trimming file cache above {} MiB when idle",
             req.floor_mib
         );
-        Mode::Floor(req.floor_mib)
+        Mode::Floor(req.floor_mib, Cgroup2::open()?)
     };
-    if matches!(mode, Mode::Floor(_)) {
-        mount_cgroup2().context("mounting cgroup2 for the floor mode's memory.reclaim")?;
-        if !Path::new(MEMORY_RECLAIM).exists() {
-            bail!("{MEMORY_RECLAIM} is missing (no memcg in this kernel)");
-        }
-    }
 
     let gate = Gate::detect();
     let mut reporter = Reporter::new();
@@ -488,12 +578,17 @@ fn run(req: vk_core::reclaim::Request) -> Result<()> {
                     }
                 }
                 Mode::Age(_) => {}
-                Mode::Floor(floor_mib) => {
+                Mode::Floor(floor_mib, cg) => {
                     if let Step::Reclaim(mib) = plan(before, *floor_mib) {
                         debug!("vk-agent reclaim: asking for {mib} MiB");
-                        match reclaim(mib) {
+                        match cg.reclaim(mib) {
                             Ok(()) => freed = freed_since(before),
-                            Err(e) => warn!("vk-agent reclaim: {MEMORY_RECLAIM}: {e}"),
+                            Err(e) => {
+                                warn!(
+                                    "vk-agent reclaim: {}: {e}",
+                                    MEMORY_RECLAIM.to_string_lossy()
+                                )
+                            }
                         }
                     }
                 }
@@ -546,16 +641,6 @@ fn age_round(mglru: &Mglru, before: Meminfo) -> u64 {
         before.reclaimable.saturating_sub(freed)
     );
     freed
-}
-
-/// Ask the root cgroup to reclaim `mib`. The kernel answers `EAGAIN` when it fell short of the
-/// amount (what it did reclaim is gone all the same), so that is not an error here.
-fn reclaim(mib: u64) -> io::Result<()> {
-    let bytes = mib.saturating_mul(1024 * 1024);
-    match std::fs::write(MEMORY_RECLAIM, bytes.to_string()) {
-        Err(e) if e.raw_os_error() != Some(libc::EAGAIN) => Err(e),
-        _ => Ok(()),
-    }
 }
 
 /// The free-page reporting order: single pages for a while after memory came free, whole

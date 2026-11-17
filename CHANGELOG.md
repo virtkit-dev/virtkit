@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Setting `reclaim` to a size or share leaves the guest's `/sys/fs/cgroup` unchanged.**
+  In guests with swap, trimming asks the kernel to spare anonymous pages when it supports
+  that option.
+
 ## [0.112.4] - 2026-11-17
 
 ### Changed
