@@ -177,6 +177,30 @@ if [ "$#" -gt 0 ]; then
 else
   scripts=("$here"/*.sh)
 fi
+
+# Build vk-testkit once for scripts that run it in guests, before their images fill
+# the disk. Pass it as VK_TESTKIT and stop the dev VM to free memory for the scripts.
+build_testkit() { # <repo>
+  local repo=$1 bin rc=0
+  bin=$(mktemp -d)
+  # dev.sh finds vk through PATH, and CI gives VK as a path.
+  ln -s "$VK" "$bin/vk"
+  PATH="$bin:$PATH" "$repo/dev.sh" build -p vk-testkit || rc=$?
+  PATH="$bin:$PATH" "$repo/dev.sh" stop || true
+  rm -rf "$bin"
+  return "$rc"
+}
+export -f build_testkit
+wants_testkit=
+for script in "${scripts[@]}"; do
+  [ "$(basename "$script")" != "$self" ] || continue
+  ! grep -q VK_TESTKIT "$script" || wants_testkit=1
+done
+if [ -z "${VK_TESTKIT:-}" ] && [ -n "$wants_testkit" ]; then
+  step "build vk-testkit" build_testkit "$(cd "$here/.." && pwd)"
+  # If the build fails, scripts that need it retry and report failures.
+  [ "${results[-1]}" != PASS ] || export VK_TESTKIT=$here/../target/x86_64-unknown-linux-musl/debug/vk-testkit
+fi
 for script in "${scripts[@]}"; do
   name=$(basename "$script")
   [ "$name" != "$self" ] || continue   # never recurse, however this script was reached
