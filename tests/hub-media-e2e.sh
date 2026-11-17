@@ -237,7 +237,8 @@ cutsha=$(sha_of "$WORK/media/cut.iso")
   "$UI/media/upload" 2>/dev/null || fail "the cut-short upload completed"
 staged() { find "$WORK/store/uploads" -maxdepth 1 -type f | grep . >/dev/null; }
 wait_for 60 eval '! staged' || fail "the registry kept the cut-short upload's staging file"
-! hub media list | grep -F "$cutsha" >/dev/null || fail "a cut-short upload was recorded"
+list=$(hub media list) || fail "hub media list failed"
+! grep -F "$cutsha" <<<"$list" >/dev/null || fail "a cut-short upload was recorded"
 ! node_get "sha256:$cutsha" -o "$WORK/cut-back.iso" 2>/dev/null ||
   fail "the registry tagged a cut-short upload"
 # The same bytes again: known, the description they have stands.
@@ -263,7 +264,9 @@ code=$(cat "$WORK/code")
 case $code in 401 | 403) ;; *) cat "$WORK/reply"; fail "the upload whose session ended answered $code" ;; esac
 grep -q "Not recorded: registry $id holds medium $endedsha as build-cache/files/win-media:ended.iso" \
   "$WORK/reply" || { cat "$WORK/reply"; fail "the page does not say where the file is"; }
-! hub media list | grep -F "$endedsha" >/dev/null || fail "the hub recorded an upload whose session ended"
+list=$(hub media list) || fail "hub media list failed"
+! grep -F "$endedsha" <<<"$list" >/dev/null ||
+  fail "the hub recorded an upload whose session ended"
 node_get "sha256:$endedsha" -o "$WORK/ended-back.iso" || fail "the registry does not hold it"
 sign_in
 code=$(ui -o "$WORK/reply" -w '%{http_code}' "${form[@]}" -F "file=@$WORK/media/ended.iso" \
@@ -285,7 +288,8 @@ if [ -n "${MEDIA_ISO:-}" ]; then
   # The CLI uploaded the same bytes: the page says so, and the description stands.
   [ "$code" = 200 ] && grep -q "Already uploaded" "$WORK/reply" ||
     { cat "$WORK/reply"; fail "the web UI upload of known bytes answered $code"; }
-  ! hub media show "$real" | grep "from the web UI" >/dev/null ||
+  shown=$(hub media show "$real") || fail "hub media show $real failed"
+  ! grep "from the web UI" <<<"$shown" >/dev/null ||
     fail "the web UI upload of known bytes changed the description"
   echo "uploaded from the web UI in $(($(date +%s) - start))s"
   hub media show "$real"
@@ -307,6 +311,7 @@ iso "$WORK/media/late.iso" LATE 1
   fail "an upload to a registry gone was taken"
 cat "$WORK/err"
 grep -q "not connected" "$WORK/err" || fail "the refusal does not say why"
-! hub media list | grep late.iso >/dev/null || fail "a refused upload was recorded"
+list=$(hub media list) || fail "hub media list failed"
+! grep late.iso <<<"$list" >/dev/null || fail "a refused upload was recorded"
 
 echo "PASS: media stream through the hub into its registry, described, approved and fetched by digest"
