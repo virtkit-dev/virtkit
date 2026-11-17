@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.112.4] - 2026-11-17
+
+### Changed
+
+- Update the Rust dependencies to their latest compatible releases, among them
+  `rsa` 0.10.0, the first stable release fixed for RUSTSEC-2023-0071 (Marvin;
+  vk ran its release candidate, which already carried the fix), `rustls-webpki`,
+  `russh` and `redb`.
+
 ## [0.112.3] - 2026-11-17
 
 ### Fixed
@@ -5592,7 +5601,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.112.3...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.112.4...HEAD
+[0.112.4]: https://github.com/virtkit-dev/virtkit/compare/v0.112.3...v0.112.4
 [0.112.3]: https://github.com/virtkit-dev/virtkit/compare/v0.112.2...v0.112.3
 [0.112.2]: https://github.com/virtkit-dev/virtkit/compare/v0.112.1...v0.112.2
 [0.112.1]: https://github.com/virtkit-dev/virtkit/compare/v0.112.0...v0.112.1
