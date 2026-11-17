@@ -6,6 +6,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Return freed guest memory to the host with `--kernel image`.** The guest loads
+  the balloon driver at boot when the image kernel supplies it as a module.
 - **Return more idle guest memory to the host.** Guests running systemd services or
   containers can now trim file cache those workloads haven't used recently, including
   cache left behind after they exit.

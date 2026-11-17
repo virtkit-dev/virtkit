@@ -20,7 +20,8 @@ use crate::run::KernelSource;
 
 /// Boot-critical modules. A stock Debian bookworm kernel is modular, so the
 /// preinit must `insmod` these before mounting `/dev/vda`: virtio-pci + virtio-blk +
-/// ext4 reach the rootfs; the last three give the reparented `vk-agent serve` its
+/// ext4 reach the rootfs. After PID 1 hands off control, `vk-agent serve` still uses
+/// the three vsock modules for its
 /// AF_VSOCK transport. Dependencies from the image's `modules.dep` load first,
 /// including modules not listed here; this list orders the traversal roots. Missing
 /// modules (e.g. `virtio_ring` when built in) are skipped with a warning.
@@ -48,6 +49,9 @@ const WANTED_MODULES: &[&str] = &[
     "vsock",
     "vmw_vsock_virtio_transport_common",
     "vmw_vsock_virtio_transport",
+    // Balloon free-page reporting returns freed guest pages to the host,
+    // including pages reclaimed by the page-cache trimmer.
+    "virtio_balloon",
 ];
 
 /// The kernel + preinit initramfs a preinit boot runs on.
