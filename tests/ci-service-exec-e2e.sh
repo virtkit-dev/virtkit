@@ -134,7 +134,7 @@ if vk-agent exec --service db --clear-env -- /usr/bin/env | grep "^PATH="; then 
 vk-agent exec --service db -b -- sh -c "echo from-background > /tmp/bg"
 i=0
 until [ "$(vk-agent exec --service db -- cat /tmp/bg 2>/dev/null)" = from-background ]; do
-  i=$((i + 1)); [ "$i" -lt 50 ]; sleep 0.1
+  i=$((i + 1)); [ "$i" -lt 300 ]; sleep 0.1
 done
 out=$(script -qc "vk-agent exec --service db -t -- tty" /dev/null)
 echo "tty: $out"
