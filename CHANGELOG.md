@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Limit CPU and memory use when restoring cached images on many-core hosts.**
+  Unpacking an image layer or reassembling a cached bundle now uses at most 16
+  workers per operation, matching the limit for caching images.
+
 ## [0.112.1] - 2026-11-16
 
 ### Changed

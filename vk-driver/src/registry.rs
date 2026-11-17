@@ -3194,10 +3194,23 @@ fn write_chunk_sparse(out: &std::fs::File, offset: u64, raw: &[u8]) -> std::io::
     out.write_all_at(raw, offset)
 }
 
+/// Cap each host-side chunk decode or encode pool to limit CPU contention with other
+/// jobs and memory held in chunk buffers on many-core hosts.
+const MAX_CHUNK_WORKERS: usize = 16;
+
+/// Size a chunk or region pool by available parallelism, capped at [`MAX_CHUNK_WORKERS`]
+/// and the item count. Return one for no items or if parallelism cannot be determined.
+pub(crate) fn chunk_workers(items: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_CHUNK_WORKERS)
+        .min(items.max(1))
+}
+
 /// Reassemble a bundle's chunks into their (disjoint) slots in parallel: each worker
 /// claims the next layer and runs `place` on it, which decompresses the chunk and
 /// writes it at its offset. The per-chunk zstd decode is the bottleneck, so this
-/// scales with cores. Returns the first worker error, if any.
+/// scales with cores, up to [`MAX_CHUNK_WORKERS`]. Returns the first worker error, if any.
 fn reassemble_parallel<F>(layers: &[OciDescriptor], place: F) -> Result<()>
 where
     F: Fn(&OciDescriptor) -> Result<()> + Sync,
@@ -3205,10 +3218,7 @@ where
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
     let err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(layers.len().max(1));
+    let workers = chunk_workers(layers.len());
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(|| {
@@ -4203,12 +4213,8 @@ mod local {
         if regions.is_empty() {
             return Ok(());
         }
-        // each worker owns up to a CHUNK_WINDOW buffer; cap the fleet so a many-core
-        // host does not pin gigabytes of windows.
-        let workers = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .min(regions.len())
-            .min(16);
+        // Each worker owns up to a CHUNK_WINDOW buffer.
+        let workers = chunk_workers(regions.len());
         let cursor = AtomicUsize::new(0);
         let cursor = &cursor;
         let open = &open;
@@ -7636,6 +7642,14 @@ pub(crate) mod tests {
             "expected most of {} chunks unchanged, only {unchanged} were",
             before.len()
         );
+    }
+
+    /// Empty and single-item passes use one worker; large passes respect the cap.
+    #[test]
+    fn chunk_workers_are_capped() {
+        assert_eq!(chunk_workers(0), 1);
+        assert_eq!(chunk_workers(1), 1);
+        assert!(chunk_workers(usize::MAX) <= MAX_CHUNK_WORKERS);
     }
 
     /// `reassemble_parallel` fills disjoint chunk slots concurrently and comes back

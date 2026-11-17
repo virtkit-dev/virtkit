@@ -691,8 +691,8 @@ impl Qcow2Writer {
 }
 
 /// Write the image a `.vk_ro_img` `view` stands for into a sparse raw file at `out`, decoding
-/// its chunks on every core. For an export whose overlay holds nothing of its own (see
-/// [`Qcow2::empty_lazy_backing`]), where the view is the whole content.
+/// its chunks with a capped worker pool. For an export whose overlay holds nothing of its
+/// own (see [`Qcow2::empty_lazy_backing`]), where the view is the whole content.
 pub fn materialize_lazy_parallel(view: &Path, out: &Path) -> Result<()> {
     let outf = File::create(out).with_context(|| format!("creating {}", out.display()))?;
     let img = VkRoImg::open(view)?;
@@ -1139,7 +1139,8 @@ impl VkRoImg {
         Ok(&self.last.as_ref().unwrap().1)
     }
 
-    /// Decode chunks on every core and feed 64 KiB nonzero blocks to `sink` on one thread.
+    /// Decode chunks with a capped worker pool and feed 64 KiB nonzero blocks to `sink`
+    /// on one thread.
     /// Parallelism targets per-chunk zstd work; positioned writes to one inode serialize.
     /// Chunks span many blocks, so skipping gaps and zeros preserves raw holes and
     /// unallocated qcow2 clusters without writing whole chunks.
@@ -1148,10 +1149,7 @@ impl VkRoImg {
         const BLOCK: usize = 64 << 10;
         let next = AtomicUsize::new(0);
         let decode_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(self.chunks.len().max(1));
+        let workers = crate::registry::chunk_workers(self.chunks.len());
         // Bounded: at most the channel's `workers` queued plus one blocked mid-`send` in
         // each decoder, so decoded data in flight stays within ~2*workers chunks.
         let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(workers);
