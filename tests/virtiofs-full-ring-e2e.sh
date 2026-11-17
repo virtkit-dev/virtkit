@@ -8,19 +8,25 @@
 # Requires an x86_64 Linux host with KVM and a non-preemptible guest kernel with kallsyms
 # and stable kernel text addresses between boots. VK must include the opt-in test hook.
 # VIRTIOFS_SECONDS defaults to 60; STEP_TIMEOUT bounds each VM (default 180).
+# VIRTIOFS_STALL (default 30 seconds) sets the no-progress threshold for a stranded burst.
+# It allows for overcommitted runners; a healthy burst takes under a second.
 # VIRTIOFS_LOG_DIR retains complete logs; otherwise they are printed and removed.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 cd "$here"
 
 seconds=${VIRTIOFS_SECONDS:-60}
+stall=${VIRTIOFS_STALL:-30}
 limit=${STEP_TIMEOUT:-180}
 expected=${VIRTIOFS_EXPECT:-0}
-for value in "$seconds" "$limit"; do
+for value in "$seconds" "$stall" "$limit"; do
   case "$value" in ''|*[!0-9]*|0) echo 'virtiofs-full-ring: invalid duration' >&2; exit 2 ;; esac
 done
-[ "$seconds" -le 3600 ] && [ "$limit" -gt "$((seconds + 30))" ] || {
-  echo 'virtiofs-full-ring: need seconds <= 3600 and STEP_TIMEOUT > seconds + 30' >&2; exit 2;
+# Allow one stall interval to detect a final stranded burst and another to free it.
+[ "$seconds" -le 3600 ] && [ "$stall" -le 600 ] && [ "$limit" -gt "$((seconds + 2 * stall + 10))" ] || {
+  echo 'virtiofs-full-ring: need seconds <= 3600, VIRTIOFS_STALL <= 600 and' \
+    'STEP_TIMEOUT > seconds + 2 * VIRTIOFS_STALL + 10' >&2
+  exit 2
 }
 case "$expected" in 0|10) ;; *) echo 'virtiofs-full-ring: VIRTIOFS_EXPECT must be 0 or 10' >&2; exit 2 ;; esac
 asked=${VK:-./dist/vk}
@@ -61,6 +67,7 @@ cat >"$work/guest.sh" <<'EOF'
 set -eu
 pc=$1
 seconds=$2
+stall=$3
 actual=$(awk '$3 == "virtio_fs_enqueue_req" {print $1}' /proc/kallsyms)
 [ "$pc" = "$actual" ] || { echo 'kernel text moved between boots'; exit 2; }
 mkdir -p /mnt/full-ring /mnt/full-ring-upper
@@ -70,16 +77,23 @@ for i in 0 1 2 3; do mkdir "/mnt/full-ring-upper/u/d$i"; done
 mount -t overlay overlay -o lowerdir=/work/tree,upperdir=/mnt/full-ring-upper/u,workdir=/mnt/full-ring-upper/w /mnt/full-ring
 # Execute from tmpfs: no demand paging from the share during the quiet/stall interval.
 cp /work/vk-testkit /mnt/full-ring-upper/vk-testkit
-exec /mnt/full-ring-upper/vk-testkit virtiofs-burst /mnt/full-ring /work 4 "$seconds"
+exec /mnt/full-ring-upper/vk-testkit virtiofs-burst /mnt/full-ring /work 4 "$seconds" "$stall"
 EOF
-status=0
-VK_TEST_VIRTIOFS_ENQUEUE_PC=$pc timeout -k 5 "$limit" "$VK" run "$image" \
-  "${kernel[@]}" --cpus 8 --mem 1024 --workdir "$work" --state-dir "$work/state" -- \
-  sh /work/guest.sh "$pc" "$seconds" >"$logs/probe.log" 2>&1 || status=$?
-cat "$logs/probe.log"
-cp "$work/state/console.vmm.log" "$logs/vmm.log"
-cp "$work/state/console.log" "$logs/console.log"
-refusals=$(grep -c '^virtiofs-full-ring: ENOSPC ' "$logs/vmm.log" || true)
+# A full ring is likely but not guaranteed: guest vCPUs share few host CPUs, and each
+# enqueue exits to the VMM. Retry once if no ENOSPC was observed; the probe is inconclusive.
+for attempt in 1 2; do
+  status=0
+  rm -rf "$work/state"
+  VK_TEST_VIRTIOFS_ENQUEUE_PC=$pc timeout -k 5 "$limit" "$VK" run "$image" \
+    "${kernel[@]}" --cpus 8 --mem 1024 --workdir "$work" --state-dir "$work/state" -- \
+    sh /work/guest.sh "$pc" "$seconds" "$stall" >"$logs/probe.log" 2>&1 || status=$?
+  cat "$logs/probe.log"
+  cp "$work/state/console.vmm.log" "$logs/vmm.log"
+  cp "$work/state/console.log" "$logs/console.log"
+  refusals=$(grep -c '^virtiofs-full-ring: ENOSPC ' "$logs/vmm.log" || true)
+  [ "$refusals" -eq 0 ] || break
+  echo "virtiofs-full-ring: attempt $attempt saw no ENOSPC"
+done
 awk '/^virtiofs-full-ring: ENOSPC / {if (++n <= 3) print}' "$logs/vmm.log"
 echo "virtiofs-full-ring: exit=$status expected=$expected refusals=$refusals"
 [ "$refusals" -gt 0 ] || { echo 'FAIL: no observed ENOSPC; result is inconclusive' >&2; exit 1; }

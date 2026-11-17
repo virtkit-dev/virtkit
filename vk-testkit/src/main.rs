@@ -6,8 +6,8 @@
 //! loose objects, `HEAD`, `info/refs` and an empty `objects/info/packs`. Served as plain
 //! files, it can be cloned. Prints the commit's id. The same files make the same commit.
 //!
-//! `vk-testkit virtiofs-burst <merged root> <share> <threads> <seconds>` runs in a guest: see
-//! [`virtiofs_burst`].
+//! `vk-testkit virtiofs-burst <merged root> <share> <threads> <seconds> [<stall seconds>]` runs
+//! in a guest: see [`virtiofs_burst`].
 
 mod virtiofs_burst;
 
@@ -15,6 +15,7 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use sha1::{Digest, Sha1};
@@ -39,22 +40,30 @@ fn run(args: &[std::ffi::OsString]) -> Result<u8> {
             writeln!(std::io::stdout(), "{commit}")?;
             Ok(0)
         }
-        [cmd, merged, share, threads, seconds] if cmd == "virtiofs-burst" => {
+        [cmd, merged, share, threads, seconds, stall @ ..]
+            if cmd == "virtiofs-burst" && stall.len() <= 1 =>
+        {
             let number = |arg: &std::ffi::OsString, what: &str| -> Result<u64> {
                 arg.to_str()
                     .and_then(|s| s.parse().ok())
                     .with_context(|| format!("{what} is not a number"))
+            };
+            let stall = match stall.first() {
+                Some(arg) => Duration::from_secs(number(arg, "the stall time")?),
+                None => virtiofs_burst::DEFAULT_STALL,
             };
             virtiofs_burst::run(
                 Path::new(merged),
                 Path::new(share),
                 usize::try_from(number(threads, "the thread count")?)?,
                 number(seconds, "the duration")?,
+                stall,
             )
         }
         _ => bail!(
             "usage: vk-testkit git-repo <src> <repo> <branch>\n       \
-             vk-testkit virtiofs-burst <merged root> <share> <threads> <seconds>"
+             vk-testkit virtiofs-burst <merged root> <share> <threads> <seconds> \
+             [<stall seconds>]"
         ),
     }
 }

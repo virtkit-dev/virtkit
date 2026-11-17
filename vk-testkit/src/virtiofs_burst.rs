@@ -1,4 +1,5 @@
-//! `vk-testkit virtiofs-burst <merged root> <share> <threads> <seconds>`: a guest stress
+//! `vk-testkit virtiofs-burst <merged root> <share> <threads> <seconds> [<stall seconds>]`: a
+//! guest stress
 //! probe for a virtio-fs request stranded behind a full virtqueue
 //! (`tests/virtiofs-full-ring-e2e.sh`).
 //!
@@ -16,7 +17,8 @@
 //! Completions can then finish before the old caller queues the refused request.
 //! The patched enqueue has already queued it under the ring lock.
 //!
-//! A watchdog declares a burst that has made no progress for [`STALL`] stranded, then looks
+//! A watchdog declares a burst that has made no progress for `<stall seconds>` (default
+//! [`DEFAULT_STALL`]) stranded, then looks
 //! up a name on the share from another thread (any completion resends queued requests) and
 //! checks that the burst ends. Exits 0 when no request stranded in `<seconds>`,
 //! [`STRANDED`] when one did and the lookup freed it, [`STRANDED_FOR_GOOD`] when it did not.
@@ -28,8 +30,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-/// How long a burst may make no progress before its pending request counts as stranded.
-pub const STALL: Duration = Duration::from_secs(10);
+/// Default no-progress threshold for a stranded pending request; callers may override it.
+pub const DEFAULT_STALL: Duration = Duration::from_secs(10);
 /// Exit status: a request stranded, and another request on the share freed it.
 pub const STRANDED: u8 = 10;
 /// Exit status: a request stranded, and another request on the share did not free it.
@@ -45,6 +47,7 @@ struct Shared {
     progress_us: AtomicU64,
     bursts: AtomicU64,
     stopping: AtomicBool,
+    stall: Duration,
 }
 
 impl Shared {
@@ -54,9 +57,18 @@ impl Shared {
 }
 
 /// Runs the probe; returns the exit status.
-pub fn run(merged: &Path, share: &Path, threads: usize, seconds: u64) -> Result<u8> {
+pub fn run(
+    merged: &Path,
+    share: &Path,
+    threads: usize,
+    seconds: u64,
+    stall: Duration,
+) -> Result<u8> {
     if !(4..=32).contains(&threads) || seconds == 0 || seconds > 3600 {
         bail!("need 4..32 threads and 1..3600 seconds");
+    }
+    if stall.is_zero() || stall > Duration::from_secs(600) {
+        bail!("need a stall time of 1..600 seconds");
     }
     // Keep the interrupt/completion CPU out of the listing threads' affinity masks.
     let cpus = listing_cpus(threads + 1)?;
@@ -78,6 +90,7 @@ pub fn run(merged: &Path, share: &Path, threads: usize, seconds: u64) -> Result<
         progress_us: AtomicU64::new(0),
         bursts: AtomicU64::new(0),
         stopping: AtomicBool::new(false),
+        stall,
     });
     for (i, dir) in dirs.into_iter().enumerate() {
         let shared = Arc::clone(&shared);
@@ -141,7 +154,7 @@ fn lister(dir: &Path, shared: &Shared) {
 }
 
 fn watchdog(share: &Path, shared: &Shared) {
-    let stall_us = u64::try_from(STALL.as_micros()).unwrap_or(u64::MAX);
+    let stall_us = u64::try_from(shared.stall.as_micros()).unwrap_or(u64::MAX);
     loop {
         std::thread::sleep(Duration::from_secs(1));
         let busy = shared.busy.load(Ordering::SeqCst);
@@ -155,7 +168,7 @@ fn watchdog(share: &Path, shared: &Shared) {
         println!(
             "stranded: burst {} has {busy} listing(s) unfinished {}s after its last progress",
             shared.bursts.load(Ordering::SeqCst),
-            STALL.as_secs()
+            shared.stall.as_secs()
         );
         // Any request on the share: its completion resends the queued ones. From its own
         // thread, so a lookup stuck behind the stranded request cannot hold the watchdog.
@@ -165,11 +178,14 @@ fn watchdog(share: &Path, shared: &Shared) {
             let _ = std::fs::symlink_metadata(rescue);
         });
         let t = Instant::now();
-        while shared.busy.load(Ordering::SeqCst) != 0 && t.elapsed() < STALL {
+        while shared.busy.load(Ordering::SeqCst) != 0 && t.elapsed() < shared.stall {
             std::thread::sleep(Duration::from_millis(10));
         }
         if shared.busy.load(Ordering::SeqCst) != 0 {
-            println!("still stranded {}s after another request", STALL.as_secs());
+            println!(
+                "still stranded {}s after another request",
+                shared.stall.as_secs()
+            );
             std::process::exit(STRANDED_FOR_GOOD.into());
         }
         println!(
