@@ -105,7 +105,7 @@ start_registry() {
   pids+=("$reg_pid")
 }
 start_registry
-connected() { hub registries | awk -v id="$id" '$1 == id && $3 == "connected"' | grep -q .; }
+connected() { hub registries | awk -v id="$id" '$1 == id && $3 == "connected"' | grep . >/dev/null; }
 wait_for 30 connected || fail "the registry did not connect"
 hub registries set-url "$id" "$REG_URL"
 takes_tokens() {
@@ -138,7 +138,7 @@ iso "$WORK/media/virtio-win.iso" virtio-win-0.1.302 8
 sha_of() { sha256sum "$1" | awk '{print $1}'; }
 ws=$(sha_of "$WORK/media/ws2025-eval-en-us.iso")
 virtio=$(sha_of "$WORK/media/virtio-win.iso")
-approved() { hub settings | grep -F executor.windows_media | grep -qF "$1"; }
+approved() { hub settings | grep -F executor.windows_media | grep -F "$1" >/dev/null; }
 
 echo "== 1. a medium streams through the hub into the registry, recorded and approved =="
 got=$(hub media add "$WORK/media/ws2025-eval-en-us.iso" --under build-cache \
@@ -179,7 +179,7 @@ hub media list
 echo "== 2. edited, approved, uploaded again, removed =="
 hub media edit "${ws:0:12}" --notes "Rearm with slmgr /rearm; replace when Microsoft withdraws it." \
   --expires 2027-05-08 >/dev/null
-hub media show "$ws" | grep -q "slmgr /rearm" || fail "the edit did not hold"
+hub media show "$ws" | grep "slmgr /rearm" >/dev/null || fail "the edit did not hold"
 hub media approve "$virtio"
 approved "$virtio" || fail "approve"
 hub media unapprove "$virtio"
@@ -189,7 +189,7 @@ hub media show "$virtio" | tee "$WORK/show"
 grep -qE "registry +$id: files/win-media:virtio-win.iso" "$WORK/show" &&
   grep -qE "registry +$id: build-cache/files/win-media:virtio-win.iso" "$WORK/show" ||
   fail "an upload elsewhere in the registry was not recorded beside the first"
-hub media show "$virtio" | grep -qE "product +virtio-win" ||
+hub media show "$virtio" | grep -E "product +virtio-win" >/dev/null ||
   fail "an upload of known bytes changed what was said of them"
 hub media remove "$ws"
 ! approved "$ws" || fail "a removed medium stays approved"
@@ -235,9 +235,9 @@ iso "$WORK/media/cut.iso" CUT 64
 cutsha=$(sha_of "$WORK/media/cut.iso")
 ! ui -o /dev/null --limit-rate 2M -m 3 "${form[@]}" -F "file=@$WORK/media/cut.iso" \
   "$UI/media/upload" 2>/dev/null || fail "the cut-short upload completed"
-staged() { find "$WORK/store/uploads" -maxdepth 1 -type f | grep -q .; }
+staged() { find "$WORK/store/uploads" -maxdepth 1 -type f | grep . >/dev/null; }
 wait_for 60 eval '! staged' || fail "the registry kept the cut-short upload's staging file"
-! hub media list | grep -qF "$cutsha" || fail "a cut-short upload was recorded"
+! hub media list | grep -F "$cutsha" >/dev/null || fail "a cut-short upload was recorded"
 ! node_get "sha256:$cutsha" -o "$WORK/cut-back.iso" 2>/dev/null ||
   fail "the registry tagged a cut-short upload"
 # The same bytes again: known, the description they have stands.
@@ -246,7 +246,7 @@ code=$(ui -o "$WORK/reply" -w '%{http_code}' -F "_csrf=$csrf" -F "registry=$id" 
   fail "the web UI upload of known bytes failed"
 [ "$code" = 200 ] && grep -q "Already uploaded" "$WORK/reply" ||
   { cat "$WORK/reply"; fail "the web UI upload of known bytes answered $code"; }
-hub media show "$uisha" | grep -q "from the web UI" ||
+hub media show "$uisha" | grep "from the web UI" >/dev/null ||
   fail "the web UI upload of known bytes changed the description"
 # The session ends while the file arrives: the registry holds it, the page says where, the hub
 # records nothing, and the next upload is taken.
@@ -263,12 +263,12 @@ code=$(cat "$WORK/code")
 case $code in 401 | 403) ;; *) cat "$WORK/reply"; fail "the upload whose session ended answered $code" ;; esac
 grep -q "Not recorded: registry $id holds medium $endedsha as build-cache/files/win-media:ended.iso" \
   "$WORK/reply" || { cat "$WORK/reply"; fail "the page does not say where the file is"; }
-! hub media list | grep -qF "$endedsha" || fail "the hub recorded an upload whose session ended"
+! hub media list | grep -F "$endedsha" >/dev/null || fail "the hub recorded an upload whose session ended"
 node_get "sha256:$endedsha" -o "$WORK/ended-back.iso" || fail "the registry does not hold it"
 sign_in
 code=$(ui -o "$WORK/reply" -w '%{http_code}' "${form[@]}" -F "file=@$WORK/media/ended.iso" \
   "$UI/media/upload") || fail "uploading it again failed"
-[ "$code" = 303 ] && hub media list | grep -qF "$endedsha" ||
+[ "$code" = 303 ] && hub media list | grep -F "$endedsha" >/dev/null ||
   { cat "$WORK/reply"; fail "uploading it again answered $code and did not record it"; }
 
 if [ -n "${MEDIA_ISO:-}" ]; then
@@ -285,7 +285,7 @@ if [ -n "${MEDIA_ISO:-}" ]; then
   # The CLI uploaded the same bytes: the page says so, and the description stands.
   [ "$code" = 200 ] && grep -q "Already uploaded" "$WORK/reply" ||
     { cat "$WORK/reply"; fail "the web UI upload of known bytes answered $code"; }
-  ! hub media show "$real" | grep -q "from the web UI" ||
+  ! hub media show "$real" | grep "from the web UI" >/dev/null ||
     fail "the web UI upload of known bytes changed the description"
   echo "uploaded from the web UI in $(($(date +%s) - start))s"
   hub media show "$real"
@@ -307,6 +307,6 @@ iso "$WORK/media/late.iso" LATE 1
   fail "an upload to a registry gone was taken"
 cat "$WORK/err"
 grep -q "not connected" "$WORK/err" || fail "the refusal does not say why"
-! hub media list | grep -q late.iso || fail "a refused upload was recorded"
+! hub media list | grep late.iso >/dev/null || fail "a refused upload was recorded"
 
 echo "PASS: media stream through the hub into its registry, described, approved and fetched by digest"

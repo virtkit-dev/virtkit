@@ -51,7 +51,7 @@ before=$(node_cell "$kvm" VMS)
 "$VK" run --detach --inactivity-timeout 0 --state-dir "$WL" \
   docker.io/library/alpine:3.21 -- sleep infinity >"$FLEET/workload.log" 2>&1 ||
   { cat "$FLEET/workload.log"; fail "the workload VM did not boot"; }
-listed() { hub workloads --node "$kvm" | grep -qF -- "$WL"; }
+listed() { hub workloads --node "$kvm" | grep -F -- "$WL" >/dev/null; }
 wait_for 60 listed || { hub workloads; fail "the VM in $WL is not among the host's workloads"; }
 hub workloads --node "$kvm"
 after=$(node_cell "$kvm" VMS)

@@ -68,7 +68,7 @@ echo "== the server holds the session =="
 # Remote Desktop sessions as the server lists them: the account on an rdp-tcp#N session, active.
 sessions=$("$VK" exec "$work/run" --service rdp-server -- qwinsta 2>&1) || true
 echo "$sessions"
-echo "$sessions" | grep -Eiq "rdp-tcp#[0-9]+ +rdpuser +[0-9]+ +active" \
+echo "$sessions" | grep -Ei "rdp-tcp#[0-9]+ +rdpuser +[0-9]+ +active" >/dev/null \
   || fail "the server lists no active RDP session for rdpuser"
 echo "ok: the server lists rdpuser's Remote Desktop session as active"
 

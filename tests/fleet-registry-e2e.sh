@@ -212,7 +212,7 @@ host_vk kvm build -f "$FLEET/build/Dockerfile" --out "$FLEET/bundle/runner.ext4"
   --cache-registry "127.0.0.1:$REG_PORT/build-cache" --build-cache instructions \
   >"$FLEET/build.log" 2>&1 || { tail -n 30 "$FLEET/build.log"; fail "the build failed"; }
 [ "$(stored)" -gt "$before" ] || fail "the build's base did not come through the registry"
-find "$REG/store/repos/build-cache" -path '*/tags/*' -type f 2>/dev/null | grep -q . ||
+find "$REG/store/repos/build-cache" -path '*/tags/*' -type f 2>/dev/null | grep . >/dev/null ||
   fail "the build wrote no cache to the registry"
 
 echo "== a bundle the node never had, pulled with the node's token =="

@@ -134,7 +134,7 @@ echo "== the node's config file wins over the hub =="
 hub settings set executor.vm.max_cpus 3
 setting_is "$k" executor.vm.max_cpus "3 (the hub)"
 setting_is "$n" executor.vm.max_cpus "1 (its config file)"
-wait_for 30 eval 'hub nodes | grep -qF "n1: settings: 1 from the hub, 1 from its config file"' ||
+wait_for 30 eval 'hub nodes | grep -F "n1: settings: 1 from the hub, 1 from its config file" >/dev/null' ||
   { hub nodes; fail "n1 does not say where its settings come from"; }
 if hub nodes | grep -F 'refused the hub'; then
   fail "a node refused a setting"

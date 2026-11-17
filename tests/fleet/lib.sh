@@ -321,7 +321,7 @@ node_reported() {
 
 # node_is <id> <connected|unreachable>
 node_is() {
-  node_row "$1" | grep -qw -- "$2"
+  node_row "$1" | grep -w -- "$2" >/dev/null
 }
 
 # fleet_kvm_node [vk]: start a node on the test host, with its KVM, using the given vk or VK.

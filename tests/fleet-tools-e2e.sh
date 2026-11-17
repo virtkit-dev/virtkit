@@ -169,7 +169,7 @@ echo "== a node that joins builds the tools the setting names, unasked =="
 good=$(hub tools add /etc/vk-hub/good --version e2e-good)
 bad=$(hub tools add /etc/vk-hub/bad --version e2e-bad)
 hub settings set tools "${good:0:12}"
-hub settings | grep -qF "tools = $good" || fail "the setting does not keep the whole sha256"
+hub settings | grep -F "tools = $good" >/dev/null || fail "the setting does not keep the whole sha256"
 mkdir -p "$FLEET/kvm"
 printf 'state_dir = "%s"\n' "$FLEET/kvm/state" >"$FLEET/kvm/config.toml"
 fleet_kvm_node
@@ -187,7 +187,7 @@ wait_for 60 page_has viewer "/tools/$good" '<h1>e2e-good</h1>' \
   "<a href=\"/node/$k\">$kvm_host</a></td><td>fleet-wide</td><td><span class=\"badge ok\">intact" \
   '<td><code>tools</code></td><td colspan="2">none: its steps reach no network</td>' \
   '<h3>Files <code>' || ui_fail "the definition's page does not show the node with its tools"
-hub_ui "/tools/$good" | grep -qF 'download>Download' && fail "a viewer is offered the download"
+hub_ui "/tools/$good" | grep -F 'download>Download' >/dev/null && fail "a viewer is offered the download"
 page_has operator "/tools/$good" 'download>Download</a>' || ui_fail "an operator is not offered the download"
 page_has viewer "/node/$k" '<section><h2>CI tools</h2>' "<a href=\"/tools/$good\">e2e-good</a>" \
   'by the fleet-wide setting' '<span class="badge ok">intact</span>' \
@@ -203,7 +203,7 @@ wait_for 600 eval 'in_node n1 test -x "/var/lib/virtkit/tools/$good/git"' ||
 [ -n "$(recorded kvm "$good")" ] || fail "the node recorded no checksums"
 [ "$(recorded kvm "$good")" = "$(recorded n1 "$good")" ] ||
   fail "the two nodes recorded other files: $(recorded kvm "$good") / $(recorded n1 "$good")"
-grep -F '"sha256"' <<<"$(recorded kvm "$good")" | grep -qF "$(sha256sum <"$VK_TESTKIT" | cut -c1-64)" ||
+grep -F '"sha256"' <<<"$(recorded kvm "$good")" | grep -F "$(sha256sum <"$VK_TESTKIT" | cut -c1-64)" >/dev/null ||
   fail "the recorded checksum is not git's"
 sleep 5
 hub nodes | grep -F "other files" && fail "nodes with the same files were flagged"
@@ -215,7 +215,7 @@ cmp -s "$VK_TESTKIT" "$FLEET/kvm/state/tools/$good/git" && fail "git was not cha
 job 'test -x /run/virtkit-tools/git' && fail "a job was given tampered tools"
 grep -F "have changed since they were installed (git)" "$FLEET/prepare.log" ||
   { cat "$FLEET/prepare.log"; fail "the job's refusal does not say why"; }
-wait_for 150 eval 'hub_audit "$k" | grep -qF "have changed since it installed them (git)"' ||
+wait_for 150 eval 'hub_audit "$k" | grep -F "have changed since it installed them (git)" >/dev/null' ||
   { hub nodes; fail "the hub did not flag the tampered tools"; }
 [ "$(issued "$k" auto-deploy e2e-good)" = 2 ] ||
   wait_for 60 eval '[ "$(issued "$k" auto-deploy e2e-good)" = 2 ]' ||
@@ -232,13 +232,13 @@ hub nodes tools "$k" --tools "$bad" && fail "a build of other tools than the set
 
 echo "== a failed build is tried again later, or now by an operator =="
 hub settings set tools "$bad" --node "$k"
-wait_for 120 eval 'note | grep -q "attempt 1 of 5 .* failed.*the next is due after"' ||
+wait_for 120 eval 'note | grep "attempt 1 of 5 .* failed.*the next is due after" >/dev/null' ||
   { hub nodes; fail "the failed build and its retry are not noted"; }
 note
 page_has viewer "/node/$k" '<span class="badge bad">failed</span> attempt 1 of 5' \
   'The next attempt is due after' "<a href=\"/tools/$bad\">e2e-bad</a>" ||
   ui_fail "the node's page does not show the failed build"
-hub_ui "/node/$k" | grep -qF 'Build now' && fail "a viewer is offered to build now"
+hub_ui "/node/$k" | grep -F 'Build now' >/dev/null && fail "a viewer is offered to build now"
 page_has operator "/node/$k" "name=\"tools\" value=\"$bad\"><button>Build now</button>" ||
   ui_fail "an operator is not offered to build the failed build's tools now"
 sleep 15
@@ -246,7 +246,7 @@ sleep 15
 hub nodes tools "$k"
 wait_for 120 eval '[ "$(issued "$k" "uid [0-9]+" e2e-bad)" = 1 ]' ||
   fail "\`vk-hub nodes tools\` did not ask again"
-wait_for 120 eval 'note | grep -q "attempt 1 of 5 .* failed"' ||
+wait_for 120 eval 'note | grep "attempt 1 of 5 .* failed" >/dev/null' ||
   fail "the second failure is not noted as a first attempt"
 [ "$(current)" = "$good" ] || fail "a failed build changed the tools"
 # Again from the node's page: the same as `vk-hub nodes tools`. Other tools are refused.
@@ -258,13 +258,13 @@ r=$(operator_post "/node/$k/action" "op=tools&tools=$bad")
 grep -qF "Issued the build of the CI tools" <<<"$r" || fail "the page did not build now: $r"
 wait_for 120 eval '[ "$(issued "$k" "ui session [0-9a-f]+ \(operator\)" e2e-bad)" = 1 ]' ||
   fail "the page's build was not issued as the operator's"
-wait_for 120 eval 'note | grep -q "attempt 1 of 5 .* failed"' ||
+wait_for 120 eval 'note | grep "attempt 1 of 5 .* failed" >/dev/null' ||
   fail "the page's build is not noted as a first attempt"
 
 echo "== a build reaches only what its definition declares =="
 sealed=$(hub tools add /etc/vk-hub/sealed --version e2e-sealed)
 hub settings set tools "$sealed" --node "$k"
-wait_for 300 eval 'note | grep -q "refused to example.org"' ||
+wait_for 300 eval 'note | grep "refused to example.org" >/dev/null' ||
   { hub nodes; fail "the build reached, or did not name, a host its definition does not declare"; }
 page_has viewer "/tools/$sealed" '<td><code>fetch</code></td><td>example.com</td><td>none</td>' \
   "<a href=\"/node/$k\">$kvm_host</a></td><td>its own setting</td>" 'example.org' ||

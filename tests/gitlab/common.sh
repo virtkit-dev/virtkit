@@ -21,7 +21,7 @@ wait_for() {
 free_port() {
   local port
   for port in $(shuf -i 20000-60000 -n 50); do
-    ss -Htln "sport = :$port" | grep -q . || {
+    ss -Htln "sport = :$port" | grep . >/dev/null || {
       echo "$port"
       return
     }

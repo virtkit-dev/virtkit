@@ -114,7 +114,7 @@ EOF
   log "hub: https://127.0.0.1:$HUB_PORT"
 }
 
-node_connected() { hub nodes | grep -q "^$NODE_ID .*connected"; }
+node_connected() { hub nodes | grep "^$NODE_ID .*connected" >/dev/null; }
 
 node_vk() { VIRTKIT_CONFIG="$RUN/node/config.toml" "$VK" "$@"; }
 
@@ -193,7 +193,7 @@ fleet_down() {
       [ -f "$f" ] || continue
       p=$(cat "$f" 2>/dev/null) || continue
       [[ $p =~ ^[0-9]+$ ]] || continue
-      tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q ' node job ' || continue
+      tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep ' node job ' >/dev/null || continue
       kill -KILL -- "-$p" 2>/dev/null || true
     done
   fi

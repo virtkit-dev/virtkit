@@ -527,7 +527,7 @@ canceled:
 EOF
   } | push_scenario cancel) || return 1
   j=$(job "$p" canceled)
-  wait_for 600 eval "gl_trace $j 2>/dev/null | grep -qE '${LINE}cancel-start'" || {
+  wait_for 600 eval "gl_trace $j 2>/dev/null | grep -E '${LINE}cancel-start' >/dev/null" || {
     bad "job $j never printed cancel-start"
     return 1
   }
@@ -552,7 +552,7 @@ survives:
 EOF
   } | push_scenario restart) || return 1
   j=$(job "$p" survives)
-  wait_for 600 eval "gl_trace $j 2>/dev/null | grep -qE '${LINE}restart-start'" || {
+  wait_for 600 eval "gl_trace $j 2>/dev/null | grep -E '${LINE}restart-start' >/dev/null" || {
     bad "job $j never printed restart-start"
     return 1
   }

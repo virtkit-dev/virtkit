@@ -93,7 +93,7 @@ eval "$(vkt export)"
 [ "${VIRTKIT_VK:-}" = "$CACHE/vk" ] && ok "export points VIRTKIT_VK at the cached artifact" || bad "export set VIRTKIT_VK=${VIRTKIT_VK:-}"
 [ "${VIRTKIT_VK_SHA256:-}" = "$SUM_VK" ] && ok "export carries the locked digest beside it" || bad "export set VIRTKIT_VK_SHA256=${VIRTKIT_VK_SHA256:-}"
 [ "${VIRTKIT_VMLINUX:-}" = "$CACHE/vmlinux" ] && ok "export points VIRTKIT_VMLINUX at the kernel" || bad "export set VIRTKIT_VMLINUX=${VIRTKIT_VMLINUX:-}"
-"$VIRTKIT_VK" | grep -q "$VERSION" && ok "the exported path runs" || bad "the exported VIRTKIT_VK did not run"
+"$VIRTKIT_VK" | grep "$VERSION" >/dev/null && ok "the exported path runs" || bad "the exported VIRTKIT_VK did not run"
 json=$(vkt export --format json)
 grep -qF "\"VIRTKIT_VK\": \"$CACHE/vk\"" <<<"$json" && ok "the JSON form carries the same path" || { bad "the JSON form disagrees"; echo "$json"; }
 

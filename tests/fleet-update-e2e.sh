@@ -111,7 +111,7 @@ on a "$old" "$old_sha"
 wait_for 30 hub release remove "$rel" || fail "the unsigned release could not be removed"
 "$VK" exec "$RUN" -- sh -c "echo '$sig' >/tmp/vk-next.sig"
 rel=$(hub release add /usr/local/share/vk-next --version "$next" --signature /tmp/vk-next.sig)
-hub release list | grep -q "^$rel .* signed " || fail "the release is not listed as signed"
+hub release list | grep "^$rel .* signed " >/dev/null || fail "the release is not listed as signed"
 
 echo "== a updates to vk $next =="
 hub nodes update "$a" --release "$rel"
@@ -141,7 +141,7 @@ rollout_done() {
   local s
   s=$(hub rollout status "$ro")
   [ "$(grep -c '  updating for ' <<<"$s")" -le 1 ] || overlap=1
-  head -n 1 <<<"$s" | grep -q '  done  '
+  head -n 1 <<<"$s" | grep '  done  ' >/dev/null
 }
 wait_for 600 rollout_done || { hub rollout status "$ro"; fail "the rollout did not finish"; }
 status=$(hub rollout status "$ro")

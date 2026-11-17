@@ -87,7 +87,7 @@ wait_for 30 runner_up || fail "the managed node did not start its runner again"
 [ "$(runner_pid)" != "$before" ] || fail "the managed node's runner was never restarted"
 
 echo "== the external node cannot stop its runner =="
-notes() { hub nodes | grep -qF "external: cannot comply: stopping acquisition"; }
+notes() { hub nodes | grep -F "external: cannot comply: stopping acquisition" >/dev/null; }
 hub nodes stop "$x"
 wait_for 60 notes || { hub nodes; fail "the external node did not say it cannot stop acquiring"; }
 cell_is "$x" ACQUIRE 'stop (node: run)' || fail "external shows $(node_cell "$x" ACQUIRE)"

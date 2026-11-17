@@ -72,7 +72,7 @@ id=$(cat "$WORK/id")
 "$WORK/bin/vk-registry" serve --config "$WORK/registry.toml" >"$WORK/registry.log" 2>&1 &
 reg_pid=$!
 pids+=($reg_pid)
-connected() { hub registries | awk -v id="$id" '$1 == id && $3 == "connected"' | grep -q .; }
+connected() { hub registries | awk -v id="$id" '$1 == id && $3 == "connected"' | grep . >/dev/null; }
 wait_for 30 connected || fail "the registry did not connect"
 hub registries
 hub registries show "$id" | tee "$WORK/show"
@@ -85,13 +85,13 @@ echo "== 2. read-only from the hub refuses pushes, and writable takes them again
 hub registries read-only "$id" on
 wait_for 15 eval '[ "$(push)" = 503 ]' || fail "the registry still takes pushes"
 curl -sf "http://127.0.0.1:$REG_PORT/v2/" >/dev/null || fail "reads stopped with writes"
-wait_for 15 eval 'hub registries | grep -q read-only' || fail "the hub does not show it read-only"
+wait_for 15 eval 'hub registries | grep read-only >/dev/null' || fail "the hub does not show it read-only"
 hub registries read-only "$id" off
 wait_for 15 eval '[ "$(push)" = 202 ]' || fail "the registry did not take pushes again"
 
 echo "== 3. what [hub] allow does not list is refused =="
 hub registries gc "$id" --dry-run
-wait_for 15 eval 'hub registries show "$id" | grep -q "refused: .*allow does not list gc"' ||
+wait_for 15 eval 'hub registries show "$id" | grep "refused: .*allow does not list gc" >/dev/null' ||
   fail "a gc the config does not allow was not refused"
 
 echo "== 4. an update installs a vk-registry release on trial =="
@@ -105,7 +105,7 @@ before=$(sha256sum "$WORK/bin/vk-registry" | awk '{print $1}')
 hub registries update "$id" --release "${sha:0:12}"
 installed() { [ "$(sha256sum "$WORK/bin/vk-registry" | awk '{print $1}')" = "$sha" ]; }
 wait_for 120 installed || fail "the release was not installed"
-wait_for 30 eval 'hub registries show "$id" | grep -q "update to vk-registry .*: done"' ||
+wait_for 30 eval 'hub registries show "$id" | grep "update to vk-registry .*: done" >/dev/null' ||
   fail "the hub does not show the update done"
 kill -0 "$reg_pid" || fail "the registry exited across its update"
 wait_for 30 connected || fail "the updated registry is not connected"

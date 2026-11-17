@@ -53,7 +53,7 @@ on() {
 }
 # keys_are <id> <html>: node <id>'s page shows its release keys as <html>.
 keys_are() {
-  hub_ui "/node/$1" | grep -qF "<tr><th>Release keys</th><td>$2</td></tr>"
+  hub_ui "/node/$1" | grep -F "<tr><th>Release keys</th><td>$2</td></tr>" >/dev/null
 }
 # release <signing key or ->: add VK_NEXT to the hub, signed with the key or unsigned.
 release() {
@@ -90,7 +90,7 @@ done
 hub nodes
 
 echo "== a pins the hub's keys, c keeps its own =="
-in_node a cat /var/lib/virtkit/node/enrollment.json | grep -qF "\"$pub\"" ||
+in_node a cat /var/lib/virtkit/node/enrollment.json | grep -F "\"$pub\"" >/dev/null ||
   fail "a's enrollment does not pin the hub's release key"
 wait_for 30 keys_are "$a" "<code>$pub</code>, pinned when it joined" ||
   fail "a does not report the hub's key as pinned when it joined"
@@ -118,7 +118,7 @@ wait_for 60 cell_is "$a" STATE ready || fail "a is $(node_cell "$a" STATE) once 
 on a "$next" "$next_sha"
 wait_for 60 standing_is "$a" current || fail "a stands $(standing "$a") against the target"
 standing_is "$c" flagged || fail "c stands $(standing "$c") against the target, not flagged"
-standing "$c" | grep -q 'signature does not verify' ||
+standing "$c" | grep 'signature does not verify' >/dev/null ||
   fail "c's flag does not say its keys refuse the target's signature: $(standing "$c")"
 on c "$old" "$old_sha"
 hub release target
@@ -136,7 +136,7 @@ hub release target
 
 echo "== cleared, the target updates no node behind it =="
 hub release target --clear
-hub release target 2>&1 | grep -q 'no target is set' || fail "the target is still set"
+hub release target 2>&1 | grep 'no target is set' >/dev/null || fail "the target is still set"
 # c, back to its pinned keys, would now take the target.
 node_config c </dev/null
 ctl c stop
