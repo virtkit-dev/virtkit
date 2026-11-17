@@ -228,7 +228,8 @@ for want in "arch +arm64" "language +fr-fr" "product +Windows 11" "approved +yes
   grep -qE "$want" "$WORK/show" || fail "the medium uploaded from the web UI lacks /$want/"
 done
 node_get "sha256:$uisha" -o "$WORK/ui-back.iso" || fail "a node cannot fetch the web UI's upload"
-ui "$UI/media/$uisha" | grep -q "from the web UI" || fail "the medium's page does not show it"
+page=$(ui "$UI/media/$uisha") && grep -q "from the web UI" <<<"$page" ||
+  fail "the medium's page does not show it"
 # Cut short: the browser goes away a few MiB in.
 iso "$WORK/media/cut.iso" CUT 64
 cutsha=$(sha_of "$WORK/media/cut.iso")
@@ -251,10 +252,11 @@ hub media show "$uisha" | grep -q "from the web UI" ||
 # records nothing, and the next upload is taken.
 iso "$WORK/media/ended.iso" ENDED 32
 endedsha=$(sha_of "$WORK/media/ended.iso")
-ui -o "$WORK/reply" -w '%{http_code}' --limit-rate 4M "${form[@]}" \
+ui -o "$WORK/reply" -w '%{http_code}' --limit-rate 2M "${form[@]}" \
   -F "file=@$WORK/media/ended.iso" "$UI/media/upload" >"$WORK/code" &
 upload_pid=$!
-sleep 3
+# End the session once streaming to the registry starts, about 16 s before completion.
+wait_for 30 staged || fail "the upload whose session ends did not reach the registry"
 hub ui logout --all >/dev/null
 wait "$upload_pid" || fail "the upload whose session ended failed"
 code=$(cat "$WORK/code")
