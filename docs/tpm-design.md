@@ -112,15 +112,15 @@ over `aes`. They are added only when a phase needs them:
 
 ### RSA and the Marvin attack
 
-The `rsa` crate carries RUSTSEC-2023-0071 (Marvin: timing in RSA decryption). It matters here: a
+RUSTSEC-2023-0071 (Marvin: timing in RSA decryption) is about `rsa` before 0.10. It matters here: a
 TPM decrypts guest-chosen ciphertexts. An EK (a restricted decryption key) does so without any
 authorization, for TPM2_StartAuthSession's salt (and phase 4's ActivateCredential), always with
 OAEP; an unrestricted key the caller is authorized to use does with TPM2_RSA_Decrypt, with any
 padding, raw RSA included. The decision:
 
-- `rsa` 0.10.0-rc on `crypto-bigint` 0.7, which carries the upstream fixes the advisory waits on
-  (constant-time modular exponentiation, constant-time padding checks; issue #626, PR #680), not
-  0.9 on `num-bigint-dig`.
+- `rsa` 0.10 on `crypto-bigint` 0.7, which carries the upstream fixes (constant-time modular
+  exponentiation, constant-time padding checks; issue #626, PR #680), not 0.9 on
+  `num-bigint-dig`.
 - Every private-key operation is blinded (signatures included), on top of the constant-time
   exponentiation.
 - OAEP is decoded in constant time, and all its failures (first byte, label hash, separator)
@@ -136,18 +136,8 @@ padding, raw RSA included. The decision:
   valid against invalid ciphertexts, interleaved: on the dev VM the medians of RSA-2048
   decryptions differ by 0.01% (OAEP) and 0.00% (RSAES), at ~2.6 ms each.
 
-`.cargo/audit.toml` keeps the advisory suppressed, with this reasoning, until `rsa` 0.10 is
-released.
-
-**Stable `rsa` 0.10, status (2026-10-06).** There is none: crates.io's newest stable `rsa` is
-0.9.10 (still `num-bigint-dig`, the code the advisory is about), the newest release 0.10.0-rc.19
-(published that day; `vk-tpm` and russh are on rc.18), and RUSTSEC-2023-0071 still lists no
-patched version. The plan: stay on the release candidate russh uses, so `Cargo.lock` holds one
-`rsa`; move both to 0.10.0 when it is released, rerunning the differential suite (RSASSA
-signatures, implicit rejection and the RSA primaries' prime search are compared or pinned
-there) and `decryption_time_does_not_depend_on_the_padding`; then drop the audit ignore if the
-advisory names 0.10.0 as patched. An RSA primary would change only if `crypto-primes` changed
-its primality verdicts, which the pinned prime search does not depend on otherwise.
+`rsa` 0.10.0 is stable and RUSTSEC-2023-0071 names it as patched, so `.cargo/audit.toml` no
+longer suppresses the advisory. `vk-tpm` and russh share that one `rsa` in `Cargo.lock`.
 
 ## Architecture
 

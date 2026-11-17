@@ -146,10 +146,11 @@ hmac = { version = "0.13", features = ["zeroize"] }
 # russh; cfb-mode is RustCrypto's CFB mode over it, a few hundred lines with no other dependency.
 aes = "0.9"
 cfb-mode = { version = "0.9", features = ["zeroize"] }
-# vk-tpm: RSA keys (EK, SRK, BitLocker, PCP KSP). RustCrypto; already in the tree via russh. The
-# release candidate on constant-time crypto-bigint, not 0.9: RUSTSEC-2023-0071 (Marvin) is fixed
-# there (.cargo/audit.toml). `hazmat` for the raw RSA a TPM offers (TPM_ALG_NULL padding).
-rsa = { version = "0.10.0-rc.18", default-features = false, features = ["std", "hazmat", "pkcs1v15"] }
+# vk-tpm: RSA keys (EK, SRK, BitLocker, PCP KSP). RustCrypto; already in the tree via russh.
+# 0.10, on constant-time crypto-bigint, fixes RUSTSEC-2023-0071 (Marvin). `hazmat` enables raw
+# TPM RSA (TPM_ALG_NULL padding); `pkcs1v15` enables RSAES-PKCS1-v1_5 and RSASSA-PKCS1-v1_5
+# (TPM_ALG_RSAES, TPM_ALG_RSASSA, and Secure Boot signature verification in vk-uefi-vars).
+rsa = { version = "0.10", default-features = false, features = ["std", "hazmat", "pkcs1v15"] }
 # vk-tpm: the prime search of deterministic RSA primary keys, and big-integer arithmetic the
 # reference implementation specifies (the ECC private scalar of a primary). Both already in the
 # tree via rsa.
@@ -210,8 +211,7 @@ log = "0"
 rand = "0.10"
 # default-features off to use the `ring` backend (consistent with oci-client)
 # rather than russh's default aws-lc-rs, while keeping `rsa` so the SSH server can
-# accept clients' RSA keys. The rsa crate carries RUSTSEC-2023-0071 (Marvin, no
-# fixed release); it is suppressed in .cargo/audit.toml (see that file).
+# accept clients' RSA keys.
 russh = { version = "0.65", default-features = false, features = ["flate2", "ring", "rsa"] }
 russh-sftp = "3"
 # /run/vk control filesystem (`ctlfs`, vk-agent): pure-Rust FUSE, mounted by
