@@ -16,7 +16,7 @@ use p256::elliptic_curve::point::AffineCoordinates;
 use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::{AffinePoint, FieldBytes, NonZeroScalar, ProjectivePoint};
 use rsa::traits::{PaddingScheme, PublicKeyParts, SignatureScheme};
-use rsa::{Oaep, Pkcs1v15Encrypt, Pkcs1v15Sign, Pss, RsaPrivateKey, RsaPublicKey};
+use rsa::{Oaep, Pkcs1v15Encrypt, Pkcs1v15Sign, PrivateKey, Pss, PublicKey};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::alg::Hash;
@@ -88,7 +88,7 @@ pub fn rsa_generate(
     bits: u16,
     exponent: u32,
     drbg: &mut Drbg,
-) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>, RsaPrivateKey)> {
+) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>, PrivateKey)> {
     let e = generation_exponent(exponent)?;
     let half = u32::from(bits / 2);
     let modulus_bytes = usize::from(bits / 8);
@@ -101,11 +101,11 @@ pub fn rsa_generate(
         } else {
             q.wrapping_sub(&p)
         };
-        if diff.bits() <= half.saturating_sub(100) {
+        if diff.bit_width() <= half.saturating_sub(100) {
             continue;
         }
         let secret = be_padded(&p, modulus_bytes / 2);
-        let Ok(mut key) = RsaPrivateKey::from_p_q(p, q, BoxedUint::from(e)) else {
+        let Ok(mut key) = PrivateKey::from_p_q(p, q, BoxedUint::from(e)) else {
             continue;
         };
         key.precompute().map_err(|_| Rc::FAILURE)?;
@@ -147,7 +147,7 @@ fn rsa_prime(drbg: &mut Drbg, bits: u32, e: u32) -> Result<BoxedUint> {
 
 /// The private key whose modulus is `n` and one of whose primes is `p` (CryptRsaLoadPrivateExponent):
 /// TPM_RC_BINDING if `p` does not divide `n`.
-pub fn rsa_private(n: &[u8], p: &[u8], exponent: u32) -> Result<RsaPrivateKey> {
+pub fn rsa_private(n: &[u8], p: &[u8], exponent: u32) -> Result<PrivateKey> {
     let bits = u32::try_from(n.len().saturating_mul(8)).map_err(|_| Rc::FAILURE)?;
     let n = BoxedUint::from_be_slice(n, bits).map_err(|_| Rc::BINDING)?;
     let p = BoxedUint::from_be_slice(p, bits).map_err(|_| Rc::BINDING)?;
@@ -161,7 +161,7 @@ pub fn rsa_private(n: &[u8], p: &[u8], exponent: u32) -> Result<RsaPrivateKey> {
         return Err(Rc::BINDING);
     };
     let e = BoxedUint::from(rsa_exponent(exponent));
-    let mut key = RsaPrivateKey::from_p_q(p_half, q_half, e).map_err(|_| Rc::BINDING)?;
+    let mut key = PrivateKey::from_p_q(p_half, q_half, e).map_err(|_| Rc::BINDING)?;
     key.precompute().map_err(|_| Rc::BINDING)?;
     Ok(key)
 }
@@ -169,14 +169,14 @@ pub fn rsa_private(n: &[u8], p: &[u8], exponent: u32) -> Result<RsaPrivateKey> {
 /// A public key, as OpenSSL takes one: any exponent (the TPM refused those below 7 when the
 /// key was loaded), an odd modulus. rsa's own encryption paddings still refuse an even
 /// exponent (a deviation: no TPM key has one).
-pub fn rsa_public(n: &[u8], exponent: u32) -> Result<RsaPublicKey> {
+pub fn rsa_public(n: &[u8], exponent: u32) -> Result<PublicKey> {
     let bits = u32::try_from(n.len().saturating_mul(8)).map_err(|_| Rc::FAILURE)?;
     let n = BoxedUint::from_be_slice(n, bits).map_err(|_| Rc::KEY)?;
-    if n.as_limbs().first().is_none_or(|l| l.0 & 1 == 0) || n.bits() < 2 {
+    if n.as_limbs().first().is_none_or(|l| l.0 & 1 == 0) || n.bit_width() < 2 {
         return Err(Rc::KEY);
     }
     let e = BoxedUint::from(rsa_exponent(exponent));
-    Ok(RsaPublicKey::new_unchecked(n, e))
+    Ok(PublicKey::new_unchecked(n, e))
 }
 
 /// The salt of an RSAPSS signature: the digest's size, unless the modulus is too small for it
@@ -191,7 +191,7 @@ fn pss_salt(hash: Hash, modulus_bytes: usize) -> usize {
 }
 
 /// An RSASSA or RSAPSS signature of `digest` (blinded).
-pub fn rsa_sign(key: &RsaPrivateKey, scheme: u16, hash: Hash, digest: &[u8]) -> Result<Vec<u8>> {
+pub fn rsa_sign(key: &PrivateKey, scheme: u16, hash: Hash, digest: &[u8]) -> Result<Vec<u8>> {
     let mut rng = SysRng;
     let signature = match scheme {
         TPM_ALG_RSASSA => {
@@ -209,7 +209,7 @@ pub fn rsa_sign(key: &RsaPrivateKey, scheme: u16, hash: Hash, digest: &[u8]) -> 
 
 /// Verify an RSASSA or RSAPSS signature (any salt length): TPM_RC_SIGNATURE if it is not one.
 pub fn rsa_verify(
-    key: &RsaPublicKey,
+    key: &PublicKey,
     scheme: u16,
     hash: Hash,
     digest: &[u8],
@@ -234,7 +234,7 @@ pub fn rsa_verify(
 /// RSA encryption with `scheme` (RSAES, OAEP with its hash and `label`, or with TPM_ALG_NULL
 /// none: `message` is then the integer, at most the modulus' size once its leading zeros go).
 pub fn rsa_encrypt(
-    key: &RsaPublicKey,
+    key: &PublicKey,
     scheme: u16,
     hash: Option<Hash>,
     label: &[u8],
@@ -281,7 +281,7 @@ fn oaep<D: sha2::Digest + sha2::digest::FixedOutputReset>(label: &[u8]) -> Oaep<
 /// the padding wrong, are all TPM_RC_VALUE; RSAES has none (implicit rejection, see
 /// [`rsaes_unpad`]).
 pub fn rsa_decrypt(
-    key: &RsaPrivateKey,
+    key: &PrivateKey,
     scheme: u16,
     hash: Option<Hash>,
     label: &[u8],
@@ -318,11 +318,11 @@ pub fn rsa_decrypt(
 /// The private exponent libtpms gives OpenSSL, which keys implicit rejection: as OpenSSL
 /// computes it, inverse of e modulo λ(n) from 2048 bits with e above 2^16 (unless that one is
 /// suspiciously small), modulo φ(n) otherwise.
-fn libtpms_exponent(key: &RsaPrivateKey) -> Result<BoxedUint> {
+fn libtpms_exponent(key: &PrivateKey) -> Result<BoxedUint> {
     use rsa::traits::PrivateKeyParts;
     let n = key.n().as_ref();
-    let bits = n.bits();
-    if bits >= 2048 && key.e().bits() > 16 && key.d().bits() > bits / 2 {
+    let bits = n.bit_width();
+    if bits >= 2048 && key.e().bit_width() > 16 && key.d().bit_width() > bits / 2 {
         return Ok(key.d().clone());
     }
     let precision = n.bits_precision();
@@ -364,7 +364,7 @@ fn rejection_prf(kdk: &[u8], label: &[u8], bytes: usize) -> Zeroizing<Vec<u8>> {
 /// malformed `em` decodes to a message derived from the private key and the ciphertext, the same
 /// every time, so that whether the padding was right never shows, not even in the result (the
 /// Bleichenbacher and Marvin oracles). Constant time but for the returned length.
-fn rsaes_unpad(key: &RsaPrivateKey, ciphertext: &[u8], em: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+fn rsaes_unpad(key: &PrivateKey, ciphertext: &[u8], em: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     use subtle::{ConditionallySelectable, ConstantTimeEq, ConstantTimeGreater, ConstantTimeLess};
     let k = em.len();
     let mut d = libtpms_exponent(key)?;

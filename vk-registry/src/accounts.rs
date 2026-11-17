@@ -388,14 +388,16 @@ impl Db {
         // redb holds an exclusive `flock` for the life of the process, so a second opener
         // — another `serve`, or the `accounts` CLI beside a running one — fails here. Say
         // which, rather than leaving the caller with redb's bare "database already open".
-        let db = Database::builder().create_file(file).with_context(|| {
-            format!(
-                "opening the accounts db at {}: only one process may hold it — stop the \
+        let db = redb::backends::FileBackend::new(file)
+            .and_then(|backend| Database::builder().create_with_backend(backend))
+            .with_context(|| {
+                format!(
+                    "opening the accounts db at {}: only one process may hold it — stop the \
                  running vk-registry, or, for `vk-registry accounts`, ask it over its \
                  admin socket instead",
-                path.display()
-            )
-        })?;
+                    path.display()
+                )
+            })?;
         Self::init(db, Some(path.to_path_buf()))
     }
 

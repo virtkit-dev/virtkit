@@ -911,12 +911,14 @@ impl Db {
             }
             Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
         };
-        let db = Database::builder().create_file(file).with_context(|| {
-            format!(
-                "opening the hub database at {}: only one vk-hub may hold it",
-                path.display()
-            )
-        })?;
+        let db = redb::backends::FileBackend::new(file)
+            .and_then(|backend| Database::builder().create_with_backend(backend))
+            .with_context(|| {
+                format!(
+                    "opening the hub database at {}: only one vk-hub may hold it",
+                    path.display()
+                )
+            })?;
         Self::init(db)
     }
 

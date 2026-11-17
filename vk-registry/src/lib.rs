@@ -339,8 +339,8 @@ fn compress_beside(tmp: &Path, raw_len: u64) -> Result<Option<PathBuf>> {
 }
 
 /// zstd-compress `raw`, embedding the decompressed size in the frame header so the
-/// registry can report a canonical `Content-Length` on HEAD without decompressing
-/// (`zstd::encode_all` omits the content size). Shared by the transparent-zstd client
+/// registry can report a canonical `Content-Length` on HEAD without decompressing,
+/// regardless of zstd's defaults. Shared by the transparent-zstd client
 /// push and this store's storage compression.
 pub fn zstd_with_size(raw: &[u8]) -> Result<Vec<u8>> {
     use std::io::Write;
@@ -7742,7 +7742,7 @@ mod tests {
 
         // and a frame that does not declare its content size is not storable either: the
         // header is what `HEAD` reports, so one that says nothing cannot be certified
-        let sizeless = zstd::encode_all(&raw[..], ZSTD_LEVEL).unwrap();
+        let sizeless = zstd_sizeless(&raw);
         assert_eq!(zstd_frame_len(&sizeless), None);
         open_session(&store, "img", "aa-3");
         let res = finish_upload(
@@ -11197,17 +11197,22 @@ mod tests {
 
     #[test]
     fn zstd_frame_len_reads_embedded_content_size() {
-        // the shared encoder embeds the content size (encode_all does not), so HEAD can
-        // read the canonical length from the frame header without decompressing.
+        // the shared encoder embeds the canonical length in the frame header,
+        // so HEAD can read it without decompressing.
         let raw = vec![7u8; 50_000];
         let frame = zstd_with_size(&raw).unwrap();
         assert_eq!(zstd_frame_len(&frame), Some(50_000));
         assert_eq!(zstd::decode_all(&frame[..]).unwrap(), raw);
-        // encode_all (no pledged size) omits it — the reason that helper exists.
-        assert_eq!(
-            zstd_frame_len(&zstd::encode_all(&raw[..], ZSTD_LEVEL).unwrap()),
-            None
-        );
+        assert_eq!(zstd_frame_len(&zstd_sizeless(&raw)), None);
+    }
+
+    /// A zstd frame whose header declares no content size.
+    fn zstd_sizeless(raw: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = zstd::stream::write::Encoder::new(Vec::new(), ZSTD_LEVEL).unwrap();
+        enc.include_contentsize(false).unwrap();
+        enc.write_all(raw).unwrap();
+        enc.finish().unwrap()
     }
 
     /// An upload is finishable only in the repository it was started in: otherwise a

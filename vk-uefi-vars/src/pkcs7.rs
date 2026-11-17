@@ -7,7 +7,7 @@
 
 use crypto_bigint::BoxedUint;
 use rsa::traits::{PublicKeyParts, SignatureScheme};
-use rsa::{Pkcs1v15Sign, RsaPublicKey};
+use rsa::{Pkcs1v15Sign, PublicKey};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
@@ -54,7 +54,7 @@ impl Hash {
         }
     }
 
-    fn verify(self, key: &RsaPublicKey, digest: &[u8], signature: &[u8]) -> bool {
+    fn verify(self, key: &PublicKey, digest: &[u8], signature: &[u8]) -> bool {
         let scheme = match self {
             Hash::Sha1 => Pkcs1v15Sign::new::<Sha1>(),
             Hash::Sha256 => Pkcs1v15Sign::new::<Sha256>(),
@@ -75,7 +75,7 @@ pub struct Certificate<'a> {
     serial: &'a [u8],
     issuer: &'a [u8],
     pub subject: &'a [u8],
-    key: Option<RsaPublicKey>,
+    key: Option<PublicKey>,
     subject_key_id: Option<&'a [u8]>,
 }
 
@@ -155,7 +155,7 @@ const MIN_RSA_BITS: u32 = 1024;
 const MAX_RSA_BITS: usize = 16384;
 
 /// An rsaEncryption SubjectPublicKeyInfo's key.
-pub(crate) fn rsa_key(spki: &[u8]) -> Option<RsaPublicKey> {
+pub(crate) fn rsa_key(spki: &[u8]) -> Option<PublicKey> {
     let (alg, rest) = der::expect(spki, der::SEQUENCE)?;
     if algorithm_oid(alg.value)? != oids::RSA_ENCRYPTION {
         return None;
@@ -170,12 +170,12 @@ pub(crate) fn rsa_key(spki: &[u8]) -> Option<RsaPublicKey> {
     let e_bits = u32::try_from(e.len().checked_mul(8)?).ok()?;
     let n = BoxedUint::from_be_slice(n, n_bits).ok()?;
     let e = BoxedUint::from_be_slice(e, e_bits).ok()?;
-    if n.bits() < MIN_RSA_BITS {
+    if n.bit_width() < MIN_RSA_BITS {
         return None;
     }
     // Bounded: the guest picks the keys of the chains it sends, and a huge modulus or exponent
     // would hold the vCPU in the verification for minutes.
-    RsaPublicKey::new_with_max_size(n, e, MAX_RSA_BITS).ok()
+    PublicKey::new_with_size_limits(n, e, PublicKey::MIN_SIZE..=MAX_RSA_BITS).ok()
 }
 
 fn read_tlv(input: &[u8]) -> Option<(Tlv<'_>, &[u8])> {

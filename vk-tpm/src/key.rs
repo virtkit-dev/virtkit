@@ -4,7 +4,7 @@
 //! LoadExternal, ReadPublic, ObjectChangeAuth, Unseal; and EvictControl). How an object is
 //! wrapped under its parent and checked before it loads is `protection.rs`.
 
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey;
 use zeroize::Zeroizing;
 
 use crate::alg::{Hash, MAX_DIGEST, TPM_ALG_NULL};
@@ -62,7 +62,7 @@ pub struct Key {
     /// The persistent handle a copy was loaded from, for one command.
     pub evict: Option<u32>,
     /// Its RSA private key, rebuilt whenever the sensitive area is loaded; never stored.
-    rsa: Option<Box<RsaPrivateKey>>,
+    rsa: Option<Box<PrivateKey>>,
 }
 
 impl Key {
@@ -107,7 +107,7 @@ impl Key {
         !self.external && !self.public_only() && self.public.is_storage_parent()
     }
 
-    pub fn rsa(&self) -> Result<&RsaPrivateKey> {
+    pub fn rsa(&self) -> Result<&PrivateKey> {
         self.rsa.as_deref().ok_or(Rc::FAILURE)
     }
 

@@ -12,7 +12,7 @@
 use crypto_bigint::BoxedUint;
 use getrandom::rand_core::UnwrapErr;
 use rsa::traits::{PublicKeyParts, SignatureScheme};
-use rsa::{Pkcs1v15Sign, RsaPrivateKey};
+use rsa::{Pkcs1v15Sign, PrivateKey};
 use sha2::{Digest, Sha256};
 
 use super::*;
@@ -238,7 +238,7 @@ fn cn(name: &str) -> Vec<u8> {
 
 /// A key and its self-signed certificate.
 struct Signer {
-    key: RsaPrivateKey,
+    key: PrivateKey,
     cert: Vec<u8>,
     name: Vec<u8>,
 }
@@ -249,7 +249,7 @@ fn signer(common_name: &str) -> Signer {
 
 /// A key `rng` makes, and its self-signed certificate: the same ones for the same `rng` state.
 fn signer_from(common_name: &str, rng: &mut impl getrandom::rand_core::CryptoRng) -> Signer {
-    let key = RsaPrivateKey::new(rng, 1024).unwrap();
+    let key = PrivateKey::new(rng, 1024).unwrap();
     let name = cn(common_name);
     let n = key.n().to_be_bytes();
     let e = BoxedUint::from(65537u32).to_be_bytes();

@@ -149,7 +149,7 @@ cfb-mode = { version = "0.9", features = ["zeroize"] }
 # vk-tpm: RSA keys (EK, SRK, BitLocker, PCP KSP). RustCrypto; already in the tree via russh. The
 # release candidate on constant-time crypto-bigint, not 0.9: RUSTSEC-2023-0071 (Marvin) is fixed
 # there (.cargo/audit.toml). `hazmat` for the raw RSA a TPM offers (TPM_ALG_NULL padding).
-rsa = { version = "0.10.0-rc.18", default-features = false, features = ["std", "hazmat"] }
+rsa = { version = "0.10.0-rc.18", default-features = false, features = ["std", "hazmat", "pkcs1v15"] }
 # vk-tpm: the prime search of deterministic RSA primary keys, and big-integer arithmetic the
 # reference implementation specifies (the ECC private scalar of a primary). Both already in the
 # tree via rsa.
