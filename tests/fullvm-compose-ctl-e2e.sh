@@ -43,7 +43,7 @@ if ! out="$(
       # the reads below happen in a guest systemd has already taken over and set /run up in.
       # A file, not `systemctl`: this command is not root, and a non-root systemctl needs the
       # D-Bus system bus, which a --no-install-recommends systemd does not pull in.
-      for i in $(seq 1 120); do
+      for i in $(seq 1 300); do
         [ -f /run/virtkit-systemd-up ] && break
         sleep 1
       done

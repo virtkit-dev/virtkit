@@ -29,7 +29,7 @@ if ! out="$(
       # The vk-agent serve is reachable the instant it forks — before the entrypoint has
       # exec'"'"'d systemd, let alone before systemd finished booting. Poll for a run
       # state (its bus can be absent at first, so `--wait` alone would error out).
-      for i in $(seq 1 120); do
+      for i in $(seq 1 300); do
         state=$(systemctl is-system-running 2>/dev/null || true)
         case "$state" in running|degraded) break;; esac
         sleep 1

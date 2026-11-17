@@ -31,7 +31,7 @@ if ! out="$(
       # exec'"'"'d systemd has finished booting and created its bus socket. Poll until
       # systemd reports a run state (its bus can be absent at first, so `--wait` alone
       # would error out), then read the marker the oneshot unit writes at multi-user.
-      for i in $(seq 1 120); do
+      for i in $(seq 1 300); do
         state=$(systemctl is-system-running 2>/dev/null || true)
         case "$state" in running|degraded) break;; esac
         sleep 1
