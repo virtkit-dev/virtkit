@@ -18,12 +18,12 @@ use anyhow::{Context, Result, bail};
 use crate::ext4_read::{Ext4Reader, FileType};
 use crate::run::KernelSource;
 
-/// Boot-critical modules, in load order. A stock Debian bookworm kernel is
-/// modular, so the preinit must `insmod` these before mounting `/dev/vda`:
-/// virtio-pci + virtio-blk + ext4 (and their dependencies) reach the rootfs; the
-/// last three give the reparented `vk-agent serve` its AF_VSOCK transport. Any
-/// name absent from the image (e.g. `virtio_ring`, often built into `virtio.ko`)
-/// is skipped with a warning.
+/// Boot-critical modules. A stock Debian bookworm kernel is modular, so the
+/// preinit must `insmod` these before mounting `/dev/vda`: virtio-pci + virtio-blk +
+/// ext4 reach the rootfs; the last three give the reparented `vk-agent serve` its
+/// AF_VSOCK transport. Dependencies from the image's `modules.dep` load first,
+/// including modules not listed here; this list orders the traversal roots. Missing
+/// modules (e.g. `virtio_ring` when built in) are skipped with a warning.
 const WANTED_MODULES: &[&str] = &[
     "virtio",
     "virtio_ring",
@@ -42,7 +42,6 @@ const WANTED_MODULES: &[&str] = &[
     "fuse",
     "virtiofs",
     // virtio_net and its failover dependencies provide eth0 for --net under libkrun.
-    // Load order is explicit: dependencies are not followed through modules.dep.
     "failover",
     "net_failover",
     "virtio_net",
@@ -369,21 +368,27 @@ impl std::io::Write for CappedWriter {
 }
 
 /// Resolve wanted module basenames to their relative paths (under
-/// `/lib/modules/<ver>`) from a `modules.dep` body, preserving the wanted order
-/// and skipping any not present. Each `modules.dep` line is `path.ko:`
-/// optionally followed by space-separated dependency paths; the leading token is
-/// the module's own relative path, and its filename is `<name>.ko`.
+/// `/lib/modules/<ver>`) from `modules.dep`. Visit roots in wanted order, adding
+/// dependencies before each module, including dependencies not wanted themselves.
+/// Skip missing wanted modules. Each `modules.dep` line gives the module's relative
+/// path (`path.ko:`), optionally followed by space-separated dependency paths;
+/// the module's filename is `<name>.ko`.
 fn resolve_module_paths(dep_text: &str, wanted: &[&str]) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
     // basename ("virtio_pci") -> relative path ("kernel/drivers/virtio/virtio_pci.ko")
-    let mut by_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut by_name: HashMap<&str, &str> = HashMap::new();
+    // relative path -> dependency paths
+    let mut deps: HashMap<&str, Vec<&str>> = HashMap::new();
     for line in dep_text.lines() {
-        let path = match line.split_once(':') {
-            Some((p, _)) => p.trim(),
-            None => line.trim(),
+        let (path, needs) = match line.split_once(':') {
+            Some((p, rest)) => (p.trim(), rest),
+            None => (line.trim(), ""),
         };
         if path.is_empty() {
             continue;
         }
+        deps.entry(path)
+            .or_insert_with(|| needs.split_whitespace().collect());
         let file = path.rsplit('/').next().unwrap_or(path);
         // Accept an optional compression suffix (Debian .ko.xz, others .ko.zst/.ko.gz)
         // so a modular distro kernel resolves; the compressed path is kept as the value
@@ -395,21 +400,36 @@ fn resolve_module_paths(dep_text: &str, wanted: &[&str]) -> Vec<String> {
             .or_else(|| file.strip_suffix(".gz"))
             .unwrap_or(file);
         if let Some(base) = stem.strip_suffix(".ko") {
-            by_name
-                .entry(base.to_string())
-                .or_insert_with(|| path.to_string());
+            by_name.entry(base).or_insert(path);
         }
     }
-    wanted
-        .iter()
-        .filter_map(|name| match by_name.get(*name) {
-            Some(rel) => Some(rel.clone()),
-            None => {
-                eprintln!("virtkit: module {name} not in modules.dep — skipping");
-                None
+    let mut order = Vec::new();
+    let mut seen = HashSet::new();
+    for name in wanted {
+        let Some(&root) = by_name.get(name) else {
+            eprintln!("virtkit: module {name} not in modules.dep — skipping");
+            continue;
+        };
+        // Emit dependencies first in depth-first order. Use a stack rather than
+        // recursion for image-supplied modules.dep; cut cycles where they close.
+        let mut stack = vec![(root, false)];
+        while let Some((path, deps_done)) = stack.pop() {
+            if deps_done {
+                order.push(path.to_string());
+                continue;
             }
-        })
-        .collect()
+            if !seen.insert(path) {
+                continue;
+            }
+            stack.push((path, true));
+            for &dep in deps.get(path).into_iter().flatten().rev() {
+                if !seen.contains(dep) {
+                    stack.push((dep, false));
+                }
+            }
+        }
+    }
+    order
 }
 
 #[cfg(test)]
@@ -456,6 +476,39 @@ kernel/net/vmw_vsock/vsock.ko:
                 "kernel/fs/ext4/ext4.ko".to_string(),
                 "kernel/net/vmw_vsock/vsock.ko".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn resolve_module_paths_loads_dependencies_first() {
+        // Debian 6.1.0-55: virtio needs virtio_ring, listed later in wanted;
+        // ext4 needs crc16, absent from wanted.
+        let dep = "\
+kernel/drivers/virtio/virtio.ko.xz: kernel/drivers/virtio/virtio_ring.ko.xz
+kernel/drivers/virtio/virtio_ring.ko.xz:
+kernel/drivers/virtio/virtio_pci.ko.xz: kernel/drivers/virtio/virtio_ring.ko.xz kernel/drivers/virtio/virtio.ko.xz
+kernel/fs/ext4/ext4.ko.xz: kernel/lib/crc16.ko.xz
+kernel/lib/crc16.ko.xz:
+";
+        let got = resolve_module_paths(dep, &["virtio", "virtio_ring", "virtio_pci", "ext4"]);
+        assert_eq!(
+            got,
+            vec![
+                "kernel/drivers/virtio/virtio_ring.ko.xz".to_string(),
+                "kernel/drivers/virtio/virtio.ko.xz".to_string(),
+                "kernel/drivers/virtio/virtio_pci.ko.xz".to_string(),
+                "kernel/lib/crc16.ko.xz".to_string(),
+                "kernel/fs/ext4/ext4.ko.xz".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn resolve_module_paths_survives_a_cycle() {
+        let dep = "kernel/a.ko: kernel/b.ko\nkernel/b.ko: kernel/a.ko\n";
+        assert_eq!(
+            resolve_module_paths(dep, &["a"]),
+            vec!["kernel/b.ko".to_string(), "kernel/a.ko".to_string()],
         );
     }
 

@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Fix boot panics with `--kernel image`.** Boot modules now load in dependency
+  order from the image's `modules.dep`, replacing the fixed order. This fixes
+  Debian bookworm kernels 6.1.0-55 and later, where `virtio` needs `virtio_ring`
+  but was loaded first ([#11](https://github.com/virtkit-dev/virtkit/issues/11)).
+
 ## [0.112.2] - 2026-11-17
 
 ### Fixed
