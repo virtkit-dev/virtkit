@@ -36,7 +36,7 @@ if [ -z "${VK_TESTKIT:-}" ]; then
   # CI supplies VK as an artifact path; dev.sh locates vk through PATH.
   bin=$(mktemp -d)
   ln -s "$(realpath "$(command -v "${VK:-./dist/vk}")")" "$bin/vk"
-  PATH="$bin:$PATH" "$here/dev.sh" build -p vk-testkit >/dev/null 2>&1 ||
+  PATH="$bin:$PATH" "$here/dev.sh" build -p vk-testkit ||
     { rm -rf "$bin"; echo "FAIL: building vk-testkit (./dev.sh build -p vk-testkit)"; exit 1; }
   rm -rf "$bin"
   VK_TESTKIT=$here/target/x86_64-unknown-linux-musl/debug/vk-testkit
