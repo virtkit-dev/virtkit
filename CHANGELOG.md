@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.112.3] - 2026-11-17
+
 ### Fixed
 
 - **Fix boot panics with `--kernel image`.** Boot modules now load in dependency
@@ -5590,7 +5592,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.112.2...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.112.3...HEAD
+[0.112.3]: https://github.com/virtkit-dev/virtkit/compare/v0.112.2...v0.112.3
 [0.112.2]: https://github.com/virtkit-dev/virtkit/compare/v0.112.1...v0.112.2
 [0.112.1]: https://github.com/virtkit-dev/virtkit/compare/v0.112.0...v0.112.1
 [0.112.0]: https://github.com/virtkit-dev/virtkit/compare/v0.111.0...v0.112.0
