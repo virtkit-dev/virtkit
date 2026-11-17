@@ -6,6 +6,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Return more idle guest memory to the host.** Guests running systemd services or
+  containers can now trim file cache those workloads haven't used recently, including
+  cache left behind after they exit.
 - **Setting `reclaim` to a size or share leaves the guest's `/sys/fs/cgroup` unchanged.**
   In guests with swap, trimming asks the kernel to spare anonymous pages when it supports
   that option.

@@ -27,7 +27,8 @@
 //! whose kernel was built without `CONFIG_PSI` falls back to a `MemAvailable` gate rather
 //! than trimming ungated.
 
-use std::ffi::CStr;
+use std::collections::HashSet;
+use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
@@ -220,7 +221,7 @@ impl Gate {
     }
 }
 
-/// One generation of the root memcg's LRU, as `lru_gen` lists it.
+/// One generation of an lruvec, as `lru_gen` lists it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Gen {
     seq: u64,
@@ -230,16 +231,30 @@ struct Gen {
     file: u64,
 }
 
-/// The multi-gen LRU control handle: the root memcg and node the commands address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Mglru {
+/// An `lru_gen` command addresses one memcg on one node. File pages stay charged to the
+/// memcg that brought them into cache. A systemd slice or container can therefore hold
+/// generations of file pages that eviction from the root lruvec cannot reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Lruvec {
     memcg: u32,
     node: u32,
+    /// The cgroup path, `/` for the root and empty when memcgs are compiled out.
+    path: String,
+    /// A removed cgroup, such as a finished systemd unit, can still hold charged pages.
+    /// Once listed with id 0, it can be reached through ancestor reclaim but has no
+    /// usable `lru_gen` id.
+    dying: bool,
+    /// Oldest first.
+    gens: Vec<Gen>,
 }
 
+/// The multi-gen LRU control handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Mglru;
+
 impl Mglru {
-    /// Mount debugfs, switch the multi-gen LRU on and find the root memcg. `Err` on a kernel
-    /// without any of it — the caller falls back to the floor.
+    /// Mount debugfs, enable the multi-gen LRU and require a usable lruvec listing.
+    /// On failure the caller tries floor-based reclaim.
     fn open() -> Result<Self> {
         // The mount below is the real check: a directory that is already there is fine.
         let _ = std::fs::create_dir_all(DEBUGFS);
@@ -254,61 +269,57 @@ impl Mglru {
         // page-table scan in `age` read accessed bits rather than guess them.
         std::fs::write(LRU_GEN_ENABLED, "y")
             .with_context(|| format!("enabling the multi-gen LRU ({LRU_GEN_ENABLED})"))?;
-        let text =
-            std::fs::read_to_string(LRU_GEN).with_context(|| format!("reading {LRU_GEN}"))?;
-        let (memcg, node) = parse_root(&text).context("no root memcg in lru_gen")?;
-        Ok(Mglru { memcg, node })
-    }
-
-    /// The root memcg's generations on our node, oldest first. A listing that does not come
-    /// back as the kernel's one-to-four contiguous sequence numbers is refused rather than
-    /// acted on: a line dropped by [`parse_gens`] would leave `first()` a generation younger
-    /// than the oldest, and `evict_oldest` would then evict pages that are still warm.
-    fn gens(&self) -> Result<Vec<Gen>> {
-        let text =
-            std::fs::read_to_string(LRU_GEN).with_context(|| format!("reading {LRU_GEN}"))?;
-        let gens = parse_gens(&text, self.memcg, self.node);
-        if !is_contiguous(&gens) {
-            bail!(
-                "unreadable {LRU_GEN} listing for memcg {} node {}",
-                self.memcg,
-                self.node
-            );
+        if Mglru.lruvecs()?.is_empty() {
+            bail!("no usable lruvec in {LRU_GEN}");
         }
-        Ok(gens)
+        Ok(Mglru)
     }
 
-    fn command(&self, cmd: &str) -> io::Result<()> {
+    /// Read the current lruvecs each round. Services and containers come and go, and
+    /// their memcg ids can be reused.
+    fn lruvecs(self) -> Result<Vec<Lruvec>> {
+        let text =
+            std::fs::read_to_string(LRU_GEN).with_context(|| format!("reading {LRU_GEN}"))?;
+        Ok(parse_lruvecs(&text))
+    }
+
+    fn command(self, cmd: &str) -> io::Result<()> {
         std::fs::write(LRU_GEN, cmd)
     }
 
-    /// Evict the oldest generation of file pages, at most `cap_pages` of it. The kernel keeps
-    /// the two youngest generations whatever is asked; with fewer than three there is
-    /// nothing old enough to evict yet. `Ok(false)` when nothing was asked for.
-    fn evict_oldest(&self, gens: &[Gen], cap_pages: u64) -> io::Result<bool> {
-        let (Some(oldest), Some(newest)) = (gens.first(), gens.last()) else {
-            return Ok(false);
+    /// Request eviction of the oldest eligible file pages (see [`evict_target`]).
+    /// Return the requested page count, or zero if no request was made.
+    fn evict_oldest(self, v: &Lruvec, budget: u64) -> io::Result<u64> {
+        let Some((seq, pages)) = evict_target(&v.gens, budget) else {
+            return Ok(0);
         };
-        if oldest.seq.saturating_add(2) > newest.seq {
-            return Ok(false);
-        }
-        self.command(&evict_cmd(self.memcg, self.node, oldest.seq, cap_pages))?;
-        Ok(true)
+        self.command(&evict_cmd(v.memcg, v.node, seq, pages))?;
+        Ok(pages)
     }
 
-    /// Open a new generation: the pages accessed from now on land in it, and everything
+    /// Open a generation in `v` for mapped pages the scan finds accessed. Everything
     /// else is one interval older. `force_scan` walks every page table so the accessed bits
     /// are read rather than guessed.
-    fn age(&self, gens: &[Gen]) -> io::Result<()> {
-        let Some(newest) = gens.last() else {
+    fn age(self, v: &Lruvec) -> io::Result<()> {
+        let Some(newest) = v.gens.last() else {
             return Ok(());
         };
-        match self.command(&age_cmd(self.memcg, self.node, newest.seq)) {
+        match self.command(&age_cmd(v.memcg, v.node, newest.seq)) {
             // EEXIST: the kernel aged on its own since we looked. Same outcome.
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
             other => other,
         }
     }
+}
+
+/// Target the oldest generation with file pages, up to `budget` pages. The kernel
+/// evicts through the named generation, so naming an earlier one reaches no file pages.
+/// The two youngest generations are ineligible.
+fn evict_target(gens: &[Gen], budget: u64) -> Option<(u64, u64)> {
+    let newest = gens.last()?;
+    let target = gens.iter().find(|g| g.file > 0)?;
+    let pages = target.file.min(budget);
+    (target.seq.saturating_add(2) <= newest.seq && pages > 0).then_some((target.seq, pages))
 }
 
 /// `- memcg node min_seq swappiness nr_to_reclaim`: evict at most `cap_pages` of generation
@@ -324,7 +335,7 @@ fn age_cmd(memcg: u32, node: u32, seq: u64) -> String {
 }
 
 /// Whether a generation listing is the one to four contiguous sequence numbers the kernel
-/// keeps. Empty is fine: a guest that has not faulted anything in yet.
+/// keeps. An empty listing is also accepted and gives the trimmer no target.
 fn is_contiguous(gens: &[Gen]) -> bool {
     gens.len() <= MAX_GENS
         && gens
@@ -332,60 +343,70 @@ fn is_contiguous(gens: &[Gen]) -> bool {
             .all(|w| w[1].seq == w[0].seq.saturating_add(1))
 }
 
-/// The `memcg <id> <path>` line of the root cgroup (path `/`, or the lone id-0 entry when
-/// memcgs are off) and the first `node <n>` under it.
-fn parse_root(text: &str) -> Option<(u32, u32)> {
-    let mut lines = text.lines();
-    let memcg = lines.by_ref().find_map(|l| {
-        let mut it = l.split_whitespace();
-        if it.next()? != "memcg" {
-            return None;
-        }
-        let id: u32 = it.next()?.parse().ok()?;
-        let path = it.next().unwrap_or("");
-        (path == "/" || path.is_empty()).then_some(id)
-    })?;
-    let node = lines.find_map(|l| {
-        let mut it = l.split_whitespace();
-        (it.next()? == "node").then(|| it.next()?.parse().ok())?
-    })?;
-    Some((memcg, node))
-}
-
-/// The generation lines under `memcg <id>` / `node <n>`: `seq age_ms anon file`, in the order
-/// the kernel prints them (oldest first).
-fn parse_gens(text: &str, memcg: u32, node: u32) -> Vec<Gen> {
-    let mut out = Vec::new();
-    let (mut in_memcg, mut in_node) = (false, false);
+/// Parse each `memcg <id> <path>` / `node <n>` block. Its `seq age_ms anon file` rows
+/// run oldest first. Discard blocks with malformed rows or invalid sequences. Skipping
+/// an unreadable oldest row could select a younger, still-warm generation for eviction.
+fn parse_lruvecs(text: &str) -> Vec<Lruvec> {
+    // The flag records whether every generation row in the block parsed.
+    let mut out: Vec<(Lruvec, bool)> = Vec::new();
+    // `memcg` holds the enclosing id and path. Either header ends the previous node
+    // block so rows after a malformed header cannot attach to it.
+    let mut memcg: Option<(u32, &str)> = None;
+    let mut in_block = false;
     for line in text.lines() {
         let mut it = line.split_whitespace();
         match it.next() {
             Some("memcg") => {
-                in_memcg = it.next().and_then(|s| s.parse::<u32>().ok()) == Some(memcg);
-                in_node = false;
+                in_block = false;
+                memcg = it.next().and_then(|s| s.parse::<u32>().ok()).map(|id| {
+                    // The path runs to the end of the line; a cgroup name may hold spaces.
+                    let rest = line.trim_start().strip_prefix("memcg").unwrap_or("");
+                    let path = rest.trim_start().split_once(char::is_whitespace);
+                    (id, path.map_or("", |(_, p)| p.trim()))
+                });
             }
             Some("node") => {
-                in_node = in_memcg && it.next().and_then(|s| s.parse::<u32>().ok()) == Some(node);
+                in_block = false;
+                if let (Some((memcg, path)), Some(node)) =
+                    (memcg, it.next().and_then(|s| s.parse::<u32>().ok()))
+                {
+                    let lruvec = Lruvec {
+                        memcg,
+                        node,
+                        path: path.to_owned(),
+                        dying: memcg == 0 && !path.is_empty() && path != "/",
+                        gens: Vec::new(),
+                    };
+                    out.push((lruvec, true));
+                    in_block = true;
+                }
             }
-            Some(seq) if in_node => {
+            Some(seq) => {
+                let Some((v, ok)) = out.last_mut().filter(|_| in_block) else {
+                    continue;
+                };
                 let mut nums = std::iter::once(seq)
                     .chain(it)
                     .map(|s| s.parse::<u64>().ok());
-                if let (Some(Some(seq)), Some(Some(age_ms)), Some(Some(anon)), Some(Some(file))) =
-                    (nums.next(), nums.next(), nums.next(), nums.next())
-                {
-                    out.push(Gen {
-                        seq,
-                        age_ms,
-                        anon,
-                        file,
-                    });
+                match (nums.next(), nums.next(), nums.next(), nums.next()) {
+                    (Some(Some(seq)), Some(Some(age_ms)), Some(Some(anon)), Some(Some(file))) => {
+                        v.gens.push(Gen {
+                            seq,
+                            age_ms,
+                            anon,
+                            file,
+                        })
+                    }
+                    _ => *ok = false,
                 }
             }
-            _ => {}
+            None => {}
         }
     }
-    out
+    out.into_iter()
+        .filter(|(v, ok)| *ok && is_contiguous(&v.gens))
+        .map(|(v, _)| v)
+        .collect()
 }
 
 /// Mount a kernel filesystem using its type as the source and the common mount flags.
@@ -401,6 +422,8 @@ fn mount(target: &str, fstype: &str) -> io::Result<()> {
 /// A detached cgroup2 mount (`fsopen` and `fsmount`) leaves `/sys/fs/cgroup` unchanged for
 /// the guest's init and container runtimes.
 struct Cgroup2 {
+    /// The mount's root directory, which is the hierarchy's root.
+    root: OwnedFd,
     /// The root cgroup's open `memory.reclaim` covers the whole hierarchy, including dying
     /// memcgs.
     reclaim: std::fs::File,
@@ -464,6 +487,7 @@ impl Cgroup2 {
         let reclaim = openat(&root, MEMORY_RECLAIM, libc::O_WRONLY)
             .context("opening the root cgroup's memory.reclaim (no memcg?)")?;
         Ok(Cgroup2 {
+            root,
             reclaim: reclaim.into(),
             swappiness: std::cell::Cell::new(true),
         })
@@ -493,6 +517,35 @@ impl Cgroup2 {
             };
         }
     }
+
+    /// Debugfs eviction bypasses the kernel's `memory.min` and `memory.low` checks. Leave
+    /// a cgroup to kernel reclaim if either setting reads nonzero there or in an ancestor.
+    /// Subtrees without a memory controller lack these files. Skip missing or unreadable
+    /// settings and continue checking the others.
+    fn protected(&self, path: &str) -> bool {
+        let mut dir = String::new();
+        for part in path.split('/').filter(|p| !p.is_empty()) {
+            if !dir.is_empty() {
+                dir.push('/');
+            }
+            dir.push_str(part);
+            for knob in ["memory.min", "memory.low"] {
+                let Ok(rel) = CString::new(format!("{dir}/{knob}")) else {
+                    return true;
+                };
+                let Ok(f) = openat(&self.root, &rel, libc::O_RDONLY) else {
+                    continue;
+                };
+                let mut text = String::new();
+                if io::Read::read_to_string(&mut std::fs::File::from(f), &mut text).is_ok()
+                    && text.trim() != "0"
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 /// `openat` below `dir`, close-on-exec.
@@ -507,26 +560,28 @@ fn openat(dir: &OwnedFd, rel: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> 
 }
 
 enum Mode {
-    Age(Mglru),
+    /// Without the cgroup2 handle, age live file cache without checking memory
+    /// protections or reclaiming cache from removed cgroups.
+    Age(Mglru, Option<Cgroup2>),
     Floor(u64, Cgroup2),
 }
 
 fn run(req: vk_core::reclaim::Request) -> Result<()> {
-    let mode = if req.by_age {
+    let mglru = if req.by_age {
         match Mglru::open() {
             Ok(m) => {
                 info!(
                     "vk-agent reclaim: evicting file cache not re-read within {}s (multi-gen LRU)",
                     u64::from(AGING_TICKS) * TICK.as_secs()
                 );
-                Mode::Age(m)
+                Some(m)
             }
             Err(e) => {
                 warn!(
                     "vk-agent reclaim: no multi-gen LRU control ({e:#}); trimming to a {} MiB floor",
                     req.floor_mib
                 );
-                Mode::Floor(req.floor_mib, Cgroup2::open()?)
+                None
             }
         }
     } else {
@@ -534,8 +589,21 @@ fn run(req: vk_core::reclaim::Request) -> Result<()> {
             "vk-agent reclaim: trimming file cache above {} MiB when idle",
             req.floor_mib
         );
-        Mode::Floor(req.floor_mib, Cgroup2::open()?)
+        None
     };
+    let mode = match (mglru, Cgroup2::open()) {
+        (Some(m), Ok(cg)) => Mode::Age(m, Some(cg)),
+        (Some(m), Err(e)) => {
+            warn!(
+                "vk-agent reclaim: {e:#}; aging file cache without checking cgroup protections \
+                 or reclaiming cache from removed cgroups"
+            );
+            Mode::Age(m, None)
+        }
+        (None, cg) => Mode::Floor(req.floor_mib, cg?),
+    };
+    // Paths seen dying in the previous round (see `drainable_pages`).
+    let mut dying = HashSet::new();
 
     let gate = Gate::detect();
     let mut reporter = Reporter::new();
@@ -565,8 +633,8 @@ fn run(req: vk_core::reclaim::Request) -> Result<()> {
             );
         } else {
             match &mode {
-                Mode::Age(mglru) if tick.is_multiple_of(AGING_TICKS) => {
-                    freed = age_round(mglru, before);
+                Mode::Age(mglru, cg) if tick.is_multiple_of(AGING_TICKS) => {
+                    freed = age_round(*mglru, cg.as_ref(), before, &mut dying);
                     rounds += 1;
                     cumulative += freed;
                     if rounds.is_multiple_of(SUMMARY_ROUNDS) {
@@ -577,18 +645,16 @@ fn run(req: vk_core::reclaim::Request) -> Result<()> {
                         );
                     }
                 }
-                Mode::Age(_) => {}
+                Mode::Age(..) => {}
                 Mode::Floor(floor_mib, cg) => {
                     if let Step::Reclaim(mib) = plan(before, *floor_mib) {
                         debug!("vk-agent reclaim: asking for {mib} MiB");
                         match cg.reclaim(mib) {
                             Ok(()) => freed = freed_since(before),
-                            Err(e) => {
-                                warn!(
-                                    "vk-agent reclaim: {}: {e}",
-                                    MEMORY_RECLAIM.to_string_lossy()
-                                )
-                            }
+                            Err(e) => warn!(
+                                "vk-agent reclaim: {}: {e}",
+                                MEMORY_RECLAIM.to_string_lossy()
+                            ),
                         }
                     }
                 }
@@ -609,38 +675,87 @@ fn freed_since(before: Meminfo) -> u64 {
         .unwrap_or(0)
 }
 
-/// One by-age round: evict the oldest generation (bounded), then open a new one. Returns the
-/// MiB that came free.
-fn age_round(mglru: &Mglru, before: Meminfo) -> u64 {
-    let gens = match mglru.gens() {
-        Ok(g) => g,
+/// Evict old file pages and age eligible live lruvecs. Use the remaining budget for
+/// root reclaim based on removed paths seen in consecutive rounds. Return the observed
+/// increase in free MiB after a successful request.
+fn age_round(
+    mglru: Mglru,
+    cg: Option<&Cgroup2>,
+    before: Meminfo,
+    dying: &mut HashSet<String>,
+) -> u64 {
+    let lruvecs = match mglru.lruvecs() {
+        Ok(v) => v,
         Err(e) => {
             warn!("vk-agent reclaim: {e:#}");
             return 0;
         }
     };
-    // MiB → 4 KiB pages.
-    let cap_pages = (before.total / EVICT_DIVISOR).max(MIN_STEP_MIB) * 256;
+    // The round's budget across every lruvec, MiB → 4 KiB pages.
+    let mut budget = (before.total / EVICT_DIVISOR).max(MIN_STEP_MIB) * 256;
     let started = Instant::now();
-    let evicted = match mglru.evict_oldest(&gens, cap_pages) {
-        Ok(asked) => asked,
-        Err(e) => {
-            warn!("vk-agent reclaim: evicting the oldest generation: {e}");
-            false
+    let mut evicted = false;
+    let live = lruvecs
+        .iter()
+        .filter(|v| !v.dying && v.gens.iter().any(|g| g.file > 0))
+        .filter(|v| !cg.is_some_and(|cg| cg.protected(&v.path)));
+    for v in live {
+        // A memcg removed after the listing can return `EINVAL`.
+        match mglru.evict_oldest(v, budget) {
+            Ok(asked) => {
+                budget -= asked;
+                evicted |= asked > 0;
+            }
+            Err(e) => debug!("vk-agent reclaim: evicting from memcg {}: {e}", v.memcg),
         }
-    };
-    let freed = if evicted { freed_since(before) } else { 0 };
-    if let Err(e) = mglru.age(&gens) {
-        warn!("vk-agent reclaim: aging: {e}");
+        if let Err(e) = mglru.age(v) {
+            debug!("vk-agent reclaim: aging memcg {}: {e}", v.memcg);
+        }
     }
-    let oldest_s = gens.first().map(|g| g.age_ms / 1000).unwrap_or(0);
+    // Neither interface can target dying memcgs alone. The eviction above skips them, and
+    // the kernel demotes offlined memcgs, so root reclaim tends to reach them early. Its
+    // scan starts in a random bin and can take old pages from live memcgs too. Eligible
+    // dying pages and the remaining budget cap the request. Pressure suspends the round.
+    let dying_mib = drainable_pages(&lruvecs, dying).min(budget) / 256;
+    if let Some(cg) = cg
+        && dying_mib > 0
+    {
+        match cg.reclaim(dying_mib) {
+            Ok(()) => evicted = true,
+            Err(e) => warn!(
+                "vk-agent reclaim: {}: {e}",
+                MEMORY_RECLAIM.to_string_lossy()
+            ),
+        }
+    }
+    let freed = if evicted { freed_since(before) } else { 0 };
     debug!(
-        "vk-agent reclaim: evicted {freed} MiB from the {oldest_s}s-old generation in {}ms, \
-         {} MiB cached",
+        "vk-agent reclaim: free memory gained {freed} MiB, {} lruvecs listed ({dying_mib} MiB \
+         eligible for root reclaim) in {}ms, estimated {} MiB cached",
+        lruvecs.len(),
         started.elapsed().as_millis(),
         before.reclaimable.saturating_sub(freed)
     );
     freed
+}
+
+/// Count file pages at dying paths seen in both rounds, then replace `prev` with this
+/// round's paths. Dying memcgs lack a usable id. Waiting a round before counting a new
+/// path gives another cgroup time to read its cache again.
+fn drainable_pages(lruvecs: &[Lruvec], prev: &mut HashSet<String>) -> u64 {
+    let now: HashSet<String> = lruvecs
+        .iter()
+        .filter(|v| v.dying)
+        .map(|v| v.path.clone())
+        .collect();
+    let pages = lruvecs
+        .iter()
+        .filter(|v| v.dying && prev.contains(&v.path))
+        .flat_map(|v| &v.gens)
+        .map(|g| g.file)
+        .sum();
+    *prev = now;
+    pages
 }
 
 /// The free-page reporting order: single pages for a while after memory came free, whole
@@ -794,24 +909,16 @@ mod tests {
     }
 
     #[test]
-    fn lru_gen_root_is_the_first_root_like_memcg() {
-        // Either shape is the whole guest: a `/` path with memcgs on, an empty one without.
-        // A slice like /system.slice/foo is neither, so it is never taken for the root.
-        assert_eq!(parse_root(LRU_GEN), Some((1, 0)));
-        assert_eq!(parse_root(LRU_GEN_NO_MEMCG), Some((0, 0)));
+    fn lru_gen_lists_every_memcg_and_node_oldest_first() {
+        // A systemd slice can hold file cache outside the root's generations.
+        let v = parse_lruvecs(LRU_GEN);
         assert_eq!(
-            parse_root("memcg    27 /system.slice/foo\n node     0\n"),
-            None
+            v.iter().map(|v| (v.memcg, v.node)).collect::<Vec<_>>(),
+            [(1, 0), (27, 0)]
         );
-        assert_eq!(parse_root("nothing here\n"), None);
-    }
-
-    #[test]
-    fn lru_gen_generations_are_read_oldest_first_for_the_addressed_memcg() {
-        let gens = parse_gens(LRU_GEN, 1, 0);
-        assert_eq!(gens.len(), 4);
+        assert_eq!(v[0].gens.len(), 4);
         assert_eq!(
-            gens[0],
+            v[0].gens[0],
             Gen {
                 seq: 12,
                 age_ms: 183042,
@@ -819,12 +926,90 @@ mod tests {
                 file: 262144
             }
         );
-        assert_eq!(gens[3].seq, 15);
-        // Another memcg's lines are not ours, nor another node's.
-        assert_eq!(parse_gens(LRU_GEN, 27, 0).len(), 2);
-        assert!(parse_gens(LRU_GEN, 1, 1).is_empty());
+        assert_eq!(v[0].gens[3].seq, 15);
+        assert_eq!(v[1].gens.len(), 2);
         // The memcg-less shape reads the same way, under id 0.
-        assert_eq!(parse_gens(LRU_GEN_NO_MEMCG, 0, 0).len(), 2);
+        let v = parse_lruvecs(LRU_GEN_NO_MEMCG);
+        assert_eq!((v[0].memcg, v[0].node, v[0].gens.len()), (0, 0, 2));
+        assert!(parse_lruvecs("nothing here\n").is_empty());
+        assert!(!parse_lruvecs(LRU_GEN).iter().any(|v| v.dying));
+        assert!(!parse_lruvecs(LRU_GEN_NO_MEMCG)[0].dying);
+    }
+
+    #[test]
+    fn a_removed_cgroup_is_drained_once_it_has_been_dying_for_a_round() {
+        // A finished oneshot unit: its id is gone, its pages are not.
+        let readbig = "memcg     0 /system.slice/readbig.service\n\
+                       \x20node     0\n\
+                       \x20         1     312728          0     153601 \n";
+        let v = parse_lruvecs(&format!("{LRU_GEN}{readbig}"));
+        assert_eq!(
+            v.iter()
+                .map(|v| (v.memcg, v.path.as_str(), v.dying))
+                .collect::<Vec<_>>(),
+            [
+                (1, "/", false),
+                (27, "/system.slice/foo", false),
+                (0, "/system.slice/readbig.service", true)
+            ]
+        );
+        let mut prev = HashSet::new();
+        // First sighting starts the grace period.
+        assert_eq!(drainable_pages(&v, &mut prev), 0);
+        // A second sighting makes those pages eligible.
+        assert_eq!(drainable_pages(&v, &mut prev), 153601);
+        // A different path starts a new grace period.
+        let other = readbig.replace("readbig", "other");
+        let v2 = parse_lruvecs(&format!("{LRU_GEN}{other}"));
+        assert_eq!(drainable_pages(&v2, &mut prev), 0);
+        assert_eq!(drainable_pages(&parse_lruvecs(LRU_GEN), &mut prev), 0);
+    }
+
+    #[test]
+    fn a_header_that_does_not_read_takes_its_rows_with_it() {
+        // Rows after a malformed header could corrupt the preceding sequence.
+        // Here row 14 would silently extend memcg 0's rows 12 and 13.
+        let text = format!(
+            "{LRU_GEN_NO_MEMCG}memcg     x /broken\n\
+                            \x20node     0\n\
+                            \x20        14         10          0         64 \n"
+        );
+        let v = parse_lruvecs(&text);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].gens.len(), 2);
+        let text = format!(
+            "{LRU_GEN_NO_MEMCG}\x20node     z\n\
+                            \x20        14         10          0         64 \n"
+        );
+        assert_eq!(parse_lruvecs(&text)[0].gens.len(), 2);
+    }
+
+    #[test]
+    fn eviction_targets_the_oldest_generation_holding_file_pages() {
+        let gens = |files: &[u64]| -> Vec<Gen> {
+            files
+                .iter()
+                .zip(10..)
+                .map(|(&file, seq)| Gen {
+                    seq,
+                    age_ms: 0,
+                    anon: 1,
+                    file,
+                })
+                .collect()
+        };
+        assert_eq!(
+            evict_target(&gens(&[100, 50, 10, 1]), 1000),
+            Some((10, 100))
+        );
+        // An anon-only oldest generation: naming it would evict nothing.
+        assert_eq!(evict_target(&gens(&[0, 50, 10, 1]), 1000), Some((11, 50)));
+        assert_eq!(evict_target(&gens(&[100, 50, 10, 1]), 30), Some((10, 30)));
+        assert_eq!(evict_target(&gens(&[100, 50, 10, 1]), 0), None);
+        // The two youngest are never old enough.
+        assert_eq!(evict_target(&gens(&[0, 0, 10, 1]), 1000), None);
+        assert_eq!(evict_target(&gens(&[5, 1]), 1000), None);
+        assert_eq!(evict_target(&[], 1000), None);
     }
 
     #[test]
@@ -846,6 +1031,11 @@ mod tests {
         assert!(!is_contiguous(&seqs(&[12, 14])));
         // More generations than the kernel keeps means we are not reading what we think.
         assert!(!is_contiguous(&seqs(&[12, 13, 14, 15, 16])));
+        // An unreadable first row invalidates only its block, even when the remaining
+        // rows are contiguous.
+        let bad = LRU_GEN.replace("        12     183042", "        zz     183042");
+        let v = parse_lruvecs(&bad);
+        assert_eq!(v.iter().map(|v| v.memcg).collect::<Vec<_>>(), [27]);
     }
 
     #[test]
