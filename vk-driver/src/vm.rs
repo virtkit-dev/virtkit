@@ -1839,13 +1839,13 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
 
     // Idle page-cache trimming (`[executor.vm] reclaim`): the job guest gives file cache it stopped
     // using back to the host whenever it is not under memory pressure, so a job's read-once
-    // trees stop counting against the box once it moves on. The job guest always keeps the
-    // agent as PID 1, so `[executor.vm] balloon` is the only axis that can take the knob away —
-    // without free-page reporting the job would lose its cache and the host would gain
-    // nothing. Its services keep a balloon of their own whatever this says, so `plan_services`
+    // trees stop counting against host RAM once the job moves on. Without
+    // `[executor.vm] balloon`, trimming would evict cache without returning RAM through
+    // free-page reporting. Linux services have their own balloons. When services have no
+    // reclaim policy of their own, `plan_services`
     // hands them `[executor.vm] reclaim` regardless.
     let reclaim = vm_reclaim(cfg)?;
-    if crate::run::wants_reclaim(crate::run::InitSource::Default, cfg.executor.vm.balloon) {
+    if cfg.executor.vm.balloon {
         crate::run::push_knob(&mut cmdline, &crate::run::reclaim_cmdline(reclaim, &mem)?);
     }
 

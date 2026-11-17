@@ -746,17 +746,11 @@ pub fn boot_unit(
         }
         // Idle page-cache trimming: a service that idles between requests gives the file
         // cache it piled up back to the host, not just the pages its processes freed. A
-        // service always gets a balloon of its own (below), so only its init axis can take
-        // the knob away.
-        if crate::run::wants_reclaim(svc.init, true) {
-            crate::run::push_knob(
-                &mut cmdline,
-                &crate::run::reclaim_cmdline(
-                    crate::run::effective_reclaim(svc.reclaim, None),
-                    &mem,
-                )?,
-            );
-        }
+        // Linux service has its own balloon in every init mode.
+        crate::run::push_knob(
+            &mut cmdline,
+            &crate::run::reclaim_cmdline(crate::run::effective_reclaim(svc.reclaim, None), &mem)?,
+        );
         if !overlay_tags.is_empty() {
             cmdline.push_str(&format!(
                 " VIRTKIT_VIRTIOFS_OVERLAY={}",

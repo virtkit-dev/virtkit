@@ -88,17 +88,28 @@ const SUMMARY_ROUNDS: u32 = 60;
 /// The kernel keeps at most this many multi-gen LRU generations (`MAX_NR_GENS`).
 const MAX_GENS: usize = 4;
 
-/// CLI entry for the loop `init` forks (`vk-agent reclaim <spec>`, the cmdline value). Errors
-/// go to the console: a guest that cannot trim still runs.
+/// The flag that keeps the trimmer's debugfs mount out of the guest's view.
+pub const PRIVATE_MOUNTS: &str = "--private-mounts";
+
+/// Init forks `vk-agent reclaim [--private-mounts] <spec>` with the kernel cmdline value.
+/// Errors go to the guest console and boot continues.
 pub fn main(args: &[String]) -> i32 {
-    let [spec] = args else {
-        eprintln!("usage: vk-agent reclaim [auto:]<floor_mib>");
-        return 2;
+    let (private, spec) = match args {
+        [flag, spec] if flag == PRIVATE_MOUNTS => (true, spec),
+        [spec] => (false, spec),
+        _ => {
+            eprintln!("usage: vk-agent reclaim [{PRIVATE_MOUNTS}] [auto:]<floor_mib>");
+            return 2;
+        }
     };
     let Some(req) = vk_core::reclaim::parse_cmdline_value(spec) else {
         eprintln!("vk-agent reclaim: {spec:?} is not [auto:]<floor_mib>");
         return 2;
     };
+    if private && let Err(e) = private_mount_ns() {
+        eprintln!("vk-agent reclaim: {e:#}");
+        return 1;
+    }
     match run(req) {
         Ok(()) => 0,
         Err(e) => {
@@ -417,6 +428,33 @@ fn mount(target: &str, fstype: &str) -> io::Result<()> {
         fstype,
         libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
     )
+}
+
+/// Isolate [`run`]'s mounts so the trimmer and image init can each mount `/sys/kernel/debug`.
+/// Init attempts to mount `/proc` and `/sys` before forking. The new namespace inherits
+/// those mounts if present.
+fn private_mount_ns() -> Result<()> {
+    // SAFETY: The trimmer is single-threaded and unshare takes only flags.
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        return Err(io::Error::last_os_error()).context("unshare(CLONE_NEWNS)");
+    }
+    // A copy of a shared mount would still propagate both ways.
+    let root = c"/";
+    // SAFETY: valid NUL-terminated path; null source/type/data are allowed for a
+    // propagation change.
+    let rc = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            root.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error()).context("making / private");
+    }
+    Ok(())
 }
 
 /// A detached cgroup2 mount (`fsopen` and `fsmount`) leaves `/sys/fs/cgroup` unchanged for

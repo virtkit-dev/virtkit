@@ -6,6 +6,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Give idle file cache back to the host with `--init image` and `--init entrypoint`.**
+  These guests now honor `--reclaim` and `x-virtkit.reclaim`.
 - **Return freed guest memory to the host with `--kernel image`.** The guest loads
   the balloon driver at boot when the image kernel supplies it as a module.
 - **Return more idle guest memory to the host.** Guests running systemd services or

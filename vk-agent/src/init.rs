@@ -75,10 +75,9 @@
 //!   VIRTKIT_RECLAIM      auto:<floor_mib> | <floor_mib> — fork the page-cache trimmer:
 //!                        while this guest is not under memory pressure, file cache it has
 //!                        not touched for a while (`auto`, via the multi-gen LRU) or above
-//!                        the floor is reclaimed and reported back to the host. The trimmer
-//!                        mounts what its mode needs — debugfs, or cgroup2 for the floor
-//!                        (the `reclaim` module). Agent-as-PID-1 boots only; the host sends
-//!                        it to no other
+//!                        the floor is reclaimed and reported back to the host. The `reclaim`
+//!                        module mounts debugfs for age-based trimming. On image-init boots,
+//!                        the trimmer uses a private mount namespace.
 //!   VIRTKIT_MEMMARK=1    keep this guest's peak memory demand (MemTotal - MemAvailable)
 //!                        in a PID 1 sampler, for `vk-agent memmark` to read back at
 //!                        teardown (see the `memmark` module). Set by the build backend
@@ -214,7 +213,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     apply_symlinks(&cmdline);
     link_ci_tools(&cmdline); // host CI tools (git/git-lfs/…) onto PATH, if the image lacks them
     maybe_atop(&cmdline); // record this guest's own stats, before anything else runs in it
-    maybe_reclaim(&cmdline); // give idle file cache back to the host, in every agent-init mode
+    maybe_reclaim(&cmdline, false); // give idle file cache back to the host
     configure_network(&cmdline);
     write_resolv_conf(&cmdline); // DNS for every net mode (kernel `ip=` pool + static switch)
     apply_tmpfs(&cmdline); // RAM scratch dirs (e.g. CI /builds) before the payload starts
@@ -410,6 +409,8 @@ fn run_full_vm(
     maybe_ssh_agent(cmdline);
     maybe_socket_volumes(cmdline);
     maybe_ctlfs(cmdline);
+    // Isolate the trimmer's debugfs mount so it cannot race the image init's mount.
+    maybe_reclaim(cmdline, true);
     let _serve = spawn_serve(socket, None)?;
 
     // Only the entrypoint axis chdirs: /sbin/init neither has nor wants a workdir. It
@@ -2136,9 +2137,9 @@ fn link_ci_tools_from(tag: &str, mnt: &str, image_has_runner: bool) -> Result<To
 }
 
 /// `VIRTKIT_RECLAIM=[auto:]<floor_mib>`: fork the page-cache trimmer (the `reclaim` module).
-/// Mounts are mode-specific: age-based trimming does not add a cgroup2 hierarchy.
+/// `private_mounts` isolates the trimmer's debugfs mount from the image init.
 /// Best effort: a guest that cannot trim still runs.
-fn maybe_reclaim(cmdline: &HashMap<String, String>) {
+fn maybe_reclaim(cmdline: &HashMap<String, String>, private_mounts: bool) {
     let Some(spec) = cmdline.get(vk_core::reclaim::CMDLINE_KEY) else {
         return;
     };
@@ -2150,7 +2151,12 @@ fn maybe_reclaim(cmdline: &HashMap<String, String>) {
         return;
     }
     // The trimmer re-parses the same spec (validated above).
-    if let Err(e) = fork_agent(&["reclaim".into(), spec.clone()]) {
+    let mut args = vec!["reclaim".to_string()];
+    if private_mounts {
+        args.push(crate::reclaim::PRIVATE_MOUNTS.into());
+    }
+    args.push(spec.clone());
+    if let Err(e) = fork_agent(&args) {
         warn!("vk-agent init: page-cache trimmer failed to start: {e}");
     }
 }

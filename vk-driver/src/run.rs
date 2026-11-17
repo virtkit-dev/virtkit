@@ -1999,13 +1999,12 @@ async fn build_and_boot(
     // Idle page-cache trimming: the --primary service's own x-virtkit.reclaim (already
     // carrying --reclaim, which default_reclaim pushed into every marker-less unit), else
     // auto. The guest gives file cache it stopped using back to the host whenever it is not
-    // under memory pressure. `vk run` always attaches a balloon.
-    if wants_reclaim(eff_init, true) {
-        push_knob(
-            &mut cmdline,
-            &reclaim_cmdline(effective_reclaim(marker_reclaim, args.reclaim), &mem)?,
-        );
-    }
+    // under memory pressure. Linux run guests have a balloon in every init mode. The agent
+    // forks both the trimmer and `serve` before handing PID 1 to the image.
+    push_knob(
+        &mut cmdline,
+        &reclaim_cmdline(effective_reclaim(marker_reclaim, args.reclaim), &mem)?,
+    );
 
     // The agent is PID 1 and receives no usable argv, so its exec-idle watchdog is
     // configured through the kernel cmdline. Zero deliberately adds no watchdog while
@@ -3344,14 +3343,6 @@ pub(crate) fn dax_inode_tags(shares: &[crate::vmm::FsShare]) -> String {
         .map(|s| s.tag.as_str())
         .collect::<Vec<_>>()
         .join(",")
-}
-
-/// Enable trimming only with agent PID 1 and a balloon. `run_init` reads the knob;
-/// `image`/`entrypoint` init execs the image's PID 1, leaving an unused `VIRTKIT_RECLAIM`
-/// environment variable and `psi=1`. An image *kernel* keeps the agent and remains eligible.
-/// Without balloon free-page reporting, trimming loses guest cache without freeing host RAM.
-pub(crate) fn wants_reclaim(init: InitSource, balloon: bool) -> bool {
-    !init.is_image() && balloon
 }
 
 /// Prefer the guest's `x-virtkit.reclaim`, then the run's `--reclaim` / `[executor.vm] reclaim`,
@@ -6753,17 +6744,6 @@ mod tests {
             effective_reclaim(Some(Policy::Off), Some(Policy::Floor(64))),
             Policy::Off
         );
-    }
-
-    // Who gets the knob at all: the agent has to stay PID 1 to read it, and the balloon has
-    // to be there to carry what it frees.
-    #[test]
-    fn only_an_agent_init_guest_with_a_balloon_gets_the_reclaim_knob() {
-        assert!(wants_reclaim(InitSource::Default, true));
-        // An image kernel still keeps the agent as PID 1; only the init axis takes it away.
-        assert!(!wants_reclaim(InitSource::Image, true));
-        assert!(!wants_reclaim(InitSource::Entrypoint, true));
-        assert!(!wants_reclaim(InitSource::Default, false));
     }
 
     /// `x-virtkit.dax` wins, then the run's `--dax`; a service that declared neither is

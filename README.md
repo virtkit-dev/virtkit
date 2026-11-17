@@ -343,9 +343,10 @@ two (by age, through the kernel's multi-gen LRU) and hands those pages back, so 
 read a few gigabytes while building stops holding them once it idles, while what a running
 build keeps re-reading stays cached. That is `reclaim: auto`; `off` keeps everything, a size
 (`512M`) or share (`5%`) keeps that much as a fixed floor. `vk run --reclaim` sets it for the
-primary and any service without its own, `[executor.vm] reclaim` for the GitLab executor. It needs the
-agent as PID 1, so an `init` of `image` or `entrypoint` opts out; `vk build` stage guests are
-left alone as well, since trimming would move the peak-memory mark they are measured by.
+primary and services unless they set `x-virtkit.reclaim`. The GitLab executor uses
+`[executor.vm] reclaim`. Trimming works with every Linux `init` mode and covers services
+started by systemd in the guest. `vk build` stages skip trimming to preserve their peak-memory
+measurements.
 
 Directory virtio-fs shares — `--workdir`, `-v` directory binds and compose volumes — use
 DAX windows to read the host page cache directly. The host maps shared files into guest
