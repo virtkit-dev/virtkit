@@ -113,6 +113,9 @@ pub struct Unit {
     /// the guest holds an address on the tap's LAN, its switch ports follow as eth1 upward
     /// and the run's service names are pinned in its `/etc/hosts`. `None` = switch only.
     pub tap: Option<crate::net::TapNet>,
+    /// What `init: image` hands PID 1 to (compose `x-virtkit.init_argv`), applied identically
+    /// primary or sibling; empty = the image's `/sbin/init`. Rides the boot config.
+    pub handoff: vk_core::runcfg::Handoff,
     /// The service's `secrets:`, resolved against the top-level declarations. A Linux guest
     /// reads each at `/run/secrets/<target>` through a read-only
     /// single-file bind in [`Self::volumes`]; a Windows one gets a copy at
@@ -285,6 +288,7 @@ pub fn merged_config(image: &RunConfig, unit: &Unit) -> RunConfig {
         cmd,
         // The readiness port gate is an image property; compose overrides never change it.
         exposed_ports: image.exposed_ports.clone(),
+        handoff: unit.handoff.clone(),
     }
 }
 
@@ -1243,7 +1247,7 @@ fn map_service(
     };
     // The per-service axes (compose `x-virtkit`): absent key/subkey = the defaults,
     // so an unmarked service keeps today's agent-as-PID1 pinned-kernel 2-vCPU/1G boot.
-    let (init, kernel, cpus, mem, reclaim, dax, nested, nics, persist_root, tap) =
+    let (init, kernel, cpus, mem, reclaim, dax, nested, nics, persist_root, tap, handoff) =
         match svc.x_virtkit {
             Some(x) => (
                 x.init()?,
@@ -1256,6 +1260,7 @@ fn map_service(
                 x.nics()?,
                 x.persist_root()?,
                 x.tap()?,
+                x.handoff()?,
             ),
             None => (
                 crate::run::InitSource::Default,
@@ -1268,8 +1273,15 @@ fn map_service(
                 1,
                 false,
                 None,
+                vk_core::runcfg::Handoff::default(),
             ),
         };
+    // Only the image's own init is handed these: an entrypoint is PID 1's argv itself, and
+    // the agent never execs an init. Refused rather than ignored, like every other x-virtkit
+    // key the boot cannot honor.
+    if init != crate::run::InitSource::Image && !handoff.init.is_empty() {
+        bail!("service {name:?}: x-virtkit.init_argv needs `init: image`, not `init: {init}`");
+    }
     // Key roots by service under the same anchor as overlays, so primary and sibling
     // use the same stable path.
     let persist_root_backing = persist_root.then(|| persist_root_path(&anchor, name));
@@ -1363,6 +1375,7 @@ fn map_service(
         nics,
         persist_root_backing,
         tap,
+        handoff,
         secrets,
         healthcheck,
         wait_for,
@@ -2123,10 +2136,24 @@ pub fn parse_symlink(spec: &str) -> Result<(String, String)> {
     }
 }
 
+/// An argv the guest agent `execvp`s as it stands: a program to run, and no NUL anywhere, which
+/// would cut an argument short on its way to exec.
+pub(crate) fn exec_argv(argv: Vec<String>) -> Result<Vec<String>> {
+    match argv.first() {
+        None => bail!("an empty command names no program to run"),
+        Some(prog) if prog.is_empty() => bail!("the program to run is an empty string"),
+        _ => {}
+    }
+    if argv.iter().any(|a| a.contains('\0')) {
+        bail!("an argument contains a NUL byte");
+    }
+    Ok(argv)
+}
+
 /// Split a compose string-form command into argv, shell-words style (like compose,
 /// without running a shell): single/double quotes group words, and a backslash
 /// escapes the next character — except inside single quotes, where it is literal.
-fn shell_words(s: &str) -> Result<Vec<String>> {
+pub(crate) fn shell_words(s: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
@@ -2321,8 +2348,8 @@ struct ComposeService {
 /// parsed into [`crate::run::InitSource`] / [`crate::run::KernelSource`], plus the
 /// guest sizing (`cpus`/`mem`), idle page-cache trimming (`reclaim`), the DAX window its
 /// shares get (`dax`), nested virtualization (`nested`), NIC count (`nics`) and root
-/// persistence (`persist_root`), and a host tap for eth0 (`tap`). An absent subkey defaults to
-/// `Default`/unset/off.
+/// persistence (`persist_root`), a host tap for eth0 (`tap`), and the argv `init: image` hands
+/// PID 1 to (`init_argv`). An absent subkey defaults to `Default`/unset/off.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct XVirtkit {
@@ -2351,6 +2378,10 @@ struct XVirtkit {
     persist_root: Option<Scalar>,
     #[serde(default)]
     tap: Option<XTap>,
+    /// the init `init: image` execs, with its arguments: a list, or a string split like
+    /// `command:`
+    #[serde(default)]
+    init_argv: Option<Cmd>,
 }
 
 /// `x-virtkit.tap`: the same spec as `vk run --tap`/`--tap-mac`/`--tap-ip`/`--tap-gw`/
@@ -2383,6 +2414,15 @@ impl XVirtkit {
                 )
             }
         }
+    }
+
+    /// `init_argv: <argv>` → [`vk_core::runcfg::Handoff`] (absent = the image's `/sbin/init`).
+    fn handoff(&self) -> Result<vk_core::runcfg::Handoff> {
+        let init = match &self.init_argv {
+            None => Vec::new(),
+            Some(cmd) => exec_argv(cmd.clone().into_argv()?).context("x-virtkit.init_argv")?,
+        };
+        Ok(vk_core::runcfg::Handoff { init })
     }
 
     /// `kernel: default|image|<path>` → [`crate::run::KernelSource`] (absent =
@@ -2589,7 +2629,7 @@ impl Scalar {
 }
 
 /// compose command/entrypoint: an argv list, or a string split shell-words style.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(untagged)]
 enum Cmd {
     List(Vec<String>),
@@ -4298,6 +4338,7 @@ mod tests {
             entrypoint: vec!["/bin/app".into()],
             cmd: vec!["--serve".into()],
             exposed_ports: vec![5432],
+            ..Default::default()
         };
         let mut unit = one("services:\n  s:\n    image: x\n    environment: [PORT=2]\n");
         // env upserts; everything else keeps the image defaults
@@ -4348,6 +4389,52 @@ mod tests {
         );
         // the entrypoint's cwd, which the agent chdirs to before the exec
         assert_eq!(cfg.workdir, "/srv");
+    }
+
+    #[test]
+    fn init_argv_reaches_the_boot_config_of_an_image_init_unit_only() {
+        let listed = one(
+            "services:\n  s:\n    image: x\n    x-virtkit:\n      init: image\n      \
+             init_argv: [/lib/systemd/systemd, --log-level=info]\n",
+        );
+        let cfg = merged_config(&RunConfig::default(), &listed);
+        assert_eq!(
+            cfg.handoff.init,
+            ["/lib/systemd/systemd", "--log-level=info"]
+        );
+        // a string splits like `command:`
+        let split = one(
+            "services:\n  s:\n    image: x\n    x-virtkit:\n      init: image\n      \
+             init_argv: \"/sbin/init --unit='multi-user.target' 'a b'\"\n",
+        );
+        assert_eq!(
+            split.handoff.init,
+            ["/sbin/init", "--unit=multi-user.target", "a b"]
+        );
+        // absent: nothing rides the boot config, and the agent execs /sbin/init
+        let bare = one("services:\n  s:\n    image: x\n    x-virtkit: { init: image }\n");
+        assert!(
+            merged_config(&RunConfig::default(), &bare)
+                .handoff
+                .is_empty()
+        );
+        // only the image's own init takes it, and it has to name a program
+        for (yaml, want) in [
+            (
+                "{ init: entrypoint, init_argv: [/sbin/init] }",
+                "needs `init: image`",
+            ),
+            ("{ init_argv: [/sbin/init] }", "needs `init: image`"),
+            ("{ init: image, init_argv: [] }", "names no program"),
+            ("{ init: image, init_argv: [''] }", "empty string"),
+        ] {
+            let yaml = format!("services:\n  s:\n    image: x\n    x-virtkit: {yaml}\n");
+            let Err(err) = parse(&yaml, Path::new("/base")) else {
+                panic!("{yaml}: accepted");
+            };
+            let err = format!("{err:#}");
+            assert!(err.contains(want), "{yaml}: {err}");
+        }
     }
 
     #[test]

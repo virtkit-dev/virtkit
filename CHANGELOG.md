@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Pass arguments to the image's init.** `x-virtkit.init_argv` (or `vk run --init-argv`)
+  sets the program and arguments that `init: image` hands PID 1 to.
+
 ## [0.112.5] - 2026-11-17
 
 ### Fixed

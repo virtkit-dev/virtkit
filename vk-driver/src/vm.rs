@@ -1196,6 +1196,7 @@ fn load_compose_fleet(ctx: &JobCtx, spec: &str) -> Result<ComposeFleet> {
         enabled[i] |= on;
     }
     enabled[primary] = true;
+    refuse_handoff(&units[primary], "the job VM, whose PID 1 stays the agent")?;
     // Confine every booting unit's job-authored `build:` and `env_file` paths to the
     // checkout before the host reads them. Reject `volumes:` and `secrets:` because they hand host
     // files to the untrusted guest.
@@ -1297,6 +1298,7 @@ fn windows_build(unit: &crate::compose::Unit) -> Result<Option<WindowsBuild>> {
     crate::winbuild::check_confined(&text, context)
         .with_context(|| format!("service {}: {}", unit.name, dockerfile.display()))?;
     // Before the build, which a first install makes long.
+    refuse_handoff(unit, "a Windows guest")?;
     refuse_windows_nics(unit)?;
     if dockerfiles.len() > 1 || !build_contexts.is_empty() || !args.is_empty() {
         bail!(
@@ -3869,6 +3871,20 @@ pub(crate) fn refuse_unsupported_nesting(requested: bool, host_nests: bool) -> R
 }
 
 /// Refuse a Windows service with more than one NIC: winsvc attaches it to the job switch alone.
+/// The handoff settings (`x-virtkit.init_argv`) are for a guest whose agent hands PID 1 to the
+/// image's init. Refused where no agent does — the job VM keeps it for the stages to exec
+/// into, a Windows guest has none — rather than dropped, so the fleet does not look like it got
+/// what it asked for.
+fn refuse_handoff(unit: &crate::compose::Unit, guest: &str) -> Result<()> {
+    if !unit.handoff.is_empty() {
+        bail!(
+            "compose service {:?}: x-virtkit.init_argv has no init to reach in {guest}",
+            unit.name
+        );
+    }
+    Ok(())
+}
+
 fn refuse_windows_nics(unit: &crate::compose::Unit) -> Result<()> {
     if unit.nics > 1 {
         bail!(
@@ -6998,6 +7014,33 @@ mod tests {
             refuse_windows_nics(&service("    x-virtkit: { nics: 2 }\n")).unwrap_err()
         );
         assert!(err.contains("one NIC"), "{err}");
+    }
+
+    /// Neither the job VM nor a Windows guest hands PID 1 to an image init, so a fleet asking
+    /// for that init's argv is refused there rather than booted without it.
+    #[test]
+    fn a_handoff_is_refused_where_no_agent_hands_pid_1_over() {
+        let service = |marker: &str| {
+            crate::compose::parse(
+                &format!("services:\n  db:\n    image: x\n{marker}"),
+                std::path::Path::new("/b"),
+                &|_| None,
+                None,
+            )
+            .unwrap()
+            .pop()
+            .unwrap()
+        };
+        refuse_handoff(
+            &service("    x-virtkit: { init: image }\n"),
+            "a Windows guest",
+        )
+        .unwrap();
+        let asks = service("    x-virtkit: { init: image, init_argv: [/sbin/init, -s] }\n");
+        let err = refuse_handoff(&asks, "a Windows guest")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("init_argv has no init to reach"), "{err}");
     }
 
     /// A job-authored fleet cannot grant itself host KVM. Checked where the fleet loads, so

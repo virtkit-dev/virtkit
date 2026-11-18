@@ -333,6 +333,7 @@ fn refuse_unsupported(args: &RunArgs) -> Result<()> {
         (!args.volumes.is_empty(), "--volume"),
         (!args.symlinks.is_empty(), "--symlink"),
         (!args.extra_disks.is_empty(), "--disk"),
+        (!args.init_argv.is_empty(), "--init-argv"),
         (!args.env.is_empty(), "--env/--env-file"),
         (args.shell, "--shell"),
         (args.tty, "--tty"),

@@ -47,6 +47,8 @@ impl From<ImageConfig> for vk_core::runcfg::RunConfig {
             entrypoint: c.entrypoint,
             cmd: c.cmd,
             exposed_ports: c.exposed_ports,
+            // A boot setting, never an image's.
+            handoff: Default::default(),
         }
     }
 }

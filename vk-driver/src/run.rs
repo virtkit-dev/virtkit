@@ -86,6 +86,32 @@ impl std::fmt::Display for InitSource {
     }
 }
 
+/// What the primary's `init: image` hands PID 1 to: `--init-argv` over the --primary service's
+/// `x-virtkit.init_argv`, as `--init` overrides its `init`. Either has to reach the image's own
+/// init, so an effective axis that is not `image` refuses them.
+fn effective_handoff(
+    args: &RunArgs,
+    primary: Option<&crate::compose::Unit>,
+) -> Result<vk_core::runcfg::Handoff> {
+    let mut handoff = primary.map(|u| u.handoff.clone()).unwrap_or_default();
+    if !args.init_argv.is_empty() {
+        handoff.init = args.init_argv.clone();
+    }
+    let init = match (args.init, primary) {
+        (InitSource::Default, Some(unit)) => unit.init,
+        (init, _) => init,
+    };
+    if init != InitSource::Image && !handoff.is_empty() {
+        let what = if args.init_argv.is_empty() {
+            "the --primary service's x-virtkit.init_argv"
+        } else {
+            "--init-argv"
+        };
+        bail!("{what} needs `init: image`, but the guest boots `init: {init}`");
+    }
+    Ok(handoff)
+}
+
 /// Which kernel the guest boots on. `Default` = virtkit's pinned/embedded kernel
 /// (virtio + ext4 built in); `Image` = the image's own `/boot/vmlinuz` + its modules,
 /// extracted host-side; `Path` = an explicit vmlinux/bzImage file.
@@ -345,6 +371,9 @@ pub struct RunArgs {
     /// latter two via the preinit handoff, and both requiring an ext4 (a `-f` build
     /// or a non-`--ram` image).
     pub init: InitSource,
+    /// `--init-argv`: the init `init: image` execs, with its arguments; empty = the --primary
+    /// service's `x-virtkit.init_argv`, else `/sbin/init`
+    pub init_argv: Vec<String>,
     /// attach an interactive shell once the guest is up (needs a terminal)
     pub shell: bool,
     /// allocate a pty for the command and wire it to the local terminal, so it runs
@@ -519,6 +548,7 @@ impl Default for RunArgs {
             vm_name: "vk:{name}".to_string(),
             ram: false,
             init: InitSource::Default,
+            init_argv: Vec::new(),
             shell: false,
             tty: false,
             net: false,
@@ -1551,6 +1581,8 @@ async fn build_and_boot(
     if let Some(name) = &args.primary {
         primary_idx = Some(resolve_primary(&compose_units, name)?);
     }
+    // Before any build, which a mismatch would otherwise wait out.
+    let eff_handoff = effective_handoff(args, primary_idx.map(|i| &compose_units[i]))?;
     // The primary's image identity and root persistence, read off its compose unit exactly as
     // a sibling's are off its `Provisioned` — so `persist_root` and `overlay,persist` key on,
     // and reset with, the same image changes whichever role the service boots in.
@@ -1831,13 +1863,14 @@ async fn build_and_boot(
             // image's kernel. The boot config carries what the agent needs before it hands
             // PID 1 over: the effective env, and the image's entrypoint+cmd+workdir, which
             // `--init entrypoint` execs as PID 1 (the other axes exec /sbin/init and ignore
-            // them).
+            // them), and the argv `--init image` execs instead of a bare /sbin/init.
             let boot_cfg = vk_core::runcfg::RunConfig {
                 env: image_env.clone(),
                 user: primary_user.clone(),
                 workdir: image_workdir.clone(),
                 entrypoint: image_entrypoint.clone(),
                 cmd: image_cmd.clone(),
+                handoff: eff_handoff.clone(),
                 ..Default::default()
             };
             let kernel_medium = medium("vmlinuz")?;
@@ -7535,6 +7568,54 @@ mod tests {
         // no primary (a bare `vk run`, or compose up): one NIC unless the flag says more
         assert_eq!(effective_nics(None, &units, None), 1);
         assert_eq!(effective_nics(Some(2), &units, None), 2);
+    }
+
+    #[test]
+    fn init_argv_ranks_the_flag_over_the_primary_service_marker() {
+        let units = crate::compose::parse(
+            "services:\n\
+             \x20 appliance:\n    image: a\n    x-virtkit: { init: image, init_argv: [/sbin/init, -s] }\n\
+             \x20 web:\n    image: w\n",
+            Path::new("/b"),
+            &|_| None,
+            None,
+        )
+        .unwrap();
+        let unit = |n: &str| units.iter().find(|u| u.name == n);
+        let args = |init, argv: &[&str]| RunArgs {
+            init,
+            init_argv: argv.iter().map(|a| a.to_string()).collect(),
+            ..RunArgs::default()
+        };
+        let init = |r: Result<vk_core::runcfg::Handoff>| r.unwrap().init;
+        // the primary service's argv when the flag is silent, the flag's when it is not
+        let silent = args(InitSource::Default, &[]);
+        assert_eq!(
+            init(effective_handoff(&silent, unit("appliance"))),
+            ["/sbin/init", "-s"]
+        );
+        let flag = args(InitSource::Default, &["/lib/systemd/systemd", "a b"]);
+        assert_eq!(
+            init(effective_handoff(&flag, unit("appliance"))),
+            ["/lib/systemd/systemd", "a b"]
+        );
+        // the flag needs an image init, from --init or the marker
+        assert!(init(effective_handoff(&silent, unit("web"))).is_empty());
+        let err = effective_handoff(&flag, unit("web"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--init-argv needs `init: image`"), "{err}");
+        let image = args(InitSource::Image, &["/sbin/init"]);
+        assert_eq!(init(effective_handoff(&image, None)), ["/sbin/init"]);
+        // an --init that moves the primary off its image init leaves its argv nowhere to go
+        let moved = args(InitSource::Entrypoint, &[]);
+        let err = effective_handoff(&moved, unit("appliance"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("x-virtkit.init_argv needs `init: image`"),
+            "{err}"
+        );
     }
 
     #[test]

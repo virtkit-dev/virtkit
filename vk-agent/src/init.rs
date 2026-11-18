@@ -446,9 +446,10 @@ fn exec_first(candidates: &[Vec<String>]) -> ! {
 /// What PID 1 becomes after the handoff, as [`ImageInit`] names it — in preference order,
 /// since only the exec itself can tell whether the image really carries a candidate.
 ///
-/// [`ImageInit::Init`] offers the image's own init alone: `VIRTKIT_HANDOFF` if the host
-/// named one, else `/sbin/init`. An image booted for its own init and missing it is broken,
-/// and looks it — the boot ends the way it did before any of this.
+/// [`ImageInit::Init`] offers the image's own init alone: the boot config's `handoff.init`
+/// argv if it has one, else `VIRTKIT_HANDOFF` if the host named one, else `/sbin/init`. An
+/// image booted for its own init and missing it is broken, and looks it — the boot ends the
+/// way it did before any of this.
 ///
 /// [`ImageInit::Entrypoint`] leads with the image's ENTRYPOINT+CMD (merged host-side with
 /// any compose override), exec'd — NOT forked as `VIRTKIT_MODE=service` does — so an
@@ -478,7 +479,11 @@ fn image_init_candidates(
             .unwrap_or_else(|| "/sbin/init".to_string()),
     ];
     if axis == ImageInit::Init {
-        return vec![init];
+        return vec![
+            cfg.map(|c| c.handoff.init.clone())
+                .filter(|argv| !argv.is_empty())
+                .unwrap_or(init),
+        ];
     }
     let mut candidates = Vec::new();
     // ENTRYPOINT+CMD and the USER that owns them come from the same config.
@@ -4224,6 +4229,17 @@ mod tests {
             image_init_candidates(ImageInit::Init, &handoff, Some(&cfg), None),
             [["/lib/systemd/systemd"]]
         );
+        // the boot config's init argv wins over both: it is the only carrier of arguments
+        let with_argv = RunConfig {
+            handoff: vk_core::runcfg::Handoff {
+                init: vec!["/lib/systemd/systemd".into(), "--log-level=debug".into()],
+            },
+            ..cfg.clone()
+        };
+        assert_eq!(
+            image_init_candidates(ImageInit::Init, &handoff, Some(&with_argv), None),
+            [["/lib/systemd/systemd", "--log-level=debug"]]
+        );
 
         // the entrypoint axis leads with the config's entrypoint+cmd, verbatim: a bare name
         // is left for execvp's PATH lookup rather than resolved here
@@ -4390,6 +4406,9 @@ mod tests {
             entrypoint: vec!["redis-server".into()],
             cmd: vec![],
             exposed_ports: vec![6379],
+            handoff: vk_core::runcfg::Handoff {
+                init: vec!["/sbin/init".into(), "--log-level=info".into()],
+            },
         };
         assert_eq!(RunConfig::from_json(&cfg.to_json()).unwrap(), cfg);
     }

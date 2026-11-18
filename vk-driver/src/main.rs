@@ -1996,6 +1996,12 @@ enum Cmd {
         /// image or `-f` build and neither works with --ram.
         #[arg(long, default_value = "default", help_heading = "Guest")]
         init: run::InitSource,
+        /// The init `--init image` execs, with its arguments, split like a compose `command:`
+        ///
+        /// Default `/sbin/init`, with no arguments. Overrides the --primary service's
+        /// `x-virtkit.init_argv`.
+        #[arg(long, value_name = "CMD", help_heading = "Guest")]
+        init_argv: Option<String>,
         /// share a host dir read-write into the guest at /work and run the command there
         ///
         /// The command's outputs then land back on the host.
@@ -3616,6 +3622,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         vm_name,
         ram,
         init,
+        init_argv,
         shell,
         tty,
         net,
@@ -3687,14 +3694,16 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 || !env.is_empty()
                 || !env_file.is_empty()
                 || *host_exec
-                || inactivity_timeout.is_some())
+                || inactivity_timeout.is_some()
+                || init_argv.is_some())
         {
             return fail(
                 &anyhow::anyhow!(
                     "--compose without an image/-f/--primary is services-only (compose up) — \
                      there is no primary VM for a command, --shell, -t, --ssh, --workdir, \
-                     --volume, --symlink, --env, --env-file, --host-exec, or \
-                     --inactivity-timeout"
+                     --volume, --symlink, --env, --env-file, --host-exec, \
+                     --inactivity-timeout, or --init-argv (a service takes \
+                     x-virtkit.init_argv)"
                 ),
                 2,
             );
@@ -3782,6 +3791,14 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Ok(v) => v,
             Err(e) => return fail(&e, 2),
         };
+        let init_argv = match init_argv
+            .as_deref()
+            .map(|cmd| compose::shell_words(cmd).and_then(compose::exec_argv))
+            .transpose()
+        {
+            Ok(v) => v.unwrap_or_default(),
+            Err(e) => return fail(&e.context("--init-argv"), 2),
+        };
         // --disk HOST[:ro]: raw block devices attached after any rootfs disk.
         let extra_disks = parse_disks(disk);
         let build_contexts = match build::parse_build_contexts(build_context) {
@@ -3843,6 +3860,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             vm_name: vm_name.clone(),
             ram: *ram,
             init: *init,
+            init_argv,
             shell: *shell,
             tty: *tty,
             net: run_net,

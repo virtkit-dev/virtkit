@@ -632,6 +632,8 @@ fn run_config(st: &ShellState) -> vk_core::runcfg::RunConfig {
         entrypoint: st.entrypoint.clone(),
         cmd: st.cmd.clone(),
         exposed_ports: st.exposed_ports.clone(),
+        // A boot setting, never an image's.
+        handoff: Default::default(),
     }
 }
 

@@ -34,7 +34,8 @@ pub const SESSION_ENV_PATH: &str = "/run/virtkit-session-env";
 /// axis one of them silently did not recognize is then not expressible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageInit {
-    /// The image's own init: `VIRTKIT_HANDOFF` when the host named one, else `/sbin/init`.
+    /// The image's own init: the [`RunConfig`]'s `handoff.init` argv when it has one, else
+    /// `VIRTKIT_HANDOFF` when the host named one, else `/sbin/init`.
     Init,
     /// The image's ENTRYPOINT+CMD, from its [`RunConfig`], exec'd as PID 1.
     Entrypoint,
@@ -85,6 +86,24 @@ pub struct RunConfig {
     /// way); empty = no port gate (readiness is just "the guest booted").
     #[serde(default)]
     pub exposed_ports: Vec<u16>,
+    /// How [`ImageInit::Init`] hands PID 1 to the image. A boot-time setting, never part of an
+    /// image's own config, so the build's sidecar leaves it out.
+    #[serde(default, skip_serializing_if = "Handoff::is_empty")]
+    pub handoff: Handoff,
+}
+
+/// What [`ImageInit::Init`] runs when the agent hands PID 1 over (compose `x-virtkit`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Handoff {
+    /// The init and its arguments; empty = `VIRTKIT_HANDOFF`, else `/sbin/init`, with none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub init: Vec<String>,
+}
+
+impl Handoff {
+    pub fn is_empty(&self) -> bool {
+        self.init.is_empty()
+    }
 }
 
 impl RunConfig {
