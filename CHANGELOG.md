@@ -18,6 +18,10 @@ All notable changes to virtkit will be documented in this file.
   the guest up for inspection, without its init. `vk status` reports where the handoff
   stands.
 
+### Changed
+
+- Update the guest kernel to Linux 6.18.64 LTS.
+
 ## [0.112.5] - 2026-11-17
 
 ### Fixed
