@@ -98,11 +98,16 @@ pub struct Handoff {
     /// The init and its arguments; empty = `VIRTKIT_HANDOFF`, else `/sbin/init`, with none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub init: Vec<String>,
+    /// A command the agent runs to completion, as root on the still-writable root and with the
+    /// exec channel up, before it hands PID 1 over; empty = none. The init runs only if this
+    /// exits 0.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepare: Vec<String>,
 }
 
 impl Handoff {
     pub fn is_empty(&self) -> bool {
-        self.init.is_empty()
+        self.init.is_empty() && self.prepare.is_empty()
     }
 }
 

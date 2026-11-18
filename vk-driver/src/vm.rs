@@ -3871,16 +3871,12 @@ pub(crate) fn refuse_unsupported_nesting(requested: bool, host_nests: bool) -> R
 }
 
 /// Refuse a Windows service with more than one NIC: winsvc attaches it to the job switch alone.
-/// The handoff settings (`x-virtkit.init_argv`, `root: ro`) are for a guest whose agent hands
+/// The handoff settings (`x-virtkit.init_argv`, `prepare`, `root: ro`) are for a guest whose agent hands
 /// PID 1 to the image's init. Refused where no agent does — the job VM keeps it for the stages to exec
 /// into, a Windows guest has none — rather than dropped, so the fleet does not look like it got
 /// what it asked for.
 fn refuse_handoff(unit: &crate::compose::Unit, guest: &str) -> Result<()> {
-    let key = if !unit.handoff.is_empty() {
-        "x-virtkit.init_argv"
-    } else if unit.root == crate::run::RootMode::Ro {
-        "x-virtkit `root: ro`"
-    } else {
+    let Some(key) = crate::compose::handoff_key(&unit.handoff, unit.root) else {
         return Ok(());
     };
     bail!(

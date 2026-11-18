@@ -125,6 +125,16 @@ pub async fn run_server(
     .await
 }
 
+/// What to run once the server listens ([`on_listening`]).
+#[allow(clippy::type_complexity)]
+static ON_LISTENING: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+/// Run `f` once this process's exec server listens: how a parent that must not go on before
+/// the channel is up learns that it is.
+pub fn on_listening(f: impl FnOnce() + Send + 'static) {
+    *ON_LISTENING.lock().unwrap() = Some(Box::new(f));
+}
+
 /// A separate wrapper for commands named exactly `vk` on a wrapped channel
 /// ([`run_server_routed`]).
 #[derive(Debug, Clone)]
@@ -170,6 +180,9 @@ pub async fn run_server_routed(
     let limit = limits.max_concurrent.map(|n| Limit::new(n, "requests"));
 
     let listener = listen(socket)?;
+    if let Some(listening) = ON_LISTENING.lock().unwrap().take() {
+        listening();
+    }
 
     let state: Arc<Mutex<TaskState>> = Arc::new(Mutex::new(TaskState::new()));
 

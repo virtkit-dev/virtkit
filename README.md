@@ -340,7 +340,9 @@ for the primary); the default is `/sbin/init` with no arguments. `root: ro` (`vk
 hands that init a read-only `/`, as a real boot does, so what it does first cannot write it —
 e.g. systemd's first-boot unit presets. `/` stays read-only until the image remounts it: for
 systemd, a `/` line with `rw` in its `/etc/fstab` (pass number 0, or `systemd-fsck-root`
-checks it first). `persist_root` keeps the root
+checks it first). `prepare` (`vk run --prepare`) runs a command to completion before that,
+as root on the still-writable root and with the exec channel already up: the init starts only
+if it exits 0, and otherwise the guest stays up, without it, for inspection. `persist_root` keeps the root
 filesystem across restarts (see [Volumes and persistent state](#volumes-and-persistent-state)).
 
 Guests give idle memory back. Pages one frees return to the host through the balloon, and a

@@ -12,6 +12,10 @@ All notable changes to virtkit will be documented in this file.
   `vk run --root ro`) hands `init: image` a read-only `/`, as a real boot does. It stays
   read-only until the image remounts it, which systemd does from a `/` line in its fstab.
   Until then, systemd's first-boot presets cannot enable units.
+- **Prepare the machine before its init starts.** `x-virtkit.prepare` (or
+  `vk run --prepare`) runs a command to completion, on a writable root and with
+  `vk exec` available, before `init: image` hands PID 1 over. A failing command leaves
+  the guest up for inspection, without its init.
 
 ## [0.112.5] - 2026-11-17
 

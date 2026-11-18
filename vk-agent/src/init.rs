@@ -11,6 +11,9 @@
 //!                       + per-service overrides) and read *before* the pivot hides
 //!                       the initramfs. The image itself stays byte-clean. Its env is
 //!                       published for login shells under /run/vk (see `runenv`).
+//!                       With `VIRTKIT_INIT=image` it also says what PID 1 is handed
+//!                       to (an init argv) and what runs to completion first (`prepare`);
+//!                       a handoff whose config does not parse does not happen.
 //!   /etc/virtkit/{env,user}  image ENV and USER as older vk wrote them into a converted
 //!                       image; still read, under the boot config, when present
 //!
@@ -180,7 +183,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
                 // From the read that named the axis: a later one could fail, and quietly hand
                 // over the writable root a read-only one was asked for.
                 let root_ro = root_read_only(&raw_cmdline);
-                return run_full_vm(socket, &cmdline, boot_config.as_ref(), axis, root_ro);
+                return run_full_vm(socket, &cmdline, boot_config, axis, root_ro);
             }
             // Only this driver writes the token, so a value it does not name means the
             // two have drifted apart: say so instead of quietly keeping PID 1 and
@@ -188,6 +191,11 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
             None => warn!("vk-agent init: unknown VIRTKIT_INIT={axis} — keeping PID 1"),
         }
     }
+
+    let boot_config = boot_config.unwrap_or_else(|e| {
+        warn!("vk-agent init: {e:#}");
+        None
+    });
 
     // If booted from the agent-only initramfs (`VIRTKIT_PIVOT=<root dev>`), mount the
     // real image ext4 and switch into it — keeping this process as PID 1 — so the agent
@@ -242,7 +250,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     maybe_ctlfs(&cmdline);
     maybe_host_exec(&cmdline);
     maybe_ssh_agent(&cmdline);
-    let serve = spawn_serve(socket, inactivity_timeout)?;
+    let serve = spawn_serve(socket, inactivity_timeout, None)?;
     // Start thread samplers after the last fork to keep children from inheriting locked state.
     // The server has not accepted commands yet, so all writes and memory demand remain covered.
     crate::fsmark::watch();
@@ -351,10 +359,21 @@ fn pivot_to_real_root() -> Result<bool> {
 fn run_full_vm(
     socket: &SocketAddr,
     cmdline: &HashMap<String, String>,
-    cfg: Option<&RunConfig>,
+    boot_config: Result<Option<RunConfig>>,
     axis: ImageInit,
     root_ro: bool,
 ) -> Result<()> {
+    // Logged now, refused at the handoff: the config may have carried a `prepare` the image's
+    // init counts on, so its init does not start without it. The other axes go on without it,
+    // as they always have.
+    let (cfg, cfg_error) = match boot_config {
+        Ok(cfg) => (cfg, None),
+        Err(e) => {
+            warn!("vk-agent image-init: {e:#}");
+            (None, Some(e))
+        }
+    };
+    let cfg = cfg.as_ref();
     // The pivot is mandatory here: the whole point is to hand off to something in the
     // image — its own /sbin/init, or its entrypoint — and neither exists anywhere but the
     // real root. Unlike the serve-mode path (which can keep serving in place), continuing
@@ -421,16 +440,24 @@ fn run_full_vm(
     maybe_ctlfs(cmdline);
     // Isolate the trimmer's debugfs mount so it cannot race the image init's mount.
     maybe_reclaim(cmdline, true);
-    let serve = spawn_serve(socket, None)?;
-
-    // Last, so all of the setup above could still write it: an init handed a read-only `/`,
-    // as a real boot hands it one, remounts it rw itself.
-    if axis == ImageInit::Init
-        && root_ro
-        && let Err(e) = remount_root_read_only()
-    {
-        return hold_failed_handoff(serve, &e);
-    }
+    // The image's init gets its link to the exec server, which reports over it, first, that
+    // it listens.
+    let link = (axis == ImageInit::Init).then(crate::handoff::Link::new);
+    let serve_end = link
+        .as_ref()
+        .and_then(|l| l.as_ref().ok())
+        .map(|(_, theirs)| std::os::fd::AsRawFd::as_raw_fd(theirs));
+    let serve = spawn_serve(socket, None, serve_end)?;
+    // Held until the exec, which closes it: no other child may inherit the server's end.
+    let _link = match link.map(|l| l.map(|(link, _theirs)| link)) {
+        None => None,
+        Some(link) => match link
+            .and_then(|link| ready_for_init(link, cfg, cfg_error.as_ref(), root_ro, serve))
+        {
+            Ok(link) => Some(link),
+            Err(e) => return hold_failed_handoff(serve, &e),
+        },
+    };
 
     // Only the entrypoint axis chdirs: /sbin/init neither has nor wants a workdir. It
     // precedes the exec so a relative entrypoint (`./prepare.sh`) resolves there.
@@ -441,6 +468,124 @@ fn run_full_vm(
         .then(|| drop_ids_for_user(cfg.map_or("", |c| c.user.as_str())))
         .flatten();
     exec_first(&image_init_candidates(axis, cmdline, cfg, drop_ids)) // never returns
+}
+
+/// How long `prepare` waits for the exec server to listen, so the host can watch it from the
+/// start. A healthy server listens in milliseconds.
+const SERVE_LISTEN_WAIT: Duration = Duration::from_secs(30);
+
+/// What has to hold before the image's init takes PID 1: a readable boot config, its `prepare`
+/// run to success once the exec server listens, then `/` remounted read-only if the cmdline
+/// asks — last, so the setup and `prepare` could still write it, and an init handed a
+/// read-only `/`, as a real boot hands it one, remounts it rw itself. A stop that came in
+/// meanwhile wins over the handoff.
+fn ready_for_init(
+    mut link: crate::handoff::Link,
+    cfg: Option<&RunConfig>,
+    cfg_error: Option<&anyhow::Error>,
+    root_ro: bool,
+    serve: libc::pid_t,
+) -> Result<crate::handoff::Link> {
+    if let Some(e) = cfg_error {
+        bail!("the boot config: {e:#}");
+    }
+    if let Some(prepare) = cfg
+        .map(|c| c.handoff.prepare.as_slice())
+        .filter(|argv| !argv.is_empty())
+    {
+        link.wait_listening(SERVE_LISTEN_WAIT)?;
+        run_prepare(prepare, serve)?;
+    }
+    if root_ro {
+        remount_root_read_only()?;
+    }
+    // Checked last, just before the exec: a stop accepted during the remount above must end
+    // the machine, not be dropped by an init that never heard of it. Only a stop between
+    // this check and the exec itself still is.
+    if STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+        wait_out_stop();
+    }
+    Ok(link)
+}
+
+/// A stop is under way: the stop worker, or the alarm it armed, ends the machine.
+fn wait_out_stop() -> ! {
+    loop {
+        // SAFETY: pause(2) has no failure mode that matters here.
+        unsafe { libc::pause() };
+    }
+}
+
+/// Set when the exec server exits while `prepare` runs, so a failed handoff does not hold a
+/// guest no one can reach.
+static SERVE_EXITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Run the boot config's `prepare` to completion: as root, from `/`, on the root the setup
+/// ran on, with the exec channel already up to watch it. A stop while it runs is honored as
+/// the service path honors one — SIGTERM to it, then the machine ends — never by handing over.
+/// Every child is reaped meanwhile, as PID 1 does, orphans `prepare` leaves included.
+fn run_prepare(argv: &[String], serve: libc::pid_t) -> Result<()> {
+    use std::sync::atomic::Ordering::SeqCst;
+    info!("vk-agent image-init: prepare {argv:?}");
+    // SAFETY: fork(2); the child only execs, or exits 127.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        bail!("forking prepare: {}", io::Error::last_os_error());
+    }
+    if pid == 0 {
+        exec_argv(argv);
+    }
+    SERVICE_PID.store(pid, SeqCst);
+    // After the fork, which must not inherit the stop worker's thread.
+    arm_stop_handling();
+    let status = loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: waitpid(2) into a local.
+        let reaped = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if reaped == pid {
+            break status;
+        }
+        if reaped == serve {
+            warn!("vk-agent image-init: the exec server exited (status {status}) during prepare");
+            SERVE_EXITED.store(true, SeqCst);
+        }
+        if reaped < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINTR) {
+                bail!("waiting for prepare: {e}");
+            }
+        }
+    };
+    if STOP_REQUESTED.load(SeqCst) {
+        if end_on_service_exit() {
+            poweroff();
+        }
+        // The stop worker ends the machine once the workloads' grace is over.
+        wait_out_stop();
+    }
+    SERVICE_PID.store(0, SeqCst);
+    if libc::WIFEXITED(status) {
+        match libc::WEXITSTATUS(status) {
+            0 => Ok(()),
+            code => bail!("prepare {argv:?} exited {code}"),
+        }
+    } else {
+        bail!(
+            "prepare {argv:?} was killed by signal {}",
+            libc::WTERMSIG(status)
+        )
+    }
+}
+
+/// Arm the stop path once: the stop worker, the signal handlers and the power-button watch.
+/// The first two start threads, so only after the last fork that must not inherit them.
+fn arm_stop_handling() {
+    static ARMED: std::sync::Once = std::sync::Once::new();
+    ARMED.call_once(|| {
+        start_stop_worker();
+        install_term_handler();
+        crate::button::watch_power_button();
+    });
 }
 
 /// Whether the kernel cmdline asks for a read-only root: its last bare `ro` or `rw`, as the
@@ -496,9 +641,13 @@ fn remount_root_read_only() -> Result<()> {
 /// exec server.
 fn hold_failed_handoff(serve: libc::pid_t, e: &anyhow::Error) -> Result<()> {
     log::error!("vk-agent image-init: {e:#} — not handing PID 1 over; holding for inspection");
-    start_stop_worker();
-    install_term_handler();
-    crate::button::watch_power_button();
+    if SERVE_EXITED.load(std::sync::atomic::Ordering::SeqCst) {
+        log::error!(
+            "vk-agent image-init: no exec server left to inspect it with — ending the machine"
+        );
+        poweroff();
+    }
+    arm_stop_handling();
     supervise(serve)
 }
 
@@ -1305,24 +1454,31 @@ fn home_for_default_user(
 }
 
 /// The boot-time service config carried in the agent initramfs — `None` when the
-/// initramfs carries none (a builder boot) or it fails to parse.
+/// initramfs carries none (a builder boot), an error when it cannot be read or parsed.
 /// Must run before the pivot: the initramfs is hidden underneath afterwards. On a boot that
 /// stays in the initramfs (`vk run --ram`) it would stay visible at `/` for the VM's life,
 /// so it is unlinked once read: its env may hold secrets.
-fn read_boot_config() -> Option<RunConfig> {
+fn read_boot_config() -> Result<Option<RunConfig>> {
     let path = format!("/{}", vk_core::runcfg::INITRAMFS_PATH);
-    let text = std::fs::read_to_string(&path).ok()?;
-    if root_is_initramfs()
+    let read = std::fs::read_to_string(&path);
+    if !matches!(&read, Err(e) if e.kind() == io::ErrorKind::NotFound)
+        && root_is_initramfs()
         && let Err(e) = std::fs::remove_file(&path)
     {
         warn!("vk-agent init: removing {path} failed: {e}");
     }
-    match RunConfig::from_json(&text) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            warn!("vk-agent init: unparsable {path}: {e}");
-            None
-        }
+    parse_boot_config(&path, read)
+}
+
+/// [`read_boot_config`]'s verdict on what reading `path` gave: only an absent file is no
+/// config, since one that is there but unreadable may have carried a `prepare`.
+fn parse_boot_config(path: &str, read: io::Result<String>) -> Result<Option<RunConfig>> {
+    match read {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {path}")),
+        Ok(text) => RunConfig::from_json(&text)
+            .map(Some)
+            .with_context(|| format!("unparsable {path}")),
     }
 }
 
@@ -3046,7 +3202,7 @@ fn run_service(cmdline: &HashMap<String, String>, config: Option<&RunConfig>) ->
     // live-debugging channel: vk-agent -s vsock-auto://<vsock.sock>:4444 exec -- <cmd>
     let serve_pid = if cmdline.get("VIRTKIT_SERVE").map(String::as_str) == Some("1") {
         let socket = socket_from_cmdline();
-        match spawn_serve(&socket, None) {
+        match spawn_serve(&socket, None, None) {
             Ok(pid) => {
                 info!("vk-agent init: exec server up on {socket} (pid {pid})");
                 Some(pid)
@@ -3269,7 +3425,11 @@ fn set_child_subreaper() {
 }
 
 /// fork() + exec the serve agent (`… --socket <socket> serve [--inactivity-timeout]`).
-fn spawn_serve(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<libc::pid_t> {
+fn spawn_serve(
+    socket: &SocketAddr,
+    inactivity_timeout: Option<u64>,
+    handoff_fd: Option<std::os::fd::RawFd>,
+) -> Result<libc::pid_t> {
     let mut args = vec![
         "--socket".to_string(),
         socket.to_string(),
@@ -3278,6 +3438,10 @@ fn spawn_serve(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<l
     if let Some(t) = inactivity_timeout {
         args.push("--inactivity-timeout".to_string());
         args.push(t.to_string());
+    }
+    if let Some(fd) = handoff_fd {
+        args.push("--handoff-fd".to_string());
+        args.push(fd.to_string());
     }
     let pid = fork_agent(&args)?;
     info!("vk-agent init: serve started (pid {pid})");
@@ -4328,6 +4492,7 @@ mod tests {
         let with_argv = RunConfig {
             handoff: vk_core::runcfg::Handoff {
                 init: vec!["/lib/systemd/systemd".into(), "--log-level=debug".into()],
+                ..Default::default()
             },
             ..cfg.clone()
         };
@@ -4493,6 +4658,21 @@ mod tests {
     }
 
     #[test]
+    fn only_an_absent_boot_config_is_none() {
+        let p = "/virtkit-service.json";
+        let absent = io::Error::from(io::ErrorKind::NotFound);
+        assert_eq!(parse_boot_config(p, Err(absent)).unwrap(), None);
+        // invalid UTF-8, as read_to_string reports it
+        let garbled = io::Error::from(io::ErrorKind::InvalidData);
+        assert!(parse_boot_config(p, Err(garbled)).is_err());
+        assert!(parse_boot_config(p, Ok("{".into())).is_err());
+        assert_eq!(
+            parse_boot_config(p, Ok("{}".into())).unwrap(),
+            Some(RunConfig::default())
+        );
+    }
+
+    #[test]
     fn boot_config_parses_the_runcfg_json() {
         let cfg = RunConfig {
             env: vec![("PORT".into(), "6379".into())],
@@ -4503,6 +4683,7 @@ mod tests {
             exposed_ports: vec![6379],
             handoff: vk_core::runcfg::Handoff {
                 init: vec!["/sbin/init".into(), "--log-level=info".into()],
+                prepare: vec!["/setup.sh".into()],
             },
         };
         assert_eq!(RunConfig::from_json(&cfg.to_json()).unwrap(), cfg);

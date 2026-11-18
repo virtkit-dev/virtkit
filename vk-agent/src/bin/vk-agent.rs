@@ -177,6 +177,9 @@ enum Commands {
         /// Refuse background commands: each runs only as long as its session
         #[arg(long)]
         no_background: bool,
+        /// The descriptor of `vk-agent init`'s handoff link, to report over (internal)
+        #[arg(long, value_name = "FD", hide = true)]
+        handoff_fd: Option<i32>,
     },
     /// Probe the agent at --socket and print its status reply
     Status,
@@ -788,6 +791,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
             vk_wrapper_max_concurrent,
             max_concurrent,
             no_background,
+            handoff_fd,
         } => {
             let log_level = if debug {
                 LevelFilter::Debug
@@ -795,6 +799,14 @@ async fn async_main(socket: SocketAddr, command: Commands) {
                 LevelFilter::Info
             };
             install_console_logger(log_level);
+            if let Some(fd) = handoff_fd {
+                match vk_agent::handoff::serve_end(fd) {
+                    Ok(mut link) => vk_core::exec::server::on_listening(move || {
+                        vk_agent::handoff::report_listening(&mut link)
+                    }),
+                    Err(e) => error!("serve: {e:#}"),
+                }
+            }
             // run_server_routed reads a zero timeout as no timeout, so it needs no filtering here.
             let duration = inactivity_timeout.map(Duration::from_secs);
             if let Err(e) = run_server_routed(

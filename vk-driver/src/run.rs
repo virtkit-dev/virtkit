@@ -86,9 +86,10 @@ impl std::fmt::Display for InitSource {
     }
 }
 
-/// What the primary's `init: image` hands PID 1 to: `--init-argv` over the --primary service's
-/// `x-virtkit.init_argv`, as `--init` overrides its `init`. Either has to reach the image's own
-/// init, so an effective axis that is not `image` refuses them.
+/// What the primary's `init: image` hands PID 1 to, and what runs first: `--init-argv` and
+/// `--prepare` over the --primary service's `x-virtkit.init_argv` and `prepare`, as `--init`
+/// overrides its `init`. They have to reach the image's own init, so an effective axis that is
+/// not `image` refuses them.
 fn effective_handoff(
     args: &RunArgs,
     primary: Option<&crate::compose::Unit>,
@@ -98,11 +99,17 @@ fn effective_handoff(
     if !args.init_argv.is_empty() {
         handoff.init = args.init_argv.clone();
     }
+    if !args.prepare.is_empty() {
+        handoff.prepare = args.prepare.clone();
+    }
     if init != InitSource::Image && !handoff.is_empty() {
-        let what = if args.init_argv.is_empty() {
-            "the --primary service's x-virtkit.init_argv"
+        let what = if !args.init_argv.is_empty() {
+            "--init-argv".to_string()
+        } else if !args.prepare.is_empty() {
+            "--prepare".to_string()
         } else {
-            "--init-argv"
+            let key = crate::compose::handoff_key(&handoff, RootMode::Rw).unwrap_or_default();
+            format!("the --primary service's {key}")
         };
         bail!("{what} needs `init: image`, but the guest boots `init: {init}`");
     }
@@ -426,6 +433,9 @@ pub struct RunArgs {
     /// `--init-argv`: the init `init: image` execs, with its arguments; empty = the --primary
     /// service's `x-virtkit.init_argv`, else `/sbin/init`
     pub init_argv: Vec<String>,
+    /// `--prepare`: what the agent runs to completion before `init: image` hands PID 1 over;
+    /// empty = the --primary service's `x-virtkit.prepare`, else nothing
+    pub prepare: Vec<String>,
     /// `--root`: how `/` is mounted when `init: image` hands PID 1 over; `None` = the --primary
     /// service's `x-virtkit.root`, else rw
     pub root: Option<RootMode>,
@@ -604,6 +614,7 @@ impl Default for RunArgs {
             ram: false,
             init: InitSource::Default,
             init_argv: Vec::new(),
+            prepare: Vec::new(),
             root: None,
             shell: false,
             tty: false,
@@ -7694,6 +7705,44 @@ mod tests {
         .to_string();
         assert!(
             err.contains("x-virtkit.init_argv needs `init: image`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn prepare_ranks_the_flag_over_the_primary_service_marker() {
+        let units = crate::compose::parse(
+            "services:\n\
+             \x20 appliance:\n    image: a\n    x-virtkit: { init: image, prepare: /setup.sh }\n\
+             \x20 web:\n    image: w\n",
+            Path::new("/b"),
+            &|_| None,
+            None,
+        )
+        .unwrap();
+        let unit = |n: &str| units.iter().find(|u| u.name == n);
+        let args = |init, prepare: &[&str]| RunArgs {
+            init,
+            prepare: prepare.iter().map(|a| a.to_string()).collect(),
+            ..RunArgs::default()
+        };
+        let resolve = |a: &RunArgs, u| effective_handoff(a, u, primary_init(a, u));
+        let silent = args(InitSource::Default, &[]);
+        assert_eq!(
+            resolve(&silent, unit("appliance")).unwrap().prepare,
+            ["/setup.sh"]
+        );
+        let flag = args(InitSource::Default, &["/other.sh", "--x"]);
+        assert_eq!(
+            resolve(&flag, unit("appliance")).unwrap().prepare,
+            ["/other.sh", "--x"]
+        );
+        let err = resolve(&flag, unit("web")).unwrap_err().to_string();
+        assert!(err.contains("--prepare needs `init: image`"), "{err}");
+        let moved = args(InitSource::Entrypoint, &[]);
+        let err = resolve(&moved, unit("appliance")).unwrap_err().to_string();
+        assert!(
+            err.contains("x-virtkit.prepare needs `init: image`"),
             "{err}"
         );
     }

@@ -1284,11 +1284,10 @@ fn map_service(
     // Only the image's own init is handed these: an entrypoint is PID 1's argv itself, and
     // the agent never execs an init. Refused rather than ignored, like every other x-virtkit
     // key the boot cannot honor.
-    if init != crate::run::InitSource::Image && !handoff.init.is_empty() {
-        bail!("service {name:?}: x-virtkit.init_argv needs `init: image`, not `init: {init}`");
-    }
-    if init != crate::run::InitSource::Image && root == crate::run::RootMode::Ro {
-        bail!("service {name:?}: x-virtkit `root: ro` needs `init: image`, not `init: {init}`");
+    if init != crate::run::InitSource::Image
+        && let Some(key) = handoff_key(&handoff, root)
+    {
+        bail!("service {name:?}: {key} needs `init: image`, not `init: {init}`");
     }
     // Key roots by service under the same anchor as overlays, so primary and sibling
     // use the same stable path.
@@ -2145,6 +2144,23 @@ pub fn parse_symlink(spec: &str) -> Result<(String, String)> {
     }
 }
 
+/// The first `x-virtkit` key set among those that only an `init: image` handoff honors, for
+/// refusing them anywhere else.
+pub(crate) fn handoff_key(
+    handoff: &vk_core::runcfg::Handoff,
+    root: crate::run::RootMode,
+) -> Option<&'static str> {
+    if !handoff.init.is_empty() {
+        Some("x-virtkit.init_argv")
+    } else if !handoff.prepare.is_empty() {
+        Some("x-virtkit.prepare")
+    } else if root == crate::run::RootMode::Ro {
+        Some("x-virtkit `root: ro`")
+    } else {
+        None
+    }
+}
+
 /// An argv the guest agent `execvp`s as it stands: a program to run, and no NUL anywhere, which
 /// would cut an argument short on its way to exec.
 pub(crate) fn exec_argv(argv: Vec<String>) -> Result<Vec<String>> {
@@ -2358,7 +2374,8 @@ struct ComposeService {
 /// guest sizing (`cpus`/`mem`), idle page-cache trimming (`reclaim`), the DAX window its
 /// shares get (`dax`), nested virtualization (`nested`), NIC count (`nics`) and root
 /// persistence (`persist_root`), a host tap for eth0 (`tap`), and the argv `init: image` hands
-/// PID 1 to (`init_argv`) on a root mounted as `root` says. An absent subkey defaults to
+/// PID 1 to (`init_argv`), after what it runs first (`prepare`), on a root mounted as `root`
+/// says. An absent subkey defaults to
 /// `Default`/unset/off/rw.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2392,6 +2409,10 @@ struct XVirtkit {
     /// `command:`
     #[serde(default)]
     init_argv: Option<Cmd>,
+    /// what the agent runs to completion before handing PID 1 to that init: a list, or a
+    /// string split like `command:`
+    #[serde(default)]
+    prepare: Option<Cmd>,
     #[serde(default)]
     root: Option<String>,
 }
@@ -2428,13 +2449,23 @@ impl XVirtkit {
         }
     }
 
-    /// `init_argv: <argv>` → [`vk_core::runcfg::Handoff`] (absent = the image's `/sbin/init`).
+    /// `init_argv`/`prepare: <argv>` → [`vk_core::runcfg::Handoff`] (absent = the image's
+    /// `/sbin/init`, with nothing run before it).
     fn handoff(&self) -> Result<vk_core::runcfg::Handoff> {
-        let init = match &self.init_argv {
-            None => Vec::new(),
-            Some(cmd) => exec_argv(cmd.clone().into_argv()?).context("x-virtkit.init_argv")?,
+        let argv = |cmd: &Option<Cmd>, key: &str| -> Result<Vec<String>> {
+            match cmd {
+                None => Ok(Vec::new()),
+                Some(cmd) => cmd
+                    .clone()
+                    .into_argv()
+                    .and_then(exec_argv)
+                    .with_context(|| format!("x-virtkit.{key}")),
+            }
         };
-        Ok(vk_core::runcfg::Handoff { init })
+        Ok(vk_core::runcfg::Handoff {
+            init: argv(&self.init_argv, "init_argv")?,
+            prepare: argv(&self.prepare, "prepare")?,
+        })
     }
 
     /// `root: rw|ro` → [`crate::run::RootMode`] (absent = rw).
@@ -4423,6 +4454,14 @@ mod tests {
             cfg.handoff.init,
             ["/lib/systemd/systemd", "--log-level=info"]
         );
+        // prepare rides alongside it, and is all a unit may set
+        let prepared = one(
+            "services:\n  s:\n    image: x\n    x-virtkit:\n      init: image\n      \
+             prepare: /usr/local/bin/setup.sh --ci\n",
+        );
+        let cfg = merged_config(&RunConfig::default(), &prepared);
+        assert_eq!(cfg.handoff.prepare, ["/usr/local/bin/setup.sh", "--ci"]);
+        assert!(cfg.handoff.init.is_empty());
         // a string splits like `command:`
         let split = one(
             "services:\n  s:\n    image: x\n    x-virtkit:\n      init: image\n      \
@@ -4453,6 +4492,11 @@ mod tests {
                 "`root: ro` needs `init: image`",
             ),
             ("{ init: image, root: yes }", "expected \"rw\" or \"ro\""),
+            (
+                "{ prepare: /setup.sh }",
+                "x-virtkit.prepare needs `init: image`",
+            ),
+            ("{ init: image, prepare: '' }", "names no program"),
         ] {
             let yaml = format!("services:\n  s:\n    image: x\n    x-virtkit: {yaml}\n");
             let Err(err) = parse(&yaml, Path::new("/base")) else {

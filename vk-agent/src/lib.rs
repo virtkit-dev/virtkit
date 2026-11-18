@@ -19,6 +19,7 @@ pub mod dropcaches;
 pub mod fsfreeze;
 pub mod fsmark;
 pub mod guestbuild;
+pub mod handoff;
 pub mod init;
 pub(crate) mod mark;
 pub mod memmark;
