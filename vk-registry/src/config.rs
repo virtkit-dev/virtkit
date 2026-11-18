@@ -84,9 +84,11 @@ pub struct ServerConfig {
     /// has.
     pub oidc: Option<OidcSpec>,
     /// Enable `/dav/` (default: true). When disabled, requests return 404 after auth; the
-    /// objects already stored under `files/` stay reachable over `/v2/` and expire under `gc`
-    /// like any tag.
+    /// objects already stored under `files/` stay reachable over `/v2/` (and over `/s3/`
+    /// unless `s3` is off) and expire under `gc` like any tag.
     pub webdav: bool,
+    /// Serve `/s3/<bucket>/<key>`, the S3 view of `/dav/files/` (default: true).
+    pub s3: bool,
     /// Connections served at once; past it, new ones wait in the listen backlog.
     pub max_connections: usize,
     /// Connections served at once from one client address (an IPv6 /64); past it, new ones
@@ -258,6 +260,8 @@ struct FileConfig {
     admin_socket: Option<FileAdminSocket>,
     /// Enable `/dav/`; defaults to true.
     webdav: Option<bool>,
+    /// Enable `/s3/`; defaults to true.
+    s3: Option<bool>,
     max_connections: Option<usize>,
     max_connections_per_client: Option<usize>,
     oidc: Option<FileOidc>,
@@ -378,6 +382,7 @@ impl ServerConfig {
             admin_socket: AdminSocket::Unset,
             oidc: None,
             webdav: true,
+            s3: true,
             max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             max_connections_per_client: crate::DEFAULT_MAX_CONNECTIONS_PER_CLIENT,
             hub: HubSettings::default(),
@@ -459,6 +464,10 @@ impl ServerConfig {
         // Only when set, so a registry with no `[[gc.prefix]]` keeps the hash it had.
         if !self.gc_prefixes.is_empty() {
             described.push_str(&format!(" gc={:?}", self.gc_prefixes));
+        }
+        // Only when turned off, so a registry that leaves it on keeps the hash it had.
+        if !self.s3 {
+            described.push_str(" s3=false");
         }
         crate::hub::Facts {
             listen: self.addr.to_string(),
@@ -669,6 +678,7 @@ impl ServerConfig {
                 public_url: o.public_url,
             }),
             webdav: f.webdav.unwrap_or(true),
+            s3: f.s3.unwrap_or(true),
             max_connections: f.max_connections.unwrap_or(crate::DEFAULT_MAX_CONNECTIONS),
             max_connections_per_client: f
                 .max_connections_per_client
@@ -952,6 +962,7 @@ impl ServerConfig {
             auth,
             tls: None,
             webdav: self.webdav,
+            s3: self.s3,
             tokens: Default::default(),
             handover: Default::default(),
         })
@@ -1850,6 +1861,27 @@ mod tests {
         assert_eq!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
         cfg.hub.tokens = true;
         assert_ne!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
+    }
+
+    /// The S3 view is on unless `s3 = false`, and only turning it off changes the config hash.
+    #[test]
+    fn the_s3_view_is_on_unless_turned_off() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-s3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let load = |body: &str| {
+            let p = dir.join("c.toml");
+            std::fs::write(&p, body).unwrap();
+            ServerConfig::load(&p, None, None).unwrap()
+        };
+        assert!(load("").s3);
+        assert!(load("s3 = true\n").s3);
+        assert!(!load("s3 = false\n").s3);
+        let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), "/s".into());
+        assert_eq!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
+        cfg.s3 = false;
+        assert_ne!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `[hub] update_drain_minutes` defaults to an hour, takes 1 to 1440, and changes the config

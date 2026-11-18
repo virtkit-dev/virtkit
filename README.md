@@ -1004,7 +1004,19 @@ repository's tags, manifests and blobs, and `/dav/files/` is a plain-file area w
 compiled units. In accounts mode, a key with `write:files/<dir>/*` fills the cache and one
 with `read:files/<dir>/*` only reads it. Cached files expire under `vk-registry gc`'s tag
 retention like any other tag, unless their manifest keeps or expires them. Set
-`webdav = false` in the server config to disable WebDAV.
+`webdav = false` in the server config to disable WebDAV; the S3 view below stays on.
+
+Machines without WebDAV setup can share the same cache through sccache's S3 backend. Each
+top-level directory is a bucket. Use the registry credential for both AWS keys. Set
+`s3 = false` to disable S3.
+
+```sh
+SCCACHE_BUCKET=cache SCCACHE_ENDPOINT=https://<registry>/s3 SCCACHE_REGION=auto \
+  AWS_ACCESS_KEY_ID=$KEY AWS_SECRET_ACCESS_KEY=$KEY sccache …
+```
+
+The endpoint supports object reads and single-request writes. See `vk-registry/DESIGN.md`.
+Treat the access key ID as a secret. S3 clients may log it (`SCCACHE_LOG=debug`).
 
 `vk registry put [--dir <dir>] [--ttl 7d | --keep] <file>...` stores files there, each once by
 digest (`/dav/files/sha256/<hex>`) and, with `--dir`, by name (`/dav/files/<dir>/<name>`), and

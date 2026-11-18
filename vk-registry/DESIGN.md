@@ -636,6 +636,47 @@ an entry alive as a writer's do. There is no per-directory policy and no size ca
 replaced or deleted object frees no disk until the next `gc`. A staging file a crashed `PUT`
 left in `uploads/` goes with the idle uploads.
 
+## S3 view for sccache (`/s3/`)
+
+sccache's S3 backend (OpenDAL's path-style `s3` service) can read, stat and write cache
+objects at `/s3/<bucket>/<key>` with `GET`, `HEAD` and single-request `PUT`. Each object is
+the plain file at `/dav/files/<bucket>/<key>`, visible to WebDAV, `vk registry get`,
+`/browse` and gc. S3 defaults on even with WebDAV disabled. Set `s3 = false` to disable it.
+
+The service root, bucket operations, other methods and nonempty queries (listings, presigned
+URLs, multipart and sub-resources) return 501 `NotImplemented`. So do `Content-MD5`,
+streaming payloads (`STREAMING-…`) and `x-amz-*` headers other than `x-amz-date` and
+`x-amz-content-sha256`. Signature checks run first, so an unsigned `x-amz-*` header on a
+signed request returns 403 `AccessDenied`. A `PUT` creates missing parent directories,
+including the bucket. A missing key returns 404 `NoSuchKey`, a cache miss for sccache.
+
+**Credentials.** Set both `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` to the registry
+credential (an API key, hub token or shared bearer). The registry uses the access key as the
+secret to verify the SigV4 header signature (`AWS4-HMAC-SHA256`). It stores no separate S3
+secret and keeps API keys hashed.
+
+Sign `host`, `x-amz-date` and every `x-amz-*` header, including the required
+`x-amz-content-sha256`. The scope must name the `s3` service. The region can be any nonempty
+sequence of ASCII letters, digits and hyphens. The date must be within 15 minutes of the
+server clock. A `PUT` that supplies a SHA-256 in place of `UNSIGNED-PAYLOAD` must match it
+before publication. A mismatch returns 400 `XAmzContentSHA256Mismatch`.
+
+The registry strips cookies and forwards signed requests to `/dav/files/…` with
+`Authorization: Bearer <access key>`. WebDAV checks the credential and its grants, including
+`write:files/<bucket>/*` and hub grants. Requests without `Authorization` use WebDAV's
+anonymous permissions. WebDAV also accepts Bearer or Basic credentials on unsigned requests.
+For example, sccache can use `SCCACHE_S3_NO_CREDENTIALS=true` with a proxy that injects the
+job's bearer token. Shared Basic credentials cannot serve as access keys. A shared bearer
+containing a comma cannot sign because commas separate the SigV4 authorization fields.
+
+Use TLS to protect the `Authorization` header. It contains the access key in clear text,
+so anyone who obtains it can sign another request. S3 tooling treats access key IDs as
+public. Client debug logs (`SCCACHE_LOG=debug`) and proxies may record the credential.
+The registry returns S3 XML errors. When authentication is enabled, a rejected credential or
+a failed grant check before lookup returns 403 `AccessDenied`, which sccache reports at
+startup or as a read-only cache. A read allowed to look up a path returns 404 `NoSuchKey`
+if the resolved object is inaccessible.
+
 ## Accounts administration
 
 `vk-registry accounts` manages users, sessions, administrators, and API keys. The command

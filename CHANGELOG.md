@@ -8,6 +8,12 @@ All notable changes to virtkit will be documented in this file.
 
 - Commit hooks can use `vk dev task -q` to suppress progress notes while keeping check output
   and diagnostics visible.
+- **sccache can share the registry's WebDAV cache over S3.** Set
+  `SCCACHE_ENDPOINT=https://<registry>/s3` and use the registry credential for both
+  `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. `/s3/<bucket>/<key>` reads and writes
+  the same objects as `/dav/files/<bucket>/<key>`. Writes use a single request. Listings,
+  multipart and bucket operations return `NotImplemented`. S3 defaults on even with
+  `webdav = false`. Set `s3 = false` to disable it.
 
 ### Changed
 

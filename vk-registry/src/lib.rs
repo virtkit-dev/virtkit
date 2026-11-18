@@ -63,6 +63,7 @@ pub(crate) mod keys;
 pub mod lock;
 pub mod oidc;
 pub mod relay;
+pub(crate) mod s3;
 pub(crate) mod staging;
 pub(crate) mod tags;
 #[cfg(test)]
@@ -113,6 +114,8 @@ pub struct ServerState {
     pub tls: Option<tokio_rustls::TlsAcceptor>,
     /// Enable WebDAV routes.
     pub webdav: bool,
+    /// Enable the S3 view of the WebDAV plain-file area (`/s3/`).
+    pub s3: bool,
     /// The hub tokens taken, once enrolled with `[hub] tokens = true`.
     pub tokens: hubtoken::TokenGate,
     /// The listeners served through, to hand to a release.
@@ -4378,6 +4381,9 @@ async fn serve_refusing(
     if !state.webdav {
         eprintln!("vk-registry: WebDAV off (webdav = false): /dav/ answers 404");
     }
+    if !state.s3 {
+        eprintln!("vk-registry: S3 view off (s3 = false): /s3/ answers 404");
+    }
     let slots = Arc::new(tokio::sync::Semaphore::new(limits.connections));
     let peers = PeerCounts::default();
     let mut refused = RefusalLog::default();
@@ -4661,7 +4667,18 @@ async fn handle(
     let (method, path) = (req.method().clone(), req.uri().path().to_string());
     let has_body = !hyper::body::Body::is_end_stream(req.body());
     let tls = state.tls.is_some();
-    let resp = route(req, state).await.unwrap_or_else(|e| {
+    let s3 = state.s3 && s3::is_s3_path(&path);
+    let routed = if s3 {
+        match s3::admit(req, vk_peer::now_secs()) {
+            Ok(req) => route(req, state).await,
+            // Drain a refused body only after signature verification, subject to WebDAV's size cap.
+            Err(r) if r.signed && has_body => dav::refuse(r.req, r.resp, &path).await,
+            Err(r) => Ok(r.resp),
+        }
+    } else {
+        route(req, state).await
+    };
+    let resp = routed.unwrap_or_else(|e| {
         if accounts::is_handed_over_error(&e) {
             return updating();
         }
@@ -4672,6 +4689,11 @@ async fn handle(
             "internal error (details in the server log)",
         )
     });
+    let resp = if s3 {
+        s3::respond(resp, &method, &path).await
+    } else {
+        resp
+    };
     Ok(with_hsts(closing_after_refusal(resp, has_body), tls))
 }
 
@@ -4994,7 +5016,8 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     // DAV authorizes each resource: `files/<dir>` or the OCI repository name. Keep it outside
     // `is_human_path` so clients receive a 401 challenge, not a login redirect.
     // Disabled WebDAV routes fall through to 404.
-    if state.webdav && (path == "/dav" || path.starts_with("/dav/")) {
+    let admitted = req.extensions().get::<s3::Admitted>().is_some();
+    if (state.webdav || admitted) && (path == "/dav" || path.starts_with("/dav/")) {
         return dav::route(&state, &authz, req).await;
     }
     if files_put::is_files_path(&path) {
@@ -6739,9 +6762,14 @@ pub(crate) fn query_param(query: &str, key: &str) -> Option<String> {
 /// lock name it mapped — never HTML, so this needs no HTML-escaping counterpart; that is
 /// [`html_escape`].
 pub fn percent_encode(s: &str) -> String {
+    percent_encode_bytes(s.as_bytes())
+}
+
+/// [`percent_encode`] for bytes that need not be UTF-8, such as a decoded S3 key.
+pub(crate) fn percent_encode_bytes(bytes: &[u8]) -> String {
     use std::fmt::Write;
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 out.push(b as char)
@@ -7307,6 +7335,7 @@ mod tests {
             auth: Authenticator::Shared(auth),
             tls,
             webdav: false,
+            s3: false,
             tokens: Default::default(),
             handover: Default::default(),
         });
@@ -7748,6 +7777,7 @@ mod tests {
                 auth: Authenticator::Shared(auth::Auth::None),
                 tls: acceptor,
                 webdav: false,
+                s3: false,
                 tokens: Default::default(),
                 handover: Default::default(),
             });
@@ -12141,6 +12171,7 @@ mod tests {
             auth: Authenticator::Shared(auth::Auth::None),
             tls: None,
             webdav: false,
+            s3: false,
             tokens: Default::default(),
             handover: Default::default(),
         });
