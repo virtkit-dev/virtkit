@@ -15,7 +15,8 @@ All notable changes to virtkit will be documented in this file.
 - **Prepare the machine before its init starts.** `x-virtkit.prepare` (or
   `vk run --prepare`) runs a command to completion, on a writable root and with
   `vk exec` available, before `init: image` hands PID 1 over. A failing command leaves
-  the guest up for inspection, without its init.
+  the guest up for inspection, without its init. `vk status` reports where the handoff
+  stands.
 
 ## [0.112.5] - 2026-11-17
 

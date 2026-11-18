@@ -3,7 +3,24 @@ use crate::net::connect;
 use futures::{SinkExt, StreamExt};
 use std::time::Duration;
 
-use super::messages::{Message, Status};
+use super::messages::{HandoffState, Message, Status};
+
+/// Where this guest's `init: image` handoff stands, for the exec server's status answers:
+/// set once, by the agent's serve, on a guest whose PID 1 hands over.
+static HANDOFF: std::sync::OnceLock<Box<dyn Fn() -> HandoffState + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// Report `source()`'s handoff state in every status answer from now on.
+pub fn report_handoff(source: impl Fn() -> HandoffState + Send + Sync + 'static) {
+    if HANDOFF.set(Box::new(source)).is_err() {
+        log::warn!("the handoff state source is already set");
+    }
+}
+
+/// The handoff state to answer a status request with; `None` when nothing reports one.
+pub(crate) fn current_handoff() -> Option<HandoffState> {
+    HANDOFF.get().map(|source| source())
+}
 
 pub async fn get_status(socket: &SocketAddr) -> Result<Status, Box<dyn std::error::Error>> {
     // bounded: the watchdog (and `vk-agent status`) must detect a stuck server,

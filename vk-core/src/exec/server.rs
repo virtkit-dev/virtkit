@@ -267,7 +267,7 @@ fn start_watchdog(status: Status, socket: SocketAddr) {
             let current_status = get_status(&socket).await;
             match current_status {
                 Ok(s) => {
-                    if s == status {
+                    if s.is_same_server(&status) {
                         continue;
                     }
                     info!(
@@ -570,7 +570,9 @@ async fn do_handle_conn(
             }
         }
         Message::CmdStatus => {
-            let status = status.clone();
+            let status = status
+                .clone()
+                .with_handoff(crate::status::current_handoff());
             send_last(stream, sink, Message::RespStatus { status }).await?;
             Ok(true)
         }

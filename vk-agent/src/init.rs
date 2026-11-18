@@ -448,16 +448,25 @@ fn run_full_vm(
         .and_then(|l| l.as_ref().ok())
         .map(|(_, theirs)| std::os::fd::AsRawFd::as_raw_fd(theirs));
     let serve = spawn_serve(socket, None, serve_end)?;
-    // Held until the exec, which closes it: no other child may inherit the server's end.
-    let _link = match link.map(|l| l.map(|(link, _theirs)| link)) {
-        None => None,
-        Some(link) => match link
-            .and_then(|link| ready_for_init(link, cfg, cfg_error.as_ref(), root_ro, serve))
-        {
-            Ok(link) => Some(link),
-            Err(e) => return hold_failed_handoff(serve, &e),
-        },
+    // The server's end closes here, so no later child inherits it. PID 1's is held until the
+    // exec closes it.
+    let (mut link, link_error) = match link.map(|l| l.map(|(link, _theirs)| link)) {
+        None => (None, None),
+        Some(Ok(link)) => (Some(link), None),
+        Some(Err(e)) => (None, Some(e)),
     };
+    if axis == ImageInit::Init
+        && let Err(e) = ready_for_init(
+            link.as_mut(),
+            link_error,
+            cfg,
+            cfg_error.as_ref(),
+            root_ro,
+            serve,
+        )
+    {
+        return hold_failed_handoff(serve, link.as_mut(), &e);
+    }
 
     // Only the entrypoint axis chdirs: /sbin/init neither has nor wants a workdir. It
     // precedes the exec so a relative entrypoint (`./prepare.sh`) resolves there.
@@ -467,11 +476,25 @@ fn run_full_vm(
     let drop_ids = (axis == ImageInit::Entrypoint)
         .then(|| drop_ids_for_user(cfg.map_or("", |c| c.user.as_str())))
         .flatten();
-    exec_first(&image_init_candidates(axis, cmdline, cfg, drop_ids)) // never returns
+    let candidates = image_init_candidates(axis, cmdline, cfg, drop_ids);
+    // The image's own init is the one candidate of its axis: an exec of it that returns is a
+    // handoff that failed, reported and held like any other, rather than PID 1 exiting.
+    if axis == ImageInit::Init {
+        let [init] = candidates.as_slice() else {
+            unreachable!("the init axis offers the image's init alone");
+        };
+        info!("vk-agent image-init: exec {init:?} (it takes PID 1)");
+        if let Some(l) = link.as_mut() {
+            l.report_exec();
+        }
+        let e = anyhow::anyhow!("exec {init:?}: {}", try_exec_argv(init));
+        return hold_failed_handoff(serve, link.as_mut(), &e);
+    }
+    exec_first(&candidates) // never returns
 }
 
-/// How long `prepare` waits for the exec server to listen, so the host can watch it from the
-/// start. A healthy server listens in milliseconds.
+/// How long the handoff waits for the exec server to listen, so the host can watch `prepare`
+/// from the start. A healthy server listens in milliseconds.
 const SERVE_LISTEN_WAIT: Duration = Duration::from_secs(30);
 
 /// What has to hold before the image's init takes PID 1: a readable boot config, its `prepare`
@@ -480,20 +503,30 @@ const SERVE_LISTEN_WAIT: Duration = Duration::from_secs(30);
 /// read-only `/`, as a real boot hands it one, remounts it rw itself. A stop that came in
 /// meanwhile wins over the handoff.
 fn ready_for_init(
-    mut link: crate::handoff::Link,
+    link: Option<&mut crate::handoff::Link>,
+    link_error: Option<anyhow::Error>,
     cfg: Option<&RunConfig>,
     cfg_error: Option<&anyhow::Error>,
     root_ro: bool,
     serve: libc::pid_t,
-) -> Result<crate::handoff::Link> {
+) -> Result<()> {
     if let Some(e) = cfg_error {
         bail!("the boot config: {e:#}");
     }
-    if let Some(prepare) = cfg
+    let prepare = cfg
         .map(|c| c.handoff.prepare.as_slice())
-        .filter(|argv| !argv.is_empty())
-    {
-        link.wait_listening(SERVE_LISTEN_WAIT)?;
+        .filter(|argv| !argv.is_empty());
+    // Read whether or not `prepare` needs it: left unread, the server's word would make the
+    // exec's close of this end reset the server's, losing the `exec` report before it.
+    match (link, link_error) {
+        (Some(link), _) => link.wait_listening(SERVE_LISTEN_WAIT)?,
+        (None, Some(e)) if prepare.is_some() => {
+            bail!("{e:#}: prepare would run before the host could watch it")
+        }
+        (None, Some(e)) => warn!("vk-agent image-init: {e:#} — the handoff goes unreported"),
+        (None, None) => {}
+    }
+    if let Some(prepare) = prepare {
         run_prepare(prepare, serve)?;
     }
     if root_ro {
@@ -505,7 +538,7 @@ fn ready_for_init(
     if STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
         wait_out_stop();
     }
-    Ok(link)
+    Ok(())
 }
 
 /// A stop is under way: the stop worker, or the alarm it armed, ends the machine.
@@ -637,10 +670,17 @@ fn remount_root_read_only() -> Result<()> {
 
 /// The handoff cannot go ahead. Rather than hand PID 1 to an init on a machine it was not
 /// promised, keep it, with the exec channel already serving, so the guest can be inspected
-/// and still stops when the host asks — as the default path does. The machine ends with the
-/// exec server.
-fn hold_failed_handoff(serve: libc::pid_t, e: &anyhow::Error) -> Result<()> {
+/// and still stops when the host asks — as the default path does — and tell the exec server
+/// why, for the host to read in its status. The machine ends with the exec server.
+fn hold_failed_handoff(
+    serve: libc::pid_t,
+    link: Option<&mut crate::handoff::Link>,
+    e: &anyhow::Error,
+) -> Result<()> {
     log::error!("vk-agent image-init: {e:#} — not handing PID 1 over; holding for inspection");
+    if let Some(link) = link {
+        link.report_failed(&format!("{e:#}"));
+    }
     if SERVE_EXITED.load(std::sync::atomic::Ordering::SeqCst) {
         log::error!(
             "vk-agent image-init: no exec server left to inspect it with — ending the machine"
@@ -675,8 +715,8 @@ fn exec_first(candidates: &[Vec<String>]) -> ! {
 ///
 /// [`ImageInit::Init`] offers the image's own init alone: the boot config's `handoff.init`
 /// argv if it has one, else `VIRTKIT_HANDOFF` if the host named one, else `/sbin/init`. An
-/// image booted for its own init and missing it is broken, and looks it — the boot ends the
-/// way it did before any of this.
+/// image booted for its own init and missing it is broken: PID 1 reports the failed exec and
+/// holds the guest for inspection ([`hold_failed_handoff`]).
 ///
 /// [`ImageInit::Entrypoint`] leads with the image's ENTRYPOINT+CMD (merged host-side with
 /// any compose override), exec'd — NOT forked as `VIRTKIT_MODE=service` does — so an

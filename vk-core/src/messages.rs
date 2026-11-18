@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// reordering a struct field, adding an enum variant, ...): rmp_serde encodes
 /// structs as fixed-length arrays, so such changes are not wire compatible
 /// across versions. A virtkit-agent predating this field decodes its `protocol` as 0.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub enum RunMode {
@@ -140,7 +140,7 @@ pub struct CmdResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{CmdExec, PROTOCOL_VERSION, RunMode, SHOWN_MAX, Status};
+    use super::{CmdExec, HandoffState, PROTOCOL_VERSION, RunMode, SHOWN_MAX, Status};
 
     /// A request is shown at most [`SHOWN_MAX`] bytes long, cut on a character boundary.
     #[test]
@@ -186,6 +186,30 @@ mod tests {
         assert_eq!(status.protocol(), 0);
         assert_ne!(status.protocol(), PROTOCOL_VERSION);
     }
+
+    /// A Status from a virtkit-agent predating the handoff field still decodes, as a guest
+    /// that reports none.
+    #[test]
+    fn pre_handoff_status_decodes_as_none() {
+        let legacy: (u32, u64, u32, String, u32) =
+            (621, 1_781_346_012, 708_802_242, "0.1.0".into(), 3);
+        let bytes = rmp_serde::to_vec(&legacy).unwrap();
+        let status: Status = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(status.handoff(), None);
+        let failed =
+            Status::default().with_handoff(Some(HandoffState::Failed("prepare exited 1".into())));
+        let back: Status = rmp_serde::from_slice(&rmp_serde::to_vec(&failed).unwrap()).unwrap();
+        assert_eq!(
+            back.handoff(),
+            Some(&HandoffState::Failed("prepare exited 1".into()))
+        );
+        // the handoff moves while the server runs: it is still the same server
+        assert!(back.is_same_server(&failed.clone().with_handoff(None)));
+        assert!(
+            back.to_string()
+                .ends_with(", handoff:failed (prepare exited 1))")
+        );
+    }
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
@@ -215,18 +239,50 @@ pub struct Status {
     timestamp_sec: u64,
     timestamp_nano: u32,
     version: String,
-    /// PROTOCOL_VERSION of the virtkit-agent that produced this Status. Trailing and
-    /// serde(default) so a Status from a pre-protocol virtkit-agent still decodes
+    /// PROTOCOL_VERSION of the virtkit-agent that produced this Status. Appended after the
+    /// original fields, in this order, and serde(default) so a Status from a pre-protocol
+    /// virtkit-agent still decodes
     /// (as 0) — letting the host report a clear skew error rather than failing to
     /// parse the status at all. See [`PROTOCOL_VERSION`].
     #[serde(default)]
     protocol: u32,
+    /// Where the guest's `init: image` handoff stands; `None` on a guest that hands no
+    /// PID 1 to its image's init. Appended after `protocol`, and serde(default) for the same
+    /// reason.
+    #[serde(default)]
+    handoff: Option<HandoffState>,
+}
+
+/// Where the agent's handoff of PID 1 to the image's own init stands.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
+pub enum HandoffState {
+    /// The agent still holds PID 1: its setup, the `prepare` command or the read-only
+    /// remount is under way.
+    Pending,
+    /// The image's init holds PID 1.
+    Done,
+    /// It never will, and why: the agent holds PID 1 for inspection.
+    Failed(String),
 }
 
 impl Status {
     /// Wire protocol version reported by this virtkit-agent (0 = predates versioning).
     pub fn protocol(&self) -> u32 {
         self.protocol
+    }
+
+    pub fn handoff(&self) -> Option<&HandoffState> {
+        self.handoff.as_ref()
+    }
+
+    pub fn with_handoff(self, handoff: Option<HandoffState>) -> Self {
+        Status { handoff, ..self }
+    }
+
+    /// Whether `other` comes from the same server process as this: everything but the
+    /// handoff state, which moves while the server runs.
+    pub fn is_same_server(&self, other: &Status) -> bool {
+        self.clone().with_handoff(None) == other.clone().with_handoff(None)
     }
 }
 
@@ -242,6 +298,7 @@ impl Default for Status {
             timestamp_nano,
             version: env!("CARGO_PKG_VERSION").to_string(),
             protocol: PROTOCOL_VERSION,
+            handoff: None,
         }
     }
 }
@@ -250,8 +307,15 @@ impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "(pid:{}, version:{}, protocol:{}, timestamp_sec:{}, timestamp_nano:{})",
+            "(pid:{}, version:{}, protocol:{}, timestamp_sec:{}, timestamp_nano:{}",
             self.pid, self.version, self.protocol, self.timestamp_sec, self.timestamp_nano
-        )
+        )?;
+        match &self.handoff {
+            None => {}
+            Some(HandoffState::Pending) => write!(f, ", handoff:pending")?,
+            Some(HandoffState::Done) => write!(f, ", handoff:done")?,
+            Some(HandoffState::Failed(why)) => write!(f, ", handoff:failed ({why})")?,
+        }
+        f.write_str(")")
     }
 }

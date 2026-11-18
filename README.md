@@ -342,7 +342,10 @@ e.g. systemd's first-boot unit presets. `/` stays read-only until the image remo
 systemd, a `/` line with `rw` in its `/etc/fstab` (pass number 0, or `systemd-fsck-root`
 checks it first). `prepare` (`vk run --prepare`) runs a command to completion before that,
 as root on the still-writable root and with the exec channel already up: the init starts only
-if it exits 0, and otherwise the guest stays up, without it, for inspection. `persist_root` keeps the root
+if it exits 0, and otherwise the guest stays up, without it, for inspection. `vk status`
+reports where that handoff stands: `pending` while the agent still holds PID 1, `done`, or
+`failed` and why. A boot is up once the guest answers and does not wait for the handoff, so a
+`prepare` can itself wait for something the host does after the boot. `persist_root` keeps the root
 filesystem across restarts (see [Volumes and persistent state](#volumes-and-persistent-state)).
 
 Guests give idle memory back. Pages one frees return to the host through the balloon, and a

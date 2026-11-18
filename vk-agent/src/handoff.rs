@@ -1,18 +1,27 @@
 //! The link between `vk-agent init`, as PID 1 of a guest that hands PID 1 to its image's
 //! init, and the exec server it forks first. Before the agent runs anything the host should be
-//! able to watch (the `prepare` command), the server reports over it that it listens.
+//! able to watch (the `prepare` command), the server reports over it that it listens. PID 1
+//! reports back where the handoff stands, which the server answers status requests with
+//! ([`vk_core::messages::HandoffState`]).
 //!
 //! A `SOCK_STREAM` socketpair: PID 1 keeps one end, close-on-exec, so the image's init never
-//! inherits it, and the server gets the other as `serve --handoff-fd`.
+//! inherits it, and the server gets the other as `serve --handoff-fd`. PID 1 writes one line
+//! per report: `exec` just before it execs the init, whose exec then closes PID 1's end, or
+//! `failed <why>` when it never will.
 
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use vk_core::messages::HandoffState;
 
 /// What the server sends once it listens.
 const LISTENING: u8 = b'L';
+
+/// The longest reason a failure report carries.
+const WHY_MAX: usize = 4096;
 
 /// PID 1's end of the link.
 pub struct Link {
@@ -76,11 +85,108 @@ impl Link {
             };
         }
     }
+
+    /// Report that the image's init is exec'd next: once the exec closes this end, the server
+    /// knows it took.
+    pub fn report_exec(&mut self) {
+        self.report("exec\n".to_string());
+    }
+
+    /// Report that the image's init will not take PID 1, and why ([`shown_why`]).
+    pub fn report_failed(&mut self, why: &str) {
+        self.report(format!("failed {}\n", shown_why(why)));
+    }
+
+    fn report(&mut self, line: String) {
+        if let Err(e) = self.sock.write_all(line.as_bytes()) {
+            log::warn!("handoff link: reporting {:?}: {e}", line.trim_end());
+        }
+    }
+}
+
+/// A failure's reason on one line, cut to [`WHY_MAX`] bytes, since every status answer
+/// carries it and an argv in it can be any length. The middle goes: the start names what
+/// failed, the end says how.
+fn shown_why(why: &str) -> String {
+    let why = why.replace('\n', " ");
+    if why.len() <= WHY_MAX {
+        return why;
+    }
+    let keep = (WHY_MAX - '…'.len_utf8()) / 2;
+    let mut head = keep;
+    while !why.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = why.len() - keep;
+    while !why.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}…{}", &why[..head], &why[tail..])
+}
+
+/// Take the server's end of the link over (`serve --handoff-fd`): report over it once the
+/// server listens, and answer status requests with where PID 1 says the handoff stands. Set
+/// up before the server serves. The report that it listens goes out whatever else fails here,
+/// since PID 1 waits for it; a server that cannot follow the link reports no handoff state at
+/// all, rather than one that would never move.
+pub fn serve(fd: RawFd) -> Result<()> {
+    let mut sock = serve_end(fd)?;
+    let follow_link = sock
+        .try_clone()
+        .context("--handoff-fd")
+        .and_then(|reports| {
+            let state = Arc::new(Mutex::new(HandoffState::Pending));
+            let follower = Arc::clone(&state);
+            std::thread::Builder::new()
+                .name("handoff".into())
+                .spawn(move || follow(io::BufReader::new(reports), &follower))
+                .context("following the handoff link")?;
+            vk_core::status::report_handoff(move || state.lock().unwrap().clone());
+            Ok(())
+        });
+    vk_core::exec::server::on_listening(move || report_listening(&mut sock));
+    follow_link
+}
+
+/// PID 1's reports, into `state`, until its end closes: the exec of the image's init closes it
+/// after an `exec` report. Closed any other way, PID 1 is gone without handing over. A failure
+/// is final, whatever comes after it.
+fn follow(reports: impl BufRead, state: &Mutex<HandoffState>) {
+    let mut exec = false;
+    for line in reports.lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(e) => {
+                // Whatever came next is lost, a failure after `exec` included.
+                let mut state = state.lock().unwrap();
+                if *state == HandoffState::Pending {
+                    *state = HandoffState::Failed(format!("reading PID 1's reports: {e}"));
+                }
+                return;
+            }
+        };
+        if line == "exec" {
+            exec = true;
+        } else if let Some(why) = line.strip_prefix("failed ") {
+            *state.lock().unwrap() = HandoffState::Failed(why.to_string());
+        } else {
+            log::warn!("handoff link: unknown report {line:?}");
+        }
+    }
+    let mut state = state.lock().unwrap();
+    if *state != HandoffState::Pending {
+        return;
+    }
+    *state = if exec {
+        HandoffState::Done
+    } else {
+        HandoffState::Failed("PID 1 closed the handoff link without handing over".into())
+    };
 }
 
 /// The server's end, from `serve --handoff-fd`: taken over close-on-exec, so no command the
 /// server runs inherits it, and returned to report on.
-pub fn serve_end(fd: RawFd) -> Result<std::os::unix::net::UnixStream> {
+fn serve_end(fd: RawFd) -> Result<std::os::unix::net::UnixStream> {
     set_cloexec(fd, true).context("--handoff-fd")?;
     // SAFETY: the descriptor was handed to this process to own, and nothing else uses it.
     Ok(std::os::unix::net::UnixStream::from(unsafe {
@@ -89,7 +195,7 @@ pub fn serve_end(fd: RawFd) -> Result<std::os::unix::net::UnixStream> {
 }
 
 /// Tell PID 1 the server listens.
-pub fn report_listening(sock: &mut std::os::unix::net::UnixStream) {
+fn report_listening(sock: &mut std::os::unix::net::UnixStream) {
     if let Err(e) = sock.write_all(&[LISTENING]) {
         log::warn!("handoff link: reporting that the server listens: {e}");
     }
@@ -131,5 +237,100 @@ mod tests {
         let (mut link, _theirs) = Link::new().unwrap();
         let err = link.wait_listening(Duration::from_millis(50)).unwrap_err();
         assert!(format!("{err:#}").contains("did not listen"), "{err:#}");
+    }
+
+    /// Both ways on one link, as a boot uses it: the server's word read, then the `exec`, then
+    /// the close. Unread, that word would have the close reset the link instead.
+    #[test]
+    fn an_exec_after_the_server_listened_is_done() {
+        let (mut link, theirs) = Link::new().unwrap();
+        let serve = serve_end(theirs.as_raw_fd()).unwrap();
+        std::mem::forget(theirs); // now owned by `serve`
+        report_listening(&mut serve.try_clone().unwrap());
+        link.wait_listening(Duration::from_secs(1)).unwrap();
+        link.report_exec();
+        drop(link);
+        let state = Mutex::new(HandoffState::Pending);
+        follow(io::BufReader::new(serve), &state);
+        assert_eq!(state.into_inner().unwrap(), HandoffState::Done);
+    }
+
+    /// Where the server says the handoff stands, as PID 1 reports it over the link.
+    #[test]
+    fn pid_1_reports_become_the_handoff_state() {
+        let state_after = |report: &dyn Fn(&mut Link)| {
+            let (mut link, theirs) = Link::new().unwrap();
+            let serve = serve_end(theirs.as_raw_fd()).unwrap();
+            std::mem::forget(theirs); // now owned by `serve`
+            report(&mut link);
+            drop(link); // the exec, or PID 1's end
+            let state = Mutex::new(HandoffState::Pending);
+            follow(io::BufReader::new(serve), &state);
+            state.into_inner().unwrap()
+        };
+        assert_eq!(state_after(&|l| l.report_exec()), HandoffState::Done);
+        assert_eq!(
+            state_after(&|l| l.report_failed("prepare [\"/s\"] exited 1\nand more")),
+            HandoffState::Failed("prepare [\"/s\"] exited 1 and more".into())
+        );
+        assert!(matches!(state_after(&|_| {}), HandoffState::Failed(_)));
+        // a reason is cut, on character boundaries, to what a status answer can carry, and
+        // keeps how it failed past an argv of any length
+        let long = format!("prepare [\"{}\"] exited 1", "é".repeat(WHY_MAX));
+        let HandoffState::Failed(shown) = state_after(&|l| l.report_failed(&long)) else {
+            panic!("not a failure");
+        };
+        assert!(shown.len() <= WHY_MAX, "{}", shown.len());
+        assert!(shown.starts_with("prepare [\"éé"), "{shown}");
+        assert!(shown.ends_with("éé\"] exited 1"), "{shown}");
+        assert!(shown.contains('…'));
+        // an exec that returned is a failure, not undone by the close that follows
+        assert_eq!(
+            state_after(&|l| {
+                l.report_exec();
+                l.report_failed("exec [\"/sbin/init\"]: No such file or directory");
+            }),
+            HandoffState::Failed("exec [\"/sbin/init\"]: No such file or directory".into())
+        );
+    }
+
+    /// On the open link, as the server reads it while PID 1 holds or execs: a failure shows at
+    /// once, an `exec` only once the exec closes PID 1's end.
+    #[test]
+    fn the_state_moves_while_pid_1_holds_the_link() {
+        let wait_for = |state: &Mutex<HandoffState>, want: &HandoffState| {
+            for _ in 0..200 {
+                if *state.lock().unwrap() == *want {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("state stayed {:?}, not {want:?}", state.lock().unwrap());
+        };
+        let follow_link = || {
+            let (link, theirs) = Link::new().unwrap();
+            let serve = serve_end(theirs.as_raw_fd()).unwrap();
+            std::mem::forget(theirs); // now owned by `serve`
+            let state = Arc::new(Mutex::new(HandoffState::Pending));
+            let follower = Arc::clone(&state);
+            let reader = std::thread::spawn(move || follow(io::BufReader::new(serve), &follower));
+            (link, state, reader)
+        };
+
+        let (mut link, state, reader) = follow_link();
+        link.report_failed("prepare exited 1");
+        let failed = HandoffState::Failed("prepare exited 1".into());
+        wait_for(&state, &failed);
+        drop(link);
+        reader.join().unwrap();
+        assert_eq!(*state.lock().unwrap(), failed);
+
+        let (mut link, state, reader) = follow_link();
+        link.report_exec();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(*state.lock().unwrap(), HandoffState::Pending);
+        drop(link); // the exec
+        reader.join().unwrap();
+        assert_eq!(*state.lock().unwrap(), HandoffState::Done);
     }
 }
