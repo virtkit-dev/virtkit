@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.113.0] - 2026-11-18
+
 ### Added
 
 - **Pass arguments to the image's init.** `x-virtkit.init_argv` (or `vk run --init-argv`)
@@ -5634,7 +5636,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.112.5...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.113.0...HEAD
+[0.113.0]: https://github.com/virtkit-dev/virtkit/compare/v0.112.5...v0.113.0
 [0.112.5]: https://github.com/virtkit-dev/virtkit/compare/v0.112.4...v0.112.5
 [0.112.4]: https://github.com/virtkit-dev/virtkit/compare/v0.112.3...v0.112.4
 [0.112.3]: https://github.com/virtkit-dev/virtkit/compare/v0.112.2...v0.112.3
