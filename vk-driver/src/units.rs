@@ -47,6 +47,9 @@ pub struct Provisioned {
     /// kernel (`Default`), the image's own kernel + modules (`Image`), or an explicit
     /// file (`Path`). Uniform with the primary path.
     pub kernel: crate::run::KernelSource,
+    /// How `/` is mounted when `init: image` hands PID 1 over (its compose `x-virtkit.root`).
+    /// Uniform with the primary path.
+    pub root: crate::run::RootMode,
     /// This service's own egress filter, from `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME` in its
     /// `variables:`. `None` = the key was absent (the job's filter alone holds it); `Some`
     /// (incl. an empty string = deny that dimension) = a restricted per-service allowlist,
@@ -354,6 +357,7 @@ pub fn provisioned(
         volumes: unit.volumes.clone(),
         init: unit.init,
         kernel: unit.kernel.clone(),
+        root: unit.root,
         egress_allow_ip_req: service_egress_req(&unit.environment, "MICROVM_EGRESS_ALLOW_IP"),
         egress_allow_name_req: service_egress_req(&unit.environment, "MICROVM_EGRESS_ALLOW_NAME"),
         cpus: unit.cpus,
@@ -551,6 +555,7 @@ pub fn boot_unit(
             frag.push_str(" VIRTKIT_KERNEL=image");
         }
         frag.push_str(&svc.init.handoff_tokens());
+        frag.push_str(svc.root.cmdline_token());
         handoff_frag = frag;
     } else {
         // The boot medium: agent + the unit's merged config, rebuilt on every start so

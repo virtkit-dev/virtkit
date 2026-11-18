@@ -105,6 +105,9 @@
 //!                        `entrypoint` (the boot config's entrypoint+cmd). Absent: the
 //!                        agent keeps PID 1 (the default and service modes below)
 //!   VIRTKIT_HANDOFF      which init `VIRTKIT_INIT=image` execs (default /sbin/init)
+//!   ro / rw              (bare, the kernel's own) how `/` is mounted when `VIRTKIT_INIT=image`
+//!                        hands PID 1 over; the last one wins, and neither keeps it rw. The
+//!                        setup before the handoff always runs on a writable root
 //!   VIRTKIT_MODE=service fork the boot config's entrypoint; the agent stays as PID 1
 //!                        and reaps orphans. A systemd image hands off via its entrypoint.
 //!   VIRTKIT_SERVE=1      (service) also start the vsock exec server (port 4444) for
@@ -154,7 +157,8 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     let _ = std::fs::create_dir_all("/proc");
     let _ = mount("proc", "/proc", "proc", 0);
 
-    let cmdline = read_cmdline();
+    let raw_cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let cmdline = parse_cmdline(&raw_cmdline);
     let inactivity_timeout = resolve_inactivity_timeout(inactivity_timeout, &cmdline);
 
     // A modular image kernel (`--kernel image`) ships its boot-critical modules on the
@@ -172,7 +176,12 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     // stays unchanged.
     if let Some(axis) = cmdline.get("VIRTKIT_INIT") {
         match ImageInit::from_token(axis) {
-            Some(axis) => return run_full_vm(socket, &cmdline, boot_config.as_ref(), axis),
+            Some(axis) => {
+                // From the read that named the axis: a later one could fail, and quietly hand
+                // over the writable root a read-only one was asked for.
+                let root_ro = root_read_only(&raw_cmdline);
+                return run_full_vm(socket, &cmdline, boot_config.as_ref(), axis, root_ro);
+            }
             // Only this driver writes the token, so a value it does not name means the
             // two have drifted apart: say so instead of quietly keeping PID 1 and
             // serving a guest that never ran what the axis asked for.
@@ -344,6 +353,7 @@ fn run_full_vm(
     cmdline: &HashMap<String, String>,
     cfg: Option<&RunConfig>,
     axis: ImageInit,
+    root_ro: bool,
 ) -> Result<()> {
     // The pivot is mandatory here: the whole point is to hand off to something in the
     // image — its own /sbin/init, or its entrypoint — and neither exists anywhere but the
@@ -411,7 +421,16 @@ fn run_full_vm(
     maybe_ctlfs(cmdline);
     // Isolate the trimmer's debugfs mount so it cannot race the image init's mount.
     maybe_reclaim(cmdline, true);
-    let _serve = spawn_serve(socket, None)?;
+    let serve = spawn_serve(socket, None)?;
+
+    // Last, so all of the setup above could still write it: an init handed a read-only `/`,
+    // as a real boot hands it one, remounts it rw itself.
+    if axis == ImageInit::Init
+        && root_ro
+        && let Err(e) = remount_root_read_only()
+    {
+        return hold_failed_handoff(serve, &e);
+    }
 
     // Only the entrypoint axis chdirs: /sbin/init neither has nor wants a workdir. It
     // precedes the exec so a relative entrypoint (`./prepare.sh`) resolves there.
@@ -422,6 +441,65 @@ fn run_full_vm(
         .then(|| drop_ids_for_user(cfg.map_or("", |c| c.user.as_str())))
         .flatten();
     exec_first(&image_init_candidates(axis, cmdline, cfg, drop_ids)) // never returns
+}
+
+/// Whether the kernel cmdline asks for a read-only root: its last bare `ro` or `rw`, as the
+/// kernel and initramfs-tools read it, up to the `--` that starts init's own arguments.
+fn root_read_only(cmdline: &str) -> bool {
+    cmdline
+        .split_whitespace()
+        .take_while(|tok| *tok != "--")
+        .filter_map(|tok| match tok {
+            "ro" => Some(true),
+            "rw" => Some(false),
+            _ => None,
+        })
+        .last()
+        .unwrap_or(false)
+}
+
+/// How long [`remount_root_read_only`] waits out a writer still holding a file on `/` open.
+const RO_REMOUNT_WAIT: Duration = Duration::from_secs(5);
+
+/// Remount `/` read-only (the superblock, as the kernel's `ro` mounts it), for the image's init.
+/// A file still open for writing makes the kernel refuse with EBUSY: the setup's own forks
+/// may be closing theirs, so retry for [`RO_REMOUNT_WAIT`] before giving up.
+fn remount_root_read_only() -> Result<()> {
+    let deadline = std::time::Instant::now() + RO_REMOUNT_WAIT;
+    loop {
+        // SAFETY: sync(2) has no failure mode.
+        unsafe { libc::sync() };
+        match mount("", "/", "", libc::MS_REMOUNT | libc::MS_RDONLY) {
+            Ok(()) => {
+                info!("vk-agent image-init: remounted / read-only for the handoff");
+                return Ok(());
+            }
+            Err(e)
+                if e.raw_os_error() == Some(libc::EBUSY)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => bail!(
+                "remounting / read-only: a process still had a file on it open for writing \
+                 after {}s",
+                RO_REMOUNT_WAIT.as_secs()
+            ),
+            Err(e) => return Err(e).context("remounting / read-only"),
+        }
+    }
+}
+
+/// The handoff cannot go ahead. Rather than hand PID 1 to an init on a machine it was not
+/// promised, keep it, with the exec channel already serving, so the guest can be inspected
+/// and still stops when the host asks — as the default path does. The machine ends with the
+/// exec server.
+fn hold_failed_handoff(serve: libc::pid_t, e: &anyhow::Error) -> Result<()> {
+    log::error!("vk-agent image-init: {e:#} — not handing PID 1 over; holding for inspection");
+    start_stop_worker();
+    install_term_handler();
+    crate::button::watch_power_button();
+    supervise(serve)
 }
 
 /// Become the first candidate that execs. `execvp` returns only when it failed, leaving
@@ -1011,7 +1089,12 @@ fn sysctl_path(key: &str) -> String {
 
 /// Parse /proc/cmdline into KEY=VALUE pairs (bare flags are ignored).
 fn read_cmdline() -> HashMap<String, String> {
-    let raw = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    parse_cmdline(&std::fs::read_to_string("/proc/cmdline").unwrap_or_default())
+}
+
+/// A kernel cmdline's KEY=VALUE pairs; bare flags are read by their own parsers
+/// ([`root_read_only`]).
+fn parse_cmdline(raw: &str) -> HashMap<String, String> {
     raw.split_whitespace()
         .filter_map(|tok| tok.split_once('='))
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -4204,6 +4287,18 @@ mod tests {
             vec!["redis-server".to_string()]
         );
         assert_eq!(wrap_user(vec!["x".into()], ""), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn the_root_is_read_only_only_when_the_last_bare_flag_says_so() {
+        assert!(!root_read_only("console=ttyS0 VIRTKIT_INIT=image"));
+        assert!(root_read_only("console=ttyS0 ro VIRTKIT_INIT=image"));
+        assert!(!root_read_only("ro rw"));
+        assert!(root_read_only("rw ro"));
+        // a value, not the flag
+        assert!(!root_read_only("VIRTKIT_X=ro rootflags=ro"));
+        // init's own arguments, not the kernel's
+        assert!(!root_read_only("console=ttyS0 -- ro"));
     }
 
     #[test]

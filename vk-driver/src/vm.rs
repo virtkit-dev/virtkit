@@ -3871,18 +3871,22 @@ pub(crate) fn refuse_unsupported_nesting(requested: bool, host_nests: bool) -> R
 }
 
 /// Refuse a Windows service with more than one NIC: winsvc attaches it to the job switch alone.
-/// The handoff settings (`x-virtkit.init_argv`) are for a guest whose agent hands PID 1 to the
-/// image's init. Refused where no agent does — the job VM keeps it for the stages to exec
+/// The handoff settings (`x-virtkit.init_argv`, `root: ro`) are for a guest whose agent hands
+/// PID 1 to the image's init. Refused where no agent does — the job VM keeps it for the stages to exec
 /// into, a Windows guest has none — rather than dropped, so the fleet does not look like it got
 /// what it asked for.
 fn refuse_handoff(unit: &crate::compose::Unit, guest: &str) -> Result<()> {
-    if !unit.handoff.is_empty() {
-        bail!(
-            "compose service {:?}: x-virtkit.init_argv has no init to reach in {guest}",
-            unit.name
-        );
-    }
-    Ok(())
+    let key = if !unit.handoff.is_empty() {
+        "x-virtkit.init_argv"
+    } else if unit.root == crate::run::RootMode::Ro {
+        "x-virtkit `root: ro`"
+    } else {
+        return Ok(());
+    };
+    bail!(
+        "compose service {:?}: {key} has no init to reach in {guest}",
+        unit.name
+    );
 }
 
 fn refuse_windows_nics(unit: &crate::compose::Unit) -> Result<()> {
@@ -7041,6 +7045,11 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("init_argv has no init to reach"), "{err}");
+        let asks = service("    x-virtkit: { init: image, root: ro }\n");
+        let err = refuse_handoff(&asks, "a Windows guest")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`root: ro` has no init to reach"), "{err}");
     }
 
     /// A job-authored fleet cannot grant itself host KVM. Checked where the fleet loads, so

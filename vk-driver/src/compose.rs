@@ -116,6 +116,9 @@ pub struct Unit {
     /// What `init: image` hands PID 1 to (compose `x-virtkit.init_argv`), applied identically
     /// primary or sibling; empty = the image's `/sbin/init`. Rides the boot config.
     pub handoff: vk_core::runcfg::Handoff,
+    /// How `/` is mounted when `init: image` hands PID 1 over (compose `x-virtkit.root`),
+    /// applied identically primary or sibling.
+    pub root: crate::run::RootMode,
     /// The service's `secrets:`, resolved against the top-level declarations. A Linux guest
     /// reads each at `/run/secrets/<target>` through a read-only
     /// single-file bind in [`Self::volumes`]; a Windows one gets a copy at
@@ -1247,7 +1250,7 @@ fn map_service(
     };
     // The per-service axes (compose `x-virtkit`): absent key/subkey = the defaults,
     // so an unmarked service keeps today's agent-as-PID1 pinned-kernel 2-vCPU/1G boot.
-    let (init, kernel, cpus, mem, reclaim, dax, nested, nics, persist_root, tap, handoff) =
+    let (init, kernel, cpus, mem, reclaim, dax, nested, nics, persist_root, tap, handoff, root) =
         match svc.x_virtkit {
             Some(x) => (
                 x.init()?,
@@ -1261,6 +1264,7 @@ fn map_service(
                 x.persist_root()?,
                 x.tap()?,
                 x.handoff()?,
+                x.root()?,
             ),
             None => (
                 crate::run::InitSource::Default,
@@ -1274,6 +1278,7 @@ fn map_service(
                 false,
                 None,
                 vk_core::runcfg::Handoff::default(),
+                crate::run::RootMode::Rw,
             ),
         };
     // Only the image's own init is handed these: an entrypoint is PID 1's argv itself, and
@@ -1281,6 +1286,9 @@ fn map_service(
     // key the boot cannot honor.
     if init != crate::run::InitSource::Image && !handoff.init.is_empty() {
         bail!("service {name:?}: x-virtkit.init_argv needs `init: image`, not `init: {init}`");
+    }
+    if init != crate::run::InitSource::Image && root == crate::run::RootMode::Ro {
+        bail!("service {name:?}: x-virtkit `root: ro` needs `init: image`, not `init: {init}`");
     }
     // Key roots by service under the same anchor as overlays, so primary and sibling
     // use the same stable path.
@@ -1376,6 +1384,7 @@ fn map_service(
         persist_root_backing,
         tap,
         handoff,
+        root,
         secrets,
         healthcheck,
         wait_for,
@@ -2349,7 +2358,8 @@ struct ComposeService {
 /// guest sizing (`cpus`/`mem`), idle page-cache trimming (`reclaim`), the DAX window its
 /// shares get (`dax`), nested virtualization (`nested`), NIC count (`nics`) and root
 /// persistence (`persist_root`), a host tap for eth0 (`tap`), and the argv `init: image` hands
-/// PID 1 to (`init_argv`). An absent subkey defaults to `Default`/unset/off.
+/// PID 1 to (`init_argv`) on a root mounted as `root` says. An absent subkey defaults to
+/// `Default`/unset/off/rw.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct XVirtkit {
@@ -2382,6 +2392,8 @@ struct XVirtkit {
     /// `command:`
     #[serde(default)]
     init_argv: Option<Cmd>,
+    #[serde(default)]
+    root: Option<String>,
 }
 
 /// `x-virtkit.tap`: the same spec as `vk run --tap`/`--tap-mac`/`--tap-ip`/`--tap-gw`/
@@ -2423,6 +2435,15 @@ impl XVirtkit {
             Some(cmd) => exec_argv(cmd.clone().into_argv()?).context("x-virtkit.init_argv")?,
         };
         Ok(vk_core::runcfg::Handoff { init })
+    }
+
+    /// `root: rw|ro` → [`crate::run::RootMode`] (absent = rw).
+    fn root(&self) -> Result<crate::run::RootMode> {
+        match self.root.as_deref() {
+            None | Some("rw") => Ok(crate::run::RootMode::Rw),
+            Some("ro") => Ok(crate::run::RootMode::Ro),
+            Some(other) => bail!("x-virtkit.root: expected \"rw\" or \"ro\", got {other:?}"),
+        }
     }
 
     /// `kernel: default|image|<path>` → [`crate::run::KernelSource`] (absent =
@@ -4427,6 +4448,11 @@ mod tests {
             ("{ init_argv: [/sbin/init] }", "needs `init: image`"),
             ("{ init: image, init_argv: [] }", "names no program"),
             ("{ init: image, init_argv: [''] }", "empty string"),
+            (
+                "{ init: entrypoint, root: ro }",
+                "`root: ro` needs `init: image`",
+            ),
+            ("{ init: image, root: yes }", "expected \"rw\" or \"ro\""),
         ] {
             let yaml = format!("services:\n  s:\n    image: x\n    x-virtkit: {yaml}\n");
             let Err(err) = parse(&yaml, Path::new("/base")) else {

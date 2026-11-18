@@ -2002,6 +2002,12 @@ enum Cmd {
         /// `x-virtkit.init_argv`.
         #[arg(long, value_name = "CMD", help_heading = "Guest")]
         init_argv: Option<String>,
+        /// How `/` is mounted when `--init image` hands PID 1 over
+        ///
+        /// `ro` is what a real boot hands its init, which remounts it rw from its fstab.
+        /// Default rw. Overrides the --primary service's `x-virtkit.root`.
+        #[arg(long, value_enum, value_name = "MODE", help_heading = "Guest")]
+        root: Option<run::RootMode>,
         /// share a host dir read-write into the guest at /work and run the command there
         ///
         /// The command's outputs then land back on the host.
@@ -3623,6 +3629,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         ram,
         init,
         init_argv,
+        root,
         shell,
         tty,
         net,
@@ -3695,15 +3702,16 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 || !env_file.is_empty()
                 || *host_exec
                 || inactivity_timeout.is_some()
-                || init_argv.is_some())
+                || init_argv.is_some()
+                || root.is_some())
         {
             return fail(
                 &anyhow::anyhow!(
                     "--compose without an image/-f/--primary is services-only (compose up) — \
                      there is no primary VM for a command, --shell, -t, --ssh, --workdir, \
                      --volume, --symlink, --env, --env-file, --host-exec, \
-                     --inactivity-timeout, or --init-argv (a service takes \
-                     x-virtkit.init_argv)"
+                     --inactivity-timeout, --init-argv or --root (a service takes \
+                     x-virtkit.init_argv and root)"
                 ),
                 2,
             );
@@ -3861,6 +3869,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             ram: *ram,
             init: *init,
             init_argv,
+            root: *root,
             shell: *shell,
             tty: *tty,
             net: run_net,

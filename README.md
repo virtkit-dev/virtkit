@@ -336,7 +336,11 @@ services:
 kernel), `image` (the image's own kernel and modules) or a kernel file path. Together they
 boot a systemd or otherwise self-booting image as a service. With `init: image`, `init_argv`
 gives the init's argv, e.g. `[/lib/systemd/systemd, --log-level=info]` (`vk run --init-argv`
-for the primary); the default is `/sbin/init` with no arguments. `persist_root` keeps the root
+for the primary); the default is `/sbin/init` with no arguments. `root: ro` (`vk run --root ro`)
+hands that init a read-only `/`, as a real boot does, so what it does first cannot write it —
+e.g. systemd's first-boot unit presets. `/` stays read-only until the image remounts it: for
+systemd, a `/` line with `rw` in its `/etc/fstab` (pass number 0, or `systemd-fsck-root`
+checks it first). `persist_root` keeps the root
 filesystem across restarts (see [Volumes and persistent state](#volumes-and-persistent-state)).
 
 Guests give idle memory back. Pages one frees return to the host through the balloon, and a

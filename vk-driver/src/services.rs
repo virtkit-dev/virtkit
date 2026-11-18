@@ -85,6 +85,7 @@ pub fn to_units(services: Vec<Service>) -> Vec<crate::compose::Unit> {
             persist_root_backing: None,
             tap: None,
             handoff: vk_core::runcfg::Handoff::default(),
+            root: crate::run::RootMode::Rw,
             secrets: Vec::new(),
             healthcheck: None,
             wait_for: Vec::new(),

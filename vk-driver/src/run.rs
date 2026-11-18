@@ -92,15 +92,12 @@ impl std::fmt::Display for InitSource {
 fn effective_handoff(
     args: &RunArgs,
     primary: Option<&crate::compose::Unit>,
+    init: InitSource,
 ) -> Result<vk_core::runcfg::Handoff> {
     let mut handoff = primary.map(|u| u.handoff.clone()).unwrap_or_default();
     if !args.init_argv.is_empty() {
         handoff.init = args.init_argv.clone();
     }
-    let init = match (args.init, primary) {
-        (InitSource::Default, Some(unit)) => unit.init,
-        (init, _) => init,
-    };
     if init != InitSource::Image && !handoff.is_empty() {
         let what = if args.init_argv.is_empty() {
             "the --primary service's x-virtkit.init_argv"
@@ -110,6 +107,61 @@ fn effective_handoff(
         bail!("{what} needs `init: image`, but the guest boots `init: {init}`");
     }
     Ok(handoff)
+}
+
+/// How `/` is mounted for the primary's `init: image` handoff: `--root` over the --primary
+/// service's `x-virtkit.root`. Read-only needs that image init to hand to.
+fn effective_root(
+    args: &RunArgs,
+    primary: Option<&crate::compose::Unit>,
+    init: InitSource,
+) -> Result<RootMode> {
+    let root = args
+        .root
+        .unwrap_or(primary.map_or(RootMode::Rw, |u| u.root));
+    if init != InitSource::Image && root == RootMode::Ro {
+        let what = if args.root.is_some() {
+            "--root ro"
+        } else {
+            "the --primary service's x-virtkit `root: ro`"
+        };
+        bail!("{what} needs `init: image`, but the guest boots `init: {init}`");
+    }
+    Ok(root)
+}
+
+/// The primary's init axis, per the uniform-axes model: a non-`Default` `--init` overrides
+/// every unit (a run-wide force), else the --primary service's own marker applies, else
+/// `Default`. Non-compose boots (plain image / `-f`) have no marker, so they keep the flag.
+fn primary_init(args: &RunArgs, primary: Option<&crate::compose::Unit>) -> InitSource {
+    match (args.init, primary) {
+        (InitSource::Default, Some(unit)) => unit.init,
+        (init, _) => init,
+    }
+}
+
+/// How `/` is mounted when `init: image` hands PID 1 over. `Ro` is what a real boot hands its
+/// init (the kernel's `ro`): the image's own init then remounts it rw from its fstab, and
+/// whatever it does before that — first-boot unit presets, for systemd — finds it read-only.
+/// `Rw` keeps the writable root the agent pivoted into.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum RootMode {
+    /// writable, as the agent's setup left it
+    #[default]
+    Rw,
+    /// read-only, as a real boot hands it to its init
+    Ro,
+}
+
+impl RootMode {
+    /// The kernel cmdline fragment (leading space, empty for `Rw`) asking the guest agent
+    /// for a read-only root at the handoff: the kernel's own `ro`, as a real boot carries it.
+    pub fn cmdline_token(self) -> &'static str {
+        match self {
+            RootMode::Rw => "",
+            RootMode::Ro => " ro",
+        }
+    }
 }
 
 /// Which kernel the guest boots on. `Default` = virtkit's pinned/embedded kernel
@@ -374,6 +426,9 @@ pub struct RunArgs {
     /// `--init-argv`: the init `init: image` execs, with its arguments; empty = the --primary
     /// service's `x-virtkit.init_argv`, else `/sbin/init`
     pub init_argv: Vec<String>,
+    /// `--root`: how `/` is mounted when `init: image` hands PID 1 over; `None` = the --primary
+    /// service's `x-virtkit.root`, else rw
+    pub root: Option<RootMode>,
     /// attach an interactive shell once the guest is up (needs a terminal)
     pub shell: bool,
     /// allocate a pty for the command and wire it to the local terminal, so it runs
@@ -549,6 +604,7 @@ impl Default for RunArgs {
             ram: false,
             init: InitSource::Default,
             init_argv: Vec::new(),
+            root: None,
             shell: false,
             tty: false,
             net: false,
@@ -1573,16 +1629,27 @@ async fn build_and_boot(
     // leaves the guest agent without a run user and the host-exec socket unchowned
     // (root-only). Set on both primary paths below; empty means root.
     let mut primary_user = String::new();
-    // The --primary primary's own init/kernel axes (from its `x-virtkit` marker),
-    // merged with the CLI axes below. None for a non-compose / non-primary boot.
-    let mut primary_axes: Option<(InitSource, KernelSource)> = None;
+    // The --primary primary's own kernel axis (from its `x-virtkit` marker), merged with the
+    // CLI axis below. None for a non-compose / non-primary boot.
+    let mut primary_kernel: Option<KernelSource> = None;
     // Resolve the --primary primary's index up front — it drives both the unified compose
     // build below and the sibling provisioning later.
     if let Some(name) = &args.primary {
         primary_idx = Some(resolve_primary(&compose_units, name)?);
     }
-    // Before any build, which a mismatch would otherwise wait out.
-    let eff_handoff = effective_handoff(args, primary_idx.map(|i| &compose_units[i]))?;
+    // Settled before any build, which a mismatch would otherwise wait out.
+    let primary_unit = primary_idx.map(|i| &compose_units[i]);
+    let eff_init = primary_init(args, primary_unit);
+    let eff_handoff = effective_handoff(args, primary_unit, eff_init)?;
+    let eff_root = effective_root(args, primary_unit, eff_init)?;
+    // The guest's ~/.ssh/config is written over the exec channel once that answers, which can
+    // be after the agent remounted `/` read-only and before the image's init remounts it rw.
+    if eff_root == RootMode::Ro && (!args.ssh_hosts.is_empty() || args.ssh_guest_config.is_some()) {
+        bail!(
+            "`root: ro` cannot take --ssh-host or [dev.ssh]: they write the guest's ~/.ssh/config \
+             once it is up, when its root may still be read-only"
+        );
+    }
     // The primary's image identity and root persistence, read off its compose unit exactly as
     // a sibling's are off its `Provisioned` — so `persist_root` and `overlay,persist` key on,
     // and reset with, the same image changes whichever role the service boots in.
@@ -1630,7 +1697,7 @@ async fn build_and_boot(
         primary_user = cfg.user.clone();
         primary_hostname = Some(unit.hostname.clone());
         primary_volumes = unit.volumes.clone();
-        primary_axes = Some((unit.init, unit.kernel.clone()));
+        primary_kernel = Some(unit.kernel.clone());
         primary = Some(cfg);
         Some(work.join("root.qcow2"))
     } else if args.dockerfiles.is_empty() {
@@ -1658,19 +1725,9 @@ async fn build_and_boot(
     // inside this window, which withholds both lines for the same reason.
     let meter = crate::usage::Meter::start();
 
-    // Effective init/kernel axes for the boot. Precedence, per the uniform-axes model:
-    //   1. a non-`Default` CLI `--init`/`--kernel` overrides every unit (a run-wide force);
-    //   2. otherwise the --primary primary's own marker axes apply;
-    //   3. absent both → `Default` (today's behavior).
-    // Non-compose boots (plain image / `-f`) have no marker, so they keep the CLI axes.
-    let (marker_init, marker_kernel) = primary_axes
-        .clone()
-        .unwrap_or((InitSource::Default, KernelSource::Default));
-    let eff_init = if args.init != InitSource::Default {
-        args.init
-    } else {
-        marker_init
-    };
+    // Effective kernel axis for the boot, with the same precedence as the init axis
+    // ([`primary_init`]): a non-`Default` `--kernel`, else the --primary service's marker.
+    let marker_kernel = primary_kernel.clone().unwrap_or(KernelSource::Default);
     let eff_kernel = if args.kernel != KernelSource::Default {
         args.kernel.clone()
     } else {
@@ -1916,6 +1973,7 @@ async fn build_and_boot(
             // Who takes PID 1 after the handoff. When init==default the agent stays PID 1
             // and pivots via the existing VIRTKIT_PIVOT path — the fragment is then empty.
             kcmd.push_str(&eff_init.handoff_tokens());
+            kcmd.push_str(eff_root.cmdline_token());
             (
                 vec![crate::vmm::Disk::overlay(overlay)],
                 Some(boot.initramfs),
@@ -7591,31 +7649,116 @@ mod tests {
         // the primary service's argv when the flag is silent, the flag's when it is not
         let silent = args(InitSource::Default, &[]);
         assert_eq!(
-            init(effective_handoff(&silent, unit("appliance"))),
+            init(effective_handoff(
+                &silent,
+                unit("appliance"),
+                primary_init(&silent, unit("appliance"))
+            )),
             ["/sbin/init", "-s"]
         );
         let flag = args(InitSource::Default, &["/lib/systemd/systemd", "a b"]);
         assert_eq!(
-            init(effective_handoff(&flag, unit("appliance"))),
+            init(effective_handoff(
+                &flag,
+                unit("appliance"),
+                primary_init(&flag, unit("appliance"))
+            )),
             ["/lib/systemd/systemd", "a b"]
         );
         // the flag needs an image init, from --init or the marker
-        assert!(init(effective_handoff(&silent, unit("web"))).is_empty());
-        let err = effective_handoff(&flag, unit("web"))
+        assert!(
+            init(effective_handoff(
+                &silent,
+                unit("web"),
+                primary_init(&silent, unit("web"))
+            ))
+            .is_empty()
+        );
+        let err = effective_handoff(&flag, unit("web"), primary_init(&flag, unit("web")))
             .unwrap_err()
             .to_string();
         assert!(err.contains("--init-argv needs `init: image`"), "{err}");
         let image = args(InitSource::Image, &["/sbin/init"]);
-        assert_eq!(init(effective_handoff(&image, None)), ["/sbin/init"]);
+        assert_eq!(
+            init(effective_handoff(&image, None, primary_init(&image, None))),
+            ["/sbin/init"]
+        );
         // an --init that moves the primary off its image init leaves its argv nowhere to go
         let moved = args(InitSource::Entrypoint, &[]);
-        let err = effective_handoff(&moved, unit("appliance"))
-            .unwrap_err()
-            .to_string();
+        let err = effective_handoff(
+            &moved,
+            unit("appliance"),
+            primary_init(&moved, unit("appliance")),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("x-virtkit.init_argv needs `init: image`"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn root_ranks_the_flag_over_the_primary_service_marker() {
+        let units = crate::compose::parse(
+            "services:\n\
+             \x20 appliance:\n    image: a\n    x-virtkit: { init: image, root: ro }\n\
+             \x20 web:\n    image: w\n",
+            Path::new("/b"),
+            &|_| None,
+            None,
+        )
+        .unwrap();
+        let unit = |n: &str| units.iter().find(|u| u.name == n);
+        let args = |init, root| RunArgs {
+            init,
+            root,
+            ..RunArgs::default()
+        };
+        let silent = args(InitSource::Default, None);
+        assert_eq!(
+            effective_root(
+                &silent,
+                unit("appliance"),
+                primary_init(&silent, unit("appliance"))
+            )
+            .unwrap(),
+            RootMode::Ro
+        );
+        assert_eq!(
+            effective_root(&silent, unit("web"), primary_init(&silent, unit("web"))).unwrap(),
+            RootMode::Rw
+        );
+        assert_eq!(
+            effective_root(&silent, None, primary_init(&silent, None)).unwrap(),
+            RootMode::Rw
+        );
+        // ranked, not ORed: an explicit rw wins over the marker's ro
+        let rw = args(InitSource::Default, Some(RootMode::Rw));
+        assert_eq!(
+            effective_root(&rw, unit("appliance"), primary_init(&rw, unit("appliance"))).unwrap(),
+            RootMode::Rw
+        );
+        let ro = args(InitSource::Image, Some(RootMode::Ro));
+        assert_eq!(
+            effective_root(&ro, None, primary_init(&ro, None)).unwrap(),
+            RootMode::Ro
+        );
+        // read-only needs the image init, from --init or the marker
+        let ro = args(InitSource::Default, Some(RootMode::Ro));
+        let err = effective_root(&ro, unit("web"), primary_init(&ro, unit("web")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--root ro needs `init: image`"), "{err}");
+        let moved = args(InitSource::Entrypoint, None);
+        let err = effective_root(
+            &moved,
+            unit("appliance"),
+            primary_init(&moved, unit("appliance")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`root: ro` needs `init: image`"), "{err}");
     }
 
     #[test]

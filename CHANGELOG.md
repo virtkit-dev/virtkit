@@ -8,6 +8,10 @@ All notable changes to virtkit will be documented in this file.
 
 - **Pass arguments to the image's init.** `x-virtkit.init_argv` (or `vk run --init-argv`)
   sets the program and arguments that `init: image` hands PID 1 to.
+- **Boot the image's init on a read-only root.** `x-virtkit.root: ro` (or
+  `vk run --root ro`) hands `init: image` a read-only `/`, as a real boot does. It stays
+  read-only until the image remounts it, which systemd does from a `/` line in its fstab.
+  Until then, systemd's first-boot presets cannot enable units.
 
 ## [0.112.5] - 2026-11-17
 
