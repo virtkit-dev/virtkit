@@ -602,6 +602,37 @@ an entry alive as a writer's do. There is no per-directory policy and no size ca
 replaced or deleted object frees no disk until the next `gc`. A staging file a crashed `PUT`
 left in `uploads/` goes with the idle uploads.
 
+## S3 view for sccache (`/s3/`)
+
+With `s3 = true`, `GET`, `HEAD` and `PUT` of `/s3/<bucket>/<key>` are the WebDAV view's
+`/dav/files/<bucket>/<key>`, for `sccache`'s S3 cache backend (OpenDAL's `s3` service,
+path-style): an object it writes is the plain file WebDAV, `vk registry get`, `/browse` and
+gc see. It is off by default, and serving it does not need `webdav = true`.
+
+That is the whole surface, sized to what sccache sends: a read, a stat and a single-request
+write. A query string (listings, presigned URLs, multipart, sub-resources), a bucket or the
+service root, another method, `Content-MD5`, an aws-chunked body and any `x-amz-*` header
+but `x-amz-date` and `x-amz-content-sha256` answer 501 `NotImplemented`, rather than being
+served in part or ignored. Writing a key creates its bucket, as a WebDAV `PUT` creates its
+parents; a missing key reads as 404 `NoSuchKey`, which sccache takes as a miss.
+
+**Credentials.** A SigV4 header signature (`AWS4-HMAC-SHA256`) is checked first, with the
+access key as its own secret: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are both the
+registry credential sccache would otherwise send as a bearer: an API key, a hub token or
+the shared bearer. The registry stores no S3 secret and API keys stay hashed. The signature
+must cover `host`, `x-amz-date` and every `x-amz-*` header, its scope must name the `s3`
+service (any region is taken), and its date must be within 15 minutes of the server's. The
+request then goes on as `Authorization: Bearer <access key>` to `/dav/files/…`, so the
+credential is checked and authorized exactly as a WebDAV request's, `write:files/<bucket>/*`
+and hub grants included; a `Cookie` is dropped first, so a browser session never authorizes
+it. A body signed by its SHA-256 (rather than `UNSIGNED-PAYLOAD`) is held to it before the
+object is written. Shared Basic credentials are not accepted as an access key.
+
+What the signature adds is binding, not secrecy: the access key travels in the
+`Authorization` header as a bearer does, so TLS is what protects it, and anyone holding the
+header can sign other requests. Refusals are S3's XML errors: an unknown or ungranted
+credential is 403 `AccessDenied`, which sccache reports at startup or as a read-only cache.
+
 ## Accounts administration
 
 `vk-registry accounts` manages users, sessions, administrators, and API keys. The command

@@ -65,7 +65,7 @@ jobs:
         env:
           E2E_REQUIRE_KVM: 1
         run: |
-          chmod +x dist/vk dist/vk-hub
+          chmod +x dist/vk dist/vk-hub dist/vk-registry
           df -h /
           free -m
           failed=0

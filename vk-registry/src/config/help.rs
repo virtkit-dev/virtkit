@@ -98,6 +98,11 @@ const KEYS: &[Key] = &[
     },
     Key {
         table: Table::Top,
+        name: "s3",
+        help: "serve /s3/<bucket>/<key>, sccache's S3 cache over /dav/files/ [default: false]",
+    },
+    Key {
+        table: Table::Top,
         name: "max_connections",
         help: "connections served at once, each holding a file\n\
                descriptor; past it, new ones wait [default: 4096]",

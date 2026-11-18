@@ -49,6 +49,7 @@ fn serve(dir: &std::path::Path) -> (String, Arc<Store>, Signer) {
         }),
         tls: None,
         webdav: false,
+        s3: false,
         tokens: Default::default(),
         handover: Default::default(),
     });
