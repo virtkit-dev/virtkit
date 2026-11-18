@@ -871,6 +871,17 @@ with `read:files/<dir>/*` only reads it. Cached files expire under `vk-registry 
 retention like any other tag, unless their manifest keeps or expires them. Set
 `webdav = false` in the server config to disable WebDAV.
 
+With `s3 = true`, the same area is also an S3 endpoint for `sccache`'s S3 backend, for
+machines that cannot use WebDAV's setup: each top-level directory is a bucket, and the
+registry credential is both AWS keys.
+
+```sh
+SCCACHE_BUCKET=cache SCCACHE_ENDPOINT=https://<registry>/s3 SCCACHE_REGION=auto \
+  AWS_ACCESS_KEY_ID=$KEY AWS_SECRET_ACCESS_KEY=$KEY sccache …
+```
+
+Only object reads and writes are served; see `vk-registry/DESIGN.md`.
+
 `vk registry put [--dir <dir>] [--ttl 7d | --keep] <file>...` stores files there, each once by
 digest (`/dav/files/sha256/<hex>`) and, with `--dir`, by name (`/dav/files/<dir>/<name>`), and
 `vk registry get <sha256:hex | dir/name>` fetches one back, checked against its digest;

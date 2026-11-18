@@ -473,6 +473,11 @@ async fn put(
         return refuse(req, resp, href).await;
     }
 
+    // The SHA-256 an S3 request's signature binds the body to, if it named one.
+    let expected = req
+        .extensions()
+        .get::<crate::s3::PayloadSha256>()
+        .map(|p| p.0.clone());
     // Stream uploads to bound memory use; the digest falls out of the same pass.
     let (path, file) = state.store.stage_file()?;
     let staging = Staging::new(path);
@@ -494,6 +499,13 @@ async fn put(
         }
         Err(DrainError::Failed(e)) => return Err(e),
     };
+    if expected.is_some_and(|e| e != hex) {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            "the body does not match its signed SHA-256",
+        ));
+    }
 
     // Off the runtime: staging compresses, and a large object would otherwise block a tokio
     // worker for seconds. The locks are taken inside, after that pass — the store lock as

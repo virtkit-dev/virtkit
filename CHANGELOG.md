@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk-registry` can serve sccache's S3 cache.** With `s3 = true`, `/s3/<bucket>/<key>`
+  reads and writes the WebDAV `files/<bucket>/` area, so an `sccache` on a machine without
+  the WebDAV setup shares the cache: set `SCCACHE_ENDPOINT=https://<registry>/s3` and the
+  registry credential as both `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Only reads and
+  single-request writes of objects are served; listings, multipart and bucket operations
+  answer `NotImplemented`. Off by default.
+
 ## [0.112.5] - 2026-11-17
 
 ### Fixed
