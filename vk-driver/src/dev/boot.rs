@@ -14,7 +14,7 @@ use super::hooks::{Where, check_requirements, note_lock, run_hook};
 use super::identity::{
     COMPOSE_SNAPSHOT, Config, LeftBehind, NotReady, VmTie, applied_on_attach, claim_not_ready,
     clear_not_ready, drift, identity_of, identity_path, left_behind, live_identity,
-    note_older_creator, read_not_ready, same_config, sha256_hex, try_read_identity,
+    note_older_creator, older_creator, read_not_ready, same_config, sha256_hex, try_read_identity,
 };
 use super::session::{ask_on_terminal, on_terminal, running_vm};
 use super::{GENERATION_MARKER, INFLIGHT_POLL, Identity, Overrides, TRANSITION_WAIT, Transition};
@@ -472,14 +472,14 @@ pub fn alias_for(state_dir: &Path) -> String {
     format!("vk-{name}")
 }
 
-/// What an `up` does about an environment that is running from a different configuration.
+/// What an `up` does about a running environment that is [`Stale`].
 #[derive(Debug, PartialEq, Eq)]
 enum Drifted {
     /// leave it alone and attach to it as recorded; the text says why
     Reuse(&'static str),
     /// rebuild and restart it into the configuration as it now reads
     Restart,
-    /// refuse to do either: the policy is that a running environment matches its config
+    /// refuse to do either: the policy is that a running environment is current
     Refuse,
 }
 
@@ -666,6 +666,8 @@ async fn swap(
 /// Also refuse an environment left not ready from a different config.
 fn after_takeover(joined: Joined, wanted: Wanted<'_>) -> Result<Transition> {
     Ok(match joined {
+        // If an older vk wins the race during a rebuild, the next attachment checks its
+        // version. This caller checks only the winning boot's configuration.
         Joined::Ready { identity, .. } => match serves(&identity, wanted) {
             Serves::Same | Serves::OnAttach => Transition::Reused,
             Serves::NeedsRestart => bail!("{}", readied_elsewhere(&identity, &wanted.digest)),
@@ -856,27 +858,71 @@ fn current_images_of(
 /// The action `up` takes for a ready environment.
 #[derive(Debug, PartialEq, Eq)]
 enum Live {
-    /// Attach: the environment serves this config (see [`serves`]).
+    /// Attach: the environment serves this config (see [`serves`]) and no older vk is
+    /// recorded as its creator.
     Current { session_only: bool },
     /// Attach: a refresh joined the boot that started the VM, which readied it from this
     /// config and images matching the sources, so restarting it would only boot the same
     /// thing twice.
     JustBooted,
-    /// The action when serving this config requires a restart.
-    Decided(Drifted),
+    /// Restart: a refresh restarts whatever else it finds, without consulting the policy.
+    Refresh,
+    /// The freshness policy's action for an environment that is [`Stale`].
+    Decided(Drifted, Stale),
+}
+
+/// Why a ready environment goes to the freshness policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Stale {
+    /// serving this config requires a restart
+    Config,
+    /// The guest agent comes from release `older` and may use incompatible image or
+    /// protocol formats. `session_only` means the config changed only in what attaching
+    /// applies.
+    Creator { older: String, session_only: bool },
+}
+
+/// A configuration that requires a restart takes precedence because restarting also
+/// replaces the guest agent.
+fn stale(running: &Identity, serves: Serves) -> Option<Stale> {
+    match serves {
+        Serves::NeedsRestart => Some(Stale::Config),
+        Serves::Same | Serves::OnAttach => {
+            older_creator(&running.created_by).map(|older| Stale::Creator {
+                older,
+                session_only: serves == Serves::OnAttach,
+            })
+        }
+    }
+}
+
+/// What makes `running` [`Stale`] for `wanted`, as the start of a sentence.
+fn stale_summary(why: &Stale, running: &Identity, wanted: Wanted<'_>) -> String {
+    match why {
+        Stale::Config => format!(
+            "the running environment was booted from a different configuration (booted {}, \
+             now {})",
+            short(&running.digest),
+            short(&wanted.digest)
+        ),
+        Stale::Creator { older, .. } => format!(
+            "the running environment was created by vk {older}; this is {}",
+            env!("CARGO_PKG_VERSION")
+        ),
+    }
 }
 
 /// Choose an action for `running` given `wanted`. Refresh reuses only a joined boot that
 /// started and readied the VM (see [`Identity::readied_by_its_boot`]), with the same digest
 /// and images that `current_images` says match the sources. Merely matching [`serves`] is
-/// insufficient. Outside refresh, attach when it serves the config or consult the
-/// freshness `decision`.
+/// insufficient. Outside refresh, pass the reason to `decision` if the environment is
+/// [`Stale`]. Otherwise attach.
 fn live_decision(
     running: &Identity,
     wanted: Wanted<'_>,
     refresh: Refresh,
     current_images: impl FnOnce() -> bool,
-    decision: impl FnOnce() -> Result<Drifted>,
+    decision: impl FnOnce(&Stale) -> Result<Drifted>,
 ) -> Result<Live> {
     match refresh {
         Refresh::No => {}
@@ -891,32 +937,36 @@ fn live_decision(
         {
             return Ok(Live::JustBooted);
         }
-        Refresh::Found | Refresh::Joined => return Ok(Live::Decided(Drifted::Restart)),
+        Refresh::Found | Refresh::Joined => return Ok(Live::Refresh),
     }
-    Ok(match serves(running, wanted) {
-        Serves::Same => Live::Current {
-            session_only: false,
+    let serves = serves(running, wanted);
+    Ok(match stale(running, serves) {
+        Some(why) => Live::Decided(decision(&why)?, why),
+        None => Live::Current {
+            session_only: serves == Serves::OnAttach,
         },
-        Serves::OnAttach => Live::Current { session_only: true },
-        Serves::NeedsRestart => Live::Decided(decision()?),
     })
 }
 
-/// The freshness policy for an environment booted from another configuration, `over` taking
-/// precedence over the plan's.
+/// Apply the freshness override or the plan's policy. An interactive prompt opens with
+/// `summary`.
 ///
 /// Under `freshness = ask`, the question reaches the terminal because this child inherited
 /// the parent's stdin and stderr and the parent is blocked reading the readiness pipe — the
 /// `setsid` that detached it (in [`boot`]) cost it the controlling terminal, not the
 /// descriptors. With no terminal there is nobody to answer, so the running environment
 /// stands.
-fn policy(plan: &Plan, over: &Overrides) -> Result<Drifted> {
+fn policy(plan: &Plan, over: &Overrides, summary: &str) -> Result<Drifted> {
     decide(
         over.freshness.unwrap_or(plan.freshness),
         on_terminal(),
-        || ask_on_terminal("rebuild and restart it now?"),
+        || ask_on_terminal(&format!("{summary} — rebuild and restart it now?")),
     )
 }
+
+const SESSION_ONLY_NOTE: &str = "its config changed only in what attaching applies (exec-env, \
+                                 editor, endpoints, tasks, egress allowlist) — no restart \
+                                 needed";
 
 /// What [`attach_or_restart`] did about a ready environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -942,17 +992,10 @@ fn attach_or_restart(
     running: &Identity,
     wanted: Wanted<'_>,
 ) -> Result<Attach> {
-    let decision = live_decision(running, wanted, refresh, current_images, || {
-        policy(plan, over)
+    let summary = |why: &Stale| stale_summary(why, running, wanted);
+    let decision = live_decision(running, wanted, refresh, current_images, |why| {
+        policy(plan, over, &summary(why))
     })?;
-    let summary = || {
-        format!(
-            "the running environment was booted from a different configuration (booted {}, \
-             now {})",
-            short(&running.digest),
-            short(&wanted.digest)
-        )
-    };
     match decision {
         Live::Current { session_only } => {
             if announce_reuse {
@@ -961,12 +1004,8 @@ fn attach_or_restart(
                     plan.state_dir.display()
                 );
                 if session_only {
-                    eprintln!(
-                        "virtkit: its config changed only in what attaching applies (exec-env, \
-                         editor, endpoints, tasks, egress allowlist) — no restart needed"
-                    );
+                    eprintln!("virtkit: {SESSION_ONLY_NOTE}");
                 }
-                note_older_creator(running);
                 // Its configuration still matches; the images it was built from may not.
                 // Say so rather than leave a caller to find out, and leave the decision to
                 // them.
@@ -986,23 +1025,37 @@ fn attach_or_restart(
             "virtkit: the boot this refresh waited for readied the environment from this \
              configuration and images matching the sources — not restarting it"
         ),
-        Live::Decided(Drifted::Reuse(why)) => {
+        Live::Decided(Drifted::Reuse(reason), ref why @ Stale::Creator { session_only, .. }) => {
             eprintln!(
-                "virtkit: {}; {why} — attaching to it as recorded, `vk dev refresh` applies \
-                 the config",
-                summary()
+                "virtkit: {}; {reason} — attaching to it as it is, `vk dev refresh` restarts \
+                 it with this one (needed when the two disagree on image or protocol formats)",
+                summary(why)
+            );
+            if announce_reuse && session_only {
+                eprintln!("virtkit: {SESSION_ONLY_NOTE}");
+            }
+        }
+        Live::Decided(Drifted::Reuse(reason), ref why @ Stale::Config) => {
+            eprintln!(
+                "virtkit: {}; {reason} — attaching to it as recorded, `vk dev refresh` \
+                 applies the config",
+                summary(why)
             );
             if let Some(note) = egress_as_booted(&running.manifest, &wanted.manifest) {
                 eprintln!("virtkit: {note}");
             }
             note_older_creator(running);
         }
-        Live::Decided(Drifted::Refuse) => bail!(
-            "{} — `vk dev refresh` reboots it into this one, `vk dev stop` ends it, or \
-             `--freshness reuse` attaches to it as it is",
-            summary()
+        Live::Decided(Drifted::Refuse, why) => bail!(
+            "{} — `vk dev refresh` {}, `vk dev stop` ends it, or `--freshness reuse` attaches \
+             to it as it is",
+            summary(&why),
+            match why {
+                Stale::Config => "reboots it into this one",
+                Stale::Creator { .. } => "restarts it with this vk",
+            }
         ),
-        Live::Decided(Drifted::Restart) => return Ok(Attach::ToRestart),
+        Live::Decided(Drifted::Restart, _) | Live::Refresh => return Ok(Attach::ToRestart),
     }
     note_transition(plan, parent_pid, Transition::Reused);
     Ok(Attach::Attached)
@@ -1102,7 +1155,11 @@ pub async fn boot(
             }
             Joined::Restart(vm) => vm,
             Joined::Drifted(left) => {
-                restart_left_behind(|| policy(plan, over), &left, &wanted.digest)?;
+                restart_left_behind(
+                    || policy(plan, over, &not_ready_summary(&left, &wanted.digest)),
+                    &left,
+                    &wanted.digest,
+                )?;
                 left.vm
             }
         };
@@ -1962,7 +2019,7 @@ mod tests {
         let same = recorded(&digest, manifest.clone());
         let session_only = recorded(&"b".repeat(64), endpoints);
         let drifted = recorded(&"a".repeat(64), serde_json::json!({}));
-        let never = || -> Result<Drifted> { panic!("the policy was consulted") };
+        let never = |_: &Stale| -> Result<Drifted> { panic!("the policy was consulted") };
         let unasked = || -> bool { panic!("the images were judged") };
 
         assert_eq!(serves(&same, wanted), Serves::Same);
@@ -1993,11 +2050,76 @@ mod tests {
             || Drifted::Refuse,
             || Drifted::Reuse("freshness = reuse"),
         ];
+        let told = |expected: Stale, answer: fn() -> Drifted| {
+            move |why: &Stale| {
+                assert_eq!(*why, expected);
+                Ok(answer())
+            }
+        };
+        let created = |config: &Identity, created_by: &str| Identity {
+            created_by: created_by.into(),
+            ..recorded(&config.digest, config.manifest.clone())
+        };
         for answer in answers {
             assert_eq!(
-                live_decision(&drifted, wanted, Refresh::No, unasked, || Ok(answer())).unwrap(),
-                Live::Decided(answer())
+                live_decision(
+                    &drifted,
+                    wanted,
+                    Refresh::No,
+                    unasked,
+                    told(Stale::Config, answer)
+                )
+                .unwrap(),
+                Live::Decided(answer(), Stale::Config)
             );
+            // Configuration drift takes precedence even with an older agent.
+            let older = created(&drifted, "vk 0.1.0 (abc)");
+            assert_eq!(
+                live_decision(
+                    &older,
+                    wanted,
+                    Refresh::No,
+                    unasked,
+                    told(Stale::Config, answer)
+                )
+                .unwrap(),
+                Live::Decided(answer(), Stale::Config)
+            );
+        }
+        // An older creator triggers the policy even when all config changes apply on attach.
+        // A current or newer creator leaves the configuration decision unchanged.
+        for (config, session_only) in [(&same, false), (&session_only, true)] {
+            let older = created(config, "vk 0.1.0 (abc)");
+            let why = Stale::Creator {
+                older: "0.1.0".into(),
+                session_only,
+            };
+            for answer in answers {
+                assert_eq!(
+                    live_decision(
+                        &older,
+                        wanted,
+                        Refresh::No,
+                        unasked,
+                        told(why.clone(), answer)
+                    )
+                    .unwrap(),
+                    Live::Decided(answer(), why.clone())
+                );
+            }
+            // An empty or unparsable record says nothing of its creator.
+            for by in [
+                crate::dev::identity::own_version().as_str(),
+                "vk 999.0.0 (dev)",
+                "",
+                "vk unknown",
+            ] {
+                assert_eq!(
+                    live_decision(&created(config, by), wanted, Refresh::No, unasked, never)
+                        .unwrap(),
+                    Live::Current { session_only }
+                );
+            }
         }
         // Refresh restarts every configuration without consulting the policy: on arrival
         // whatever its images, after joining a boot unless that boot readied it from this
@@ -2005,13 +2127,13 @@ mod tests {
         for running in [&same, &session_only, &drifted] {
             assert_eq!(
                 live_decision(running, wanted, Refresh::Found, unasked, never).unwrap(),
-                Live::Decided(Drifted::Restart)
+                Live::Refresh
             );
         }
         for running in [&session_only, &drifted] {
             assert_eq!(
                 live_decision(running, wanted, Refresh::Joined, unasked, never).unwrap(),
-                Live::Decided(Drifted::Restart)
+                Live::Refresh
             );
         }
         // A claim's re-readying of a VM that was already up, or a record that does not say,
@@ -2027,7 +2149,7 @@ mod tests {
         for running in [&reclaimed, &old] {
             assert_eq!(
                 live_decision(running, wanted, Refresh::Joined, unasked, never).unwrap(),
-                Live::Decided(Drifted::Restart)
+                Live::Refresh
             );
             assert_eq!(
                 live_decision(running, wanted, Refresh::No, unasked, never).unwrap(),
@@ -2036,10 +2158,7 @@ mod tests {
                 }
             );
         }
-        for (current, joined) in [
-            (true, Live::JustBooted),
-            (false, Live::Decided(Drifted::Restart)),
-        ] {
+        for (current, joined) in [(true, Live::JustBooted), (false, Live::Refresh)] {
             assert_eq!(
                 live_decision(&same, wanted, Refresh::Joined, || current, never).unwrap(),
                 joined
@@ -2047,6 +2166,32 @@ mod tests {
         }
         let refusal = readied_elsewhere(&drifted, &digest);
         assert!(refusal.contains("booted aaaaaaaaaaaa, now "), "{refusal}");
+    }
+
+    #[test]
+    fn a_stale_environment_is_summarised_by_what_made_it_stale() {
+        let t = scratch("stale-summary");
+        let wanted = identity_of(&plan_in(&t.0), None).unwrap();
+        let running = recorded(&"a".repeat(64), serde_json::json!({}));
+        assert_eq!(
+            stale_summary(&Stale::Config, &running, &wanted),
+            format!(
+                "the running environment was booted from a different configuration (booted \
+                 aaaaaaaaaaaa, now {})",
+                short(&wanted.digest)
+            )
+        );
+        let creator = Stale::Creator {
+            older: "0.1.0".into(),
+            session_only: false,
+        };
+        assert_eq!(
+            stale_summary(&creator, &running, &wanted),
+            format!(
+                "the running environment was created by vk 0.1.0; this is {}",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
     }
 
     #[test]
@@ -2081,10 +2226,10 @@ mod tests {
         let config = identity_of(&plan, None).unwrap();
         let manifest = config.manifest.clone();
         let wanted = &config;
-        let never = || -> Result<Drifted> { panic!("the policy was consulted") };
+        let never = |_: &Stale| -> Result<Drifted> { panic!("the policy was consulted") };
         assert_eq!(
             live_decision(&joined, wanted, Refresh::Joined, || true, never).unwrap(),
-            Live::Decided(Drifted::Restart)
+            Live::Refresh
         );
         // A boot by an earlier vk recorded no fingerprints: `up` attaches to it, but a
         // refresh cannot know it booted this file.
@@ -2093,7 +2238,7 @@ mod tests {
         let older = recorded(&crate::dev::identity::digest_of(&older).unwrap(), older);
         assert_eq!(
             live_decision(&older, wanted, Refresh::Joined, || true, never).unwrap(),
-            Live::Decided(Drifted::Restart)
+            Live::Refresh
         );
         assert_eq!(
             live_decision(&older, wanted, Refresh::No, || true, never).unwrap(),
@@ -2351,6 +2496,46 @@ mod tests {
         assert_eq!(restarts.unwrap(), Attach::Attached);
         let note = std::fs::read_to_string(transition_path(&plan.state_dir, pid)).unwrap();
         assert!(note.starts_with("reused "), "{note}");
+
+        // A matching configuration can still require a restart for an older guest agent.
+        let older = Identity {
+            created_by: "vk 0.1.0 (abc)".into(),
+            ..recorded(&digest, config.manifest.clone())
+        };
+        let err = attach_or_restart(
+            &plan,
+            &under(Freshness::RequireCurrent),
+            Refresh::No,
+            || false,
+            true,
+            pid,
+            &older,
+            wanted,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.starts_with(&format!(
+                "the running environment was created by vk 0.1.0; this is {} — `vk dev refresh` \
+                 restarts it with this vk,",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{err}"
+        );
+        assert_eq!(
+            attach_or_restart(
+                &plan,
+                &under(Freshness::Refresh),
+                Refresh::No,
+                || false,
+                true,
+                pid,
+                &older,
+                wanted,
+            )
+            .unwrap(),
+            Attach::ToRestart
+        );
     }
 
     #[test]
@@ -2497,7 +2682,7 @@ mod tests {
                         wanted,
                         Refresh::Joined,
                         || true,
-                        || panic!("the policy was consulted"),
+                        |_| panic!("the policy was consulted"),
                     )
                     .unwrap();
                     let kept = decided == Live::JustBooted;

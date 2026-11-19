@@ -12,7 +12,8 @@ use super::boot::{alias, worktree_git_dir};
 use super::hooks::{check_requirements, stamped};
 use super::identity::{
     Config, LeftBehind, NotReady, VmTie, applied_on_attach, drift, generation_of, identity_of,
-    left_behind, read_identity, read_not_ready, root_identity, same_config, wrapper_digest,
+    left_behind, older_creator, read_identity, read_not_ready, root_identity, same_config,
+    wrapper_digest,
 };
 use super::session::running_vm;
 
@@ -263,7 +264,16 @@ impl Status {
             None => {}
         }
         if let Some(by) = &self.created_by {
-            line("created by", by.clone());
+            line(
+                "created by",
+                match older_creator(by) {
+                    Some(_) => format!(
+                        "{by} — older than this vk; the freshness policy decides on the next \
+                         `vk dev` command that attaches to it"
+                    ),
+                    None => by.clone(),
+                },
+            );
         }
         let short = |d: &str| d.chars().take(12).collect::<String>();
         if let Some(generation) = &self.generation {
@@ -656,6 +666,29 @@ mod tests {
             state(&readying),
             Some(NotReadyState::Readying { pid: me.pid })
         );
+    }
+
+    #[test]
+    fn an_environment_an_older_vk_created_says_the_policy_decides() {
+        let t = scratch("status-created-by");
+        let mut s = status(&plan_in(&t.0)).unwrap();
+        s.pid = Some(41);
+        s.running = true;
+        let created_by = |s: &Status| {
+            s.render()
+                .lines()
+                .find_map(|l| l.strip_prefix("created by").map(|v| v.trim().to_string()))
+        };
+        s.created_by = Some("vk 0.1.0 (abc)".into());
+        assert_eq!(
+            created_by(&s).unwrap(),
+            "vk 0.1.0 (abc) — older than this vk; the freshness policy decides on the next \
+             `vk dev` command that attaches to it"
+        );
+        for by in [crate::dev::identity::own_version(), "vk unknown".into()] {
+            s.created_by = Some(by.clone());
+            assert_eq!(created_by(&s).unwrap(), by);
+        }
     }
 
     #[test]

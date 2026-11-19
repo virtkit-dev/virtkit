@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dev environments created by an older `vk` now follow `freshness`.** Their guest agent
+  comes from that release. This applies to `vk dev up`, `code`, `service up`, `exec` and
+  `shell` in the primary guest, and tasks that need the environment. `ask` offers a restart
+  and reuses with a note if declined or without a terminal. `reuse` attaches with a note,
+  `refresh` restarts, and `require-current` refuses attachment and suggests `vk dev refresh`.
+
 ## [0.113.0] - 2026-11-18
 
 ### Added

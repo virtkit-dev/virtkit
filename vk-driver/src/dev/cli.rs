@@ -27,9 +27,10 @@ pub struct Dev {
     /// the environment to work in: `dev`, or a name under `[environments]`
     #[arg(long, value_name = "NAME", default_value = "dev", global = true)]
     environment: String,
-    /// what to do about a running environment that no longer matches the config
+    /// what to do about a running environment that is out of date
     ///
-    /// Overrides the config's own `freshness` for this invocation.
+    /// One that no longer matches the config, or that an older vk created. Overrides the
+    /// config's own `freshness` for this invocation.
     #[arg(long, value_name = "POLICY", global = true)]
     freshness: Option<crate::dev::config::Freshness>,
     /// where built stages are cached, over the config's `[dev.cache]`
@@ -94,9 +95,9 @@ enum DevAction {
     ///
     /// Boots what the config describes and leaves it running: the build and boot are in the
     /// foreground, and this returns once the guest is ready. An environment already running
-    /// the same configuration is a no-op; one running a different configuration is handled
-    /// as the config's `freshness` (or `--freshness`) says. To rebuild and restart one that
-    /// matches, use `vk dev refresh`.
+    /// the same configuration is a no-op; one running a different configuration, or created
+    /// by an older vk, is handled as the config's `freshness` (or `--freshness`) says. To
+    /// rebuild and restart one that matches, use `vk dev refresh`.
     Up {
         /// fail promptly when a boot someone else started is in flight, instead of joining it
         #[arg(long)]
@@ -298,12 +299,13 @@ enum DevAction {
     /// Rebuild the environment and restart it into the result
     ///
     /// Unconditional, and the only command that is: `up` leaves an environment that matches
-    /// its config alone, and `--freshness` only says what one that has drifted gets. The
-    /// build runs while the current environment keeps working, so the only downtime is the
-    /// restart itself — and a build that fails leaves what is running alone. Does not ask: a
-    /// wrapper that wants to confirm first should do the asking. The one exception: a refresh
-    /// that waited for another `vk dev`'s boot keeps it when that boot started the VM from
-    /// this config and from images all known to match the sources.
+    /// its config alone, and `--freshness` only says what one that has drifted (or that an
+    /// older vk created) gets. The build runs while the current environment keeps working, so
+    /// the only downtime is the restart itself — and a build that fails leaves what is
+    /// running alone. Does not ask: a wrapper that wants to confirm first should do the
+    /// asking. The one exception: a refresh that waited for another `vk dev`'s boot keeps it
+    /// when that boot started the VM from this config and from images all known to match the
+    /// sources.
     Refresh {
         /// say what would change (as `plan --diff` does) without building or restarting
         #[arg(long)]
@@ -735,7 +737,7 @@ async fn dev_action(
             Err(e) => fail(&e, 1),
         },
         // The one unconditional rebuild-and-restart: `up` never reboots an environment
-        // that matches, and `--freshness` only says what a drifted one gets.
+        // that matches and has no older creator. Only stale environments follow the policy.
         DevAction::Refresh { dry_run: false } => {
             match dev_up(&plan, host_cfg, over, true, true, true).await {
                 Ready::Act => ExitCode::SUCCESS,

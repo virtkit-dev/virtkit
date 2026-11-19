@@ -270,7 +270,9 @@ mapping. `exec` passes arguments directly and reproduces the command's exit
 status; use `sh -lc '…'` explicitly for shell syntax.
 
 A matching running environment is reused. When its recorded configuration differs
-from the current plan, `freshness` controls the next attachment:
+from the current plan in a way that requires a restart, or its recorded creator is an
+older `vk`, `freshness` controls the next attachment. The guest agent comes from the
+release that booted it. If the creator is unknown, only the configuration matters.
 
 | Policy | Behavior |
 | --- | --- |

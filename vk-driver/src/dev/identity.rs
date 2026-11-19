@@ -20,7 +20,7 @@ pub(super) fn own_version() -> String {
 /// injected agent is that release's, so a newer host vk may not open what it produces (image
 /// formats, protocols) until the environment is restarted. Unparsable or absent records — from
 /// a vk that did not write one — say nothing.
-fn older_creator(created_by: &str) -> Option<String> {
+pub(super) fn older_creator(created_by: &str) -> Option<String> {
     let recorded: crate::check::Version = created_by.split_whitespace().nth(1)?.parse().ok()?;
     let own = crate::check::Version::own().ok()?;
     (recorded < own).then(|| recorded.to_string())

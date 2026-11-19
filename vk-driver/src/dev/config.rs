@@ -258,7 +258,7 @@ pub enum CheckoutMode {
 }
 
 /// What `vk dev` does when the environment that is running was booted from something other
-/// than what the config now says.
+/// than what the config now says, or an older vk created it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Freshness {
