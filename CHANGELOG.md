@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **A dev environment an older `vk` created now follows `freshness`.** Its agent is that
+  release's, so `vk dev up`, `exec`, `shell`, `code` and `service` apply the `freshness`
+  policy to it, as to a changed configuration: under `ask` they offer to restart it, under
+  `refresh` they restart it. Starting a service no longer reuses one silently.
+
 ## [0.113.0] - 2026-11-18
 
 ### Added

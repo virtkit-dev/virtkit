@@ -14,7 +14,7 @@ use super::hooks::{Where, check_requirements, note_lock, run_hook};
 use super::identity::{
     COMPOSE_SNAPSHOT, Config, LeftBehind, NotReady, VmTie, applied_on_attach, claim_not_ready,
     clear_not_ready, drift, identity_of, identity_path, left_behind, live_identity,
-    note_older_creator, read_not_ready, same_config, sha256_hex, try_read_identity,
+    note_older_creator, older_creator, read_not_ready, same_config, sha256_hex, try_read_identity,
 };
 use super::session::{ask_on_terminal, on_terminal, running_vm};
 use super::{GENERATION_MARKER, INFLIGHT_POLL, Identity, Overrides, TRANSITION_WAIT, Transition};
@@ -894,11 +894,14 @@ fn live_decision(
         Refresh::Found | Refresh::Joined => return Ok(Live::Decided(Drifted::Restart)),
     }
     Ok(match serves(running, wanted) {
+        Serves::NeedsRestart => Live::Decided(decision()?),
+        // The agent an older vk injected may not speak this one's image or protocol formats:
+        // the policy decides, as for a configuration that needs a restart.
+        _ if older_creator(&running.created_by).is_some() => Live::Decided(decision()?),
         Serves::Same => Live::Current {
             session_only: false,
         },
         Serves::OnAttach => Live::Current { session_only: true },
-        Serves::NeedsRestart => Live::Decided(decision()?),
     })
 }
 
@@ -945,13 +948,21 @@ fn attach_or_restart(
     let decision = live_decision(running, wanted, refresh, current_images, || {
         policy(plan, over)
     })?;
-    let summary = || {
-        format!(
+    // A configuration that still serves leaves the creator as the only reason to decide.
+    let outdated_creator = (serves(running, wanted) != Serves::NeedsRestart)
+        .then(|| older_creator(&running.created_by))
+        .flatten();
+    let summary = || match &outdated_creator {
+        Some(older) => format!(
+            "the running environment was created by vk {older}; this is {}",
+            env!("CARGO_PKG_VERSION")
+        ),
+        None => format!(
             "the running environment was booted from a different configuration (booted {}, \
              now {})",
             short(&running.digest),
             short(&wanted.digest)
-        )
+        ),
     };
     match decision {
         Live::Current { session_only } => {
@@ -966,7 +977,6 @@ fn attach_or_restart(
                          editor, endpoints, tasks, egress allowlist) — no restart needed"
                     );
                 }
-                note_older_creator(running);
                 // Its configuration still matches; the images it was built from may not.
                 // Say so rather than leave a caller to find out, and leave the decision to
                 // them.
@@ -985,6 +995,11 @@ fn attach_or_restart(
         Live::JustBooted => eprintln!(
             "virtkit: the boot this refresh waited for readied the environment from this \
              configuration and images matching the sources — not restarting it"
+        ),
+        Live::Decided(Drifted::Reuse(why)) if outdated_creator.is_some() => eprintln!(
+            "virtkit: {}; {why} — attaching to it as it is, `vk dev refresh` restarts it with \
+             this one (needed when the two disagree on image or protocol formats)",
+            summary()
         ),
         Live::Decided(Drifted::Reuse(why)) => {
             eprintln!(
@@ -1998,6 +2013,30 @@ mod tests {
                 live_decision(&drifted, wanted, Refresh::No, unasked, || Ok(answer())).unwrap(),
                 Live::Decided(answer())
             );
+        }
+        // So does an environment an older vk created, whatever its config: its agent is that
+        // release's. One this vk or a later one created is attached to as its config says.
+        for config in [&same, &session_only] {
+            let created = |created_by: String| Identity {
+                created_by,
+                ..recorded(&config.digest, config.manifest.clone())
+            };
+            let older = created("vk 0.1.0 (abc)".into());
+            for answer in answers {
+                assert_eq!(
+                    live_decision(&older, wanted, Refresh::No, unasked, || Ok(answer())).unwrap(),
+                    Live::Decided(answer())
+                );
+            }
+            for by in [
+                crate::dev::identity::own_version(),
+                "vk 999.0.0 (dev)".into(),
+            ] {
+                assert!(matches!(
+                    live_decision(&created(by), wanted, Refresh::No, unasked, never).unwrap(),
+                    Live::Current { .. }
+                ));
+            }
         }
         // Refresh restarts every configuration without consulting the policy: on arrival
         // whatever its images, after joining a boot unless that boot readied it from this
