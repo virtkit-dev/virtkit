@@ -6,7 +6,7 @@
 
 use std::ffi::CString;
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
 
@@ -433,13 +433,115 @@ pub fn mount_bind_ro(src: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Count stacked mounts in `/proc/self/mountinfo`. An unresolved target counts as zero.
+/// Return `None` if the mount table cannot be read.
+fn mount_depth(target: &Path) -> Option<usize> {
+    let Ok(target) = fs::canonicalize(target) else {
+        return Some(0);
+    };
+    let info = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    Some(mounts_at(&info, &target))
+}
+
+/// Count entries whose fifth mountinfo field decodes to `target` (`\NNN` octal escapes).
+fn mounts_at(info: &str, target: &Path) -> usize {
+    info.lines()
+        .filter_map(|l| l.split(' ').nth(4))
+        .filter(|mp| Path::new(&unescape_octal(mp)) == target)
+        .count()
+}
+
+/// Directory of per-target mount depths shared by `mount` and `umount`.
+const MOUNT_DEPTHS: &str = "/run/vk-mount-depths";
+
+fn depth_note(target: &Path) -> std::path::PathBuf {
+    let name: String = target
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Path::new(MOUNT_DEPTHS).join(name)
+}
+
+/// Record the depth before mounting. If the note cannot be written or a mount hides the
+/// notes directory under `/run`, teardown attempts one unmount.
+fn note_depth(target: &Path) {
+    // Discard stale depth from a previous step whose setup failed.
+    let _ = fs::remove_file(depth_note(target));
+    if let Some(depth) = mount_depth(target) {
+        let _ = fs::create_dir_all(MOUNT_DEPTHS);
+        let _ = fs::write(depth_note(target), depth.to_string());
+    }
+}
+
+/// The most mounts [`umount_to_noted`] takes off one target.
+const MAX_STACKED: usize = 16;
+
+/// Remove mounts above the recorded depth, including any the step stacked on its own.
+/// Stop at or below the original depth to preserve guest mounts such as `/tmp` and
+/// accept a mount the step already removed. Without a depth note, try one unmount.
+fn umount_to_noted(target: &Path) -> Result<()> {
+    let note = depth_note(target);
+    let keep = fs::read_to_string(&note)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok());
+    let _ = fs::remove_file(&note);
+    let Some(keep) = keep else {
+        return umount(target);
+    };
+    let mut unmounted = 0;
+    loop {
+        match mount_depth(target) {
+            Some(depth) if depth <= keep => return Ok(()),
+            // With no mount table, stop after any successful unmount.
+            None if unmounted > 0 => return Ok(()),
+            _ if unmounted == MAX_STACKED => bail!(
+                "{} is still mounted after {MAX_STACKED} unmounts",
+                target.display()
+            ),
+            _ => {
+                umount(target)?;
+                unmounted += 1;
+            }
+        }
+    }
+}
+
+/// Decode mountinfo's byte-sized `\NNN` escapes, including escaped spaces and newlines.
+fn unescape_octal(s: &str) -> std::ffi::OsString {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\'
+            && let Some(d) = b.get(i + 1..i + 4)
+            && d.iter().all(|c| (b'0'..=b'7').contains(c))
+            && let Ok(c) = u8::try_from(d.iter().fold(0u32, |n, c| n * 8 + u32::from(c - b'0')))
+        {
+            out.push(c);
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    std::ffi::OsString::from_vec(out)
+}
+
 /// Unmount `target`, then remove the (now-empty) mountpoint best-effort — so a COPY/
 /// mount scratch dir or a bind target Docker would not persist does not litter the
-/// image. A non-empty/pre-existing directory is left in place (rmdir fails).
+/// image. Even a pre-existing empty directory can be removed. Non-empty directories remain.
 pub fn umount(target: &Path) -> Result<()> {
     let tgt = CString::new(target.as_os_str().as_bytes()).context("mountpoint has a NUL")?;
     // SAFETY: valid C string.
-    let rc = unsafe { libc::umount2(tgt.as_ptr(), 0) };
+    let mut rc = unsafe { libc::umount2(tgt.as_ptr(), 0) };
+    // Detach a busy mount so the next step can write to the layer even if a daemon
+    // still holds the mount open. The mount is released after its last reference.
+    if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBUSY) {
+        // SAFETY: valid C string.
+        rc = unsafe { libc::umount2(tgt.as_ptr(), libc::MNT_DETACH) };
+    }
     if rc != 0 {
         return Err(std::io::Error::last_os_error())
             .with_context(|| format!("unmounting {}", target.display()));
@@ -671,8 +773,12 @@ fn primary_gid(user: &str) -> Option<u32> {
 pub fn main(args: &[String]) -> i32 {
     let result = match args.first().map(String::as_str) {
         Some("mount") => match &args[1..] {
-            [flag, device, target] if flag == "--ro" => mount_ro(device, Path::new(target)),
+            [flag, device, target] if flag == "--ro" => {
+                note_depth(Path::new(target));
+                mount_ro(device, Path::new(target))
+            }
             [flag, device, target, uid, gid, mode] if flag == "--scratch" => {
+                note_depth(Path::new(target));
                 match (
                     scratch_num(uid, 10, "uid"),
                     scratch_num(gid, 10, "gid"),
@@ -683,9 +789,11 @@ pub fn main(args: &[String]) -> i32 {
                 }
             }
             [flag, src, target] if flag == "--bind" => {
+                note_depth(Path::new(target));
                 mount_bind_ro(Path::new(src), Path::new(target))
             }
             [flag, target, size] if flag == "--tmpfs" => {
+                note_depth(Path::new(target));
                 mount_tmpfs(Path::new(target), (size != "-").then_some(size.as_str()))
             }
             _ => {
@@ -695,7 +803,7 @@ pub fn main(args: &[String]) -> i32 {
             }
         },
         Some("umount") => match &args[1..] {
-            [target] => umount(Path::new(target)),
+            [target] => umount_to_noted(Path::new(target)),
             _ => return usage("umount <mountpoint>"),
         },
         Some("copy") => copy_cmd(&args[1..]),
@@ -775,11 +883,30 @@ fn usage(msg: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_spec, is_live_image_content, noted_ephemeral_in, pending_exit_code, recorded_paths,
-        tmpfs_mount_data,
+        copy_spec, is_live_image_content, mounts_at, noted_ephemeral_in, pending_exit_code,
+        recorded_paths, tmpfs_mount_data, unescape_octal,
     };
     use std::path::Path;
     use vk_core::dockerignore::Ignore;
+
+    #[test]
+    fn mounts_at_counts_the_mounts_stacked_at_a_target() {
+        let info = "22 1 0:21 / / rw - ext4 /dev/vda rw\n\
+                    30 22 0:30 / /work\\040dir rw - tmpfs tmpfs rw\n\
+                    31 22 0:31 / /tmp rw - ext4 /dev/vdb rw\n\
+                    40 31 0:40 / /tmp rw - tmpfs tmpfs rw\n";
+        assert_eq!(mounts_at(info, Path::new("/work dir")), 1);
+        assert_eq!(mounts_at(info, Path::new("/")), 1);
+        assert_eq!(mounts_at(info, Path::new("/work")), 0);
+        // the guest's own /tmp, and a step's tmpfs over it
+        assert_eq!(mounts_at(info, Path::new("/tmp")), 2);
+        // an escape whose value does not fit a byte is kept as written
+        assert_eq!(
+            unescape_octal("a\\777b"),
+            std::ffi::OsString::from("a\\777b")
+        );
+        assert_eq!(unescape_octal("a\\040b"), std::ffi::OsString::from("a b"));
+    }
 
     #[test]
     fn tmpfs_mount_data_validates_size() {

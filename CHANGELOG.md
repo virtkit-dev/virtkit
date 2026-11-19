@@ -44,6 +44,9 @@ All notable changes to virtkit will be documented in this file.
   out-of-memory kill. The guest command's status is 128 + the signal number. A missing
   status also fails the step. Earlier builds could cache and export a partial layer.
   The next build rebuilds layers from the old cache generation.
+- **A build step fails if a mount cannot be removed.** This prevents a leftover
+  `RUN --mount` or `COPY --from` mount from diverting the next step's writes from its
+  image layer.
 
 ## [0.113.0] - 2026-11-18
 

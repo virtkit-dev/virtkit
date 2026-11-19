@@ -409,6 +409,55 @@ fn run_invocation(shell: &str, heredoc: bool, state: &ShellState) -> (Vec<String
     }
 }
 
+/// Unmount guest targets in order and report all failed targets. A leftover mount can
+/// divert the next step's writes from its layer. Stop on a transport error to preserve
+/// its kind and avoid waiting on an unresponsive guest for each remaining target.
+fn unmount_all<'a>(
+    session: &crate::run::VmSession,
+    targets: impl Iterator<Item = &'a String>,
+    sink: &crate::executor::OutputSink,
+) -> Result<()> {
+    let mut left: Vec<&str> = Vec::new();
+    for target in targets {
+        let um = [GUEST_AGENT.to_string(), "umount".into(), target.clone()];
+        match block_on(session.exec(&um, None, sink)) {
+            Ok(0) => {}
+            Ok(_) => left.push(target),
+            Err(e) => return Err(e.context(format!("unmounting {target}"))),
+        }
+    }
+    if left.is_empty() {
+        Ok(())
+    } else {
+        bail!("could not unmount {}", left.join(", "))
+    }
+}
+
+/// Reverse setup order so a mount covering an earlier one comes down first.
+fn teardown_order<'a>(
+    scratch: Option<&'a String>,
+    binds: impl Iterator<Item = (Option<&'a String>, &'a String)>,
+    tmpfs: impl Iterator<Item = &'a String>,
+) -> Vec<&'a String> {
+    let mut setup: Vec<&String> = scratch
+        .into_iter()
+        .chain(binds.flat_map(|(device, target)| device.into_iter().chain([target])))
+        .chain(tmpfs)
+        .collect();
+    setup.reverse();
+    setup
+}
+
+/// Preserve a teardown I/O error for infrastructure failure classification. Include
+/// other teardown failures in the step error message.
+fn step_failure(failure: String, teardown: Result<()>) -> anyhow::Error {
+    match teardown {
+        Err(e) if e.chain().any(|c| c.is::<std::io::Error>()) => e.context(failure),
+        Err(e) => anyhow::anyhow!("{failure} ({e:#})"),
+        Ok(()) => anyhow::anyhow!(failure),
+    }
+}
+
 /// Identify a failed heredoc RUN by its opener to keep file contents out of the error.
 fn run_failure(code: impl std::fmt::Display, shell: &str, heredoc: Option<&str>) -> String {
     format!("RUN exited {code}: {}", heredoc.unwrap_or(shell))
@@ -2615,42 +2664,20 @@ impl Executor for MicroVm {
             }
         }
         let code = block_on(session.exec_env(&argv, env, user, &sink))?;
-        // Tear the mounts down (target before its device mountpoint), best-effort.
-        for (device, _, target) in binds.iter().rev() {
-            let _ = block_on(session.exec(
-                &[GUEST_AGENT.to_string(), "umount".into(), target.clone()],
-                None,
-                &sink,
-            ));
-            if let Some((_, mp)) = device {
-                let _ = block_on(session.exec(
-                    &[GUEST_AGENT.to_string(), "umount".into(), mp.clone()],
-                    None,
-                    &sink,
-                ));
-            }
-        }
-        // Unmount the tmpfs mounts (best-effort); their RAM-backed contents are discarded.
-        for (target, _) in &tmpfs {
-            let _ = block_on(session.exec(
-                &[GUEST_AGENT.to_string(), "umount".into(), target.clone()],
-                None,
-                &sink,
-            ));
-        }
-        // Unmount the scratch target too, so its (discarded) contents don't shadow the target
-        // path for the next step; the scratch device itself stays attached for the stage.
-        if let Some(target) = &scratch_target {
-            let _ = block_on(session.exec(
-                &[GUEST_AGENT.to_string(), "umount".into(), target.clone()],
-                None,
-                &sink,
-            ));
-        }
+        let unmounts = teardown_order(
+            scratch_target.as_ref(),
+            binds
+                .iter()
+                .map(|(device, _, target)| (device.as_ref().map(|(_, mp)| mp), target)),
+            tmpfs.iter().map(|(target, _)| target),
+        );
+        let teardown = unmount_all(session, unmounts.into_iter(), &sink)
+            .context("RUN: tearing its mounts down");
         if code != 0 {
-            bail!("{}", run_failure(code, &shell, heredoc));
+            let failure = run_failure(code, &shell, heredoc);
+            return Err(step_failure(failure, teardown));
         }
-        Ok(())
+        teardown
     }
     fn copy(&mut self, fs: &Rootfs, op: &Copy, from: Option<&Rootfs>, workdir: &str) -> Result<()> {
         let needed: Vec<&str> = from.map(|src| vec![src.label.as_str()]).unwrap_or_default();
@@ -2719,18 +2746,14 @@ impl Executor for MicroVm {
         }
         argv.push(resolve_copy_dest(&op.dest, workdir));
         let code = block_on(session.exec(&argv, None, &self.output_sink))?;
-        if let Some(mp) = mount {
-            let _ = block_on(session.exec(
-                &[GUEST_AGENT.to_string(), "umount".into(), mp],
-                None,
-                &self.output_sink,
-            ));
-        }
+        let teardown = unmount_all(session, mount.iter(), &self.output_sink)
+            .context("COPY: unmounting its source");
         if code != 0 {
             let src = from.map_or("context", |f| f.label.as_str());
-            bail!("COPY from {src} {:?} -> {} failed", op.sources, op.dest);
+            let failure = format!("COPY from {src} {:?} -> {} failed", op.sources, op.dest);
+            return Err(step_failure(failure, teardown));
         }
-        Ok(())
+        teardown
     }
     fn export_ext4(&mut self, fs: &Rootfs, out: &Path, format: ImageFormat) -> Result<Exported> {
         let image = self.stage_image(fs)?;
@@ -3451,6 +3474,34 @@ mod tests {
                 "heredoc: {heredoc}: {out}"
             );
         }
+    }
+
+    #[test]
+    fn a_step_failure_is_blamed_on_the_transport_first() {
+        let io = |kind| anyhow::Error::new(std::io::Error::new(kind, "x"));
+        let kind = |e: &anyhow::Error| {
+            e.chain()
+                .find_map(|c| c.downcast_ref::<std::io::Error>())
+                .map(std::io::Error::kind)
+        };
+        let e = step_failure("f".into(), Err(io(std::io::ErrorKind::BrokenPipe)));
+        assert_eq!(kind(&e), Some(std::io::ErrorKind::BrokenPipe));
+        assert_eq!(kind(&step_failure("f".into(), Ok(()))), None);
+        let e = step_failure("f".into(), Err(anyhow::anyhow!("could not unmount /m")));
+        assert_eq!(kind(&e), None);
+        assert!(format!("{e:#}").contains("could not unmount /m"), "{e:#}");
+    }
+
+    #[test]
+    fn mounts_come_down_in_the_reverse_of_their_setup() {
+        let s = |v: &str| v.to_string();
+        let (scratch, dev, a, b, t) = (s("/scratch"), s("/mnt/m-0"), s("/a"), s("/b"), s("/t"));
+        let order = teardown_order(
+            Some(&scratch),
+            [(Some(&dev), &a), (None, &b)].into_iter(),
+            [&t].into_iter(),
+        );
+        assert_eq!(order, [&t, &b, &a, &dev, &scratch]);
     }
 
     /// A base image on the registry's host is asked for with its credential, resolved at each
