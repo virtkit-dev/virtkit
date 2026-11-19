@@ -5957,9 +5957,22 @@ impl VmSession {
         user: Option<String>,
         sink: &crate::executor::OutputSink,
     ) -> Result<i32> {
-        let r = crate::executor::exec_script(
+        self.exec_env(command, Vec::new(), user, sink).await
+    }
+
+    /// [`VmSession::exec`], with `env` (`NAME=value` entries) added to the command's
+    /// environment.
+    pub(crate) async fn exec_env(
+        &self,
+        command: &[String],
+        env: Vec<String>,
+        user: Option<String>,
+        sink: &crate::executor::OutputSink,
+    ) -> Result<i32> {
+        let r = crate::executor::exec_script_env(
             &self.addr,
             command,
+            env,
             Vec::new(),
             user,
             sink,

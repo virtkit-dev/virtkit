@@ -4,11 +4,14 @@
 //! definition reader using BuildKit's continuation and parser directive rules. The parser
 //! models FROM, RUN, COPY, ARG, ENV, WORKDIR, USER, LABEL, ENTRYPOINT and CMD. It accepts
 //! other keywords as `Other`, with an uppercase name and trimmed arguments, for the planner
-//! and executor to interpret. Our images use no heredocs, ADD or ONBUILD (see the feature
-//! survey), and this parser does not implement them.
+//! and executor to interpret. A standalone `RUN <<EOF` supplies a script. A command such
+//! as `RUN cat > f <<'EOF'` receives the body on stdin. The parser rejects `#!` scripts
+//! and heredocs on COPY, ADD and ONBUILD. The build rejects RUN heredocs on Windows or
+//! under a nondefault SHELL. The surveyed images use neither ADD nor ONBUILD, so the
+//! parser leaves both unimplemented (see the feature survey).
 
 use anyhow::{Context, Result, bail};
-use vk_hub_proto::dockerfile::{HINT_PREFIX, logical_lines};
+use vk_hub_proto::dockerfile::{HINT_PREFIX, Heredoc, heredoc_word, logical_lines};
 
 /// A parsed Dockerfile: its instruction stream in source order.
 #[derive(Debug, Clone)]
@@ -118,6 +121,9 @@ pub struct Run {
     /// a flag the Linux build starts honouring moves to a field of its own, keyed by
     /// `canonical()`.
     pub extra_flags: Vec<(String, String)>,
+    /// Opening command after RUN flags, used for progress and diagnostics. The cache key
+    /// includes `cmd` and this field's presence, which selects the heredoc wrapper.
+    pub heredoc: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -170,6 +176,9 @@ pub fn parse(src: &str) -> Result<Dockerfile> {
     let mut instructions = Vec::new();
     for line in logical {
         let mut instr = parse_instruction(&line.text)?;
+        if !line.heredocs.is_empty() {
+            attach_heredocs(&mut instr, &line.heredocs)?;
+        }
         if !line.hints.is_empty() {
             let hint = parse_guest_hints(&line.hints)?;
             match &mut instr {
@@ -277,6 +286,51 @@ fn parse_guest_hints(lines: &[String]) -> Result<GuestHint> {
     Ok(hint)
 }
 
+/// Match BuildKit's `dispatchRun`. A standalone heredoc supplies the shell script.
+/// Otherwise append each body and terminator for the shell to read as a redirection.
+fn attach_heredocs(instr: &mut Instruction, docs: &[Heredoc]) -> Result<()> {
+    let Instruction::Run(run) = instr else {
+        let keyword = keyword_of(instr);
+        if keyword == "ONBUILD" {
+            bail!("a heredoc on ONBUILD is not supported");
+        }
+        bail!("a heredoc on {keyword} is not supported; write the file in a RUN instead");
+    };
+    let Cmdline::Shell(cmd) = &run.cmd else {
+        bail!("a heredoc needs RUN's shell form, not its exec form");
+    };
+    // As buildkit's `MustParseHeredoc`, which takes a word that does not lex for none.
+    let alone = matches!(heredoc_word(cmd), Ok(Some(_)));
+    let script = match docs {
+        [doc] if alone => {
+            let body = if doc.chomp {
+                doc.content
+                    .split_inclusive('\n')
+                    .map(|l| l.trim_start_matches('\t'))
+                    .collect()
+            } else {
+                doc.content.clone()
+            };
+            if body.starts_with("#!") {
+                bail!("a RUN heredoc starting with #! is not supported; run the interpreter on it");
+            }
+            body
+        }
+        _ => {
+            let mut s = cmd.clone();
+            for doc in docs {
+                s.push('\n');
+                s.push_str(&doc.content);
+                s.push_str(&doc.name);
+            }
+            s
+        }
+    };
+    run.heredoc = Some(cmd.clone());
+    run.cmd = Cmdline::Shell(script);
+    Ok(())
+}
+
 /// Split `<KEYWORD> <rest>` and dispatch. Keyword match is case-insensitive.
 fn parse_instruction(line: &str) -> Result<Instruction> {
     let (kw, rest) = match line.split_once(char::is_whitespace) {
@@ -374,6 +428,7 @@ fn parse_run(rest: &str) -> Result<Run> {
         network,
         security,
         extra_flags,
+        heredoc: None,
     })
 }
 
@@ -677,6 +732,97 @@ mod tests {
             let err = parse_instruction(bad).unwrap_err().to_string();
             assert!(err.contains("given twice"), "{bad}: {err}");
         }
+    }
+
+    fn run_of(src: &str) -> String {
+        let df = parse(src).unwrap();
+        let [Instruction::From(_), Instruction::Run(r), rest @ ..] = df.instructions.as_slice()
+        else {
+            panic!("{:?}", df.instructions)
+        };
+        assert!(
+            rest.iter().all(|i| matches!(i, Instruction::Cmd(_))),
+            "{rest:?}"
+        );
+        let Cmdline::Shell(s) = &r.cmd else {
+            panic!("{:?}", r.cmd)
+        };
+        s.clone()
+    }
+
+    #[test]
+    fn a_run_heredoc_feeds_its_body_to_the_command() {
+        // The heredoc body is handed to the shell with the command; none of its lines
+        // becomes an instruction, comments and blank lines included.
+        let src = "FROM x\nRUN cat > /f <<'C'\n# not a comment\n\nFROM y\nC\nCMD z\n";
+        assert_eq!(run_of(src), "cat > /f <<'C'\n# not a comment\n\nFROM y\nC");
+        // two heredocs on one line, read in order; a continuation before them
+        let src = "FROM x\nRUN cat <<A > /a && \\\n  cat <<\"B\" > /b\na\nA\nb\nB\n";
+        assert_eq!(
+            run_of(src),
+            "cat <<A > /a &&   cat <<\"B\" > /b\na\nA\nb\nB"
+        );
+        // `<< EOF` with a space; CRLF bodies kept as written
+        let src = "FROM x\nRUN cat > /f << EOF\r\nx\r\nEOF\r\nCMD y\n";
+        assert_eq!(run_of(src), "cat > /f << EOF\nx\r\nEOF");
+        // a command after the heredoc reads the body on stdin: the RUN is not the heredoc alone
+        assert_eq!(
+            run_of("FROM x\nRUN <<EOF cat\nx\nEOF\n"),
+            "<<EOF cat\nx\nEOF"
+        );
+        // <<- ends on a tab-indented terminator; the shell strips the body's tabs
+        let src = "FROM x\nRUN cat <<-E > /f\n\tx\n\tE\n";
+        assert_eq!(run_of(src), "cat <<-E > /f\n\tx\nE");
+    }
+
+    #[test]
+    fn a_run_made_of_a_heredoc_alone_runs_its_body() {
+        assert_eq!(
+            run_of("FROM x\nRUN <<EOF\nset -e\necho a\nEOF\nCMD y\n"),
+            "set -e\necho a\n"
+        );
+        assert_eq!(run_of("FROM x\nRUN <<-EOF\n\techo a\n\tEOF\n"), "echo a\n");
+        // flags do not count: past them, a heredoc alone is a script, a command is not
+        assert_eq!(
+            run_of("FROM x\nRUN --network=none <<EOF\necho a\nEOF\n"),
+            "echo a\n"
+        );
+        assert_eq!(
+            run_of("FROM x\nRUN --mount=type=cache,target=/c cat <<EOF\nb\nEOF\n"),
+            "cat <<EOF\nb\nEOF"
+        );
+        // what the progress line shows is the opener, not the body
+        let df = parse("FROM x\nRUN <<EOF\nsecret\nEOF\n").unwrap();
+        let Instruction::Run(r) = &df.instructions[1] else {
+            unreachable!()
+        };
+        assert_eq!(r.heredoc.as_deref(), Some("<<EOF"));
+    }
+
+    #[test]
+    fn a_heredoc_vk_cannot_run_is_refused() {
+        for (src, want) in [
+            (
+                "FROM x\nRUN cat <<EOF\nno end\n",
+                "unterminated heredoc <<EOF",
+            ),
+            ("FROM x\nCOPY <<EOF /f\nx\nEOF\n", "heredoc on COPY"),
+            (
+                "FROM x\nONBUILD RUN <<EOF\nENV A=B\nEOF\n",
+                "heredoc on ONBUILD",
+            ),
+            ("# escape=x\nFROM x\n", "invalid escape token"),
+            ("FROM x\nRUN <<EOF\n#!/usr/bin/python3\nEOF\n", "#!"),
+        ] {
+            let err = format!("{:#}", parse(src).unwrap_err());
+            assert!(err.contains(want), "{src:?}: {err}");
+        }
+        // `<<` that is no heredoc word leaves the following lines alone
+        assert_eq!(
+            run_of("FROM x\nRUN echo $((1<<2))\nCMD y\n"),
+            "echo $((1<<2))"
+        );
+        assert_eq!(run_of("FROM x\nRUN echo '<<EOF'\nCMD y\n"), "echo '<<EOF'");
     }
 
     #[test]

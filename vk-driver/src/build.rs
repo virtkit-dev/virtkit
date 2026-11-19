@@ -1864,6 +1864,7 @@ fn resolve_stages(
                     cmd: cfg.cmd,
                     exposed_ports: cfg.exposed_ports,
                     build_args: Vec::new(),
+                    shell: cfg.shell,
                 }
             }
             Base::Scratch => ShellState::default(),
@@ -1925,6 +1926,18 @@ fn resolve_stages(
             //     change anywhere in the source chains into every consumer; without it, a
             //     consumer whose own instructions did not change would restore a snapshot
             //     holding the *old* source content.
+            // BuildKit honors the stage's SHELL. Reject a mismatch before building because
+            // /bin/sh can interpret the script or options such as `-o pipefail` differently.
+            if let Instruction::Run(r) = &instr
+                && let Some(opener) = &r.heredoc
+                && !default_shell(&state.shell)
+            {
+                bail!(
+                    "RUN {opener}: a heredoc under SHELL {:?} is not supported: vk runs RUN \
+                     steps with /bin/sh, so only SHELL [\"/bin/sh\", \"-c\"] is taken",
+                    state.shell
+                );
+            }
             let content = match &instr {
                 Instruction::Copy(c) => match &c.from {
                     None => {
@@ -4011,8 +4024,10 @@ fn canonical(instr: &Instruction) -> String {
             o(&f.as_name),
             o(&f.platform)
         ),
+        // A heredoc wrapper needs a distinct cache key even for identical scripts.
+        // Keep the existing key format for ordinary RUNs.
         I::Run(r) => format!(
-            "RUN{US}{}{US}net={}{US}sec={}{US}mounts={}",
+            "RUN{US}{}{US}net={}{US}sec={}{US}mounts={}{}",
             cmd(&r.cmd),
             o(&r.network),
             o(&r.security),
@@ -4031,7 +4046,12 @@ fn canonical(instr: &Instruction) -> String {
                     o(&m.mode),
                 ))
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(","),
+            if r.heredoc.is_some() {
+                format!("{US}heredoc")
+            } else {
+                String::new()
+            }
         ),
         I::Copy(c) => format!(
             "COPY{US}from={}{US}chown={}{US}chmod={}{US}link={}{US}{}->{}",
@@ -4255,9 +4275,11 @@ fn instr_label(instr: &Instruction) -> String {
     match instr {
         Instruction::Run(r) => format!(
             "RUN {}",
-            match &r.cmd {
-                parser::Cmdline::Shell(s) => s.clone(),
-                parser::Cmdline::Exec(v) => v.join(" "),
+            // A heredoc's opener, not the bodies: they are file contents, not a command.
+            match (&r.heredoc, &r.cmd) {
+                (Some(opener), _) => opener.clone(),
+                (None, parser::Cmdline::Shell(s)) => s.clone(),
+                (None, parser::Cmdline::Exec(v)) => v.join(" "),
             }
         ),
         Instruction::Copy(c) => {
@@ -4301,6 +4323,11 @@ fn restore_into(ex: &mut dyn Executor, name: &str, key: &str) -> Result<Rootfs> 
     Ok(fs)
 }
 
+/// Whether `shell` (a `SHELL`, or a base image's `Shell`) is the default `/bin/sh -c`.
+fn default_shell(shell: &[String]) -> bool {
+    shell.is_empty() || shell == ["/bin/sh", "-c"]
+}
+
 /// Apply a non-filesystem instruction (ENV/WORKDIR/USER/ENTRYPOINT/CMD/EXPOSE) — updates the
 /// shell state only, so it needs no materialized rootfs.
 fn apply_meta(state: &mut ShellState, instr: &Instruction) {
@@ -4319,6 +4346,14 @@ fn apply_meta(state: &mut ShellState, instr: &Instruction) {
             state.cmd.clear();
         }
         Instruction::Cmd(c) => state.cmd = cmdline_argv(c),
+        // Only the heredoc check uses SHELL. Preserve malformed or empty arrays as raw
+        // text so they fail the default-shell check.
+        Instruction::Other { name, args } if name == "SHELL" => {
+            state.shell = match serde_json::from_str::<Vec<String>>(args) {
+                Ok(argv) if !argv.is_empty() => argv,
+                _ => vec![args.clone()],
+            };
+        }
         // The one `Other` the exported runtime config models: the sidecar records these, so a
         // service built from a Dockerfile gates readiness on its ports rather than on its guest
         // merely booting. The parser upper-cases the keyword, so any spelling lands here.
@@ -4432,7 +4467,7 @@ fn apply_fs(
                     ResolvedMount { spec: m, from }
                 })
                 .collect();
-            ex.run(fs, &r.cmd, &mounts, state)?;
+            ex.run(fs, &r.cmd, r.heredoc.as_deref(), &mounts, state)?;
         }
         Instruction::Copy(c) => {
             let from = match &c.from {
@@ -5269,6 +5304,42 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn a_heredoc_under_another_shell_is_refused() {
+        let drive_src = |src: &str| {
+            let ba = Vars::new();
+            let plan = plan_one(src, &ba);
+            let order = plan
+                .build_order(plan.resolve_target(None).unwrap())
+                .unwrap();
+            drive(
+                &plan,
+                &order,
+                &ba,
+                &mut DryRun::new(),
+                false,
+                BuildCache::Instructions,
+                &Progress::disabled(),
+                &Arc::new(Timings::new()),
+            )
+        };
+        let bash = "SHELL [\"/bin/bash\", \"-o\", \"pipefail\", \"-c\"]\n";
+        let pipeline = "RUN false | cat <<EOF\nx\nEOF\n";
+        let err = drive_src(&format!("FROM x\n{bash}{pipeline}")).unwrap_err();
+        assert!(format!("{err:#}").contains("under SHELL"), "{err:#}");
+        // inherited from the stage it is built from
+        assert!(drive_src(&format!("FROM x AS a\n{bash}FROM a\n{pipeline}")).is_err());
+        // the default shell, spelled out or not, and a heredoc before the SHELL are fine
+        assert!(drive_src(&format!("FROM x\n{pipeline}")).is_ok());
+        let sh = "SHELL [\"/bin/sh\", \"-c\"]\n";
+        assert!(drive_src(&format!("FROM x\n{sh}{pipeline}")).is_ok());
+        assert!(drive_src(&format!("FROM x\n{pipeline}{bash}")).is_ok());
+        // SHELL is taken as written: `$SH` is no /bin/sh, and an empty SHELL no default
+        let arg_sh = "ARG SH=/bin/sh\nSHELL [\"$SH\", \"-c\"]\n";
+        assert!(drive_src(&format!("FROM x\n{arg_sh}{pipeline}")).is_err());
+        assert!(drive_src(&format!("FROM x\nSHELL []\n{pipeline}")).is_err());
+    }
+
     fn transcript(src: &str, target: Option<&str>) -> Vec<String> {
         let ba = Vars::new();
         let plan = plan_one(src, &ba);
@@ -5337,10 +5408,11 @@ mod tests {
             &mut self,
             fs: &Rootfs,
             cmd: &parser::Cmdline,
+            heredoc: Option<&str>,
             mounts: &[ResolvedMount<'_>],
             state: &ShellState,
         ) -> Result<()> {
-            let r = self.inner.run(fs, cmd, mounts, state);
+            let r = self.inner.run(fs, cmd, heredoc, mounts, state);
             if r.is_ok()
                 && self.cancel_after_run
                 && let Some(c) = &self.cancel
@@ -6095,6 +6167,7 @@ mod tests {
                 network: None,
                 security: None,
                 extra_flags: Vec::new(),
+                heredoc: None,
             })
         };
         // an explicit, deliberate string (not the Debug repr)
@@ -6104,6 +6177,12 @@ mod tests {
         );
         // content-sensitive and stable; distinct instruction kinds differ
         assert_ne!(canonical(&run("make")), canonical(&run("make test")));
+        // an empty heredoc script and a bare RUN run under different wrappers: keyed apart
+        let empty_heredoc = parser::parse("FROM x\nRUN <<EOF\nEOF\n")
+            .unwrap()
+            .instructions[1]
+            .clone();
+        assert_ne!(canonical(&empty_heredoc), canonical(&run("")));
         assert_ne!(
             canonical(&Instruction::Workdir("/a".into())),
             canonical(&Instruction::User("/a".into()))
@@ -6117,6 +6196,7 @@ mod tests {
                 network: None,
                 security: None,
                 extra_flags: Vec::new(),
+                heredoc: None,
             })
         };
         let scratch = || Mount {
@@ -6774,11 +6854,16 @@ RUN --mount=type=bind,from=build,source=/src,target=/s /usr/bin/out --selftest
     struct Answered {
         inner: DryRun,
         digest: Option<String>,
+        /// what the base image's config says
+        config: crate::oci::ImageConfig,
     }
 
     impl Executor for Answered {
         fn resolve_base_digest(&mut self, _image: &str) -> Option<String> {
             self.digest.clone()
+        }
+        fn base_config(&mut self, _image: &str) -> Result<crate::oci::ImageConfig> {
+            Ok(self.config.clone())
         }
         fn from_image(&mut self, stage: &str, image: &str) -> Result<Rootfs> {
             self.inner.from_image(stage, image)
@@ -6805,10 +6890,11 @@ RUN --mount=type=bind,from=build,source=/src,target=/s /usr/bin/out --selftest
             &mut self,
             fs: &Rootfs,
             cmd: &parser::Cmdline,
+            heredoc: Option<&str>,
             mounts: &[ResolvedMount<'_>],
             state: &ShellState,
         ) -> Result<()> {
-            self.inner.run(fs, cmd, mounts, state)
+            self.inner.run(fs, cmd, heredoc, mounts, state)
         }
         fn export_ext4(
             &mut self,
@@ -6818,6 +6904,28 @@ RUN --mount=type=bind,from=build,source=/src,target=/s /usr/bin/out --selftest
         ) -> Result<Exported> {
             self.inner.export_ext4(fs, out, format)
         }
+    }
+
+    #[test]
+    fn a_heredoc_under_the_base_images_shell_is_refused() {
+        let ba = Vars::new();
+        let resolve = |shell: &[&str]| {
+            let plan = plan_one("FROM debian:bookworm\nRUN cat <<EOF\nx\nEOF\n", &ba);
+            let order = plan.all_order().unwrap();
+            let mut ex = Answered {
+                inner: DryRun::new(),
+                digest: None,
+                config: crate::oci::ImageConfig {
+                    shell: shell.iter().map(|s| s.to_string()).collect(),
+                    ..Default::default()
+                },
+            };
+            resolve_stages(&plan, &order, &ba, &mut ex, None).map(|_| ())
+        };
+        let err = resolve(&["/bin/bash", "-c"]).unwrap_err();
+        assert!(format!("{err:#}").contains("under SHELL"), "{err:#}");
+        assert!(resolve(&["/bin/sh", "-c"]).is_ok());
+        assert!(resolve(&[]).is_ok());
     }
 
     #[test]
@@ -6836,6 +6944,7 @@ RUN --mount=type=bind,from=build,source=/src,target=/s /usr/bin/out --selftest
             let mut ex = Answered {
                 inner: DryRun::new(),
                 digest: digest.map(str::to_string),
+                config: crate::oci::ImageConfig::default(),
             };
             resolve_stages(&plan, &order, &ba, &mut ex, None).unwrap()[&0]
                 .final_key
@@ -8731,6 +8840,7 @@ RUN ship
             network: None,
             security: None,
             extra_flags: Vec::new(),
+            heredoc: None,
         });
         let root = hash_key("FROM scratch");
         let chained = chain_key(&root, &run, None);

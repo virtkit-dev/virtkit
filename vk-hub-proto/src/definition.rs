@@ -26,8 +26,10 @@ pub struct DeclaredEgress {
 }
 
 /// Returns each stage's declared egress in file order. Errors cover misplaced `# vk:`
-/// lines, hint fields without `=`, duplicate parser directives and invalid escape tokens.
+/// lines, hint fields without `=`, duplicate parser directives, invalid escape tokens,
+/// unterminated heredocs and heredoc words that do not lex.
 pub fn declared_egress(dockerfile: &str) -> Result<Vec<DeclaredStage>, String> {
+    // The same lines `vk build` reads, heredoc bodies left out.
     let (instructions, trailing) = logical_lines(dockerfile)?;
     if !trailing.is_empty() {
         return Err(format!(
@@ -35,7 +37,7 @@ pub fn declared_egress(dockerfile: &str) -> Result<Vec<DeclaredStage>, String> {
         ));
     }
     let mut stages = Vec::new();
-    for LogicalLine { text, hints } in instructions {
+    for LogicalLine { text, hints, .. } in instructions {
         let mut words = text.split_whitespace();
         let keyword = words.next().unwrap_or_default();
         if !keyword.eq_ignore_ascii_case("FROM") {
@@ -85,7 +87,7 @@ fn egress_of(hints: &[String]) -> Result<Option<DeclaredEgress>, String> {
 
 /// Dockerfiles whose declarations vk-driver's tests check `vk build` reads alike.
 #[doc(hidden)]
-pub const SAMPLES: [&str; 6] = [
+pub const SAMPLES: [&str; 7] = [
     "FROM alpine AS offline\n\
      # vk: allow-name=cache.nixos.org,github.com mem=2G\n\
      # vk: allow-ip=10.0.0.0/8:443 allow-name=codeload.github.com\n\
@@ -97,6 +99,8 @@ pub const SAMPLES: [&str; 6] = [
     "# vk: allow-ip=192.0.2.1 cpus=2\nFROM alpine \\\n  AS fetch\nRUN wget x\nFROM scratch AS tools\nCOPY --from=fetch /x /x\n",
     "FROM alpine AS one\n\n# vk: allow-name=x.example\n\n# a comment\nFROM alpine AS two\n",
     "",
+    "FROM alpine AS a\nRUN cat > /f <<'EOF'\n# vk: allow-name=body.example\nFROM alpine AS phantom\nEOF\n\
+     # vk: allow-name=b.example\nFROM alpine AS b\n",
 ];
 
 #[cfg(test)]
@@ -153,6 +157,11 @@ mod tests {
             [bare("one"), stage("two", &[], &["x.example"])]
         );
         assert_eq!(declared_egress(SAMPLES[5]).unwrap(), []);
+        // A heredoc body is data: its `FROM` and `# vk:` lines are no stage and declare nothing.
+        assert_eq!(
+            declared_egress(SAMPLES[6]).unwrap(),
+            [bare("a"), stage("b", &[], &["b.example"])]
+        );
     }
 
     #[test]

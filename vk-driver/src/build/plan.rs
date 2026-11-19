@@ -188,8 +188,10 @@ impl Plan {
                     other => {
                         // only this file's own stages may receive instructions.
                         if !file_has_stage {
+                            // Its keyword only: a RUN's command may carry heredoc bodies.
                             bail!(
-                                "instruction before the first FROM in {}: {other:?}",
+                                "{} before the first FROM in {}",
+                                crate::build::parser::keyword_of(other),
                                 input.origin.display()
                             );
                         }
@@ -504,6 +506,14 @@ mod tests {
 
     fn plan(src: &str) -> Plan {
         plan_args(src, &Vars::new()).unwrap()
+    }
+
+    #[test]
+    fn an_instruction_before_the_first_from_is_named_not_shown() {
+        let err = plan_args("RUN <<EOF\nSENTINEL\nEOF\nFROM x\n", &Vars::new()).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("RUN before the first FROM"), "{err}");
+        assert!(!err.contains("SENTINEL"), "{err}");
     }
 
     #[test]

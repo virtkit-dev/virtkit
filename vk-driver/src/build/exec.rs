@@ -61,6 +61,9 @@ pub struct ShellState {
     /// lives in `env`, and this is not part of the exported runtime config. Set per RUN
     /// step by the resolver; empty otherwise.
     pub build_args: Vec<(String, String)>,
+    /// The shell a `SHELL` or the base image's config names, empty for the default. A Linux
+    /// build runs every RUN with `/bin/sh` regardless; only a heredoc RUN checks it.
+    pub shell: Vec<String>,
 }
 
 /// How a `RUN`'s `--mount=…,from=` resolves: the source stage's committed rootfs.
@@ -160,10 +163,13 @@ pub trait Executor {
         None
     }
     /// Execute a `RUN` over `fs` with the accumulated shell state and resolved mounts.
+    /// `heredoc` is the command as written when `cmd` carries heredoc bodies: what a
+    /// message about the step names, since the bodies are file contents.
     fn run(
         &mut self,
         fs: &Rootfs,
         cmd: &Cmdline,
+        heredoc: Option<&str>,
         mounts: &[ResolvedMount<'_>],
         state: &ShellState,
     ) -> Result<()>;
@@ -313,6 +319,7 @@ impl Executor for DryRun {
         &mut self,
         _fs: &Rootfs,
         cmd: &Cmdline,
+        heredoc: Option<&str>,
         mounts: &[ResolvedMount<'_>],
         state: &ShellState,
     ) -> Result<()> {
@@ -325,7 +332,8 @@ impl Executor for DryRun {
             state.user,
             state.workdir,
             froms,
-            render_cmd(cmd)
+            // a heredoc's opener: its bodies are file contents, not the command
+            heredoc.map_or_else(|| render_cmd(cmd), str::to_string)
         ));
         Ok(())
     }
@@ -358,6 +366,52 @@ impl Executor for DryRun {
             .push(format!("export-ext4 {} -> {}", fs.label, out.display()));
         Ok(Exported::Dry)
     }
+}
+
+/// Build the guest shell invocation with the stage's ENV, ARG and WORKDIR.
+fn run_invocation(shell: &str, heredoc: bool, state: &ShellState) -> (Vec<String>, Vec<String>) {
+    // assemble a /bin/sh script: env exports, cd into WORKDIR, then the command.
+    // A RUN command is executed raw (Docker leaves it to the shell), so the in-scope
+    // ENV and ARG are exported here for the shell to expand `$VAR` against.
+    let mut script = String::new();
+    for (k, v) in state.env.iter().chain(&state.build_args) {
+        script.push_str(&format!("export {k}={}; ", crate::shell::quote(v)));
+    }
+    let wd = if state.workdir.is_empty() {
+        "/"
+    } else {
+        &state.workdir
+    };
+    // WORKDIR creates the directory (as Docker does), so `cd` into a not-yet-existing
+    // workdir succeeds; best-effort so a non-root RUN over an existing dir still runs.
+    let q = crate::shell::quote(wd);
+    if heredoc {
+        // On a line of its own: a heredoc script may hold no command at all.
+        script.push_str(&format!(
+            "mkdir -p {q} 2>/dev/null; cd {q} || exit\n{shell}"
+        ));
+    } else {
+        script.push_str(&format!("mkdir -p {q} 2>/dev/null; cd {q} && {shell}"));
+    }
+    // The guest logs argv and environment names. Pass the script as an environment value
+    // and unset it before running the commands so children do not inherit its contents.
+    if heredoc {
+        // `?`: a script that failed to arrive fails the step rather than running nothing.
+        let argv = ["sh", "-c", "eval \"${VK_RUN_SCRIPT?}\""]
+            .map(str::to_string)
+            .to_vec();
+        (
+            argv,
+            vec![format!("VK_RUN_SCRIPT=unset VK_RUN_SCRIPT; {script}")],
+        )
+    } else {
+        (vec!["sh".to_string(), "-c".to_string(), script], Vec::new())
+    }
+}
+
+/// Identify a failed heredoc RUN by its opener to keep file contents out of the error.
+fn run_failure(code: impl std::fmt::Display, shell: &str, heredoc: Option<&str>) -> String {
+    format!("RUN exited {code}: {}", heredoc.unwrap_or(shell))
 }
 
 fn render_cmd(cmd: &Cmdline) -> String {
@@ -539,6 +593,7 @@ impl Executor for Planner {
         &mut self,
         _fs: &Rootfs,
         _cmd: &Cmdline,
+        _heredoc: Option<&str>,
         _mounts: &[ResolvedMount<'_>],
         _state: &ShellState,
     ) -> Result<()> {
@@ -2403,6 +2458,7 @@ impl Executor for MicroVm {
         &mut self,
         fs: &Rootfs,
         cmd: &Cmdline,
+        heredoc: Option<&str>,
         mounts: &[ResolvedMount<'_>],
         state: &ShellState,
     ) -> Result<()> {
@@ -2487,23 +2543,7 @@ impl Executor for MicroVm {
             Cmdline::Shell(s) => s.clone(),
             Cmdline::Exec(v) => v.join(" "),
         };
-        // assemble a /bin/sh script: env exports, cd into WORKDIR, then the command.
-        // A RUN command is executed raw (Docker leaves it to the shell), so the in-scope
-        // ENV and ARG are exported here for the shell to expand `$VAR` against.
-        let mut script = String::new();
-        for (k, v) in state.env.iter().chain(&state.build_args) {
-            script.push_str(&format!("export {k}={}; ", crate::shell::quote(v)));
-        }
-        let wd = if state.workdir.is_empty() {
-            "/"
-        } else {
-            &state.workdir
-        };
-        // WORKDIR creates the directory (as Docker does), so `cd` into a not-yet-existing
-        // workdir succeeds; best-effort so a non-root RUN over an existing dir still runs.
-        let q = crate::shell::quote(wd);
-        script.push_str(&format!("mkdir -p {q} 2>/dev/null; cd {q} && {shell}"));
-        let argv = vec!["sh".to_string(), "-c".to_string(), script];
+        let (argv, env) = run_invocation(&shell, heredoc.is_some(), state);
         let user = match state.user.as_str() {
             "" | "root" => None,
             u => Some(u.to_string()),
@@ -2574,7 +2614,7 @@ impl Executor for MicroVm {
                 bail!("RUN --mount=type=tmpfs: mounting tmpfs at {target} failed");
             }
         }
-        let code = block_on(session.exec(&argv, user, &sink))?;
+        let code = block_on(session.exec_env(&argv, env, user, &sink))?;
         // Tear the mounts down (target before its device mountpoint), best-effort.
         for (device, _, target) in binds.iter().rev() {
             let _ = block_on(session.exec(
@@ -2608,7 +2648,7 @@ impl Executor for MicroVm {
             ));
         }
         if code != 0 {
-            bail!("RUN exited {code}: {shell}");
+            bail!("{}", run_failure(code, &shell, heredoc));
         }
         Ok(())
     }
@@ -3212,12 +3252,13 @@ impl Executor for Host {
         &mut self,
         _fs: &Rootfs,
         cmd: &Cmdline,
+        heredoc: Option<&str>,
         _mounts: &[ResolvedMount<'_>],
         _state: &ShellState,
     ) -> Result<()> {
         bail!(
             "host PoC does not execute RUN ({}) — that needs the microVM executor",
-            render_cmd(cmd)
+            heredoc.map_or_else(|| render_cmd(cmd), str::to_string)
         )
     }
     fn stage_sources(&mut self, _sources: &[Rootfs], context: &Path) -> Result<()> {
@@ -3365,6 +3406,59 @@ mod tests {
     // Temp dirs are minted over in `build`'s tests, so the tags here share one namespace with
     // the tags there — keep any tag added here distinct from both.
     use crate::build::tests::tmpdir;
+
+    /// A RUN's guest command, heredoc script or not, run here under the host's `/bin/sh`: the
+    /// script runs verbatim in the WORKDIR, without seeing the variable that carried it.
+    #[test]
+    fn a_run_invocation_runs_its_script_verbatim_in_the_workdir() {
+        let dir = tmpdir("run-invocation");
+        let run = |shell: &str, heredoc: bool, workdir: &str| {
+            let state = ShellState {
+                workdir: workdir.into(),
+                env: vec![("GREETING".into(), "hi there".into())],
+                ..ShellState::default()
+            };
+            let (argv, env) = run_invocation(shell, heredoc, &state);
+            let out = std::process::Command::new("/bin/sh")
+                .args(&argv[1..])
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .envs(env.iter().map(|e| e.split_once('=').unwrap()))
+                .output()
+                .unwrap();
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+            )
+        };
+        let wd = dir.join("made").to_string_lossy().into_owned();
+        let script = "echo \"$GREETING\" '$GREETING' `echo tick` \"${VK_RUN_SCRIPT-unset}\"\n\
+                      pwd\n";
+        for heredoc in [false, true] {
+            assert_eq!(
+                run(script, heredoc, &wd),
+                (Some(0), format!("hi there $GREETING tick unset\n{wd}\n")),
+                "heredoc: {heredoc}"
+            );
+        }
+        // a heredoc script may be empty, and its exit status is the step's
+        assert_eq!(run("", true, &wd), (Some(0), String::new()));
+        assert_eq!(
+            run("echo a\nexit 3\necho b\n", true, &wd),
+            (Some(3), "a\n".into())
+        );
+        // a WORKDIR that cannot be entered runs nothing
+        let blocked = dir.join("file");
+        std::fs::write(&blocked, "").unwrap();
+        let blocked = blocked.join("sub").to_string_lossy().into_owned();
+        for heredoc in [false, true] {
+            let (code, out) = run("echo ran", heredoc, &blocked);
+            assert!(
+                code != Some(0) && out.is_empty(),
+                "heredoc: {heredoc}: {out}"
+            );
+        }
+    }
 
     /// A base image on the registry's host is asked for with its credential, resolved at each
     /// pull so a renewal is seen; an image anywhere else, anonymously.
@@ -3923,6 +4017,26 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_heredoc_run_is_named_by_its_opener() {
+        let msg = run_failure(1, "false <<'EOF'\nSENTINEL\nEOF", Some("false <<'EOF'"));
+        assert_eq!(msg, "RUN exited 1: false <<'EOF'");
+        assert_eq!(run_failure(2, "make", None), "RUN exited 2: make");
+        // nor does --print-plan's transcript show the body
+        let mut ex = DryRun::new();
+        let base = ex.from_image("b", "debian").unwrap();
+        ex.run(
+            &base,
+            &Cmdline::Shell("cat <<EOF\nSENTINEL\nEOF".into()),
+            Some("cat <<EOF"),
+            &[],
+            &ShellState::default(),
+        )
+        .unwrap();
+        assert!(!ex.transcript.iter().any(|l| l.contains("SENTINEL")));
+        assert!(ex.transcript.iter().any(|l| l.ends_with("cat <<EOF")));
+    }
+
+    #[test]
     fn dryrun_records_primitives() {
         let mut ex = DryRun::new();
         let base = ex.from_image("build", "debian:bookworm").unwrap();
@@ -3930,6 +4044,7 @@ mod tests {
         ex.run(
             &base,
             &Cmdline::Shell("apt-get update".into()),
+            None,
             &[],
             &ShellState {
                 user: "root".into(),

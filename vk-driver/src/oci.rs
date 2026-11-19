@@ -26,7 +26,8 @@ pub type Note<'a> = &'a (dyn Fn(&str) + Sync);
 /// The parts of an OCI image's config a build inherits into a stage: environment
 /// (notably `PATH`), default user and working directory, the runtime entrypoint/cmd,
 /// and the exposed ports a service gates its readiness on (all carried through to the
-/// exported runtime-config sidecar).
+/// exported runtime-config sidecar), and its `Shell`, read only to refuse a heredoc RUN
+/// under another shell.
 #[derive(Default, Debug, Clone)]
 pub struct ImageConfig {
     pub env: Vec<(String, String)>,
@@ -36,6 +37,9 @@ pub struct ImageConfig {
     pub cmd: Vec<String>,
     /// TCP ports from the config's `ExposedPorts` (the guest gates readiness on them).
     pub exposed_ports: Vec<u16>,
+    /// `Shell`: the shell a shell-form `RUN` runs with, as a `SHELL` sets it; empty for the
+    /// default.
+    pub shell: Vec<String>,
 }
 
 impl From<ImageConfig> for vk_core::runcfg::RunConfig {
@@ -454,6 +458,7 @@ pub fn parse_config_object(c: &serde_json::Value) -> ImageConfig {
         entrypoint: argv(&c["Entrypoint"]),
         cmd: argv(&c["Cmd"]),
         exposed_ports: exposed_tcp_ports(&c["ExposedPorts"]),
+        shell: argv(&c["Shell"]),
     }
 }
 
@@ -1104,10 +1109,11 @@ mod tests {
     #[test]
     fn parse_image_config_fields() {
         let json = r#"{"architecture":"amd64","config":{
-            "User":"app","WorkingDir":"/srv",
+            "User":"app","WorkingDir":"/srv","Shell":["/bin/bash","-c"],
             "Env":["PATH=/usr/local/bin:/bin","LANG=C.UTF-8","BARE"]}}"#;
         let c = parse_config(json);
         assert_eq!(c.user.as_deref(), Some("app"));
+        assert_eq!(c.shell, ["/bin/bash", "-c"]);
         assert_eq!(c.workdir.as_deref(), Some("/srv"));
         assert_eq!(
             c.env,

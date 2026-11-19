@@ -610,6 +610,10 @@ fn reboot_mode(run: &parser::Run) -> Result<&str> {
     if !run.mounts.is_empty() || run.security.is_some() {
         bail!("RUN --mount and --security do not apply to a Windows build");
     }
+    // Its command line is a batch file's line, which a heredoc's newlines would end.
+    if run.heredoc.is_some() {
+        bail!("RUN heredocs are not supported in a Windows build");
+    }
     if let Some((name, _)) = run.extra_flags.iter().find(|(k, _)| k != "reboot") {
         bail!("RUN --{name}: a Windows build takes --reboot only");
     }
@@ -1962,6 +1966,10 @@ mod tests {
             ("SHELL []\n", "non-empty JSON array"),
             ("RUN --network=host a\n", "--network=host"),
             ("ENTRYPOINT [\"a\"]\n", "provisions with CMD alone"),
+            (
+                "RUN <<EOF\necho a\nEOF\n",
+                "heredocs are not supported in a Windows build",
+            ),
         ];
         for (body, want) in refused {
             let err = refusal(&format!("{WINISO}{body}"));

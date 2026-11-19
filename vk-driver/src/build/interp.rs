@@ -143,6 +143,7 @@ pub fn expand_instruction(instr: &Instruction, vars: &Vars) -> Instruction {
             network: r.network.clone(),
             security: r.security.clone(),
             extra_flags: r.extra_flags.clone(),
+            heredoc: r.heredoc.clone(),
         }),
         Instruction::Copy(c) => Instruction::Copy(parser::Copy {
             sources: c.sources.iter().map(|s| e(s)).collect(),
@@ -166,6 +167,8 @@ pub fn expand_instruction(instr: &Instruction, vars: &Vars) -> Instruction {
         }
         Instruction::Entrypoint(c) => Instruction::Entrypoint(expand_cmd(c, vars)),
         Instruction::Cmd(c) => Instruction::Cmd(expand_cmd(c, vars)),
+        // SHELL takes no substitution in Docker: `$SH` names an executable called `$SH`.
+        Instruction::Other { name, .. } if name == "SHELL" => instr.clone(),
         Instruction::Other { name, args } => Instruction::Other {
             name: name.clone(),
             args: e(args),
@@ -287,6 +290,7 @@ mod tests {
             network: None,
             security: None,
             extra_flags: Vec::new(),
+            heredoc: None,
         });
         match expand_instruction(&run, &v) {
             Instruction::Run(r) => {

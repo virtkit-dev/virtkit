@@ -28,6 +28,14 @@ All notable changes to virtkit will be documented in this file.
   than `\` or `` ` `` is an error. One leading byte-order mark is ignored.
 - **Guest exec requests log only environment variable names.** Values passed through
   `vk exec --env` stay out of the request log.
+- **`vk build` supports Linux `RUN` heredocs.** `RUN <<EOF` executes the body as a shell
+  script. `RUN cat > f <<'EOF'` passes the body to `cat`, fixing the empty file produced
+  by earlier versions. Both forms require `/bin/sh -c`, whether set by `SHELL`, inherited
+  from an earlier stage or base image config, or left at the default. `SHELL` takes its
+  arguments literally. The build rejects heredocs on `COPY`, `ADD` and `ONBUILD`, standalone
+  heredoc scripts starting with `#!`, and all heredocs in Windows builds. Progress, step
+  errors and `--print-plan` identify the step by its opening command. The guest's logged
+  exec request omits the body. The hub ignores stage declarations and hints inside heredocs.
 
 ## [0.113.0] - 2026-11-18
 

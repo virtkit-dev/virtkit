@@ -607,6 +607,19 @@ pub async fn exec_script(
     output: &OutputSink,
     cancel: Option<&CancellationToken>,
 ) -> Result<CmdResult> {
+    exec_script_env(addr, command, Vec::new(), script, user, output, cancel).await
+}
+
+/// [`exec_script`], with `env` (`NAME=value` entries) added to the command's environment.
+pub async fn exec_script_env(
+    addr: &SocketAddr,
+    command: &[String],
+    env: Vec<String>,
+    script: Vec<u8>,
+    user: Option<String>,
+    output: &OutputSink,
+    cancel: Option<&CancellationToken>,
+) -> Result<CmdResult> {
     let (mut stream, mut sink) = vk_core::net::connect(addr)
         .await
         .context("connecting to the VM's vk-agent")?;
@@ -617,7 +630,7 @@ pub async fn exec_script(
     sink.send(Message::CmdExec(CmdExec {
         name: name.clone(),
         args: args.to_vec(),
-        env: vec![],
+        env,
         clear_env: false,
         mode: RunMode::Interactive,
         dir: None,
