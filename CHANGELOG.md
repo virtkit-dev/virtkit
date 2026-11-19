@@ -12,6 +12,9 @@ All notable changes to virtkit will be documented in this file.
 - **Boot a persistent disk with its own kernel (experimental).** `vk run --boot-disk DISK
   --init image|entrypoint` selects the newest matching kernel and initrd in the GPT disk's
   ext2 `/boot` on every boot, including guest reboots.
+  With `--boot-cmdline root=…`, a Debian initramfs-tools initrd with a merged `/usr`
+  can mount the root before handoff, including LVM on LUKS unlocked with a key file
+  on `/boot`.
 
 ## [0.113.1] - 2026-11-20
 

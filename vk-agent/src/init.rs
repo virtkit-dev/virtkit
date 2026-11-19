@@ -319,6 +319,18 @@ fn pivot_to_real_root() -> Result<bool> {
     let _ = std::fs::create_dir_all("/proc");
     let _ = mount("proc", "/proc", "proc", 0);
     let cmdline = read_cmdline();
+    if cmdline.get("VIRTKIT_BOOT").map(String::as_str) == Some("initrd") {
+        // Detach both early /proc mounts before /init mounts its own and moves it
+        // into the new root. Otherwise the old mounts stay in the initramfs.
+        // SAFETY: a NUL-terminated literal path; a failure ends the loop.
+        while unsafe { libc::umount2(c"/proc".as_ptr(), libc::MNT_DETACH) } == 0 {}
+        let timeout = cmdline
+            .get("VIRTKIT_INITRD_TIMEOUT")
+            .and_then(|s| s.parse().ok())
+            .map_or(INITRD_ROOT_TIMEOUT, Duration::from_secs);
+        root_from_distro_initrd(timeout)?;
+        return Ok(true);
+    }
     let Some(dev) = cmdline.get("VIRTKIT_PIVOT").cloned() else {
         return Ok(false);
     };
@@ -356,7 +368,87 @@ fn pivot_to_real_root() -> Result<bool> {
     Ok(true)
 }
 
-/// Remove initramfs files under `dir`, skipping other devices such as the new root, /proc and /dev.
+/// File where the `run-init` stand-in writes the mounted root's path.
+const INITRD_ROOT: &str = "/virtkit-root";
+/// Fallback when the host omits `VIRTKIT_INITRD_TIMEOUT` (seconds). The initrd
+/// may need to unlock a disk and wait for its devices.
+const INITRD_ROOT_TIMEOUT: Duration = Duration::from_secs(110);
+
+/// Run the initrd's `/init` as a child to mount the root, for example on LUKS or
+/// LVM. It moves `/dev`, `/run`, `/sys` and `/proc` into the root, then execs
+/// `run-init`. vk's stand-in writes the root path to [`INITRD_ROOT`] and exits,
+/// leaving the agent to take over. This requires `/sbin` to point to `usr/sbin`.
+/// On an unmerged initrd, the original `run-init` refuses to run outside PID 1.
+fn root_from_distro_initrd(timeout: Duration) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::process::CommandExt;
+    let _ = std::fs::remove_file(INITRD_ROOT);
+    // On timeout, kill /init and any helpers still in its process group.
+    let mut child = std::process::Command::new("/init")
+        .process_group(0)
+        .spawn()
+        .context("starting the initrd's /init")?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(st) = child.try_wait().context("waiting for the initrd's /init")? {
+            break st;
+        }
+        if std::time::Instant::now() > deadline {
+            // SAFETY: kill(2) on the group this process just made.
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            let _ = child.wait();
+            bail!(
+                "the initrd's /init mounted no root within {}s",
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let root = match std::fs::read_to_string(INITRD_ROOT) {
+        Ok(root) if status.success() && !root.trim().is_empty() => root.trim().to_string(),
+        _ => bail!("the initrd's /init ended ({status}) without mounting the root"),
+    };
+    // Require a separate filesystem before cleanup could empty a directory
+    // on the initramfs mistaken for the mounted root.
+    let dev = |p: &str| std::fs::symlink_metadata(p).map(|m| m.dev()).ok();
+    if !root.starts_with('/')
+        || dev(&root).is_none()
+        || dev(&root) == dev("/")
+        || dev(&root) == dev(&format!("{root}/.."))
+    {
+        bail!("the initrd's /init named {root:?}, which is no mounted root");
+    }
+    // Reclaim the initramfs files and modules from RAM, as switch_root does.
+    free_initramfs(Path::new("/"));
+    std::env::set_current_dir(&root).with_context(|| format!("chdir {root}"))?;
+    mount(".", "/", "", libc::MS_MOVE).with_context(|| format!("mount --move {root} /"))?;
+    // SAFETY: chroot(2) on a NUL-terminated literal path.
+    let rc = unsafe { libc::chroot(c".".as_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error()).context("chroot into the new root");
+    }
+    std::env::set_current_dir("/").context("chdir / after chroot")?;
+    // Standard fds may still refer to the old console or be closed if the
+    // initramfs had none. Use the new root's console for the handoff.
+    reopen_console();
+    // A later `ro` can override vk's `rw`. Setup and `prepare` need a writable
+    // root until the read-only handoff.
+    if root_is_read_only() {
+        mount("", "/", "", libc::MS_REMOUNT | mount_flags_of("/"))
+            .context("remounting the root read-write")?;
+    }
+    info!("vk-agent init: took the root the initrd mounted at {root}");
+    Ok(())
+}
+
+/// Whether `/` is mounted read-only.
+fn root_is_read_only() -> bool {
+    // SAFETY: statvfs is plain data, valid zeroed, and statvfs writes only the struct passed.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    unsafe { libc::statvfs(c"/".as_ptr(), &mut st) == 0 && st.f_flag & libc::ST_RDONLY != 0 }
+}
+
+/// Remove initramfs files under `dir`, skipping other filesystems such as the new root and `/proc`.
 fn free_initramfs(dir: &Path) {
     use std::os::unix::fs::MetadataExt;
     let Ok(dev) = std::fs::symlink_metadata(dir).map(|m| m.dev()) else {
@@ -380,6 +472,68 @@ fn free_initramfs(dir: &Path) {
             let _ = std::fs::remove_file(&path);
         }
     }
+}
+
+/// Point stdin, stdout and stderr at `/dev/console`.
+fn reopen_console() {
+    // SAFETY: open/dup2/close on a NUL-terminated path and descriptors this process owns.
+    unsafe {
+        let fd = libc::open(c"/dev/console".as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        if fd < 0 {
+            warn!(
+                "vk-agent init: opening /dev/console: {}",
+                io::Error::last_os_error()
+            );
+            return;
+        }
+        for target in 0..3 {
+            if libc::dup2(fd, target) < 0 {
+                warn!(
+                    "vk-agent init: pointing fd {target} at /dev/console: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+        if fd > 2 {
+            libc::close(fd);
+        }
+    }
+}
+
+/// Preserve flags such as nosuid, nodev, noexec and the atime policy across
+/// remount. The caller sets read-only separately.
+fn mount_flags_of(path: &str) -> libc::c_ulong {
+    let Ok(c) = CString::new(path) else {
+        return 0;
+    };
+    // SAFETY: statvfs is plain data, valid zeroed, and statvfs writes only the struct passed.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return 0;
+    }
+    ms_flags(st.f_flag)
+}
+
+// statvfs and mount flags the libc crate does not name for musl.
+const ST_NOSYMFOLLOW: libc::c_ulong = 0x2000;
+const MS_NOSYMFOLLOW: libc::c_ulong = 0x100;
+const ST_RELATIME: libc::c_ulong = 0x1000;
+
+/// The mount flags matching statvfs's `f_flag`, read-only aside.
+fn ms_flags(f_flag: libc::c_ulong) -> libc::c_ulong {
+    [
+        (libc::ST_NOSUID, libc::MS_NOSUID),
+        (libc::ST_NODEV, libc::MS_NODEV),
+        (libc::ST_NOEXEC, libc::MS_NOEXEC),
+        (libc::ST_SYNCHRONOUS, libc::MS_SYNCHRONOUS),
+        (libc::ST_NOATIME, libc::MS_NOATIME),
+        (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
+        (ST_NOSYMFOLLOW, MS_NOSYMFOLLOW),
+        (ST_RELATIME, libc::MS_RELATIME),
+    ]
+    .iter()
+    .filter(|(st_flag, _)| f_flag & st_flag != 0)
+    .fold(0, |acc, (_, ms)| acc | ms)
 }
 
 /// Image-init handoff (`vk run --init image|entrypoint`): pivot into the real root,
@@ -429,10 +583,13 @@ fn run_full_vm(
     // is needed because `spawn_serve` execs `/proc/self/exe` (else exit 127); /dev
     // (devtmpfs) is needed for the device nodes the setup opens. systemd re-mounts these
     // after the handoff (already-mounted is fine).
-    let _ = std::fs::create_dir_all("/proc");
-    let _ = mount("proc", "/proc", "proc", 0);
-    let _ = std::fs::create_dir_all("/dev");
-    let _ = mount("devtmpfs", "/dev", "devtmpfs", 0);
+    // The initrd already moved /proc and /dev into its root. Keep their mount options.
+    if cmdline.get("VIRTKIT_BOOT").map(String::as_str) != Some("initrd") {
+        let _ = std::fs::create_dir_all("/proc");
+        let _ = mount("proc", "/proc", "proc", 0);
+        let _ = std::fs::create_dir_all("/dev");
+        let _ = mount("devtmpfs", "/dev", "devtmpfs", 0);
+    }
     // Re-create the /dev/fd links directly rather than relying on the pre-pivot
     // devtmpfs (which carries them across this remount only because devtmpfs is a
     // single kernel-global instance, not a fresh tree per mount) — idempotent, and
@@ -443,15 +600,22 @@ fn run_full_vm(
     // eth0 — it would look absent until the image's init mounted sysfs, long after the
     // handoff. Worth a warning, unlike the two above: the only symptom of a missing /sys
     // is an eth0 that never appears.
+    // The initrd also moves /sys into its root.
     let _ = std::fs::create_dir_all("/sys");
-    if let Err(e) = mount("sysfs", "/sys", "sysfs", 0)
+    let initrd_root = cmdline.get("VIRTKIT_BOOT").map(String::as_str) == Some("initrd");
+    if !initrd_root
+        && let Err(e) = mount("sysfs", "/sys", "sysfs", 0)
         && e.raw_os_error() != Some(libc::EBUSY)
     {
         warn!("vk-agent image-init: mounting /sys failed: {e} — eth0 will look absent");
     }
 
-    // Mount /boot before prepare can install a kernel on the underlying root filesystem.
-    if cmdline.get("VIRTKIT_BOOT").map(String::as_str) == Some("disk") {
+    // Try to mount supported fstab entries before `prepare` can install a kernel
+    // under the root filesystem's /boot directory.
+    if matches!(
+        cmdline.get("VIRTKIT_BOOT").map(String::as_str),
+        Some("disk" | "initrd")
+    ) {
         mount_fstab();
     }
 
@@ -697,7 +861,7 @@ const RO_REMOUNT_WAIT: Duration = Duration::from_secs(5);
 /// writable on the same superblock.
 fn remount_root_read_only() -> Result<()> {
     let flags = if read_cmdline().contains_key("VIRTKIT_BOOT") {
-        libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY
+        libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | mount_flags_of("/")
     } else {
         libc::MS_REMOUNT | libc::MS_RDONLY
     };
@@ -981,7 +1145,7 @@ fn modprobe_listed() {
     );
     // Detach sysfs before the pivot hides it. The real root mounts its own.
     // SAFETY: a NUL-terminated literal path; a failure only leaves the mount in place.
-    let _ = unsafe { libc::umount2(c"/sys".as_ptr(), libc::MNT_DETACH) };
+    while unsafe { libc::umount2(c"/sys".as_ptr(), libc::MNT_DETACH) } == 0 {}
 }
 
 /// Load the boot-critical modules listed (one absolute `.ko` path per line) in the
@@ -2988,6 +3152,10 @@ fn claim_run_tmpfs(cmdline: &HashMap<String, String>, publishes_env: bool) {
     if !publishes_env && !ctl_enabled(cmdline) && !socket_volume_under_run(cmdline) {
         return;
     }
+    // Keep the initrd's /run with udev's records for unlocked disks and LVM volumes.
+    if cmdline.get("VIRTKIT_BOOT").map(String::as_str) == Some("initrd") {
+        return;
+    }
     // As `mount_api_filesystems` does: an image that ships no /run (FROM scratch) has
     // nothing to mount on otherwise.
     let _ = std::fs::create_dir_all("/run");
@@ -3942,7 +4110,27 @@ fn cstr(s: &str) -> CString {
 mod tests {
     use super::*;
 
+    #[test]
+    fn statvfs_flags_map_to_mount_flags() {
+        use super::{MS_NOSYMFOLLOW, ST_NOSYMFOLLOW, ST_RELATIME, ms_flags};
+        assert_eq!(ms_flags(0), 0);
+        assert_eq!(
+            ms_flags(libc::ST_RDONLY),
+            0,
+            "read-only is the caller's to set"
+        );
+        assert_eq!(
+            ms_flags(libc::ST_NOSUID | libc::ST_NODEV | ST_RELATIME),
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_RELATIME
+        );
+        assert_eq!(
+            ms_flags(ST_NOSYMFOLLOW | libc::ST_NOEXEC),
+            MS_NOSYMFOLLOW | libc::MS_NOEXEC
+        );
+    }
+
     /// git's helpers and scripts are left to an image with git; git-lfs is a tool of its own.
+
     #[test]
     fn git_family() {
         for name in [

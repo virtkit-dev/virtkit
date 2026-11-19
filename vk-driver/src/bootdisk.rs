@@ -1,12 +1,15 @@
 //! Boot a persistent disk on the kernel installed in its own `/boot` (`vk run --boot-disk`,
-//! experimental; see `docs/vm-boot-from-disk-design.md`, phase 1).
+//! experimental; see `docs/vm-boot-from-disk-design.md`).
 //!
-//! On the GPT disk, the host reads the ext2 XBOOTLDR partition. Only the guest mounts
-//! the x86-64 Linux root partition. On each launch, [`resolve`] selects the newest complete
-//! `vmlinuz-<release>`/`initrd.img-<release>` pair in `/boot`. The kernel unpacks vk's
-//! archive after the guest initrd, so the agent becomes `/init` and uses the guest's
-//! `modprobe` to load the listed modules for that release. The archive also carries the
-//! boot config.
+//! On every launch, including guest reboots, [`resolve`] reads the GPT disk's ext2
+//! XBOOTLDR partition and selects the newest complete `vmlinuz-<release>` and
+//! `initrd.img-<release>` pair. vk appends its archive to the guest initrd with
+//! the agent ([`AGENT_PATH`]), boot config and module names for the initrd's
+//! `modprobe`. `rdinit=` starts the agent and leaves the guest's `/init` intact.
+//!
+//! The agent mounts a `Linux root (x86-64)` partition directly. With `--boot-cmdline`,
+//! it runs Debian initramfs-tools' `/init` to mount a root such as LVM on LUKS.
+//! A `run-init` stand-in returns the mounted root to the agent.
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +18,20 @@ use anyhow::{Context, Result, bail};
 use crate::diskimg::DiskImage;
 use crate::ext4_read::{Ext4Reader, FileType};
 use crate::gpt;
+
+/// Agent path in the archive, selected by `rdinit=`.
+pub const AGENT_PATH: &str = "vk-init";
+/// `run-init` path in a merged-/usr initrd, where `/sbin` points to `usr/sbin`.
+const RUN_INIT_PATH: &str = "usr/sbin/run-init";
+/// With `VIRTKIT_BOOT=initrd`, `/init` execs this stand-in to report the root
+/// and exit. The dry run (`-n`) succeeds and the capability drop (`-d`) is
+/// skipped because the agent handles the PID 1 handoff.
+const RUN_INIT_STANDIN: &str = "#!/bin/sh
+# vk: hand the mounted root to vk's agent, PID 1, instead of exec'ing its init.
+[ \"$1\" = -n ] && exit 0
+[ \"$1\" = -d ] && shift 2
+echo \"$1\" > /virtkit-root
+";
 
 /// Bound host memory use when reading a guest initrd. Distro initrds with firmware can reach tens of MB.
 const MAX_INITRD_BYTES: u64 = 512 << 20;
@@ -90,13 +107,19 @@ fn modprobe_list() -> Vec<&'static str> {
         .collect()
 }
 
-/// Package the agent as `/init`, the boot config and module names. The guest initrd supplies the modules.
+/// Package the agent, boot config, module names and `run-init` stand-in.
+/// The guest initrd supplies `/init` and the modules for its kernel.
 pub fn build_vk_cpio(agent: &Path, cfg: &vk_core::runcfg::RunConfig, out: &Path) -> Result<()> {
     let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
     let mut cpio = crate::cpio::CpioWriter::new(std::io::BufWriter::new(file));
     let f = std::fs::File::open(agent).with_context(|| format!("opening {}", agent.display()))?;
     let size = u32::try_from(f.metadata()?.len()).context("the agent exceeds the cpio format")?;
-    cpio.file("init", 0o755, size, f)?;
+    cpio.file(AGENT_PATH, 0o755, size, f)?;
+    // run-init can be a hard link to the multi-call binary that provides `sh`.
+    // A regular file would overwrite every link in place. Extracting a symlink
+    // first makes the kernel unlink run-init before installing the stand-in.
+    cpio.symlink(RUN_INIT_PATH, "vk-replaced", (0, 0))?;
+    cpio.file_bytes(RUN_INIT_PATH, 0o755, RUN_INIT_STANDIN.as_bytes())?;
     cpio.file_bytes(
         vk_core::runcfg::MODPROBE_LIST,
         0o644,
@@ -256,7 +279,8 @@ mod tests {
         assert!(cpio.starts_with(b"070701"));
         let has = |needle: &[u8]| cpio.windows(needle.len()).any(|w| w == needle);
         for name in [
-            "init",
+            AGENT_PATH,
+            RUN_INIT_PATH,
             vk_core::runcfg::MODPROBE_LIST,
             vk_core::runcfg::INITRAMFS_PATH,
             "TRAILER!!!",
@@ -264,5 +288,6 @@ mod tests {
             assert!(has(name.as_bytes()), "{name}");
         }
         assert!(has(b"AGENT") && has(b"btrfs") && has(b"virtio_pci"));
+        assert!(has(RUN_INIT_STANDIN.as_bytes()));
     }
 }

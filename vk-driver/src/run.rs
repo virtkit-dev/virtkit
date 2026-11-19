@@ -326,6 +326,24 @@ fn session_exit_code(r: &vk_core::messages::CmdResult) -> Result<i32> {
     }
 }
 
+/// Minimum host boot timeout. The initrd timeout is 10 seconds shorter.
+const MIN_INITRD_BOOT_TIMEOUT_SECS: u64 = 30;
+
+/// Reserve the agent's settings and init selection. `--` would end the kernel
+/// arguments before vk appends its own.
+fn check_boot_cmdline(extra: &str) -> Result<()> {
+    if extra.split_whitespace().next().is_none() {
+        bail!("--boot-cmdline is empty: it names the root the disk's initrd mounts");
+    }
+    for t in extra.split_whitespace() {
+        let name = t.split_once('=').map_or(t, |(n, _)| n);
+        if t == "--" || name.starts_with("VIRTKIT_") || name == "rdinit" || name == "init" {
+            bail!("--boot-cmdline: `{t}` would override vk's own kernel arguments");
+        }
+    }
+    Ok(())
+}
+
 /// A stop signal (its number) that ended the run during the services' starts. [`run`] then
 /// exits as the signal's default action would have, with 128 + its number, so a `--detach`
 /// parent reports the failure.
@@ -387,6 +405,8 @@ pub struct RunArgs {
     pub root_image: Option<PathBuf>,
     /// `--boot-disk`: a persistent GPT disk booted on the kernel in its own `/boot`
     pub boot_disk: Option<PathBuf>,
+    /// `--boot-cmdline`: kernel arguments for a `--boot-disk` whose own initrd mounts the root
+    pub boot_cmdline: Option<String>,
     /// Keep `console=ttyS0` (don't rewrite to hvc0) for a BYO stock kernel whose
     /// virtio-console is modular (`vk run --console-serial`). See [`crate::vmm::VmSpec`].
     pub console_serial: bool,
@@ -607,6 +627,7 @@ impl Default for RunArgs {
             kernel: KernelSource::Default,
             root_image: None,
             boot_disk: None,
+            boot_cmdline: None,
             console_serial: false,
             pmu: false,
             nested: false,
@@ -1713,6 +1734,15 @@ async fn build_and_boot(
         if !eff_init.is_image() {
             bail!("--boot-disk needs --init image|entrypoint");
         }
+        if let Some(extra) = &args.boot_cmdline {
+            check_boot_cmdline(extra)?;
+            if args.boot_timeout_secs < MIN_INITRD_BOOT_TIMEOUT_SECS {
+                bail!(
+                    "--boot-cmdline needs --boot-timeout {MIN_INITRD_BOOT_TIMEOUT_SECS} or more: \
+                     the disk's initrd may unlock and wait for its root"
+                );
+            }
+        }
         // The disk is the machine's root: a persistent root beside it would go unused.
         if primary_persist_root.is_some() {
             bail!("--boot-disk is the machine's root; a persist_root primary keeps another");
@@ -1980,13 +2010,24 @@ async fn build_and_boot(
                 resolved.release,
                 disk.display()
             );
-            let root = crate::bootdisk::root_partition(&disk)?;
+            let root = match &args.boot_cmdline {
+                // Override a caller's `ro` for setup and `prepare`. `--root ro`
+                // appends a final `ro` for the handoff.
+                Some(extra) => format!(
+                    "VIRTKIT_BOOT=initrd VIRTKIT_INITRD_TIMEOUT={} {extra} rw",
+                    args.boot_timeout_secs - 10
+                ),
+                None => format!(
+                    "VIRTKIT_BOOT=disk VIRTKIT_PIVOT=/dev/vda{}",
+                    crate::bootdisk::root_partition(&disk)?
+                ),
+            };
             boot_kernel = kernel_medium;
             boot_disk = Some(bd);
             let mut kcmd = format!(
-                "console=ttyS0 pci=conf1 VIRTKIT_PIVOT=/dev/vda{root} \
-                 VIRTKIT_VSOCK_PORT={VSOCK_PORT} VIRTKIT_HOSTNAME={} VIRTKIT_KERNEL=image \
-                 VIRTKIT_BOOT=disk",
+                "console=ttyS0 pci=conf1 rdinit=/{} {root} VIRTKIT_VSOCK_PORT={VSOCK_PORT} \
+                 VIRTKIT_HOSTNAME={} VIRTKIT_KERNEL=image",
+                crate::bootdisk::AGENT_PATH,
                 primary_hostname.as_deref().unwrap_or(PRIMARY_HOSTNAME)
             );
             kcmd.push_str(&eff_init.handoff_tokens());
@@ -6774,6 +6815,21 @@ mod tests {
         // A bogus signal number from the agent still fails.
         assert_ne!(r(None, Some(0)).unwrap(), 0);
         assert!(r(None, None).is_err());
+    }
+
+    #[test]
+    fn boot_cmdline_cannot_override_vks_arguments() {
+        assert!(check_boot_cmdline("root=/dev/mapper/vg00-lvroot quiet").is_ok());
+        for bad in [
+            "",
+            "  ",
+            "root=/dev/x --",
+            "VIRTKIT_BOOT=disk",
+            "rdinit=/sh",
+            "init=/bin/sh",
+        ] {
+            assert!(check_boot_cmdline(bad).is_err(), "{bad:?}");
+        }
     }
 
     fn no_units() -> std::sync::Arc<crate::manager::Manager> {

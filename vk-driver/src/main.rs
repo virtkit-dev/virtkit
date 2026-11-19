@@ -1913,10 +1913,11 @@ enum Cmd {
         root_image: Option<PathBuf>,
         /// Boot this persistent disk on the kernel in its own /boot (experimental)
         ///
-        /// A GPT disk with an ext2 /boot partition of type XBOOTLDR and a root partition
-        /// of type `Linux root (x86-64)`, written in place. Every boot, a guest reboot
-        /// included, takes the newest vmlinuz/initrd.img pair in that /boot; the image
-        /// provides only the run's config. Needs `--init image|entrypoint`.
+        /// A GPT disk with an ext2 /boot partition of type XBOOTLDR, written in place. Every
+        /// boot, a guest reboot included, takes the newest vmlinuz/initrd.img pair in that
+        /// /boot; the image provides only the run's config. The root is a partition of type
+        /// `Linux root (x86-64)`, or what the disk's initrd mounts given --boot-cmdline.
+        /// Needs `--init image|entrypoint`.
         #[arg(
             long,
             value_name = "PATH",
@@ -1924,6 +1925,19 @@ enum Cmd {
             conflicts_with = "root_image"
         )]
         boot_disk: Option<PathBuf>,
+        /// With --boot-disk, let the disk's initrd mount the root, given these kernel arguments
+        ///
+        /// For a root only the guest knows how to reach (LUKS, LVM): e.g.
+        /// `root=/dev/mapper/vg00-lvroot`. vk takes over the root once it is mounted. Needs
+        /// a Debian initramfs-tools initrd with a merged /usr; refuses arguments that would
+        /// override vk's own (`VIRTKIT_*`, `init=`, `rdinit=`, `--`).
+        #[arg(
+            long,
+            value_name = "ARGS",
+            help_heading = "Guest",
+            requires = "boot_disk"
+        )]
+        boot_cmdline: Option<String>,
         /// keep console=ttyS0 for a BYO stock kernel (`--kernel <path>`)
         ///
         /// For a kernel whose virtio-console (hvc0) is a module, so early boot output reaches
@@ -3643,6 +3657,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         kernel,
         root_image,
         boot_disk,
+        boot_cmdline,
         console_serial,
         pmu,
         nested,
@@ -3890,6 +3905,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             kernel: kernel.clone(),
             root_image: root_image.clone(),
             boot_disk: boot_disk.clone(),
+            boot_cmdline: boot_cmdline.clone(),
             console_serial: *console_serial,
             pmu: *pmu,
             nested: *nested,
