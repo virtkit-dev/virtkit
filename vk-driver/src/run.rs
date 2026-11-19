@@ -5999,6 +5999,11 @@ impl VmSession {
         crate::oomkills::fetch(&self.addr, self.cancel.as_ref()).await
     }
 
+    /// OOM kills since this stage guest booted. See [`crate::oomkills::count`].
+    pub(crate) async fn oom_count(&self) -> Option<u64> {
+        crate::oomkills::count(&self.addr, self.cancel.as_ref()).await
+    }
+
     /// Run a guest command (as root) and report whether it exited 0 — for best-effort
     /// quiesce helpers where a missing binary or non-zero exit just means "fall back".
     async fn guest_ok(&self, argv: &[&str]) -> bool {

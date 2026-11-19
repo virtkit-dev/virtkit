@@ -17,6 +17,26 @@ const BUDGET: Duration = Duration::from_secs(5);
 /// Maximum kills parsed from untrusted guest output; the agent applies the same limit.
 const MAX: usize = 64;
 
+/// Guest OOM kills since boot, or `None` if no valid count arrives within [`BUDGET`].
+pub(crate) async fn count(addr: &SocketAddr, cancel: Option<&CancellationToken>) -> Option<u64> {
+    let (out, sink) = crate::executor::stdout_capture();
+    let argv = [
+        crate::run::GUEST_AGENT.to_string(),
+        "oomkills".to_string(),
+        "--count".to_string(),
+    ];
+    let asked = tokio::time::timeout(
+        BUDGET,
+        crate::executor::exec_script(addr, &argv, Vec::new(), None, &sink, cancel),
+    )
+    .await;
+    if !matches!(asked, Ok(Ok(r)) if r.code == Some(0)) {
+        return None;
+    }
+    let buf = out.lock().ok()?;
+    std::str::from_utf8(&buf).ok()?.trim().parse().ok()
+}
+
 /// Fetch recorded OOM kills from the live guest at `addr`, stopping at [`BUDGET`] or when
 /// `cancel` fires. Return `None` when no reliable answer is available, allowing callers to
 /// distinguish that case from a watched guest with no kills.

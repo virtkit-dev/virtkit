@@ -448,14 +448,37 @@ fn teardown_order<'a>(
     setup
 }
 
-/// Preserve a teardown I/O error for infrastructure failure classification. Include
-/// other teardown failures in the step error message.
-fn step_failure(failure: String, teardown: Result<()>) -> anyhow::Error {
-    match teardown {
-        Err(e) if e.chain().any(|c| c.is::<std::io::Error>()) => e.context(failure),
-        Err(e) => anyhow::anyhow!("{failure} ({e:#})"),
-        Ok(()) => anyhow::anyhow!(failure),
-    }
+/// Teardown I/O errors take precedence and skip the second OOM count. Other teardown errors
+/// stay in the diagnostic. A higher count classifies the failure as out of memory. A missing
+/// second count after a valid first reading classifies it as a timeout. The build skips
+/// failure caching for both I/O error kinds.
+fn step_failure(
+    kills_before: Option<u64>,
+    oom_after: impl FnOnce() -> Option<u64>,
+    failure: String,
+    teardown: Result<()>,
+) -> anyhow::Error {
+    let failure = match teardown {
+        Err(e) if e.chain().any(|c| c.is::<std::io::Error>()) => return e.context(failure),
+        Err(e) => format!("{failure} ({e:#})"),
+        Ok(()) => failure,
+    };
+    let cause = match oom_during(kills_before, oom_after()) {
+        Some(true) => (
+            std::io::ErrorKind::OutOfMemory,
+            "the guest ran out of memory",
+        ),
+        None if kills_before.is_some() => (
+            std::io::ErrorKind::TimedOut,
+            "the guest did not say whether it ran out of memory",
+        ),
+        _ => return anyhow::anyhow!(failure),
+    };
+    anyhow::Error::new(std::io::Error::new(cause.0, cause.1)).context(failure)
+}
+
+fn oom_during(before: Option<u64>, after: Option<u64>) -> Option<bool> {
+    Some(after? > before?)
 }
 
 /// Identify a failed heredoc RUN by its opener to keep file contents out of the error.
@@ -2663,6 +2686,7 @@ impl Executor for MicroVm {
                 bail!("RUN --mount=type=tmpfs: mounting tmpfs at {target} failed");
             }
         }
+        let kills_before = block_on(session.oom_count());
         let code = block_on(session.exec_env(&argv, env, user, &sink))?;
         let unmounts = teardown_order(
             scratch_target.as_ref(),
@@ -2675,7 +2699,8 @@ impl Executor for MicroVm {
             .context("RUN: tearing its mounts down");
         if code != 0 {
             let failure = run_failure(code, &shell, heredoc);
-            return Err(step_failure(failure, teardown));
+            let oom_after = || block_on(session.oom_count());
+            return Err(step_failure(kills_before, oom_after, failure, teardown));
         }
         teardown
     }
@@ -2745,13 +2770,15 @@ impl Executor for MicroVm {
             }
         }
         argv.push(resolve_copy_dest(&op.dest, workdir));
+        let kills_before = block_on(session.oom_count());
         let code = block_on(session.exec(&argv, None, &self.output_sink))?;
         let teardown = unmount_all(session, mount.iter(), &self.output_sink)
             .context("COPY: unmounting its source");
         if code != 0 {
             let src = from.map_or("context", |f| f.label.as_str());
             let failure = format!("COPY from {src} {:?} -> {} failed", op.sources, op.dest);
-            return Err(step_failure(failure, teardown));
+            let oom_after = || block_on(session.oom_count());
+            return Err(step_failure(kills_before, oom_after, failure, teardown));
         }
         teardown
     }
@@ -3477,17 +3504,36 @@ mod tests {
     }
 
     #[test]
-    fn a_step_failure_is_blamed_on_the_transport_first() {
+    fn oom_during_needs_a_kill_in_the_step() {
+        assert_eq!(oom_during(Some(2), Some(2)), Some(false));
+        assert_eq!(oom_during(Some(2), Some(3)), Some(true));
+        assert_eq!(oom_during(Some(2), None), None);
+        assert_eq!(oom_during(None, Some(3)), None);
+    }
+
+    #[test]
+    fn a_step_failure_is_classified_transport_then_oom_then_content() {
         let io = |kind| anyhow::Error::new(std::io::Error::new(kind, "x"));
         let kind = |e: &anyhow::Error| {
             e.chain()
                 .find_map(|c| c.downcast_ref::<std::io::Error>())
                 .map(std::io::Error::kind)
         };
-        let e = step_failure("f".into(), Err(io(std::io::ErrorKind::BrokenPipe)));
-        assert_eq!(kind(&e), Some(std::io::ErrorKind::BrokenPipe));
-        assert_eq!(kind(&step_failure("f".into(), Ok(()))), None);
-        let e = step_failure("f".into(), Err(anyhow::anyhow!("could not unmount /m")));
+        let fail = |before, after: Option<u64>, teardown| {
+            step_failure(before, move || after, "RUN exited 1: x".into(), teardown)
+        };
+        use std::io::ErrorKind::{BrokenPipe, OutOfMemory, TimedOut};
+        // teardown I/O errors skip the second reading
+        let e = step_failure(Some(1), || panic!("asked"), "f".into(), Err(io(BrokenPipe)));
+        assert_eq!(kind(&e), Some(BrokenPipe));
+        assert_eq!(kind(&fail(Some(1), Some(2), Ok(()))), Some(OutOfMemory));
+        assert_eq!(kind(&fail(Some(1), None, Ok(()))), Some(TimedOut));
+        assert_eq!(kind(&fail(None, None, Ok(()))), None);
+        let e = fail(
+            Some(1),
+            Some(1),
+            Err(anyhow::anyhow!("could not unmount /m")),
+        );
         assert_eq!(kind(&e), None);
         assert!(format!("{e:#}").contains("could not unmount /m"), "{e:#}");
     }

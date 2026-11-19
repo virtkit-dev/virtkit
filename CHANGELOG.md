@@ -47,6 +47,8 @@ All notable changes to virtkit will be documented in this file.
 - **A build step fails if a mount cannot be removed.** This prevents a leftover
   `RUN --mount` or `COPY --from` mount from diverting the next step's writes from its
   image layer.
+- **Builds retry failed steps after a guest OOM kill.** If a `RUN` or `COPY` fails and
+  virtkit detects a new OOM kill in the guest, the next build retries the step.
 
 ## [0.113.0] - 2026-11-18
 

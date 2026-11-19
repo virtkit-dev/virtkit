@@ -182,13 +182,41 @@ fn remove_log() {
     }
 }
 
+fn oom_kill_count(vmstat: &str) -> Option<u64> {
+    vmstat
+        .lines()
+        .find_map(|l| l.strip_prefix("oom_kill "))
+        .and_then(|n| n.trim().parse().ok())
+}
+
 /// `vk-agent oomkills`: print the recorded kills, one [`Kill::render`] line each, for the host.
 /// Exit 1 when the guest was not watched (no log), so the host reports nothing rather than
 /// "no kills"; an empty output with exit 0 is a watched guest that lost no process. A write
 /// that fails also exits 1 — a truncated list would under-report.
+///
+/// `vk-agent oomkills --count` prints `oom_kill` from `/proc/vmstat`. The kernel increments
+/// it at kill time, so two readings can bracket a build step even if the log writer lags.
 pub fn main(args: &[String]) -> i32 {
+    if let [flag] = args
+        && flag == "--count"
+    {
+        return match std::fs::read_to_string("/proc/vmstat")
+            .ok()
+            .as_deref()
+            .and_then(oom_kill_count)
+        {
+            Some(n) => {
+                println!("{n}");
+                0
+            }
+            None => {
+                eprintln!("oomkills: no oom_kill count in /proc/vmstat");
+                1
+            }
+        };
+    }
     if !args.is_empty() {
-        eprintln!("usage: vk-agent oomkills");
+        eprintln!("usage: vk-agent oomkills [--count]");
         return 2;
     }
     let text = match std::fs::read_to_string(LOG) {
@@ -221,6 +249,15 @@ mod tests {
     const RECORD: &str = "3,1302,48291057,-;Out of memory: Killed process 1234 (cc1plus) \
         total-vm:2216564kB, anon-rss:1998812kB, file-rss:1024kB, shmem-rss:0kB, UID:0 \
         pgtables:4100kB oom_score_adj:0\n";
+
+    #[test]
+    fn oom_kill_count_reads_the_vmstat_counter() {
+        assert_eq!(
+            oom_kill_count("pgfault 10\noom_kill 3\noom_kill_x 9\n"),
+            Some(3)
+        );
+        assert_eq!(oom_kill_count("pgfault 10\n"), None);
+    }
 
     #[test]
     fn a_kernel_oom_record_parses_to_the_victim() {
