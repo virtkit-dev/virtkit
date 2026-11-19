@@ -118,6 +118,7 @@ macro_rules! version_mark {
 pub mod client;
 pub mod definition;
 pub mod dispatch;
+pub mod dockerfile;
 pub mod egress;
 pub mod gitlab;
 pub mod job;

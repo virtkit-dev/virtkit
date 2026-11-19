@@ -1,16 +1,14 @@
 //! Dockerfile → instruction stream.
 //!
-//! Lexing mirrors buildkit's `frontend/dockerfile/parser` (moby/buildkit, ref:
-//! `Parse` in frontend/dockerfile/parser/parser.go): a default `\` escape token
-//! overridable by a leading `# escape=` parser directive, `#` full-line comments,
-//! and continuation lines joined when a (comment-stripped) line ends with the escape
-//! token — comment-only lines inside a continuation are skipped. We model the
-//! instruction subset our images use (FROM/RUN/COPY/ARG/ENV/WORKDIR/USER/LABEL/
-//! ENTRYPOINT/CMD/…); anything else is kept verbatim as `Other` rather than erroring,
-//! since the planner/executor only act on the ones they understand. No heredocs/ADD/
-//! ONBUILD (none appear in our Dockerfiles — see the feature survey).
+//! The build parser and the hub's egress reader share `vk_hub_proto::dockerfile`.
+//! Modeled instructions include FROM, RUN, COPY, ARG, ENV, WORKDIR, USER, LABEL,
+//! ENTRYPOINT and CMD. The parser accepts other keywords as `Other` with the keyword
+//! uppercased and the arguments trimmed. This lets the planner and executor handle
+//! the instructions they recognize. Heredocs, ADD and ONBUILD are unsupported and
+//! absent from the Dockerfiles in the feature survey.
 
 use anyhow::{Context, Result, bail};
+use vk_hub_proto::dockerfile::{HINT_PREFIX, logical_lines};
 
 /// A parsed Dockerfile: its instruction stream in source order.
 #[derive(Debug, Clone)]
@@ -109,21 +107,6 @@ const WINDOWS_HINTS: [&str; 7] = [
 const ALLOW_IP: &str = "allow-ip";
 const ALLOW_NAME: &str = "allow-name";
 
-/// The comment prefix a stage's sizing line carries. Mid-file and stage-scoped, so it cannot
-/// collide with buildkit's file-scoped `# syntax=` / `# check=` parser directives, and any
-/// other comment stays a comment.
-const HINT_PREFIX: &str = "vk:";
-
-/// The body of a `# vk:` sizing line, or `None` for an ordinary comment.
-///
-/// Strip exactly one `#`, allowing `## vk: …` to disable a hint. Match the prefix without
-/// regard to case, consistent with Dockerfile instruction keywords.
-fn hint_body(comment: &str) -> Option<&str> {
-    let rest = comment.strip_prefix('#')?.trim_start();
-    let (prefix, body) = rest.split_at_checked(HINT_PREFIX.len())?;
-    prefix.eq_ignore_ascii_case(HINT_PREFIX).then_some(body)
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Run {
     pub cmd: Cmdline,
@@ -181,12 +164,9 @@ pub enum Cmdline {
     Exec(Vec<String>),
 }
 
-const DEFAULT_ESCAPE: char = '\\';
-
 /// Parse a Dockerfile's text into its instruction stream.
 pub fn parse(src: &str) -> Result<Dockerfile> {
-    let escape = detect_escape(src);
-    let (logical, trailing) = logical_lines(src, escape);
+    let (logical, trailing) = logical_lines(src);
     let mut instructions = Vec::new();
     for line in logical {
         let mut instr = parse_instruction(&line.text)?;
@@ -295,108 +275,6 @@ fn parse_guest_hints(lines: &[String]) -> Result<GuestHint> {
         )?;
     }
     Ok(hint)
-}
-
-/// `# escape=<char>` must precede any instruction (and any non-directive comment).
-/// Mirrors buildkit's `possibleParserDirective`: only `\` or `` ` `` are accepted.
-fn detect_escape(src: &str) -> char {
-    for raw in src.lines() {
-        let line = raw.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix('#') {
-            let rest = rest.trim();
-            if let Some(val) = rest.strip_prefix("escape=") {
-                return match val.trim() {
-                    "`" => '`',
-                    _ => DEFAULT_ESCAPE,
-                };
-            }
-            // a non-directive comment ends the directive window only if it is not the
-            // first thing; buildkit allows the escape directive only before any
-            // instruction, so we keep scanning comments but stop at an instruction.
-            continue;
-        }
-        break; // first instruction: no (more) directives
-    }
-    DEFAULT_ESCAPE
-}
-
-/// One logical instruction line, with the `# vk:` lines gathered above it.
-struct LogicalLine {
-    text: String,
-    hints: Vec<String>,
-}
-
-/// Join physical lines into logical instruction lines per buildkit's rules: strip
-/// `#` comment-only lines, and continue across lines whose comment-stripped content
-/// ends with the escape token (skipping comment-only lines inside a continuation).
-///
-/// `# vk:` comments are the one exception to "dropped": they are carried to the next
-/// instruction, which is what makes them a hint about that stage rather than prose. Returns
-/// the lines and any hint left over at the end of the file, which sizes nothing.
-fn logical_lines(src: &str, escape: char) -> (Vec<LogicalLine>, Vec<String>) {
-    let mut out: Vec<LogicalLine> = Vec::new();
-    let mut hints: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut continuing = false;
-    for raw in src.lines() {
-        let trimmed = raw.trim_end();
-        let is_comment = trimmed.trim_start().starts_with('#');
-        if is_comment {
-            // comment-only lines are dropped, both standalone and inside a continuation —
-            // except a `# vk:` one outside a continuation, held for the coming instruction.
-            if !continuing && let Some(rest) = hint_body(trimmed.trim_start()) {
-                hints.push(rest.trim().to_string());
-            }
-            continue;
-        }
-        if !continuing {
-            if trimmed.trim().is_empty() {
-                continue;
-            }
-            cur.clear();
-        }
-        let (content, cont) = trim_continuation(trimmed, escape);
-        // Join continuation pieces with a single space, each piece trimmed — buildkit
-        // concatenates raw bytes, but normalizing whitespace here keeps the joined
-        // instruction stable regardless of indentation around the escape.
-        let piece = content.trim();
-        if !piece.is_empty() {
-            if !cur.is_empty() {
-                cur.push(' ');
-            }
-            cur.push_str(piece);
-        }
-        continuing = cont;
-        if !continuing {
-            let line = cur.trim().to_string();
-            if !line.is_empty() {
-                out.push(LogicalLine {
-                    text: line,
-                    hints: std::mem::take(&mut hints),
-                });
-            }
-        }
-    }
-    if continuing && !cur.trim().is_empty() {
-        out.push(LogicalLine {
-            text: cur.trim().to_string(),
-            hints: std::mem::take(&mut hints),
-        });
-    }
-    (out, hints)
-}
-
-/// Strip a trailing escape token (with optional trailing whitespace) → continuation.
-fn trim_continuation(line: &str, escape: char) -> (&str, bool) {
-    let t = line.trim_end();
-    if let Some(stripped) = t.strip_suffix(escape) {
-        (stripped, true)
-    } else {
-        (line, false)
-    }
 }
 
 /// Split `<KEYWORD> <rest>` and dispatch. Keyword match is case-insensitive.

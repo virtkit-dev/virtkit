@@ -4,8 +4,7 @@
 //! node's own build reads the same lines with `vk build`'s parser, which this reading agrees
 //! with (vk-driver's tests check it does) and which alone validates them.
 
-/// The comment prefix of a stage's `# vk:` lines.
-const HINT_PREFIX: &str = "vk:";
+use crate::dockerfile::{HINT_PREFIX, LogicalLine, logical_lines};
 
 /// A stage of a Dockerfile, and the egress its `# vk:` lines declare.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -28,53 +27,14 @@ pub struct DeclaredEgress {
 /// Every stage of `dockerfile`, in order, with what it declares; why not, for a file whose
 /// `# vk:` lines are not about a stage, or are not `key=value` lists.
 pub fn declared_egress(dockerfile: &str) -> Result<Vec<DeclaredStage>, String> {
-    let escape = detect_escape(dockerfile);
-    let mut stages = Vec::new();
-    let mut hints: Vec<&str> = Vec::new();
-    let mut line = String::new();
-    let mut continuing = false;
-    let mut instructions: Vec<(String, Vec<&str>)> = Vec::new();
-    for raw in dockerfile.lines() {
-        let trimmed = raw.trim_end();
-        if trimmed.trim_start().starts_with('#') {
-            // Comments are dropped, inside a continuation too, but a `# vk:` one outside it is
-            // held for the coming instruction.
-            if !continuing && let Some(body) = hint_body(trimmed.trim_start()) {
-                hints.push(body.trim());
-            }
-            continue;
-        }
-        if !continuing {
-            if trimmed.trim().is_empty() {
-                continue;
-            }
-            line.clear();
-        }
-        let (content, more) = match trimmed.strip_suffix(escape) {
-            Some(stripped) => (stripped, true),
-            None => (trimmed, false),
-        };
-        let piece = content.trim();
-        if !piece.is_empty() {
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(piece);
-        }
-        continuing = more;
-        if !continuing && !line.trim().is_empty() {
-            instructions.push((line.trim().to_string(), std::mem::take(&mut hints)));
-        }
-    }
-    if continuing && !line.trim().is_empty() {
-        instructions.push((line.trim().to_string(), std::mem::take(&mut hints)));
-    }
-    if !hints.is_empty() {
+    let (instructions, trailing) = logical_lines(dockerfile);
+    if !trailing.is_empty() {
         return Err(format!(
             "`# {HINT_PREFIX}` at the end of the file is about no stage"
         ));
     }
-    for (text, hints) in instructions {
+    let mut stages = Vec::new();
+    for LogicalLine { text, hints } in instructions {
         let mut words = text.split_whitespace();
         let keyword = words.next().unwrap_or_default();
         if !keyword.eq_ignore_ascii_case("FROM") {
@@ -101,7 +61,7 @@ pub fn declared_egress(dockerfile: &str) -> Result<Vec<DeclaredStage>, String> {
 }
 
 /// What a stage's `# vk:` lines, `hints`, declare; other keys are `vk build`'s to read.
-fn egress_of(hints: &[&str]) -> Result<Option<DeclaredEgress>, String> {
+fn egress_of(hints: &[String]) -> Result<Option<DeclaredEgress>, String> {
     let mut egress: Option<DeclaredEgress> = None;
     for field in hints.iter().flat_map(|h| h.split_whitespace()) {
         let Some((key, value)) = field.split_once('=') else {
@@ -120,31 +80,6 @@ fn egress_of(hints: &[&str]) -> Result<Option<DeclaredEgress>, String> {
         );
     }
     Ok(egress)
-}
-
-/// The body of a `# vk:` line, or `None` for any other comment: one `#` stripped, so `## vk:`
-/// is commented out, and the prefix in any case.
-fn hint_body(comment: &str) -> Option<&str> {
-    let rest = comment.strip_prefix('#')?.trim_start();
-    let (prefix, body) = rest.split_at_checked(HINT_PREFIX.len())?;
-    prefix.eq_ignore_ascii_case(HINT_PREFIX).then_some(body)
-}
-
-/// The escape character an `# escape=` parser directive sets, before the first instruction.
-fn detect_escape(src: &str) -> char {
-    for raw in src.lines() {
-        let line = raw.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some(rest) = line.strip_prefix('#') else {
-            break;
-        };
-        if let Some(value) = rest.trim().strip_prefix("escape=") {
-            return if value.trim() == "`" { '`' } else { '\\' };
-        }
-    }
-    '\\'
 }
 
 /// Dockerfiles whose declarations vk-driver's tests check `vk build` reads alike.
