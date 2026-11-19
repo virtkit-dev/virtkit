@@ -1,11 +1,11 @@
 //! Dockerfile → instruction stream.
 //!
-//! The build parser and the hub's egress reader share `vk_hub_proto::dockerfile`.
-//! Modeled instructions include FROM, RUN, COPY, ARG, ENV, WORKDIR, USER, LABEL,
-//! ENTRYPOINT and CMD. The parser accepts other keywords as `Other` with the keyword
-//! uppercased and the arguments trimmed. This lets the planner and executor handle
-//! the instructions they recognize. Heredocs, ADD and ONBUILD are unsupported and
-//! absent from the Dockerfiles in the feature survey.
+//! `vk_hub_proto::dockerfile` splits instruction lines for both this parser and the hub's
+//! definition reader using BuildKit's continuation and parser directive rules. The parser
+//! models FROM, RUN, COPY, ARG, ENV, WORKDIR, USER, LABEL, ENTRYPOINT and CMD. It accepts
+//! other keywords as `Other`, with an uppercase name and trimmed arguments, for the planner
+//! and executor to interpret. Our images use no heredocs, ADD or ONBUILD (see the feature
+//! survey), and this parser does not implement them.
 
 use anyhow::{Context, Result, bail};
 use vk_hub_proto::dockerfile::{HINT_PREFIX, logical_lines};
@@ -166,7 +166,7 @@ pub enum Cmdline {
 
 /// Parse a Dockerfile's text into its instruction stream.
 pub fn parse(src: &str) -> Result<Dockerfile> {
-    let (logical, trailing) = logical_lines(src);
+    let (logical, trailing) = logical_lines(src).map_err(anyhow::Error::msg)?;
     let mut instructions = Vec::new();
     for line in logical {
         let mut instr = parse_instruction(&line.text)?;
@@ -859,14 +859,19 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_parser_directive_fails_the_parse() {
+        let err = format!("{:#}", parse("# escape=x\nFROM scratch\n").unwrap_err());
+        assert!(err.contains("parser directive on line 1"), "{err}");
+    }
+
+    #[test]
     fn line_continuation_joins_across_comments() {
-        // buildkit: a comment line inside a continuation is skipped, the join holds.
         let df = parse("RUN echo a \\\n  # a comment in the middle\n  && echo b\n").unwrap();
         assert_eq!(df.instructions.len(), 1);
         let Instruction::Run(r) = &df.instructions[0] else {
             panic!("expected RUN, got {:?}", df.instructions[0])
         };
-        assert_eq!(r.cmd, Cmdline::Shell("echo a && echo b".into()));
+        assert_eq!(r.cmd, Cmdline::Shell("echo a   && echo b".into()));
     }
 
     #[test]
@@ -875,7 +880,7 @@ mod tests {
         let Instruction::Run(r) = &df.instructions[0] else {
             panic!()
         };
-        assert_eq!(r.cmd, Cmdline::Shell("echo a echo b".into()));
+        assert_eq!(r.cmd, Cmdline::Shell("echo a   echo b".into()));
     }
 
     #[test]

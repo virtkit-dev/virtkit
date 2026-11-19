@@ -2,7 +2,8 @@
 //! `# vk: allow-name=… allow-ip=…` lines, which a node holds the stage's RUN steps to. The hub
 //! reads them to show an operator, from the definition it holds, where its builds may go; the
 //! node's own build reads the same lines with `vk build`'s parser, which this reading agrees
-//! with (vk-driver's tests check it does) and which alone validates them.
+//! with (vk-driver tests their agreement). The build validates the egress allowlist.
+//! Both readers reject duplicate parser directives and invalid escape tokens.
 
 use crate::dockerfile::{HINT_PREFIX, LogicalLine, logical_lines};
 
@@ -24,10 +25,10 @@ pub struct DeclaredEgress {
     pub names: Vec<String>,
 }
 
-/// Every stage of `dockerfile`, in order, with what it declares; why not, for a file whose
-/// `# vk:` lines are not about a stage, or are not `key=value` lists.
+/// Returns each stage's declared egress in file order. Errors cover misplaced `# vk:`
+/// lines, hint fields without `=`, duplicate parser directives and invalid escape tokens.
 pub fn declared_egress(dockerfile: &str) -> Result<Vec<DeclaredStage>, String> {
-    let (instructions, trailing) = logical_lines(dockerfile);
+    let (instructions, trailing) = logical_lines(dockerfile)?;
     if !trailing.is_empty() {
         return Err(format!(
             "`# {HINT_PREFIX}` at the end of the file is about no stage"
@@ -160,5 +161,6 @@ mod tests {
         assert!(err("# vk: allow-name=a\nRUN a\n").contains("must precede a FROM"));
         assert!(err("FROM a\n# vk: allow-name=a\n").contains("about no stage"));
         assert!(err("# vk: allow-name\nFROM a\n").contains("expected key=value"));
+        assert!(err("# escape=x\nFROM a\n").contains("parser directive on line 1"));
     }
 }

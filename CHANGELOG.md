@@ -18,6 +18,14 @@ All notable changes to virtkit will be documented in this file.
   readying an environment another `vk` booted records that `vk` as its creator, not itself,
   so `freshness` and `vk dev status` still see an older guest agent. This holds for boots by
   this release onward; one by an earlier `vk` is recorded with no creator.
+- **`vk build` preserves whitespace across Dockerfile continuations.** A quoted word split
+  across lines stays whole. A changed instruction can miss the build cache once. Blank
+  lines inside a continuation are skipped, and a doubled escape token (`\\`) ends the line.
+  `vk build` and the hub's tools page read `# escape=`, `# syntax=` and `# check=` only
+  at the start of the file, ignoring key case and spacing around `=`. A blank line,
+  ordinary comment or instruction ends the directives. A comment above `` # escape=` ``
+  therefore leaves the default `\` in effect. A repeated directive or an escape other
+  than `\` or `` ` `` is an error. One leading byte-order mark is ignored.
 
 ## [0.113.0] - 2026-11-18
 
