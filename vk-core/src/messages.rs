@@ -112,13 +112,23 @@ const SHOWN_MAX: usize = 256;
 
 impl fmt::Display for CmdExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Environment values may contain secrets.
+        let env: Vec<&str> = self
+            .env
+            .iter()
+            .map(|e| e.split_once('=').map_or(e.as_str(), |(k, _)| k))
+            .collect();
         let mut shown = format!(
             "(name:{}, args:{:?}, {:?}{}{})",
             self.name,
             self.args,
             self.mode,
             if self.clear_env { ", clear_env" } else { "" },
-            self.env.join(" ")
+            if env.is_empty() {
+                String::new()
+            } else {
+                format!(", env:{env:?}")
+            },
         );
         if shown.len() > SHOWN_MAX {
             let mut end = SHOWN_MAX;
@@ -158,6 +168,25 @@ mod tests {
         let shown = cmd.to_string();
         assert!(shown.len() <= SHOWN_MAX + '…'.len_utf8(), "{}", shown.len());
         assert!(shown.ends_with('…'));
+    }
+
+    #[test]
+    fn a_request_shows_its_environment_by_name() {
+        let cmd = CmdExec {
+            name: "sh".into(),
+            args: vec![],
+            env: vec!["TOKEN=SENTINEL".into(), "BARE".into()],
+            clear_env: false,
+            mode: RunMode::Interactive,
+            dir: None,
+            tty: None,
+            user: None,
+        };
+        let shown = cmd.to_string();
+        assert!(shown.contains(r#"env:["TOKEN", "BARE"]"#), "{shown}");
+        assert!(!shown.contains("SENTINEL"), "{shown}");
+        let bare = CmdExec { env: vec![], ..cmd };
+        assert!(!bare.to_string().contains("env:"), "{bare}");
     }
 
     #[test]

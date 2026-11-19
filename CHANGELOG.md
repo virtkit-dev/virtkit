@@ -26,6 +26,8 @@ All notable changes to virtkit will be documented in this file.
   ordinary comment or instruction ends the directives. A comment above `` # escape=` ``
   therefore leaves the default `\` in effect. A repeated directive or an escape other
   than `\` or `` ` `` is an error. One leading byte-order mark is ignored.
+- **Guest exec requests log only environment variable names.** Values passed through
+  `vk exec --env` stay out of the request log.
 
 ## [0.113.0] - 2026-11-18
 
