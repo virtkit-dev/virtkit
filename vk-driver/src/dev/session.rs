@@ -103,6 +103,9 @@ struct Readying {
     /// what the identity records as the boot time, for the age in `vk dev list`: a
     /// takeover's is the one its marker carried over, a fresh boot's when its readying began
     booted_secs: u64,
+    /// what the identity records as its creator: this vk for a fresh boot, a takeover's the
+    /// one its marker carried over
+    created_by: String,
     claimed: bool,
 }
 
@@ -118,6 +121,7 @@ fn begin_readying(plan: &Plan) -> Result<Readying> {
     let mut readying = Readying {
         booted,
         booted_secs: crate::vms::unix_now(),
+        created_by: own_version(),
         claimed: false,
         digest,
         manifest,
@@ -126,6 +130,7 @@ fn begin_readying(plan: &Plan) -> Result<Readying> {
         let vm = booted?;
         if let Some(claimed) = own.filter(|l| l.vm == vm) {
             readying.booted_secs = claimed.booted_secs;
+            readying.created_by = claimed.created_by.clone();
             readying.claimed = true;
             // The boot is the claimed one: record the compose file it read, or that its
             // marker does not say, rather than this parent's snapshot. Only serializing a
@@ -143,6 +148,7 @@ fn begin_readying(plan: &Plan) -> Result<Readying> {
             digest: readying.digest.clone(),
             manifest: readying.manifest.clone(),
             booted_secs: readying.booted_secs,
+            created_by: readying.created_by.clone(),
             readier: Some(Readier::of(std::process::id())?),
             why: String::new(),
         })
@@ -158,14 +164,7 @@ async fn ready_or_mark(
     readying: &Readying,
     running: impl FnOnce() -> Option<VmTie>,
 ) -> Result<()> {
-    let readied = ready_booted(
-        plan,
-        &readying.digest,
-        &readying.manifest,
-        readying.booted_secs,
-        !readying.claimed,
-    )
-    .await;
+    let readied = ready_booted(plan, readying).await;
     let Err(e) = &readied else {
         drop_own_not_ready(plan);
         return readied;
@@ -182,6 +181,7 @@ async fn ready_or_mark(
             digest: readying.digest.clone(),
             manifest: readying.manifest.clone(),
             booted_secs: readying.booted_secs,
+            created_by: readying.created_by.clone(),
             readier: None,
             why: format!("{e:#}"),
         })
@@ -194,15 +194,18 @@ async fn ready_or_mark(
 }
 
 /// The readying steps of a fresh boot — the endpoints, `hooks.create`, `hooks.start` and
-/// the identity recorded last — for the config that resolves to `digest`/`manifest`.
-/// `by_its_boot` is what the identity records as [`Identity::readied_by_its_boot`].
-async fn ready_booted(
-    plan: &Plan,
-    digest: &str,
-    manifest: &serde_json::Value,
-    booted_secs: u64,
-    by_its_boot: bool,
-) -> Result<()> {
+/// the identity recorded last — for what `readying` describes. A claimed readying records
+/// that the VM's own boot did not ready it ([`Identity::readied_by_its_boot`]).
+async fn ready_booted(plan: &Plan, readying: &Readying) -> Result<()> {
+    let Readying {
+        digest,
+        manifest,
+        booted_secs,
+        created_by,
+        claimed,
+        ..
+    } = readying;
+    let by_its_boot = !claimed;
     // What was actually booted, read off the registry entry the boot filed. `None` where
     // there is no entry to read it from, which leaves the creation hook unstamped rather
     // than stamped with something that describes nothing.
@@ -223,9 +226,9 @@ async fn ready_booted(
     write_identity(
         plan,
         &Identity {
-            digest: digest.to_string(),
-            booted_secs,
-            created_by: own_version(),
+            digest: digest.clone(),
+            booted_secs: *booted_secs,
+            created_by: created_by.clone(),
             generation: generation.unwrap_or_default(),
             manifest: manifest.clone(),
             storage_backings,
@@ -1076,6 +1079,7 @@ mod tests {
             digest: digest.clone(),
             manifest: manifest.clone(),
             booted_secs,
+            created_by: own_version(),
             claimed: false,
         };
         let me = Readier::of(std::process::id());
@@ -1084,6 +1088,7 @@ mod tests {
             digest: digest.clone(),
             manifest: manifest.clone(),
             booted_secs: 1000,
+            created_by: String::new(),
             readier: me,
             why: String::new(),
         };
@@ -1097,18 +1102,22 @@ mod tests {
         let recorded: crate::dev::Identity =
             serde_json::from_slice(&std::fs::read(&identity).unwrap()).unwrap();
         assert_eq!(recorded.booted_secs, 1000);
+        assert_eq!(recorded.created_by, own_version());
         assert!(recorded.readied_by_its_boot);
         assert!(!marker.exists(), "a ready environment is not marked");
-        // A claim's readying records that the VM's own boot did not ready it.
+        // A claim's readying records that the VM's own boot did not ready it, and the vk
+        // whose boot did.
         mark_not_ready(&plan, &under_way());
         let claimed = Readying {
             claimed: true,
+            created_by: "vk 0.1.0 (abc)".into(),
             ..readying(Some(vm), 1000)
         };
         ready_or_mark(&plan, &claimed, || Some(vm)).await.unwrap();
         let recorded: crate::dev::Identity =
             serde_json::from_slice(&std::fs::read(&identity).unwrap()).unwrap();
         assert!(!recorded.readied_by_its_boot);
+        assert_eq!(recorded.created_by, "vk 0.1.0 (abc)");
 
         // The last step fails — a directory where the identity goes — with the VM this
         // parent readied still up: marked as naming nobody, with the identity it would have
@@ -1124,6 +1133,7 @@ mod tests {
             (left.vm, left.digest.as_str(), left.booted_secs),
             (vm, digest.as_str(), 1000)
         );
+        assert_eq!(left.created_by, own_version());
         assert_eq!(left.why, format!("{e:#}"));
         assert!(left.readier.is_none() && left.abandoned());
 
@@ -1193,6 +1203,7 @@ mod tests {
                 digest: digest.clone(),
                 manifest: manifest.clone(),
                 booted_secs: 1000,
+                created_by: String::new(),
                 claimed,
             };
             ready_or_mark(&plan, &readying, || Some(vm)).await.unwrap();
@@ -1342,15 +1353,33 @@ mod tests {
         assert!(left.why.is_empty() && !left.abandoned());
         assert_eq!(Some(left.vm), readying.booted);
         assert_eq!(left.booted_secs, readying.booted_secs);
+        assert_eq!(left.created_by, own_version());
+        assert_eq!(readying.created_by, own_version());
         assert!(!readying.claimed);
 
-        // A marker a claim left naming this process hands its boot time over.
+        // A marker a claim left naming this process hands its boot time and creator over.
         let mut claimed = left;
         claimed.booted_secs = 1000;
+        claimed.created_by = "vk 0.1.0 (abc)".into();
         mark_not_ready(&plan, &claimed);
         let readying = begin_readying(&plan).unwrap();
         assert!(readying.claimed);
-        assert_eq!(read_not_ready(&plan).unwrap().booted_secs, 1000);
+        assert_eq!(readying.created_by, "vk 0.1.0 (abc)");
+        let left = read_not_ready(&plan).unwrap();
+        assert_eq!(
+            (left.booted_secs, left.created_by.as_str()),
+            (1000, "vk 0.1.0 (abc)")
+        );
+
+        // One a vk wrote before markers carried the creator says nothing of it.
+        let mut old = serde_json::to_value(&left).unwrap();
+        old.as_object_mut().unwrap().remove("created_by");
+        std::fs::write(
+            plan.state_dir.join("not-ready"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(begin_readying(&plan).unwrap().created_by, "");
     }
 
     /// The child's note is best effort: a claim's marker naming this parent is enough for it
@@ -1380,6 +1409,7 @@ mod tests {
                 digest,
                 manifest,
                 booted_secs: 1000,
+                created_by: "vk 0.1.0 (abc)".into(),
                 readier: Readier::of(std::process::id()),
                 why: String::new(),
             },
@@ -1389,6 +1419,10 @@ mod tests {
             serde_json::from_slice(&std::fs::read(plan.state_dir.join("dev.json")).unwrap())
                 .unwrap();
         assert_eq!(recorded.booted_secs, 1000);
+        assert_eq!(
+            recorded.created_by, "vk 0.1.0 (abc)",
+            "a takeover records the vk whose boot it readied"
+        );
         assert!(
             !recorded.readied_by_its_boot,
             "a claimed readying is not the VM's own boot's"

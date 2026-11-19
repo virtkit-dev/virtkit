@@ -133,6 +133,11 @@ pub(super) struct NotReady {
     /// what that identity would have recorded as [`Identity::booted_secs`], carried over by
     /// a claim so the environment's age stays that of its boot
     pub booted_secs: u64,
+    /// what that identity would record as [`Identity::created_by`]: the vk whose boot injected
+    /// the agent, carried over by a claim so a takeover does not pass that agent off as its
+    /// own. Empty from a vk that did not record it, which says nothing of the creator.
+    #[serde(default)]
+    pub created_by: String,
     /// the parent readying the VM; `None` once its readying failed
     pub readier: Option<Readier>,
     /// why the readying failed; empty while it is under way
@@ -991,6 +996,7 @@ mod tests {
             digest,
             manifest,
             booted_secs: 1000,
+            created_by: String::new(),
             readier: None,
             why: "hooks.start: exited with 1".into(),
         }

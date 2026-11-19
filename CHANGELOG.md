@@ -12,6 +12,13 @@ All notable changes to virtkit will be documented in this file.
   and reuses with a note if declined or without a terminal. `reuse` attaches with a note,
   `refresh` restarts, and `require-current` refuses attachment and suggests `vk dev refresh`.
 
+### Fixed
+
+- **Taking over a half-readied dev environment keeps its creator.** A `vk dev` that finishes
+  readying an environment another `vk` booted records that `vk` as its creator, not itself,
+  so `freshness` and `vk dev status` still see an older guest agent. This holds for boots by
+  this release onward; one by an earlier `vk` is recorded with no creator.
+
 ## [0.113.0] - 2026-11-18
 
 ### Added

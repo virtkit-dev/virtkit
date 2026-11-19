@@ -1968,6 +1968,7 @@ mod tests {
             digest: "a".repeat(64),
             manifest: serde_json::json!({}),
             booted_secs: 0,
+            created_by: String::new(),
             readier: None,
             why: "hooks.start: exited with 1".into(),
         };
@@ -2423,6 +2424,7 @@ mod tests {
             digest: "a".repeat(64),
             manifest: serde_json::json!({}),
             booted_secs: 0,
+            created_by: String::new(),
             readier: None,
             why: "hooks.start: exited with 1".into(),
         }))
@@ -2653,6 +2655,7 @@ mod tests {
                     digest: digest.clone(),
                     manifest: manifest.clone(),
                     booted_secs: 1000,
+                    created_by: String::new(),
                     readier: crate::dev::identity::Readier::of(std::process::id()),
                     why: String::new(),
                 },
@@ -2990,6 +2993,7 @@ mod tests {
                 digest: digest.clone(),
                 manifest: manifest.clone(),
                 booted_secs: 1000,
+                created_by: String::new(),
                 readier: None,
                 why: "hooks.start: exited with 1".into(),
             },

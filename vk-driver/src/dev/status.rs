@@ -618,6 +618,7 @@ mod tests {
             digest: digest.clone(),
             manifest: manifest.clone(),
             booted_secs: 1000,
+            created_by: String::new(),
             readier,
             why: why.into(),
         };
@@ -764,6 +765,7 @@ mod tests {
             digest: digest.clone(),
             manifest: manifest.clone(),
             booted_secs: 1000,
+            created_by: String::new(),
             readier: None,
             why: "hooks.start: exited with 1".into(),
         };
