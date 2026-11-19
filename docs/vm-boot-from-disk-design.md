@@ -46,7 +46,8 @@ handoff leaves the guest available for inspection when exec is running.
 `vk-agent/src/init.rs:419`, `vk-agent/src/init.rs:496`, `vk-agent/src/init.rs:671`,
 `vk-agent/src/init.rs:736`.
 
-The btrfs prototype pairs `tools/btrfs-root` with `vk run --root-image`.
+The btrfs prototype pairs `tools/btrfs-root` with `vk run --root-image`; `tools/boot-disk`
+lays a partitioned seed out for `vk run --boot-disk`.
 With `--kernel image`, vk substitutes the raw root **after** obtaining the kernel and modules
 from the image ext4, and the agent probes the root superblock and mounts the detected type. The
 converter mounts the source ext4 in a guest and runs `mkfs.btrfs --rootdir` without mounting
