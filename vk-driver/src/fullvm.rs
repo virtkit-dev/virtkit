@@ -25,7 +25,7 @@ use crate::run::KernelSource;
 /// AF_VSOCK transport. Dependencies from the image's `modules.dep` load first,
 /// including modules not listed here; this list orders the traversal roots. Missing
 /// modules (e.g. `virtio_ring` when built in) are skipped with a warning.
-const WANTED_MODULES: &[&str] = &[
+pub(crate) const WANTED_MODULES: &[&str] = &[
     "virtio",
     "virtio_ring",
     "virtio_pci_legacy_dev",
@@ -217,7 +217,7 @@ fn kernel_version(reader: &Ext4Reader) -> Result<String> {
 // Caps on what an image — possibly a guest-written disk — can make the host allocate, by the
 // size it gives a file or by what that file decompresses to. Each is far past any real one.
 /// Maximum size of a kernel image, and separately of its decompressed payload.
-const MAX_KERNEL_BYTES: u64 = 256 << 20;
+pub(crate) const MAX_KERNEL_BYTES: u64 = 256 << 20;
 /// Maximum size of a module, and separately of its decompressed output.
 const MAX_MODULE_BYTES: u64 = 64 << 20;
 /// Maximum `modules.dep` size.
@@ -259,7 +259,7 @@ const ELF_MAGIC: &[u8] = &[0x7f, 0x45, 0x4c, 0x46];
 /// matching decoder, accepting the first result that is an ELF. This mirrors the
 /// kernel tree's `scripts/extract-vmlinux`, with the decoders built in: gzip, xz and
 /// zstd, which cover the distributions' kernels.
-fn extract_vmlinux(image: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn extract_vmlinux(image: &[u8]) -> Result<Vec<u8>> {
     if image.starts_with(ELF_MAGIC) {
         return Ok(image.to_vec());
     }

@@ -624,6 +624,22 @@ fn press_power_button_on_sigterm(handle: VmmHandle, grace: Duration) -> Result<(
     Ok(())
 }
 
+/// Refresh the kernel and initramfs from the newest complete pair in `/boot` before a
+/// relaunch. `vk run` validates and writes the first pair before starting the VM.
+fn refresh_boot_disk(spec: &VmSpec) -> Result<()> {
+    let Some(bd) = &spec.boot_disk else {
+        return Ok(());
+    };
+    let initramfs = spec
+        .initramfs
+        .as_deref()
+        .context("a --boot-disk VM has no initramfs to write")?;
+    let resolved = crate::bootdisk::resolve(bd, &spec.kernel, initramfs)
+        .with_context(|| format!("reading the kernel in {}'s /boot", bd.disk.display()))?;
+    eprintln!("virtkit: booting {} from its /boot", resolved.release);
+    Ok(())
+}
+
 /// Boot `spec`, relaunching the VM in place on a guest reset when `spec.reboot` is set.
 ///
 /// Runs in the libkrun boot process (before any Tokio runtime, so `fork` is safe). The
@@ -652,6 +668,8 @@ pub fn keep(spec: &VmSpec) -> Result<i32> {
     // A restored VM resumes from its snapshot once; a reset boots it afresh, from its disks,
     // which have moved on from the snapshot's memory since.
     let mut restore = true;
+    // The first launch boots the media `vk run` wrote; each later one reads /boot again.
+    let mut first = true;
     loop {
         // Stale listen sockets from the previous boot make libkrun's vsock bind fail
         // (EEXIST). Remove exactly the ones libkrun rebinds (listen=true) — never the
@@ -663,6 +681,12 @@ pub fn keep(spec: &VmSpec) -> Result<i32> {
                 let _ = std::fs::remove_file(&vp.socket);
             }
         }
+        if !std::mem::replace(&mut first, false)
+            && let Err(e) = refresh_boot_disk(spec)
+        {
+            eprintln!("virtkit: {e:#}");
+            return Ok(1);
+        }
         let started = Instant::now();
 
         // Block the keeper's signals across the fork so the child never runs the keeper's
@@ -673,6 +697,12 @@ pub fn keep(spec: &VmSpec) -> Result<i32> {
             libc::sigaddset(&mut set, libc::SIGTERM);
             libc::sigaddset(&mut set, libc::SIGUSR1);
             libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        }
+        // A stop received while refreshing /boot had no child to signal. Handle it before forking.
+        if STOP_REQUESTED.load(Ordering::SeqCst) {
+            // SAFETY: `set` is the initialized set blocked above.
+            unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+            return Ok(0);
         }
 
         let pid = unsafe { libc::fork() };

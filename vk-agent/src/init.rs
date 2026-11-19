@@ -171,6 +171,10 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     if std::path::Path::new("/virtkit-modules").exists() {
         load_preinit_modules();
     }
+    // The guest initrd provides modprobe, the modules and their dependencies.
+    if Path::new(&format!("/{}", vk_core::runcfg::MODPROBE_LIST)).exists() {
+        modprobe_listed();
+    }
 
     // Image init (`vk run --init image|entrypoint`): the IMAGE takes PID 1. Handled
     // entirely by run_full_vm — pivot into the real root, fork a reparented serve, then
@@ -325,12 +329,22 @@ fn pivot_to_real_root() -> Result<bool> {
     // /dev/fd/<n> until the image's own init got around to creating the links.
     link_dev_std_fds();
     std::fs::create_dir_all("/newroot")?;
+    // Wait for the disk driver to expose the root partition.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !Path::new(&dev).exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     // If the image kernel builds btrfs as a module, preinit must load it before this mount.
     let fstype = vk_core::fsprobe::fstype_of(Path::new(&dev))
         .with_context(|| format!("reading the superblock of {dev}"))?
         .with_context(|| format!("{dev}: the superblock is neither ext4 nor btrfs"))?;
     mount(&dev, "/newroot", fstype, 0)
         .with_context(|| format!("mounting real root {dev} ({fstype})"))?;
+    // Reclaim the guest initrd before the pivot hides it for the rest of the boot.
+    // The running agent remains accessible through /proc/self/exe after unlinking.
+    if cmdline.get("VIRTKIT_BOOT").map(String::as_str) == Some("disk") {
+        free_initramfs(Path::new("/"));
+    }
     std::env::set_current_dir("/newroot").context("chdir /newroot")?;
     mount(".", "/", "", libc::MS_MOVE).context("mount --move /newroot /")?;
     let rc = unsafe { libc::chroot(c".".as_ptr()) };
@@ -340,6 +354,32 @@ fn pivot_to_real_root() -> Result<bool> {
     std::env::set_current_dir("/").context("chdir / after chroot")?;
     info!("vk-agent init: pivoted into real root {dev}");
     Ok(true)
+}
+
+/// Remove initramfs files under `dir`, skipping other devices such as the new root, /proc and /dev.
+fn free_initramfs(dir: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(dev) = std::fs::symlink_metadata(dir).map(|m| m.dev()) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(md) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if md.dev() != dev {
+            continue;
+        }
+        if md.is_dir() {
+            free_initramfs(&path);
+            let _ = std::fs::remove_dir(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Image-init handoff (`vk run --init image|entrypoint`): pivot into the real root,
@@ -408,6 +448,11 @@ fn run_full_vm(
         && e.raw_os_error() != Some(libc::EBUSY)
     {
         warn!("vk-agent image-init: mounting /sys failed: {e} — eth0 will look absent");
+    }
+
+    // Mount /boot before prepare can install a kernel on the underlying root filesystem.
+    if cmdline.get("VIRTKIT_BOOT").map(String::as_str) == Some("disk") {
+        mount_fstab();
     }
 
     // Apply only the virtkit-provided setup the image's own init won't do: the guest's name
@@ -647,12 +692,20 @@ const RO_REMOUNT_WAIT: Duration = Duration::from_secs(5);
 /// Remount `/` read-only (the superblock, as the kernel's `ro` mounts it), for the image's init.
 /// A file still open for writing makes the kernel refuse with EBUSY: the setup's own forks
 /// may be closing theirs, so retry for [`RO_REMOUNT_WAIT`] before giving up.
+///
+/// Disk boots remount only `/` so btrfs subvolumes such as `/var` and `/home` can stay
+/// writable on the same superblock.
 fn remount_root_read_only() -> Result<()> {
+    let flags = if read_cmdline().contains_key("VIRTKIT_BOOT") {
+        libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY
+    } else {
+        libc::MS_REMOUNT | libc::MS_RDONLY
+    };
     let deadline = std::time::Instant::now() + RO_REMOUNT_WAIT;
     loop {
         // SAFETY: sync(2) has no failure mode.
         unsafe { libc::sync() };
-        match mount("", "/", "", libc::MS_REMOUNT | libc::MS_RDONLY) {
+        match mount("", "/", "", flags) {
             Ok(()) => {
                 info!("vk-agent image-init: remounted / read-only for the handoff");
                 return Ok(());
@@ -877,6 +930,58 @@ fn passwd_home(user: &str) -> Option<std::ffi::OsString> {
         let bytes = std::ffi::CStr::from_ptr((*p).pw_dir).to_bytes();
         (!bytes.is_empty()).then(|| std::ffi::OsStr::from_bytes(bytes).to_os_string())
     }
+}
+
+/// Use the guest's `mount` for fstab entries on btrfs, ext2, ext4 and vfat, including
+/// subvolumes, /boot, data volumes and the ESP. Mount failures warn and allow handoff.
+fn mount_fstab() {
+    match std::process::Command::new("mount")
+        .args(["-a", "-t", "btrfs,ext2,ext4,vfat"])
+        .status()
+    {
+        Ok(st) if st.success() => info!("vk-agent image-init: mounted the fstab's filesystems"),
+        Ok(st) => warn!("vk-agent image-init: mount -a: {st}"),
+        Err(e) => warn!("vk-agent image-init: running mount -a: {e}"),
+    }
+}
+
+/// Load [`vk_core::runcfg::MODPROBE_LIST`] with the guest initrd's `modprobe` and module tree.
+/// A built-in can succeed without loading a module. Warn on a failed lookup and continue.
+fn modprobe_listed() {
+    let list = match std::fs::read_to_string(format!("/{}", vk_core::runcfg::MODPROBE_LIST)) {
+        Ok(list) => list,
+        Err(e) => {
+            warn!("vk-agent preinit: reading the module list: {e} — loading no modules");
+            return;
+        }
+    };
+    // modprobe reads parameters from /proc/cmdline and loaded-module state from /sys.
+    // A sysfs mount failure still allows the load attempt.
+    let _ = std::fs::create_dir_all("/sys");
+    let _ = mount("sysfs", "/sys", "sysfs", 0);
+    let mut loaded = 0;
+    let mods: Vec<&str> = list
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    for m in &mods {
+        match std::process::Command::new("modprobe").arg(m).status() {
+            Ok(st) if st.success() => loaded += 1,
+            Ok(st) => warn!("vk-agent preinit: modprobe {m}: {st}"),
+            Err(e) => {
+                warn!("vk-agent preinit: running modprobe: {e} — loading no modules");
+                return;
+            }
+        }
+    }
+    info!(
+        "vk-agent preinit: modprobe loaded {loaded}/{} modules",
+        mods.len()
+    );
+    // Detach sysfs before the pivot hides it. The real root mounts its own.
+    // SAFETY: a NUL-terminated literal path; a failure only leaves the mount in place.
+    let _ = unsafe { libc::umount2(c"/sys".as_ptr(), libc::MNT_DETACH) };
 }
 
 /// Load the boot-critical modules listed (one absolute `.ko` path per line) in the

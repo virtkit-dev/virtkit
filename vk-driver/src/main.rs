@@ -26,6 +26,7 @@ mod atop_view;
 mod atoplog;
 mod autogc;
 mod blockrt;
+mod bootdisk;
 mod build;
 mod cachelock;
 mod check;
@@ -1910,6 +1911,19 @@ enum Cmd {
         /// whose btrfs module the preinit loads: the pinned kernel has none.
         #[arg(long, value_name = "PATH", help_heading = "Guest")]
         root_image: Option<PathBuf>,
+        /// Boot this persistent disk on the kernel in its own /boot (experimental)
+        ///
+        /// A GPT disk with an ext2 /boot partition of type XBOOTLDR and a root partition
+        /// of type `Linux root (x86-64)`, written in place. Every boot, a guest reboot
+        /// included, takes the newest vmlinuz/initrd.img pair in that /boot; the image
+        /// provides only the run's config. Needs `--init image|entrypoint`.
+        #[arg(
+            long,
+            value_name = "PATH",
+            help_heading = "Guest",
+            conflicts_with = "root_image"
+        )]
+        boot_disk: Option<PathBuf>,
         /// keep console=ttyS0 for a BYO stock kernel (`--kernel <path>`)
         ///
         /// For a kernel whose virtio-console (hvc0) is a module, so early boot output reaches
@@ -3628,6 +3642,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         workdir_cache,
         kernel,
         root_image,
+        boot_disk,
         console_serial,
         pmu,
         nested,
@@ -3874,6 +3889,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             workdir_cache: *workdir_cache,
             kernel: kernel.clone(),
             root_image: root_image.clone(),
+            boot_disk: boot_disk.clone(),
             console_serial: *console_serial,
             pmu: *pmu,
             nested: *nested,

@@ -2,9 +2,6 @@
 //! Check the header and entry array CRCs and each partition's bounds. A damaged primary
 //! is an error. The reader never consults the backup.
 
-// Only the tests use the reader until disk boot is wired up.
-#![allow(dead_code)]
-
 use anyhow::{Context, Result, bail};
 
 use crate::diskimg::DiskImage;

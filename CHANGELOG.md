@@ -9,6 +9,9 @@ All notable changes to virtkit will be documented in this file.
 - **Boot from a raw root image (experimental).** `vk run --root-image DISK` uses an ext4
   or btrfs disk as the root with `--init image|entrypoint` or `--kernel image`. For btrfs,
   use `--kernel image` with btrfs built in or available as a module.
+- **Boot a persistent disk with its own kernel (experimental).** `vk run --boot-disk DISK
+  --init image|entrypoint` selects the newest matching kernel and initrd in the GPT disk's
+  ext2 `/boot` on every boot, including guest reboots.
 
 ## [0.113.1] - 2026-11-20
 

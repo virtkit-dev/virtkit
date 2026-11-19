@@ -747,6 +747,10 @@ pub struct VmSpec {
     /// A snapshot directory ([`crate::vmmctl`]) the VM starts from instead of booting.
     #[serde(default)]
     pub restore_from: Option<PathBuf>,
+    /// Persistent `--boot-disk` media. `vk run` writes `kernel` and `initramfs` for the first
+    /// launch. On reset the keeper reads `/boot` again to pick up guest kernel upgrades.
+    #[serde(default)]
+    pub boot_disk: Option<crate::bootdisk::BootDisk>,
 }
 
 fn default_rng() -> bool {

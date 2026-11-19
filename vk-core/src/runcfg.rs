@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 /// real root (the pivot hides the initramfs).
 pub const INITRAMFS_PATH: &str = "virtkit-service.json";
 
+/// Archive path listing modules for the guest initrd's `modprobe` to load before mounting root.
+pub const MODPROBE_LIST: &str = "virtkit-modprobe";
+
 /// Guest file the embedded SSH server reads into every session's environment: how a
 /// development environment's `exec-env` reaches Remote-SSH's server process and terminals.
 /// The host writes it (as root, mode 0600) once the guest is up and again on every attach,

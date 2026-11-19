@@ -385,6 +385,8 @@ pub struct RunArgs {
     pub kernel: KernelSource,
     /// `--root-image`: a raw disk image to boot as the root instead of the image's ext4
     pub root_image: Option<PathBuf>,
+    /// `--boot-disk`: a persistent GPT disk booted on the kernel in its own `/boot`
+    pub boot_disk: Option<PathBuf>,
     /// Keep `console=ttyS0` (don't rewrite to hvc0) for a BYO stock kernel whose
     /// virtio-console is modular (`vk run --console-serial`). See [`crate::vmm::VmSpec`].
     pub console_serial: bool,
@@ -604,6 +606,7 @@ impl Default for RunArgs {
             workdir_cache: crate::vmm::ShareCache::Auto,
             kernel: KernelSource::Default,
             root_image: None,
+            boot_disk: None,
             console_serial: false,
             pmu: false,
             nested: false,
@@ -1706,6 +1709,15 @@ async fn build_and_boot(
             "x-virtkit.persist_root needs a root disk; --ram boots the rootfs from RAM with none"
         );
     }
+    if args.boot_disk.is_some() {
+        if !eff_init.is_image() {
+            bail!("--boot-disk needs --init image|entrypoint");
+        }
+        // The disk is the machine's root: a persistent root beside it would go unused.
+        if primary_persist_root.is_some() {
+            bail!("--boot-disk is the machine's root; a persist_root primary keeps another");
+        }
+    }
     if let (Some(root), Some(fstype)) = (&args.root_image, root_fstype) {
         let kernel = match (&args.kernel, primary_unit) {
             (KernelSource::Default, Some(unit)) => unit.kernel.clone(),
@@ -1936,8 +1948,55 @@ async fn build_and_boot(
     // needs the agent-as-/init handoff, and a modular image kernel needs the module
     // initramfs. A default/default run keeps the existing non-image branches below.
     // The axes are the merged effective values (CLI force > primary marker > default).
+    // Keep the disk and vk archive paths so the keeper can refresh the boot media on reset.
+    let mut boot_disk: Option<crate::bootdisk::BootDisk> = None;
     let (mut disks, initramfs, mut cmdline): (Vec<crate::vmm::Disk>, Option<PathBuf>, String) =
-        if eff_init.is_image() || eff_kernel == KernelSource::Image {
+        if let Some(disk) = &args.boot_disk {
+            // The disk supplies the kernel and root partition. The image supplies only the run config.
+            let disk = std::fs::canonicalize(disk)
+                .with_context(|| format!("--boot-disk {}: cannot access", disk.display()))?;
+            let boot_cfg = vk_core::runcfg::RunConfig {
+                env: image_env.clone(),
+                user: primary_user.clone(),
+                workdir: image_workdir.clone(),
+                entrypoint: image_entrypoint.clone(),
+                cmd: image_cmd.clone(),
+                handoff: eff_handoff.clone(),
+                ..Default::default()
+            };
+            let vk_cpio = medium("vk.cpio")?;
+            crate::bootdisk::build_vk_cpio(agent, &boot_cfg, &vk_cpio)?;
+            let kernel_medium = medium("vmlinuz")?;
+            let preinit = medium("initramfs.cpio")?;
+            let bd = crate::bootdisk::BootDisk {
+                disk: disk.clone(),
+                vk_cpio,
+            };
+            // Read once here so a disk vk cannot boot fails the run, not the boot child.
+            let resolved = crate::bootdisk::resolve(&bd, &kernel_medium, &preinit)
+                .with_context(|| format!("--boot-disk {}", disk.display()))?;
+            println!(
+                "virtkit: booting {} from the /boot of {}",
+                resolved.release,
+                disk.display()
+            );
+            let root = crate::bootdisk::root_partition(&disk)?;
+            boot_kernel = kernel_medium;
+            boot_disk = Some(bd);
+            let mut kcmd = format!(
+                "console=ttyS0 pci=conf1 VIRTKIT_PIVOT=/dev/vda{root} \
+                 VIRTKIT_VSOCK_PORT={VSOCK_PORT} VIRTKIT_HOSTNAME={} VIRTKIT_KERNEL=image \
+                 VIRTKIT_BOOT=disk",
+                primary_hostname.as_deref().unwrap_or(PRIMARY_HOSTNAME)
+            );
+            kcmd.push_str(&eff_init.handoff_tokens());
+            kcmd.push_str(eff_root.cmdline_token());
+            (
+                vec![crate::vmm::Disk::for_image(disk, false)?],
+                Some(preinit),
+                kcmd,
+            )
+        } else if eff_init.is_image() || eff_kernel == KernelSource::Image {
             // Boot via the preinit initramfs. First get the raw ext4: a `-f` build already
             // produced one (dockerfile_ext4), otherwise build root.ext4 from the image
             // source exactly as the disk path below does.
@@ -2739,7 +2798,8 @@ async fn build_and_boot(
         .iter()
         .chain(&args.volumes)
         .any(|v| v.disk && !v.read_only)
-        || args.extra_disks.iter().any(|(_, readonly)| !readonly);
+        || args.extra_disks.iter().any(|(_, readonly)| !readonly)
+        || boot_disk.is_some();
     let spec = crate::vmm::VmSpec {
         kernel: boot_kernel,
         cmdline,
@@ -2777,6 +2837,7 @@ async fn build_and_boot(
         serial_input: None,
         control: None,
         restore_from: None,
+        boot_disk,
     };
     // Control server on the primary's per-port control socket — only the
     // primary's guest can reach it, so the control plane is scoped to this run —
@@ -5942,6 +6003,7 @@ pub(crate) async fn boot_session(
         serial_input: None,
         control: None,
         restore_from: None,
+        boot_disk: None,
     };
     let vmm = crate::vmm::selected();
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
@@ -8699,6 +8761,7 @@ mod tests {
             serial_input: None,
             control: None,
             restore_from: None,
+            boot_disk: None,
         };
         let mut child = spawn_vmm(&CatVmm, &spec, crate::prio::Prio::Normal).unwrap();
         assert!(child.wait().unwrap().success());

@@ -1,6 +1,7 @@
 # Booting an OCI-seeded VM from its persistent disk
 
-**Status:** Proposed for x86-64 Linux guests. The compose `boot: disk` mode is unimplemented.
+**Status:** Experimental `vk run --boot-disk` implements part of phase 1 for x86-64 Linux
+guests. Compose `boot: disk` remains proposed.
 
 **Source baseline:** virtkit release 0.113.1, plus ext2 block-map support in
 `vk-driver/src/ext4_read.rs`. Paths refer to virtkit. The target is an appliance installed from

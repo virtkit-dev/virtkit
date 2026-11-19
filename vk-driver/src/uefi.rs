@@ -643,6 +643,7 @@ pub(crate) fn guest_spec(
         serial_input: Some(work.join(CONSOLE_SOCKET)),
         control: Some(work.join(CONTROL_SOCKET)),
         restore_from: restore.map(Path::to_path_buf),
+        boot_disk: None,
     })
 }
 

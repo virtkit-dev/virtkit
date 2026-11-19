@@ -49,7 +49,6 @@ impl DiskImage {
     }
 
     /// Return a window of `len` bytes starting at `offset` in this window.
-    #[allow(dead_code)] // used by tests until disk boot reads partitions
     pub fn slice(self, offset: u64, len: u64) -> Result<Self> {
         let end = offset.checked_add(len).context("window end overflows")?;
         if end > self.len {
