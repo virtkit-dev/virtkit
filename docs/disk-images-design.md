@@ -42,7 +42,8 @@ lifetime (one pipeline, or every pipeline until gc).
 An installed Debian-based appliance is a partitioned disk: ESP, LVM, btrfs subvolumes,
 optionally LUKS, its own GRUB, kernel and initramfs. Only the UEFI path boots it as it is,
 through its boot loader, which an upgrade test must exercise anyway (upgrades replace the
-kernel and GRUB).
+kernel and GRUB). For direct kernel boot without firmware, see the
+[proposal to boot from the machine's own disk](vm-boot-from-disk-design.md).
 
 ## Design
 
