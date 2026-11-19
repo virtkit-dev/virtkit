@@ -316,6 +316,16 @@ fn guest_status(result: vk_core::messages::CmdResult) -> Result<()> {
     }
 }
 
+/// Return the command's exit code or 128 + the terminating signal number.
+/// Reject a missing status so the build cannot cache a step whose outcome is unknown.
+fn session_exit_code(r: &vk_core::messages::CmdResult) -> Result<i32> {
+    match (r.code, r.signal) {
+        (Some(code), _) => Ok(code),
+        (None, Some(signal)) => Ok(128i32.saturating_add(signal.max(1))),
+        (None, None) => bail!("the guest command ended without an exit status"),
+    }
+}
+
 /// A stop signal (its number) that ended the run during the services' starts. [`run`] then
 /// exits as the signal's default action would have, with 128 + its number, so a `--detach`
 /// parent reports the failure.
@@ -5950,7 +5960,7 @@ impl VmSession {
     }
 
     /// Run `command` (optionally as `user`) in the live guest, relaying its output through
-    /// `sink`; returns its exit code.
+    /// `sink`; returns its exit code, 128 + the signal's number for a killed command.
     pub(crate) async fn exec(
         &self,
         command: &[String],
@@ -5980,7 +5990,7 @@ impl VmSession {
         )
         .await
         .context("running the command in the guest")?;
-        Ok(r.code.unwrap_or(0))
+        session_exit_code(&r)
     }
 
     /// Fetch this stage guest's OOM kills through the session so cancellation also stops the
@@ -6649,6 +6659,18 @@ mod tests {
         let result = guest_exit(&e).expect("a signal is a GuestExit too");
         assert_eq!((result.code, result.signal), (None, Some(9)));
         assert!(e.to_string().contains("killed by signal 9"), "{e}");
+    }
+
+    #[test]
+    fn session_exit_code_never_reads_a_killed_command_as_success() {
+        let r = |code, signal| session_exit_code(&CmdResult { code, signal });
+        assert_eq!(r(Some(0), None).unwrap(), 0);
+        assert_eq!(r(Some(2), None).unwrap(), 2);
+        // SIGKILL, including an OOM kill, gives shell status 137.
+        assert_eq!(r(None, Some(9)).unwrap(), 137);
+        // A bogus signal number from the agent still fails.
+        assert_ne!(r(None, Some(0)).unwrap(), 0);
+        assert!(r(None, None).is_err());
     }
 
     fn no_units() -> std::sync::Arc<crate::manager::Manager> {

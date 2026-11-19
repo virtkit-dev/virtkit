@@ -40,6 +40,10 @@ All notable changes to virtkit will be documented in this file.
   As in Docker, `<<- EOF` and `cat<<EOF` do not open a heredoc. An unknown instruction
   in the intended body now stops the build. Previously the build could succeed with the
   intended file missing.
+- **`vk build` fails when a `RUN` or `COPY` process dies from a signal**, including an
+  out-of-memory kill. The guest command's status is 128 + the signal number. A missing
+  status also fails the step. Earlier builds could cache and export a partial layer.
+  The next build rebuilds layers from the old cache generation.
 
 ## [0.113.0] - 2026-11-18
 

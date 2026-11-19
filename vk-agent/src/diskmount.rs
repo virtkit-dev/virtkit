@@ -107,8 +107,8 @@ fn is_live_image_content(p: &Path, root_dev: u64) -> bool {
             .is_some_and(|m| m.dev() == root_dev)
 }
 
-/// The exit code `cleanup-pending` reports: 0 when `cleanup` will still change the image, so the
-/// host's `matches!(…, Ok(0))` probe reads a shell-style "yes".
+/// `cleanup-pending` returns 0 if cleanup will change the image and 1 otherwise.
+/// Only 1 skips the host's re-push. A probe killed by SIGKILL returns 137.
 fn pending_exit_code(pending: bool) -> i32 {
     i32::from(!pending)
 }

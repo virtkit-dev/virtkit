@@ -3048,18 +3048,11 @@ impl Executor for MicroVm {
                 Some(session) => {
                     let argv = [GUEST_AGENT.to_string(), "cleanup-pending".to_string()];
                     match block_on(session.exec(&argv, None, &self.output_sink)) {
-                        Ok(code) => code == 0,
-                        Err(e) => {
-                            // Not knowing leaves the mid-stage snapshot published under this
-                            // stage's final key, so a later cached build would ship bytes the
-                            // export does not have. Say so rather than diverge silently.
-                            eprintln!(
-                                "virtkit: build: could not ask the guest whether its shutdown \
-                                 changes the image ({e:#}) — this stage's cache entry may not \
-                                 match the exported image"
-                            );
-                            false
-                        }
+                        // Only 1 rules out cleanup changes. Re-pushing an unchanged image is harmless.
+                        Ok(code) => code != 1,
+                        // A failed probe could leave a mid-stage snapshot under the final key.
+                        // Re-push the finished image so a cache hit matches the export.
+                        Err(_) => true,
                     }
                 }
             };

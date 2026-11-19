@@ -3930,7 +3930,7 @@ fn stage_input_rootfs(
 /// other key from one of those roots, so this alone invalidates a whole cache generation.
 /// An old entry does not need deleting: it simply stops being looked up, and idle GC
 /// reclaims it like any other unused blob.
-const CACHE_KEY_VERSION: &str = "5";
+const CACHE_KEY_VERSION: &str = "6";
 
 /// The namespaces a build-cache key can belong to. One `build-cache` repository holds every
 /// kind of cached artefact, so a key says which kind it is — both to a reader (`/browse`,
