@@ -546,7 +546,7 @@ mod tests {
             ["RUN cat <<EOF > it's", "x", "EOF"]
         );
         // `<<- EOF` and a bare `<<-` are no heredoc words, as in buildkit: the lines after them
-        // stay instructions
+        // stay instructions, so `vk build` rejects `x`.
         assert_eq!(
             texts("RUN cat > /f <<- EOF\nx\nRUN echo ok # <<-\nCMD y\n"),
             ["RUN cat > /f <<- EOF", "x", "RUN echo ok # <<-", "CMD y"]

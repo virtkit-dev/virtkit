@@ -36,6 +36,10 @@ All notable changes to virtkit will be documented in this file.
   heredoc scripts starting with `#!`, and all heredocs in Windows builds. Progress, step
   errors and `--print-plan` identify the step by its opening command. The guest's logged
   exec request omits the body. The hub ignores stage declarations and hints inside heredocs.
+- **`vk build` rejects unknown Dockerfile instructions**, including misspelt keywords.
+  As in Docker, `<<- EOF` and `cat<<EOF` do not open a heredoc. An unknown instruction
+  in the intended body now stops the build. Previously the build could succeed with the
+  intended file missing.
 
 ## [0.113.0] - 2026-11-18
 

@@ -2,11 +2,12 @@
 //!
 //! `vk_hub_proto::dockerfile` splits instruction lines for both this parser and the hub's
 //! definition reader using BuildKit's continuation and parser directive rules. The parser
-//! models FROM, RUN, COPY, ARG, ENV, WORKDIR, USER, LABEL, ENTRYPOINT and CMD. It accepts
-//! other keywords as `Other`, with an uppercase name and trimmed arguments, for the planner
-//! and executor to interpret. A standalone `RUN <<EOF` supplies a script. A command such
-//! as `RUN cat > f <<'EOF'` receives the body on stdin. The parser rejects `#!` scripts
-//! and heredocs on COPY, ADD and ONBUILD. The build rejects RUN heredocs on Windows or
+//! models FROM, RUN, COPY, ARG, ENV, WORKDIR, USER, LABEL, ENTRYPOINT and CMD. For other
+//! known instructions, `Other` preserves the uppercase name and trimmed arguments for the
+//! planner and executor. The parser rejects unknown keywords. A standalone `RUN <<EOF`
+//! supplies a script. A command such as `RUN cat > f <<'EOF'` receives the body on stdin.
+//! The parser rejects `#!` scripts and heredocs on COPY, ADD and ONBUILD. The build
+//! rejects RUN heredocs on Windows or
 //! under a nondefault SHELL. The surveyed images use neither ADD nor ONBUILD, so the
 //! parser leaves both unimplemented (see the feature survey).
 
@@ -354,12 +355,26 @@ fn parse_instruction(line: &str) -> Result<Instruction> {
         "USER" => Instruction::User(rest.to_string()),
         "ENTRYPOINT" => Instruction::Entrypoint(parse_cmdline(rest)),
         "CMD" => Instruction::Cmd(parse_cmdline(rest)),
-        other => Instruction::Other {
+        other if UNMODELLED.contains(&other) => Instruction::Other {
             name: other.to_string(),
             args: rest.to_string(),
         },
+        _ => bail!("unknown instruction: {kw}"),
     })
 }
+
+/// Known instructions passed to each build as [`Instruction::Other`]. Builds handle
+/// instructions such as EXPOSE and Windows SHELL and reject or skip the rest.
+const UNMODELLED: [&str; 8] = [
+    "ADD",
+    "EXPOSE",
+    "HEALTHCHECK",
+    "MAINTAINER",
+    "ONBUILD",
+    "SHELL",
+    "STOPSIGNAL",
+    "VOLUME",
+];
 
 fn parse_from(rest: &str) -> Result<From> {
     // [--flag=value ...] <image> [--flag=value ...] [AS <name>]
@@ -811,6 +826,16 @@ mod tests {
                 "FROM x\nONBUILD RUN <<EOF\nENV A=B\nEOF\n",
                 "heredoc on ONBUILD",
             ),
+            // As in BuildKit, none opens a heredoc. The unclosed quote fails lexing.
+            ("FROM x\nRUN cat <<'EOF\nx\n", "unknown instruction: x"),
+            (
+                "FROM x\nRUN cat > /f <<- EOF\npayload\nEOF\n",
+                "unknown instruction: payload",
+            ),
+            (
+                "FROM x\nRUN cat<<EOF >/f\npayload\nEOF\n",
+                "unknown instruction: payload",
+            ),
             ("# escape=x\nFROM x\n", "invalid escape token"),
             ("FROM x\nRUN <<EOF\n#!/usr/bin/python3\nEOF\n", "#!"),
         ] {
@@ -1202,7 +1227,17 @@ mod tests {
     }
 
     #[test]
-    fn arg_env_and_unknown_kept_verbatim() {
+    fn an_unknown_instruction_is_refused_and_an_unmodelled_one_kept() {
+        let err = format!("{:#}", parse("FROM x\nRNU make\n").unwrap_err());
+        assert!(err.contains("unknown instruction: RNU"), "{err}");
+        for kw in UNMODELLED {
+            let df = parse(&format!("FROM x\n{} a\n", kw.to_ascii_lowercase())).unwrap();
+            assert_eq!(keyword_of(&df.instructions[1]), kw);
+        }
+    }
+
+    #[test]
+    fn arg_env_and_unmodelled_kept_verbatim() {
         let df = parse("ARG debversion=bookworm-20231120\nENV A=1 B=2\nEXPOSE 8080\n").unwrap();
         assert_eq!(
             df.instructions[0],
