@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk dev list` shows stable workspace-based names for `vk dev stop`, `gc` and `prune`.
+  `vk run --name` sets an explicit name. Runs with `--state-dir` or `--detach` get a name
+  from what they boot. Services-only compose runs stay unnamed.
+
 ### Fixed
 
 - `vk dev up` can finish setting up a running environment after the process that started it

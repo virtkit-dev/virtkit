@@ -244,7 +244,30 @@ async fn ready_booted(plan: &Plan, readying: &Readying) -> Result<()> {
             storage_backings,
             readied_by_its_boot: by_its_boot,
         },
-    )
+    )?;
+    name_environment(plan);
+    Ok(())
+}
+
+/// Claim a stable name after recording the environment's identity. Only direct children
+/// of the dev base are discoverable by name. If the claim fails, the directory name
+/// still works and the next listing or name lookup retries.
+fn name_environment(plan: &Plan) {
+    let named = crate::dev::plan::dev_state_base().and_then(|base| {
+        let parent = plan.state_dir.parent().map(crate::vms::canonical);
+        if parent != Some(crate::vms::canonical(&base)) {
+            return Ok(());
+        }
+        let name = crate::dev::list::default_name(&plan.workspace, &plan.environment);
+        crate::names::Index::open()?.claim(&plan.state_dir, &name)?;
+        Ok(())
+    });
+    if let Err(e) = named {
+        eprintln!(
+            "vk: warning: naming the {} environment: {e:#}",
+            plan.environment
+        );
+    }
 }
 
 /// Serialize `exec-env` for the guest's SSH server as one `NAME=value` per line. Skip names

@@ -65,6 +65,7 @@ mod libkrun_sys;
 mod local;
 mod manager;
 mod mkoci;
+mod names;
 mod net;
 mod node;
 mod numa;
@@ -95,6 +96,7 @@ mod spawn;
 mod sshagent;
 mod sshclient;
 mod sshconf;
+mod statefile;
 mod switch;
 mod task;
 mod term;
@@ -2318,13 +2320,13 @@ enum Cmd {
         ssh_key: Vec<String>,
         /// Write a ready-to-use SSH client setup into the state dir
         ///
-        /// Implies --ssh and needs --state-dir. Generates a keypair of its own (reused on
+        /// Implies --ssh and needs a state dir: --state-dir, --name or --detach. Generates a keypair of its own (reused on
         /// later boots, so nothing else is authorised by default), and writes `ssh-config`
         /// plus `ssh`, `scp` and `sftp` shims in `bin/` beside it: connect with `vk ssh
         /// <state-dir>`, `ssh -F <state-dir>/ssh-config <alias>`, or by putting
         /// `<state-dir>/bin` first on PATH for a program that spawns the bare tools (VS Code
         /// Remote-SSH, Emacs TRAMP). Needs `ssh`, `scp` and `sftp` on the host's PATH.
-        #[arg(long = "ssh-client", requires = "state_dir", help_heading = "SSH")]
+        #[arg(long = "ssh-client", help_heading = "SSH")]
         ssh_client: bool,
         /// Host alias the --ssh-client config declares
         ///
@@ -2368,15 +2370,37 @@ enum Cmd {
         insecure: bool,
         /// pin the run's sockets, console log and build media to this directory
         ///
-        /// Created/reused, mode 0700, never removed — instead of a fresh temp dir, so external
+        /// Created/reused, mode 0700, kept (only an empty one under vk's own
+        /// `$XDG_STATE_HOME/virtkit/run` may be removed) — instead of a fresh temp dir, so external
         /// tooling can attach to the running VM: `vk-agent -s vsock-auto://DIR/vsock.sock:4444
         /// exec …`.
         #[arg(
             long = "state-dir",
             value_name = "DIR",
+            overrides_with = "state_dir",
             help_heading = "Mounts and disks"
         )]
         state_dir: Option<PathBuf>,
+        /// name the VM, a handle it keeps after it stops
+        ///
+        /// 1 to 40 of a-z, 0-9, `.`, `_` and `-`, starting with a letter or a digit, and not
+        /// all digits (that reads as a pid). Without `--state-dir`, the VM gets a state dir of its own under
+        /// `$XDG_STATE_HOME/virtkit/run`, kept after it stops.
+        /// A `--state-dir` or `--detach` run without a name gets one from what it boots;
+        /// compose up, which boots no primary VM, takes none. A named run keeps its whole
+        /// command line, `--password` included, in `run.json` in its state dir, readable by
+        /// its owner alone. The last `--name`, `--state-dir` and `--detach` given win, so a
+        /// script can override its own.
+        #[arg(
+            long,
+            value_name = "NAME",
+            overrides_with = "name",
+            help_heading = "Detach"
+        )]
+        name: Option<String>,
+        /// set by `main` for a remembered run: its name, recipe and state-dir lock
+        #[arg(skip)]
+        remembered: Option<std::sync::Arc<names::Remembered>>,
         /// with --compose, the workspace root it reads as `${VK_WORKSPACE}` [default: the cwd]
         ///
         /// The project the run is about. Naming it here lets the committed file say
@@ -2525,7 +2549,10 @@ enum Cmd {
         /// The build + boot run in the foreground (Ctrl-C aborts them), then `vk` detaches so
         /// the terminal is freed while the VM keeps running. Intended for a long-lived run
         /// (`--ssh`, or `-- sleep infinity`).
-        #[arg(long = "detach", help_heading = "Detach")]
+        ///
+        /// A detached run is named and remembered as with `--name`, except a compose up, which
+        /// boots no primary.
+        #[arg(long = "detach", overrides_with = "detach", help_heading = "Detach")]
         detach: bool,
         /// With --detach, power the VM off after this many idle seconds
         ///
@@ -2968,11 +2995,20 @@ fn main() -> ExitCode {
     // Parsed here, before the fork below and before any runtime exists: what detaches is a
     // property of the command, and clap answers `--help`/`--version` by printing and
     // exiting — so neither is ever forked and printed twice.
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     // Before the fork, so the detaching parent is quiet too.
     if let Cmd::Run { quiet: true, .. } = &cli.cmd {
         quiet::set();
     }
+
+    // A named or detached run gets its name and state dir now, before the fork, so the
+    // parent and the daemon agree on them and a failure is reported in the foreground: an
+    // invalid or taken name as a usage error, a failure to record it as a run failure.
+    let prepared = match prepare_run_name(&mut cli.cmd) {
+        Ok(p) => p,
+        Err(e) if e.downcast_ref::<names::Refused>().is_some() => return fail(&e, 2),
+        Err(e) => return fail(&e, 1),
+    };
 
     // `vk run … --detach`, and the `vk dev` actions that boot — daemonize once the guest is
     // ready. The fork must precede the Tokio runtime (forking a live multi-threaded runtime
@@ -2988,10 +3024,234 @@ fn main() -> ExitCode {
             detach::note_after_boot();
             return on_runtime(cli);
         }
+        // Report the final name, including any automatic collision suffix.
+        if let (true, Cmd::Run { name: Some(n), .. }) = (ok, &cli.cmd) {
+            quiet::enote!("virtkit: the VM is named {n}");
+        }
         return code;
     }
 
-    on_runtime(cli)
+    let code = on_runtime(cli);
+    // Only the process that ran the VM knows whether it became ready.
+    prepared.settle();
+    code
+}
+
+/// Resources to release if the VM never becomes ready. A leftover provisional name
+/// would block a retry until reclaimed.
+#[derive(Debug, Default)]
+struct Prepared {
+    /// the remembered run, whose state-dir lock this holds until it is settled
+    remembered: Option<std::sync::Arc<names::Remembered>>,
+    /// this invocation gave the dir its name, under the index lock
+    name_made: bool,
+    /// this invocation created the dir, under the run base
+    dir_made: bool,
+}
+
+impl Prepared {
+    /// Take back what was made if the run never had a VM up. The state dir's lock is still
+    /// held, as it has been since before the name was claimed, so no other run used the dir
+    /// meanwhile: what was made is this run's alone.
+    fn settle(&self) {
+        let Some(r) = &self.remembered else {
+            return;
+        };
+        if r.up() {
+            return;
+        }
+        if self.name_made
+            && let Err(e) = r.index().release(r.dir())
+        {
+            eprintln!("vk: warning: giving back the name {}: {e:#}", r.name());
+        }
+        if self.dir_made {
+            // Name release is independent of this best-effort directory cleanup.
+            let _ = std::fs::remove_dir_all(r.dir());
+        }
+    }
+}
+
+/// Prepare a primary VM's state directory and provisional name for `--name`,
+/// `--state-dir` or `--detach`. Allocate a directory if needed and lock it before the
+/// claim until the run ends. [`names::Remembered::publish`] commits the name and writes
+/// `run.json` at readiness. [`Prepared::settle`] handles an unsuccessful boot.
+fn prepare_run_name(cmd: &mut Cmd) -> anyhow::Result<Prepared> {
+    prepare_run_name_in(cmd, || Ok((names::Index::open()?, names::run_base()?)))
+}
+
+/// [`prepare_run_name`] with the name index and the run base `places()` returns.
+fn prepare_run_name_in(
+    cmd: &mut Cmd,
+    places: impl FnOnce() -> anyhow::Result<(names::Index, PathBuf)>,
+) -> anyhow::Result<Prepared> {
+    let Cmd::Run {
+        name,
+        state_dir,
+        remembered,
+        detach,
+        image,
+        file,
+        compose,
+        primary,
+        target,
+        workspace,
+        workdir,
+        ..
+    } = cmd
+    else {
+        return Ok(Prepared::default());
+    };
+    if boots_no_primary(image.as_deref(), file, primary.as_deref()) {
+        // Nothing to run at all: the run says so itself, and nothing is named for it.
+        if compose.is_none() {
+            return Ok(Prepared::default());
+        }
+        // Services-only compose runs have no primary VM to name.
+        if let Some(n) = name {
+            return Err(names::refuse(format!(
+                "--name {n}: compose up (no image, -f or --primary) boots no VM to name; \
+                 give it a primary, or leave the name out"
+            )));
+        }
+        return Ok(Prepared::default());
+    }
+    if name.is_none() && state_dir.is_none() && !*detach {
+        return Ok(Prepared::default());
+    }
+    if let Some(n) = name.as_deref() {
+        names::validate(n)?;
+    }
+    let project = workspace
+        .as_deref()
+        .or(workdir.as_deref())
+        .map(std::path::absolute)
+        .transpose()?;
+    let recipe = names::Recipe::now(project)?;
+    let base = auto_name_base(
+        image.as_deref(),
+        !file.is_empty(),
+        primary.as_deref(),
+        target.as_deref(),
+        &recipe.project_dir,
+    );
+    let (idx, run_base) = places()?;
+    let (dir, dir_made) = match state_dir.as_deref() {
+        Some(d) => (run_state_dir(d)?, false),
+        None => {
+            let readable = name.clone().unwrap_or_else(|| names::sanitize(&base));
+            (new_run_dir(&run_base, &readable, detach::nonce)?, true)
+        }
+    };
+    // The lock first: a name is claimed, and given back, only by the run that holds the dir.
+    // Provisional until the VM is first up: a run killed before then leaves a name the next
+    // claim takes back.
+    let claimed = run::lock_state_dir(&dir).and_then(|lock| {
+        let (given, created) = match name.as_deref() {
+            Some(n) => (n.to_string(), idx.provisional().claim_exact(&dir, n)?),
+            None => idx.provisional().claim(&dir, &base)?,
+        };
+        Ok((lock, given, created))
+    });
+    let (lock, given, name_made) = match claimed {
+        Ok(claimed) => claimed,
+        Err(e) => {
+            if dir_made {
+                // Empty, and made by this call.
+                let _ = std::fs::remove_dir(&dir);
+            }
+            return Err(e);
+        }
+    };
+    *name = Some(given.clone());
+    *state_dir = Some(dir.clone());
+    let r = std::sync::Arc::new(names::Remembered::new(dir, lock, idx, given, recipe));
+    *remembered = Some(r.clone());
+    Ok(Prepared {
+        remembered: Some(r),
+        name_made,
+        dir_made,
+    })
+}
+
+/// Create missing directories with owner-only permissions and return the canonical
+/// `--state-dir` path for the name index.
+fn run_state_dir(dir: &Path) -> anyhow::Result<PathBuf> {
+    let dir = std::path::absolute(dir)?;
+    crate::statefile::create_dir_all(&dir)?;
+    Ok(vms::canonical(&dir))
+}
+
+/// A managed state dir for a run named `name`, `<run_base>/<name>-<token>`, created by this
+/// call and no other: a token already taken is drawn again. `name` is cut short as needed
+/// for the VMM's sockets to fit under the dir.
+fn new_run_dir(
+    run_base: &Path,
+    name: &str,
+    mut token: impl FnMut() -> String,
+) -> anyhow::Result<PathBuf> {
+    crate::statefile::create_dir_all(run_base)?;
+    let run_base = vms::canonical(run_base);
+    for _ in 0..16 {
+        let token = token();
+        let token = token.get(..8).unwrap_or(&token);
+        // At least one byte of the name, then `-` and the token.
+        let keep = crate::dev::plan::state_dir_room(&run_base)?
+            .checked_sub(1 + token.len())
+            .filter(|keep| *keep >= 1)
+            .ok_or_else(|| crate::dev::plan::no_room(&run_base))?;
+        // ASCII: a name is, and so is what sanitizing leaves.
+        let readable = name.get(..keep.min(name.len())).unwrap_or(name);
+        let dir = run_base.join(format!("{readable}-{token}"));
+        match crate::statefile::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!("creating {}", dir.display())));
+            }
+        }
+    }
+    anyhow::bail!("no free state directory name under {}", run_base.display())
+}
+
+/// Whether the command supplies no primary image, Dockerfile or compose primary.
+fn boots_no_primary(image: Option<&str>, file: &[PathBuf], primary: Option<&str>) -> bool {
+    file.is_empty() && image.is_none() && primary.is_none()
+}
+
+/// What an unnamed run is called after, by the source it boots (as [`run`] picks it): the
+/// compose primary; for a Dockerfile, its target, else its project directory's name, as a dev
+/// environment is named; else the image's own name (no registry, no tag); else `vm`.
+fn auto_name_base(
+    image: Option<&str>,
+    dockerfile: bool,
+    primary: Option<&str>,
+    target: Option<&str>,
+    project: &Path,
+) -> String {
+    if let Some(p) = primary {
+        return p.to_string();
+    }
+    if dockerfile {
+        if let Some(t) = target {
+            return t.to_string();
+        }
+        return project
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "vm".into());
+    }
+    let Some(image) = image else {
+        return "vm".into();
+    };
+    let last = image
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(image);
+    let last = last.split('@').next().unwrap_or(last);
+    last.split(':').next().unwrap_or(last).to_string()
 }
 
 /// The CLI proper runs on a Tokio runtime (formerly `#[tokio::main]`).
@@ -3723,6 +3983,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         ssh_alias,
         ssh_user,
         state_dir,
+        remembered,
         workspace,
         volume,
         symlink,
@@ -3742,7 +4003,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         ..
     } = &cli.cmd
     {
-        let services_only = file.is_empty() && image.is_none() && primary.is_none();
+        let services_only = boots_no_primary(image.as_deref(), file, primary.as_deref());
         if services_only && compose.is_none() {
             return fail(
                 &anyhow::anyhow!("run needs an image, --file <Dockerfile>, or a --compose file"),
@@ -3971,6 +4232,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             ssh_alias: ssh_alias.clone(),
             ssh_user: ssh_user.clone(),
             state_dir: state_dir.clone(),
+            remembered: remembered.clone(),
             workspace: workspace.clone(),
             volumes,
             symlinks,
@@ -3988,9 +4250,20 @@ async fn cli_main(cli: Cli) -> ExitCode {
             detach_log: detach_log.clone(),
             command: command.clone(),
         };
+        // `main` gave a named or detached run its state dir; any other needs `--state-dir`.
+        if args.ssh_client && args.state_dir.is_none() {
+            return fail(
+                &anyhow::anyhow!("--ssh-client needs a state dir: --state-dir, --name or --detach"),
+                2,
+            );
+        }
         return match run::run(&args, &cfg).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) if build::not_cached(&e) => fail(&e, 3),
+            // Returned rather than exited on, so `main` still gives back a name it made.
+            Err(e) if let Some(code) = run::stop_code(&e) => {
+                ExitCode::from(u8::try_from(code).unwrap_or(1))
+            }
             Err(e) => match run::guest_exit(&e) {
                 // Reproduce the guest's exit code or terminating signal, as `vk exec` does.
                 Some(result) => exec::exit(result),
@@ -7872,6 +8145,304 @@ mod tests {
                 "update"
             ]
         );
+    }
+
+    #[test]
+    fn an_unnamed_run_is_named_after_what_it_boots() {
+        let p = Path::new("/home/me/shop");
+        let image = |i| auto_name_base(Some(i), false, None, None, p);
+        assert_eq!(image("alpine:3.20"), "alpine");
+        assert_eq!(image("ghcr.io/org/tool@sha256:ab"), "tool");
+        assert_eq!(image("./bundles/win11/"), "win11");
+        assert_eq!(
+            auto_name_base(Some("x"), true, Some("devcontainer"), Some("t"), p),
+            "devcontainer"
+        );
+        assert_eq!(auto_name_base(None, true, None, Some("dev"), p), "dev");
+        // A Dockerfile with no target: the project it is about.
+        assert_eq!(auto_name_base(None, true, None, None, p), "shop");
+        assert_eq!(auto_name_base(None, true, None, None, Path::new("/")), "vm");
+        // A Dockerfile supplies the root, so an image beside it names nothing.
+        assert_eq!(auto_name_base(Some("alpine"), true, None, None, p), "shop");
+    }
+
+    /// A run with nothing to boot is refused by the run itself: nothing is named for it, so
+    /// the corrected command that follows finds its name free.
+    #[test]
+    fn a_run_with_nothing_to_boot_claims_no_name() {
+        let mut cli = Cli::try_parse_from(["vk", "run", "--name", "nothing-to-boot"]).unwrap();
+        let made = prepare_run_name(&mut cli.cmd).unwrap();
+        assert!(made.remembered.is_none() && !made.name_made && !made.dir_made);
+        let Cmd::Run { state_dir, .. } = cli.cmd else {
+            panic!("not a run");
+        };
+        assert_eq!(state_dir, None);
+    }
+
+    /// Services-only compose runs stay unnamed even with `--detach` and reject `--name`.
+    #[test]
+    fn compose_up_is_never_named() {
+        let cmd = |args: &[&str]| {
+            let mut cli = Cli::try_parse_from(["vk", "run"].iter().chain(args)).unwrap();
+            prepare_run_name(&mut cli.cmd).map(|_| cli.cmd)
+        };
+        let Cmd::Run {
+            name, state_dir, ..
+        } = cmd(&["--compose", "c.yml", "--detach"]).unwrap()
+        else {
+            panic!("not a run");
+        };
+        assert_eq!((name, state_dir), (None, None));
+        let Err(err) = cmd(&["--compose", "c.yml", "--name", "x"]) else {
+            panic!("named");
+        };
+        assert!(format!("{err}").contains("compose up"), "{err}");
+        assert!(err.downcast_ref::<names::Refused>().is_some());
+        assert!(boots_no_primary(None, &[], None));
+        assert!(!boots_no_primary(None, &[], Some("web")));
+        assert!(!boots_no_primary(Some("alpine"), &[], None));
+        assert!(!boots_no_primary(None, &["Dockerfile".into()], None));
+    }
+
+    /// `--name`, `--state-dir` and `--detach` accept overrides. Other single-value
+    /// options, such as `--username`, still reject duplicates.
+    #[test]
+    fn run_takes_the_last_name_state_dir_and_detach_only() {
+        let cli = Cli::try_parse_from([
+            "vk",
+            "run",
+            "--state-dir",
+            "/a",
+            "--name",
+            "x",
+            "alpine",
+            "--state-dir",
+            "/b",
+            "--detach",
+            "--detach",
+            "--name",
+            "y",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let Cmd::Run {
+            state_dir, name, ..
+        } = cli.cmd
+        else {
+            panic!("not a run");
+        };
+        assert_eq!(state_dir.as_deref(), Some(Path::new("/b")));
+        assert_eq!(name.as_deref(), Some("y"));
+        let twice = ["vk", "run", "--username", "a", "--username", "b", "alpine"];
+        assert!(Cli::try_parse_from(twice).is_err());
+    }
+
+    /// A scratch state base, removed on drop.
+    struct Base(PathBuf);
+    impl Drop for Base {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn base(tag: &str) -> Base {
+        let d = std::env::temp_dir().join(format!("vk-main-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        Base(vms::canonical(&d))
+    }
+
+    /// Prepare `vk run ARGS` against the state base `b`.
+    fn prepare(b: &Base, args: &[&str]) -> anyhow::Result<(Prepared, Cmd)> {
+        let mut cli = Cli::try_parse_from(["vk", "run"].iter().chain(args)).unwrap();
+        let places = (names::Index::at(b.0.join("names")), b.0.join("run"));
+        let made = prepare_run_name_in(&mut cli.cmd, || Ok(places))?;
+        Ok((made, cli.cmd))
+    }
+
+    /// A run that fails before its VM is up gives back the name it gave and touches nothing
+    /// else in a state dir it did not make: a `run.json` there is another run's. The
+    /// corrected command that follows gets the name.
+    #[test]
+    fn a_failed_run_gives_back_only_what_it_made() {
+        let b = base("settle");
+        let dir = b.0.join("mine");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join(names::RECIPE), "{}").unwrap();
+        let d = dir.to_str().unwrap();
+        let (made, _) = prepare(&b, &["--state-dir", d, "--name", "test", "alpine"]).unwrap();
+        assert!(made.name_made && !made.dir_made);
+        made.settle();
+        assert_eq!(std::fs::read(dir.join(names::RECIPE)).unwrap(), b"{}");
+        let idx = names::Index::at(b.0.join("names"));
+        assert_eq!(idx.lookup("test"), None);
+        drop(made);
+        // A managed dir is removed along with its name, and the name is free again.
+        let (made, cmd) = prepare(&b, &["--name", "test", "alpine"]).unwrap();
+        assert!(made.name_made && made.dir_made);
+        let Cmd::Run { state_dir, .. } = cmd else {
+            panic!("not a run");
+        };
+        let managed = state_dir.unwrap();
+        assert!(
+            managed.starts_with(b.0.join("run")),
+            "{}",
+            managed.display()
+        );
+        made.settle();
+        assert!(!managed.exists());
+        let (again, _) = prepare(&b, &["--name", "test", "alpine"]).unwrap();
+        assert!(again.name_made);
+        // A taken name is the caller's mistake, refused before anything is left behind.
+        let Err(e) = prepare(&b, &["--name", "test", "alpine"]) else {
+            panic!("a taken name was given");
+        };
+        assert!(e.downcast_ref::<names::Refused>().is_some(), "{e:#}");
+        assert_eq!(std::fs::read_dir(b.0.join("run")).unwrap().count(), 1);
+    }
+
+    /// A run holds its state dir from before it claims the name until it ends, so a second
+    /// run on the dir is refused meanwhile, and a run that fails never gives back a name a
+    /// run that came up uses.
+    #[test]
+    fn only_the_run_holding_the_dir_gives_its_name_back() {
+        let b = base("contend");
+        let dir = b.0.join("shared");
+        let d = dir.to_str().unwrap();
+        let idx = names::Index::at(b.0.join("names"));
+        let first = prepare(&b, &["--state-dir", d, "alpine"]).unwrap();
+        assert!(first.0.name_made);
+        let Err(e) = prepare(&b, &["--state-dir", d, "alpine"]) else {
+            panic!("two runs share a dir");
+        };
+        assert!(format!("{e:#}").contains("in use"), "{e:#}");
+        first.0.settle();
+        drop(first);
+        assert_eq!(idx.lookup("alpine"), None);
+        // This one comes up: its name and recipe are published, and kept when it ends.
+        let up = prepare(&b, &["--state-dir", d, "alpine"]).unwrap();
+        let r = up.0.remembered.clone().unwrap();
+        r.publish().unwrap();
+        up.0.settle();
+        drop((up, r));
+        assert!(dir.join(names::RECIPE).exists());
+        // A later run that fails gave nothing, so takes nothing back.
+        let failed = prepare(&b, &["--state-dir", d, "alpine"]).unwrap();
+        assert!(!failed.0.name_made);
+        failed.0.settle();
+        assert_eq!(idx.lookup("alpine"), Some(vms::canonical(&dir)));
+    }
+
+    /// A run killed before its VM was up — no settling — leaves its managed dir unlocked and
+    /// without a recipe; one whose dir was removed leaves nothing. Either way the same
+    /// `--name` is free again for the next run.
+    #[test]
+    fn a_killed_or_removed_run_leaves_its_name_free() {
+        let b = base("killed");
+        let (made, cmd) = prepare(&b, &["--name", "app", "alpine"]).unwrap();
+        let Cmd::Run { state_dir, .. } = &cmd else {
+            panic!("not a run");
+        };
+        let killed = state_dir.clone().unwrap();
+        // Still running: the name is its own.
+        assert!(prepare(&b, &["--name", "app", "alpine"]).is_err());
+        drop((made, cmd));
+        let (made, cmd) = prepare(&b, &["--name", "app", "alpine"]).unwrap();
+        assert!(made.name_made && !killed.exists());
+        // This one came up and stopped; then its dir was removed.
+        made.remembered.as_ref().unwrap().publish().unwrap();
+        let Cmd::Run { state_dir, .. } = &cmd else {
+            panic!("not a run");
+        };
+        let removed = state_dir.clone().unwrap();
+        drop((made, cmd));
+        assert!(prepare(&b, &["--name", "app", "alpine"]).is_err());
+        std::fs::remove_dir_all(&removed).unwrap();
+        let (made, _) = prepare(&b, &["--name", "app", "alpine"]).unwrap();
+        assert!(made.name_made);
+    }
+
+    /// Reclaiming a provisional name preserves files in both caller-supplied and managed
+    /// directories. A committed name survives a missing recipe while its directory exists.
+    #[test]
+    fn a_killed_run_gives_up_its_name_but_keeps_its_files() {
+        let b = base("leftovers");
+        let own = b.0.join("mine");
+        let d = own.to_str().unwrap();
+        let (made, cmd) = prepare(&b, &["--state-dir", d, "--name", "app", "alpine"]).unwrap();
+        std::fs::write(own.join("root.ext4"), "disk").unwrap();
+        drop((made, cmd));
+        let (made, cmd) = prepare(&b, &["--name", "app", "alpine"]).unwrap();
+        assert!(made.name_made);
+        assert_eq!(std::fs::read(own.join("root.ext4")).unwrap(), b"disk");
+        // Killed again, after writing into the dir `vk` made for it: that dir stays too.
+        let Cmd::Run { state_dir, .. } = &cmd else {
+            panic!("not a run");
+        };
+        let managed = state_dir.clone().unwrap();
+        std::fs::write(managed.join("console.log"), "boot").unwrap();
+        drop((made, cmd));
+        let (made, _) = prepare(&b, &["--name", "app", "alpine"]).unwrap();
+        assert!(made.name_made);
+        assert!(managed.join("console.log").exists());
+        // A VM that came up but has no recipe (its write failed, say) keeps name and disk.
+        let r = made.remembered.clone().unwrap();
+        r.publish().unwrap();
+        std::fs::remove_file(r.dir().join(names::RECIPE)).unwrap();
+        std::fs::write(r.dir().join("root.ext4"), "disk").unwrap();
+        let up = r.dir().to_path_buf();
+        drop((made, r));
+        let (other, _) = prepare(&b, &["--name", "other", "alpine"]).unwrap();
+        assert!(other.name_made);
+        let idx = names::Index::at(b.0.join("names"));
+        assert_eq!(idx.lookup("app"), Some(up.clone()));
+        assert_eq!(std::fs::read(up.join("root.ext4")).unwrap(), b"disk");
+    }
+
+    /// A run that waited for a dir `vk dev gc` removed meanwhile does not boot in whatever
+    /// is made at the path next, and a held lock never gets its dir made again.
+    #[test]
+    fn a_lock_on_a_replaced_dir_is_refused() {
+        let b = base("replaced");
+        let dir = b.0.join("state");
+        std::fs::create_dir(&dir).unwrap();
+        let held = std::fs::File::open(&dir).unwrap();
+        run::same_dir(&held, &dir).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(run::same_dir(&held, &dir).is_err());
+        std::fs::create_dir(&dir).unwrap();
+        let e = run::same_dir(&held, &dir).unwrap_err();
+        assert!(format!("{e}").contains("replaced"), "{e}");
+    }
+
+    /// A managed dir is made by this run alone: a token already taken is drawn again, and
+    /// the name is cut short for the VMM's sockets to fit, down to a byte; past that, the
+    /// error says what to do.
+    #[test]
+    fn a_managed_dir_is_new_and_fits_the_socket_budget() {
+        let b = base("rundir");
+        let run_base = b.0.join("run");
+        std::fs::create_dir_all(run_base.join("app-aaaaaaaa")).unwrap();
+        let mut tokens = ["aaaaaaaa", "bbbbbbbb"].into_iter().map(String::from);
+        let dir = new_run_dir(&run_base, "app", || tokens.next().unwrap()).unwrap();
+        assert_eq!(dir, run_base.join("app-bbbbbbbb"));
+        // A base that leaves room for exactly one byte of the name, then one that leaves none.
+        let used = run_base.as_os_str().len() + 1;
+        let pad = run::STATE_DIR_MAX - used - "/x-aaaaaaaa".len();
+        let tight = run_base.join("p".repeat(pad));
+        let dir = new_run_dir(&tight, "app", || "aaaaaaaa".into()).unwrap();
+        assert_eq!(dir, tight.join("a-aaaaaaaa"));
+        assert_eq!(dir.as_os_str().len(), run::STATE_DIR_MAX);
+        let over = run_base.join("p".repeat(pad + 1));
+        let e = new_run_dir(&over, "app", || "aaaaaaaa".into()).unwrap_err();
+        assert!(format!("{e}").contains("XDG_STATE_HOME"), "{e}");
+    }
+
+    #[test]
+    fn a_stop_by_a_signal_exits_as_the_signal_would() {
+        let e = anyhow::Error::from(run::Stopped(libc::SIGINT)).context("starting");
+        assert_eq!(run::stop_code(&e), Some(130));
+        assert_eq!(run::stop_code(&anyhow::anyhow!("other")), None);
     }
 
     // `-h` is a summary: a short line per command, per flag and per possible value, with

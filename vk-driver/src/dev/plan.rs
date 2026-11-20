@@ -1041,14 +1041,14 @@ const READABLE_MAX: usize = 64;
 const TASK_NAME_MAX: usize = 32;
 
 /// Directory name budget: [`crate::run::STATE_DIR_MAX`] minus `base` and its separator.
-fn state_dir_room(base: &Path) -> Result<usize> {
+pub(crate) fn state_dir_room(base: &Path) -> Result<usize> {
     crate::run::STATE_DIR_MAX
         .checked_sub(base.as_os_str().len() + 1)
         .filter(|room| *room >= 1)
         .ok_or_else(|| no_room(base))
 }
 
-fn no_room(base: &Path) -> anyhow::Error {
+pub(crate) fn no_room(base: &Path) -> anyhow::Error {
     anyhow!(
         "{} leaves no room for a VM's own state directory: its sockets are bound under \
          that directory and a unix socket path holds at most {} bytes. Point XDG_STATE_HOME \

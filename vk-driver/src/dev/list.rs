@@ -91,8 +91,10 @@ pub struct Running {
 /// One state directory, as `vk dev list` reports it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Row {
-    /// the directory's own name, and what `vk dev gc` takes
+    /// VM name accepted by `vk dev stop`, `gc` and `prune`, or the state directory name
     pub name: String,
+    /// the state directory's own name, which still names the environment too
+    pub dir_name: String,
     pub dir: PathBuf,
     /// the workspace the identity records; `None` when nothing was recorded
     pub workspace: Option<PathBuf>,
@@ -130,6 +132,70 @@ impl Row {
     fn stale(&self) -> bool {
         self.status != Status::Running
             && (self.has(Flag::WorkspaceMissing) || self.has(Flag::Ephemeral))
+    }
+}
+
+/// Migrate older environments without rebooting them. Claim names in boot order so the
+/// oldest gets the unsuffixed name when it is free. An up-to-date index needs no writes.
+/// If a claim fails, remaining environments still resolve by their state directory names.
+pub fn name_unnamed() {
+    let (Ok(base), Ok(idx)) = (
+        crate::dev::plan::dev_state_base(),
+        crate::names::Index::open(),
+    ) else {
+        return;
+    };
+    if let Err(e) = name_unnamed_in(&base, &idx) {
+        eprintln!("vk: warning: naming dev environments: {e:#}");
+    }
+}
+
+/// [`name_unnamed`] for the environments under `base`, in the index `idx`. An ephemeral
+/// directory (no `dev.json`) gets no name.
+pub(crate) fn name_unnamed_in(base: &Path, idx: &crate::names::Index) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Ok(());
+    };
+    let named: std::collections::HashSet<PathBuf> =
+        idx.all().into_iter().map(|(_, dir)| dir).collect();
+    let mut todo: Vec<(u64, PathBuf, String)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| crate::vms::canonical(&e.path()))
+        .filter(|dir| !named.contains(dir))
+        .filter_map(|dir| {
+            let bytes = std::fs::read(dir.join("dev.json")).ok()?;
+            let identity: crate::dev::Identity = serde_json::from_slice(&bytes).ok()?;
+            let text = |key: &str| identity.manifest.get(key)?.as_str().map(str::to_string);
+            let base = default_name(
+                Path::new(&text("workspace").unwrap_or_default()),
+                &text("environment").unwrap_or_else(|| "dev".into()),
+            );
+            Some((identity.booted_secs, dir, base))
+        })
+        .collect();
+    if todo.is_empty() {
+        return Ok(());
+    }
+    todo.sort();
+    let _lock = idx.lock()?;
+    for (_, dir, base) in todo {
+        idx.claim_locked(&dir, &base)?;
+    }
+    Ok(())
+}
+
+/// The name a dev environment is first given: its workspace's directory name, then
+/// `-<environment>` for any environment but `dev`.
+pub fn default_name(workspace: &Path, environment: &str) -> String {
+    let ws = workspace
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "workspace".into());
+    match environment {
+        "dev" => crate::names::sanitize(&ws),
+        env => crate::names::sanitize(&format!("{ws}-{env}")),
     }
 }
 
@@ -200,6 +266,7 @@ fn row(dir: &Path, running: &[Running], with_sizes: bool, with_flags: bool) -> R
     let booted_secs = identity.as_ref().map(|i| i.booted_secs);
     Row {
         name: dir.file_name().unwrap_or_default().to_string_lossy().into(),
+        dir_name: dir.file_name().unwrap_or_default().to_string_lossy().into(),
         dir: dir.to_path_buf(),
         workspace,
         workspace_folder: manifest("workspace_folder"),
@@ -346,7 +413,13 @@ fn short_creator(created_by: &str) -> String {
 /// Which rows a `gc` takes: the ones named, plus — under `--all-stale` — every one whose
 /// checkout is gone or that never recorded a boot. A running environment is never removed;
 /// naming one is an error, not a silent skip.
-pub fn select_gc(rows: Vec<Row>, names: &[String], all_stale: bool) -> Result<Vec<Row>> {
+/// `resolve` maps a word to the state dir it names, as [`crate::names::resolve`] does.
+pub fn select_gc(
+    rows: Vec<Row>,
+    names: &[String],
+    all_stale: bool,
+    resolve: impl Fn(&str) -> Result<Option<PathBuf>>,
+) -> Result<Vec<Row>> {
     // Unreachable from the CLI, where a bare `gc` passes its workspace's name; kept so an
     // empty selection is an error, not a no-op.
     if names.is_empty() && !all_stale {
@@ -354,20 +427,50 @@ pub fn select_gc(rows: Vec<Row>, names: &[String], all_stale: bool) -> Result<Ve
     }
     let mut selected: Vec<Row> = Vec::new();
     for name in names {
-        let Some(row) = rows.iter().find(|r| &r.name == name) else {
-            bail!("no dev environment state named {name} (`vk dev list` names them)");
-        };
-        selected.push(row.clone());
+        selected.push(find(&rows, name, &resolve)?.clone());
     }
     if all_stale {
         selected.extend(rows.iter().filter(|r| r.stale()).cloned());
     }
     selected.sort_by(|a, b| a.name.cmp(&b.name));
-    selected.dedup_by(|a, b| a.name == b.name);
+    selected.dedup_by(|a, b| a.dir == b.dir);
+    refuse_running(selected)
+}
+
+/// Bare `gc` selects by the workspace's state directory to avoid name collisions.
+/// A workspace without state yields an empty selection.
+pub fn select_dir(rows: Vec<Row>, dir: &Path) -> Result<Vec<Row>> {
+    let dir = crate::vms::canonical(dir);
+    refuse_running(
+        rows.into_iter()
+            .filter(|r| crate::vms::canonical(&r.dir) == dir)
+            .collect(),
+    )
+}
+
+/// `selected`, unless one of them is running.
+fn refuse_running(selected: Vec<Row>) -> Result<Vec<Row>> {
     if let Some(row) = selected.iter().find(|r| r.status == Status::Running) {
         bail!("{} is running — `vk dev stop {}` first", row.name, row.name);
     }
     Ok(selected)
+}
+
+/// The row `word` names, resolved by `resolve` — [`crate::names::resolve`], as `vk dev stop`
+/// resolves it — so a word that is one VM's name and another's state dir name is refused
+/// here as there, rather than one of them picked to destroy.
+pub fn find<'a>(
+    rows: &'a [Row],
+    word: &str,
+    resolve: impl Fn(&str) -> Result<Option<PathBuf>>,
+) -> Result<&'a Row> {
+    let Some(dir) = resolve(word)? else {
+        bail!("no dev environment state named {word} (`vk dev list` names them)");
+    };
+    let dir = crate::vms::canonical(&dir);
+    rows.iter()
+        .find(|r| crate::vms::canonical(&r.dir) == dir)
+        .with_context(|| format!("{word} is not a dev environment ({})", dir.display()))
 }
 
 /// Preview each selected environment with its top-level state entries and sizes,
@@ -397,7 +500,7 @@ pub fn preview(selected: &[Row]) -> String {
 
 /// Take a state directory's lock — the one a boot and a live run hold — for as long as the
 /// returned file lives. `None` when somebody else holds it, or when the directory is gone.
-pub(super) fn try_lock_state_dir(dir: &Path) -> Option<std::fs::File> {
+pub(crate) fn try_lock_state_dir(dir: &Path) -> Option<std::fs::File> {
     use std::os::fd::AsRawFd;
     let f = std::fs::File::open(dir).ok()?;
     // SAFETY: the fd is owned by `f`, which the caller keeps alive; LOCK_NB does not block.
@@ -412,7 +515,9 @@ pub(super) fn try_lock_state_dir(dir: &Path) -> Option<std::fs::File> {
 /// Lock all directories before removing any, and hold each lock until its directory is gone.
 /// Refuse the whole operation if a boot or live VM holds a lock. Selection predates the
 /// prompt, so these locks and a fresh running-VM check protect boots started meanwhile.
-pub fn remove(selected: &[Row]) -> Result<String> {
+/// Each one's names are forgotten in `index`, under its lock across the removal, so a boot
+/// that makes the directory again meanwhile keeps the name it claims.
+pub fn remove(selected: &[Row], index: &crate::names::Index) -> Result<String> {
     let mut locked = Vec::new();
     for row in selected {
         let Some(lock) = try_lock_state_dir(&row.dir) else {
@@ -434,8 +539,13 @@ pub fn remove(selected: &[Row]) -> Result<String> {
     let mut out = String::new();
     for (row, lock) in locked {
         crate::publish::stop_all_quietly(&row.dir, PUBLISH_STOP);
+        let names = index.lock()?;
         std::fs::remove_dir_all(&row.dir)
             .with_context(|| format!("removing {}", row.dir.display()))?;
+        if let Err(e) = index.release_locked(&row.dir) {
+            eprintln!("vk: warning: forgetting the name of {}: {e:#}", row.name);
+        }
+        drop(names);
         drop(lock);
         out.push_str(&format!(
             "removed {} ({})\n",
@@ -475,11 +585,26 @@ fn running_vms() -> Vec<Running> {
 /// the state base scanned against what is running. Measuring what each holds on disk is a stat
 /// walk of every file in it, done by default; `--no-sizes` (`sizes = false`) opts out.
 pub fn state(sizes: bool) -> Result<Vec<Row>> {
-    Ok(scan(
-        &crate::dev::plan::dev_state_base()?,
-        &running_vms(),
-        sizes,
-    ))
+    let mut rows = scan(&crate::dev::plan::dev_state_base()?, &running_vms(), sizes);
+    apply_names(&mut rows);
+    Ok(rows)
+}
+
+/// Name every row as the name index does, naming the environments that have none first,
+/// and order them by name.
+pub fn apply_names(rows: &mut [Row]) {
+    name_unnamed();
+    let Ok(idx) = crate::names::Index::open() else {
+        return;
+    };
+    let all = idx.all();
+    for row in rows.iter_mut() {
+        let canonical = crate::vms::canonical(&row.dir);
+        if let Some((name, _)) = all.iter().find(|(_, d)| *d == row.dir || *d == canonical) {
+            row.name = name.clone();
+        }
+    }
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
 /// [`state`] without sizes or flags: no workspace is looked at, so a hung share or an
@@ -522,6 +647,16 @@ mod tests {
         TmpDir(dir)
     }
 
+    /// A scratch name index beside the scratch dev base `base`.
+    fn index(base: &Path) -> crate::names::Index {
+        crate::names::Index::at(base.with_file_name("names"))
+    }
+
+    /// What `names::resolve` does, against [`index`] and `base`.
+    fn resolver(base: &Path) -> impl Fn(&str) -> Result<Option<PathBuf>> + '_ {
+        move |word| crate::names::resolve_in(&index(base), base, word)
+    }
+
     /// A state dir with a `dev.json` recording `workspace`, as `after_boot` writes one.
     fn booted(base: &Path, name: &str, workspace: &Path, created_by: &str) -> PathBuf {
         let dir = base.join(name);
@@ -548,6 +683,38 @@ mod tests {
         std::fs::write(dir.join("root.qcow2"), vec![0u8; 4096]).unwrap();
         std::fs::write(dir.join("console.log"), "boot\n").unwrap();
         dir
+    }
+
+    #[test]
+    fn unnamed_environments_get_names_oldest_boot_first_and_ephemeral_ones_none() {
+        let tmp = scratch("names");
+        let base = tmp.0.join("dev");
+        let idx = crate::names::Index::at(tmp.0.join("names"));
+        let with = |name: &str, ws: &str, env: &str, booted: u64| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let identity = serde_json::json!({
+                "digest": "d", "booted_secs": booted,
+                "manifest": {"workspace": ws, "environment": env},
+            });
+            std::fs::write(dir.join("dev.json"), identity.to_string()).unwrap();
+            crate::vms::canonical(&dir)
+        };
+        // Two checkouts named `app`: the one booted first keeps the plain name.
+        let newer = with("app-1111", "/a/app", "dev", 200);
+        let older = with("app-2222", "/b/app", "dev", 100);
+        let ci = with("app-ci-3333", "/a/app", "ci", 300);
+        ephemeral(&base, "app-task-x-44");
+        name_unnamed_in(&base, &idx).unwrap();
+        assert_eq!(idx.name_of(&older).as_deref(), Some("app"));
+        assert_eq!(idx.name_of(&newer).as_deref(), Some("app-2"));
+        assert_eq!(idx.name_of(&ci).as_deref(), Some("app-ci"));
+        assert_eq!(idx.all().len(), 3);
+        // Run again, nothing changes.
+        name_unnamed_in(&base, &idx).unwrap();
+        assert_eq!(idx.all().len(), 3);
+        assert_eq!(default_name(Path::new("/x/My Repo"), "dev"), "my-repo");
+        assert_eq!(default_name(Path::new("/"), "e2e"), "workspace-e2e");
     }
 
     #[test]
@@ -688,15 +855,17 @@ mod tests {
             &tmp.0.join("removed"),
             "vk 0.62.0 (abc)",
         );
-        let selected = select_gc(scan(&base, &[], true), &[], true).unwrap();
+        let selected = select_gc(scan(&base, &[], true), &[], true, resolver(&base)).unwrap();
 
         // A boot that started while the caller was answering the prompt holds the lock.
         let held = try_lock_state_dir(&dir).expect("free to begin with");
-        let e = remove(&selected).unwrap_err();
+        let e = remove(&selected, &index(&base)).unwrap_err();
         assert!(format!("{e:#}").contains("is in use by"), "{e:#}");
         assert!(dir.exists(), "the boot's state directory survived");
         drop(held);
-        let removed = crate::testutil::once_released("is in use by", || remove(&selected)).unwrap();
+        let removed =
+            crate::testutil::once_released("is in use by", || remove(&selected, &index(&base)))
+                .unwrap();
         assert!(removed.starts_with("removed gone-bbbb"));
         assert!(!dir.exists());
     }
@@ -722,7 +891,7 @@ mod tests {
         assert_eq!(rows[0].mem_used_bytes, Some(1_288_490_189));
         assert_eq!(rows[0].mem.as_deref(), Some("8G"));
         assert!(!rows[0].stale());
-        let e = select_gc(rows, &["repo-aaaa".into()], false).unwrap_err();
+        let e = select_gc(rows, &["repo-aaaa".into()], false, resolver(&base)).unwrap_err();
         assert!(format!("{e:#}").contains("repo-aaaa is running"), "{e:#}");
     }
 
@@ -743,23 +912,91 @@ mod tests {
         ephemeral(&base, "repo-hook-cccc");
         let rows = scan(&base, &[], true);
 
-        let stale = select_gc(rows.clone(), &[], true).unwrap();
+        let stale = select_gc(rows.clone(), &[], true, resolver(&base)).unwrap();
         assert_eq!(
             stale.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
             ["gone-bbbb", "repo-hook-cccc"]
         );
         // A name is taken whether or not it is stale, and never twice.
-        let named = select_gc(rows.clone(), &["repo-aaaa".into()], true).unwrap();
+        let named = select_gc(rows.clone(), &["repo-aaaa".into()], true, resolver(&base)).unwrap();
         assert_eq!(named.len(), 3);
-        let both = select_gc(rows.clone(), &["gone-bbbb".into()], true).unwrap();
+        let both = select_gc(rows.clone(), &["gone-bbbb".into()], true, resolver(&base)).unwrap();
         assert_eq!(both.len(), 2);
-        let e = select_gc(rows.clone(), &["nope".into()], false).unwrap_err();
+        let e = select_gc(rows.clone(), &["nope".into()], false, resolver(&base)).unwrap_err();
         assert!(
             format!("{e:#}").contains("no dev environment state named nope"),
             "{e:#}"
         );
-        let e = select_gc(rows, &[], false).unwrap_err();
+        let e = select_gc(rows, &[], false, resolver(&base)).unwrap_err();
         assert!(format!("{e:#}").contains("--all-stale"), "{e:#}");
+    }
+
+    /// Environment A is named `app` in `app-aaaa`. A workspace called `app-aaaa` gets that
+    /// as its VM name, as can a `vk run --name app-aaaa`: the word then names two VMs, so a
+    /// destructive command refuses it, as `vk dev stop` does. Each one's other name, or a
+    /// bare `gc`'s own state dir, selects only that one.
+    #[test]
+    fn a_name_that_is_another_vms_dir_name_is_refused() {
+        let tmp = scratch("collide");
+        let base = tmp.0.join("state");
+        std::fs::create_dir_all(&base).unwrap();
+        let (a_ws, b_ws) = (tmp.0.join("app"), tmp.0.join("app-aaaa"));
+        for ws in [&a_ws, &b_ws] {
+            std::fs::create_dir_all(ws).unwrap();
+        }
+        let a = booted(&base, "app-aaaa", &a_ws, "vk 0.62.0 (abcdef)");
+        let b = booted(&base, "app-aaaa-bbbb", &b_ws, "vk 0.62.0 (abcdef)");
+        let idx = index(&base);
+        idx.claim_exact(&a, "app").unwrap();
+        idx.claim_exact(&b, "app-aaaa").unwrap();
+        let rows = scan(&base, &[], false);
+        let e = select_gc(rows.clone(), &["app-aaaa".into()], false, resolver(&base)).unwrap_err();
+        assert!(format!("{e:#}").contains("ambiguous"), "{e:#}");
+        assert_eq!(find(&rows, "app", resolver(&base)).unwrap().dir, a);
+        assert_eq!(
+            find(&rows, "app-aaaa-bbbb", resolver(&base)).unwrap().dir,
+            b
+        );
+        let own = select_dir(rows.clone(), &b).unwrap();
+        assert_eq!(own.iter().map(|r| &r.dir).collect::<Vec<_>>(), [&b]);
+        // A run takes over the name: the word is still two VMs', and a run is no dev row.
+        idx.release(&b).unwrap();
+        let run = tmp.0.join("elsewhere/app-aaaa-1234");
+        std::fs::create_dir_all(&run).unwrap();
+        idx.claim_exact(&run, "app-aaaa").unwrap();
+        let e = find(&rows, "app-aaaa", resolver(&base)).unwrap_err();
+        assert!(format!("{e:#}").contains("ambiguous"), "{e:#}");
+        idx.claim_exact(&run, "runner").unwrap_err();
+        idx.release(&run).unwrap();
+        idx.claim_exact(&run, "runner").unwrap();
+        let e = find(&rows, "runner", resolver(&base)).unwrap_err();
+        assert!(format!("{e:#}").contains("not a dev environment"), "{e:#}");
+    }
+
+    /// GC forgets a removed environment's name, in the index it is given.
+    #[test]
+    fn removal_forgets_the_name() {
+        let tmp = scratch("forget");
+        let base = tmp.0.join("state");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = booted(
+            &base,
+            "gone-aaaa",
+            &tmp.0.join("removed"),
+            "vk 0.62.0 (abcdef)",
+        );
+        let idx = index(&base);
+        idx.claim_exact(&dir, "gone").unwrap();
+        let selected = select_gc(
+            scan(&base, &[], false),
+            &["gone".into()],
+            false,
+            resolver(&base),
+        )
+        .unwrap();
+        remove(&selected, &idx).unwrap();
+        assert_eq!(idx.lookup("gone"), None);
+        assert!(!dir.exists());
     }
 
     #[test]
@@ -842,7 +1079,7 @@ mod tests {
         std::fs::write(go.join("vscode-server/extensions/x"), vec![0u8; 2048]).unwrap();
         std::fs::write(go.join("endpoints.json"), "{}").unwrap();
 
-        let selected = select_gc(scan(&base, &[], true), &[], true).unwrap();
+        let selected = select_gc(scan(&base, &[], true), &[], true, resolver(&base)).unwrap();
         let text = preview(&selected);
         assert!(
             text.starts_with("would remove 1 environment(s):\n"),
@@ -854,7 +1091,7 @@ mod tests {
         // Logs belong to the run, not the user: they are not offered as storage.
         assert!(!text.contains("console.log"), "{text}");
 
-        let report = remove(&selected).unwrap();
+        let report = remove(&selected, &index(&base)).unwrap();
         assert!(report.starts_with("removed gone-bbbb ("), "{report}");
         assert!(!go.exists(), "the stale state dir survived");
         assert!(keep.exists(), "the live state dir was removed");

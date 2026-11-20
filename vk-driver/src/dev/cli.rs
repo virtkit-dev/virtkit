@@ -687,7 +687,7 @@ async fn dev_action(
     } = &action
         && (*all_stale || !names.is_empty())
     {
-        return dev_gc(*yes, *all_stale, names, false);
+        return dev_gc(*yes, *all_stale, names, None);
     }
     // Like named stops, named prunes use host state and work from another or deleted
     // workspace. Select from the recorded boot state without resolving a config.
@@ -1112,12 +1112,8 @@ async fn dev_action(
             Err(e) => fail(&e, 1),
         },
         // Only a bare `gc` gets here; named and `--all-stale` runs returned before the
-        // config. Selected by state-directory name, as `vk dev list` and a named `gc` are.
-        DevAction::Gc { yes, .. } => {
-            // `plan` joins an ASCII name onto the state base: the `Row.name` `scan` reads.
-            let name = plan.state_dir.file_name().unwrap_or_default();
-            dev_gc(yes, false, &[name.to_string_lossy().into_owned()], true)
-        }
+        // config. Selected by the plan's own state dir, which no other environment shares.
+        DevAction::Gc { yes, .. } => dev_gc(yes, false, &[], Some(&plan.state_dir)),
         DevAction::Init { .. }
         | DevAction::List { .. }
         | DevAction::Stop { name: Some(_), .. }
@@ -1191,18 +1187,15 @@ enum Ready {
     Done(ExitCode),
 }
 
-/// `vk dev gc`: choose what goes, show it, ask, and remove exactly that. Selects by
-/// state-directory name and reads no config. `own` marks a bare `gc`, whose name came from
-/// the config: no state under it is nothing to remove, as a bare `stop` of a stopped
-/// environment is not a failure. A run that only showed what would go did not do what it
+/// Preview the selected environments and remove them after confirmation. A bare `gc`
+/// uses the configured state directory and succeeds if it has no state. Without a
+/// terminal or `--yes`, the command prints the preview without doing what it
 /// was asked, and exits 1.
-fn dev_gc(yes: bool, all_stale: bool, names: &[String], own: bool) -> ExitCode {
+fn dev_gc(yes: bool, all_stale: bool, names: &[String], own: Option<&Path>) -> ExitCode {
     // Always measured: the preview's whole job is to show what is about to be destroyed.
-    let selected = match crate::dev::list::state(true).and_then(|rows| {
-        if own && !rows.iter().any(|r| names.contains(&r.name)) {
-            return Ok(Vec::new());
-        }
-        crate::dev::list::select_gc(rows, names, all_stale)
+    let selected = match crate::dev::list::state(true).and_then(|rows| match own {
+        Some(dir) => crate::dev::list::select_dir(rows, dir),
+        None => crate::dev::list::select_gc(rows, names, all_stale, crate::names::resolve),
     }) {
         Ok(s) => s,
         Err(e) => return fail(&e, 1),
@@ -1230,7 +1223,7 @@ fn dev_gc(yes: bool, all_stale: bool, names: &[String], own: bool) -> ExitCode {
             Err(e) => return fail(&e, 1),
         }
     }
-    match crate::dev::list::remove(&selected) {
+    match crate::names::Index::open().and_then(|idx| crate::dev::list::remove(&selected, &idx)) {
         Ok(report) => write_report(&report),
         Err(e) => fail(&e, 1),
     }
@@ -1252,21 +1245,14 @@ fn dev_stop_named(name: &str, timeout: u64) -> ExitCode {
     }
 }
 
-/// Match only immediate directories, like `list`, without collecting their metadata.
+/// Resolve a VM name or state directory name without building the full environment listing.
 fn named_state_dir(name: &str) -> anyhow::Result<PathBuf> {
-    let base = plan::dev_state_base()?;
-    let entries = match std::fs::read_dir(&base) {
-        Ok(entries) => Some(entries),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(anyhow::Error::new(e).context("reading dev environment state")),
-    };
-    for entry in entries.into_iter().flatten() {
-        let entry = entry?;
-        if entry.file_name() == std::ffi::OsStr::new(name) && entry.file_type()?.is_dir() {
-            return Ok(entry.path());
-        }
+    let base = crate::vms::canonical(&plan::dev_state_base()?);
+    match crate::names::resolve(name)? {
+        Some(dir) if crate::vms::canonical(&dir).parent() == Some(base.as_path()) => Ok(dir),
+        Some(dir) => anyhow::bail!("{name} is not a dev environment ({})", dir.display()),
+        None => anyhow::bail!("no dev environment state named {name} (`vk dev list` names them)"),
     }
-    anyhow::bail!("no dev environment state named {name} (`vk dev list` names them)")
 }
 
 /// Bring the environment up, from whichever of the two processes this is (see `dev`'s module

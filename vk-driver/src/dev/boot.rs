@@ -1298,7 +1298,7 @@ pub async fn boot(
             Err(e) => eprintln!("virtkit: [dev.ssh] agent forwarding disabled: {e:#}"),
         }
     }
-    crate::run::run(&args, cfg).await
+    crate::run::run_or_exit_on_stop(&args, cfg).await
 }
 
 /// Build the environment's images into the cache, running nothing.

@@ -378,11 +378,10 @@ fn check_boot_cmdline(extra: &str) -> Result<()> {
     Ok(())
 }
 
-/// A stop signal (its number) that ended the run during the services' starts. [`run`] then
-/// exits as the signal's default action would have, with 128 + its number, so a `--detach`
-/// parent reports the failure.
+/// A stop signal (its number) that ended the run during the services' starts. The run then
+/// exits with 128 + its number ([`stop_code`]), so a `--detach` parent reports the failure.
 #[derive(Debug, PartialEq)]
-struct Stopped(i32);
+pub(crate) struct Stopped(pub(crate) i32);
 
 impl Stopped {
     fn exit_code(&self) -> i32 {
@@ -397,6 +396,20 @@ impl std::fmt::Display for Stopped {
 }
 
 impl std::error::Error for Stopped {}
+
+/// The exit code of a run that `e` says was stopped by a signal while its services started.
+pub(crate) fn stop_code(e: &anyhow::Error) -> Option<i32> {
+    e.downcast_ref::<Stopped>().map(Stopped::exit_code)
+}
+
+/// [`run`] for a caller with nothing to do after a stop: exit as [`stop_code`] says, at once.
+pub(crate) async fn run_or_exit_on_stop(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
+    let result = run(args, cfg).await;
+    if let Some(code) = result.as_ref().err().and_then(stop_code) {
+        std::process::exit(code);
+    }
+    result
+}
 
 pub struct RunArgs {
     /// Image to boot (a docker ref or an OCI reference). Ignored when `dockerfile` is set
@@ -585,8 +598,11 @@ pub struct RunArgs {
     pub ssh_alias: String,
     /// pin the run's scratch dir (sockets, console log) to a stable path instead
     /// of a fresh temp dir, so external tooling can attach to the running VM; the
-    /// directory is reused across runs and never removed
+    /// directory is reused across runs and kept (an empty one under vk's managed
+    /// run dir may be removed when its provisional name is reclaimed)
     pub state_dir: Option<PathBuf>,
+    /// the state directory lock and the name and recipe to publish at readiness
+    pub remembered: Option<std::sync::Arc<crate::names::Remembered>>,
     /// the run's workspace root, which a compose file reads as `${VK_WORKSPACE}`;
     /// None = the launch cwd
     pub workspace: Option<PathBuf>,
@@ -711,6 +727,7 @@ impl Default for RunArgs {
             ssh_client: false,
             ssh_alias: "vk-run".to_string(),
             state_dir: None,
+            remembered: None,
             workspace: None,
             volumes: Vec::new(),
             symlinks: Vec::new(),
@@ -785,7 +802,13 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
     // compose siblings and Dockerfile stage builds, which reach it via the process-global).
     crate::vmm::set_vm_name_template(args.vm_name.clone());
     let mut work = match &args.state_dir {
-        Some(dir) => WorkDir::pinned(dir.clone())?,
+        Some(dir) => {
+            let held = match &args.remembered {
+                Some(r) if r.dir() == crate::vms::canonical(dir) => Some(r.lock()?),
+                _ => None,
+            };
+            WorkDir::pinned(dir.clone(), held)?
+        }
         None => launch_dir(&default_scratch_base()?)?,
     };
     // The byte channel is a sum over everything appended to it, and a work dir can outlive the
@@ -862,7 +885,7 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
 
     // No primary (no image, no -f, no --primary) + a compose file = compose up:
     // services only, held until ctrl-c.
-    let result = if args.image.is_empty() && args.dockerfiles.is_empty() && args.primary.is_none() {
+    if args.image.is_empty() && args.dockerfiles.is_empty() && args.primary.is_none() {
         if args.root_image.is_some() {
             bail!(
                 "--root-image is the primary VM's root, and a services-only compose run boots none"
@@ -877,17 +900,7 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
         compose_up(args, cfg, &state_dir, &work.path, &agent.path, &kernel.path).await
     } else {
         build_and_boot(args, cfg, &state_dir, &work.path, &agent.path, &kernel.path).await
-    };
-    if let Some(stopped) = result
-        .as_ref()
-        .err()
-        .and_then(|e| e.downcast_ref::<Stopped>())
-    {
-        let code = stopped.exit_code();
-        drop(work);
-        std::process::exit(code);
     }
-    result
 }
 
 /// Default base for `vk run`'s durable shared image cache: `$XDG_DATA_HOME/virtkit`, else
@@ -1183,23 +1196,30 @@ impl WorkDir {
         })
     }
 
-    /// Create-or-reuse a caller-pinned scratch dir (`--state-dir`).
-    fn pinned(path: PathBuf) -> Result<WorkDir> {
+    /// Create-or-reuse a caller-pinned scratch dir (`--state-dir`), taking its lock unless
+    /// `held` is it already (a remembered run's, taken before its name was claimed).
+    fn pinned(path: PathBuf, held: Option<std::fs::File>) -> Result<WorkDir> {
         // Make the path absolute so the registered run and derived paths work from any cwd.
         let path =
             std::path::absolute(&path).with_context(|| format!("resolving {}", path.display()))?;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&path)
-            .with_context(|| format!("creating {}", path.display()))?;
+        match &held {
+            // Never made again here: the lock is on the dir `main` named, and must still be.
+            Some(lock) => same_dir(lock, &path)?,
+            None => crate::statefile::create_dir_all(&path)?,
+        }
         // 0700 on create AND reuse: the dir holds the VM's control sockets (the
         // exec channel is a root shell in the guest), and unlike the temp-dir
         // default this path is caller-chosen — often inside a repo tree — so
         // deny other users traversal regardless of umask or a pre-existing mode.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restricting {} to 0700", path.display()))?;
-        let lock = lock_state_dir(&path)?;
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(crate::statefile::DIR_MODE),
+        )
+        .with_context(|| format!("restricting {} to its owner", path.display()))?;
+        let lock = match held {
+            Some(lock) => lock,
+            None => lock_state_dir(&path)?,
+        };
         remove_stale_sockets(&path)?;
         mark_active(&path);
         Ok(WorkDir {
@@ -1279,7 +1299,7 @@ const STATE_DIR_LOCK_RETRY: Duration = Duration::from_millis(5);
 /// unlink the live run's sockets and fight over the binds, so refuse it up front, once the
 /// lock has stayed held for [`STATE_DIR_LOCK_GRACE`]. Advisory and filesystem-local, like the
 /// other locks in the tree.
-fn lock_state_dir(dir: &Path) -> Result<std::fs::File> {
+pub(crate) fn lock_state_dir(dir: &Path) -> Result<std::fs::File> {
     lock_state_dir_within(dir, STATE_DIR_LOCK_GRACE, || {
         std::thread::sleep(STATE_DIR_LOCK_RETRY)
     })
@@ -1321,7 +1341,24 @@ fn lock_state_dir_within(
         }
         return Err(err).with_context(|| format!("locking {}", dir.display()));
     }
+    // Locked while waiting is a dir that may since have been removed (by `vk dev gc`) and
+    // made again: its lock says nothing about the dir now at the path.
+    same_dir(&f, dir)?;
     Ok(f)
+}
+
+/// Whether `locked`, a dir's open handle, is still the dir at `dir`: same device and inode.
+pub(crate) fn same_dir(locked: &std::fs::File, dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let held = locked.metadata().context("reading a locked state dir")?;
+    let now = std::fs::metadata(dir).ok();
+    if now.is_some_and(|m| (m.dev(), m.ino()) == (held.dev(), held.ino())) {
+        return Ok(());
+    }
+    bail!(
+        "state-dir {} was removed or replaced while this run waited for it — run it again",
+        dir.display()
+    )
 }
 
 /// Best-effort identity of whoever holds `f`'s `flock`, as `pid 1234, up 19m`.
@@ -1545,6 +1582,14 @@ fn primary_nested_marker(
 /// here, so the two cannot disagree about which file they mean.
 pub(crate) fn registry_key(work: &Path) -> PathBuf {
     crate::vms::canonical(work)
+}
+
+/// As a remembered run's VM is first ready, commit its name and record its recipe.
+/// Best-effort like the registry entry: the VM is up whether or not they are recorded.
+pub(crate) fn publish_remembered(args: &RunArgs) {
+    if let Some(Err(e)) = args.remembered.as_ref().map(|r| r.publish()) {
+        eprintln!("virtkit: warning: could not record the VM's name and run.json: {e:#}");
+    }
 }
 
 /// Canonical project directory used by `vk list` and directory selectors: `--workspace`,
@@ -5224,6 +5269,10 @@ async fn drive(
         // and command startup.
         if stopping.is_cancelled() {
             return Ok(());
+        }
+        if first_pass {
+            // Before a detached parent is released: it then reports a run that is in place.
+            publish_remembered(args);
         }
         if first_pass && args.detach {
             crate::detach::signal_ready(args.detach_log.as_deref())?;
@@ -9003,11 +9052,24 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let up = PathBuf::from_iter(cwd.components().skip(1).map(|_| ".."));
         let relative = up.join(dir.strip_prefix("/").unwrap());
-        let work = WorkDir::pinned(relative).unwrap();
+        let work = WorkDir::pinned(relative, None).unwrap();
         assert_eq!(work.path, std::path::absolute(&work.path).unwrap());
         assert!(work.path.is_absolute() && work.path.is_dir());
         drop(work);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A remembered run's lock is on the dir `main` named: gone since, it is not made again
+    /// for the run to boot in a dir no lock covers.
+    #[test]
+    fn a_held_lock_never_has_its_dir_made_again() {
+        let dir = std::env::temp_dir().join(format!("vk-heldstate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let held = std::fs::File::open(&dir).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(WorkDir::pinned(dir.clone(), Some(held)).is_err());
+        assert!(!dir.exists());
     }
 
     #[test]

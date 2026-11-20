@@ -569,13 +569,28 @@ A `vk run --state-dir DIR` boots a VM that outlives a single command: its socket
 console log live in DIR, and the run is recorded in a host-side registry. `vk list` reads
 that registry, dropping entries whose run has died, and is what `vk exec`, `vk status`,
 `vk logs`, `vk stop` and `vk reboot` resolve a directory against — `vk logs` also reads the
-console of a VM the registry has already dropped, since DIR keeps it. A run without
-`--state-dir` is not listed, unless it boots a UEFI bundle; pair `--state-dir` with
-`--detach` for a background VM. The root image a `-f` run builds into DIR is removed by
+console of a VM the registry has already dropped, since DIR keeps it. A foreground run
+without `--state-dir` or `--name` appears in `vk list` only if it boots a UEFI bundle.
+Use `--detach` to run a VM in the background. The root image a `-f` run builds into DIR is removed by
 `vk gc` once no run has used DIR for 14 days, and built again by the next.
 
+Dev environments get a stable **name** from their workspace directory, with `-ENV` appended
+for environments other than `dev`. `vk run --name` requests an exact name. Without it,
+`--state-dir` or `--detach` derives a name from what the run boots. If the automatic name
+`app` is taken, `vk` tries `app-2`, `app-3`, and so on. A detached run prints its name.
+
+A foreground run without `--name` or `--state-dir` stays unnamed and is forgotten on exit.
+Services-only compose runs (`--compose` without an image, `-f` or `--primary`) have no
+primary VM to name. A named run without `--state-dir` gets a directory under
+`$XDG_STATE_HOME/virtkit/run`. Once its VM is ready, `vk` saves its arguments in the state
+directory as `run.json`, readable only by its owner.
+
+`vk` manages the whole `$XDG_STATE_HOME/virtkit/run` directory. If a run dies before its
+name is committed, a later name claim may remove its empty state directory directly under
+that path, whoever created it. Files in a nonempty directory survive.
+
 ```sh
-vk run --state-dir "$PWD/.vk" --detach --ssh -f Dockerfile --target dev
+vk run --name app --detach --ssh -f Dockerfile --target dev
 vk list
 ```
 

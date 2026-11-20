@@ -418,12 +418,8 @@ pub(super) fn run(plan: &Plan, opts: &Options) -> Result<String> {
 pub(super) fn run_by_name(name: &str, opts: &Options) -> Result<String> {
     // Resolve against the same host-wide listing `vk dev list` shows, so an unknown name
     // fails here the way it does there.
-    let Some(row) = super::list::state(false)?
-        .into_iter()
-        .find(|r| r.name == name)
-    else {
-        bail!("no dev environment state named {name} (`vk dev list` names them)");
-    };
+    let rows = super::list::state(false)?;
+    let row = super::list::find(&rows, name, crate::names::resolve)?;
     run_env(&env_of_state(&row.dir), opts, default_confirm)
 }
 

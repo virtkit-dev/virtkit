@@ -1039,7 +1039,7 @@ pub(crate) async fn run(
         control: Some(work.join(CONTROL_SOCKET)),
     });
 
-    let result = hold(&mut ch, &console, args.detach_log.as_deref()).await;
+    let result = hold(&mut ch, &console, args).await;
     if ch.try_wait().ok().flatten().is_none() {
         // Stopped: the power button, then qemu-ga's shutdown; the VM ended ([`force_off`]) once
         // `winsvc::STOP_GRACE` (the grace a Windows compose service gets) runs out or on a second
@@ -1144,7 +1144,7 @@ pub(crate) fn set_clock(ga: &mut crate::qga::Client) -> Result<()> {
 
 /// Wait for the VMM to exit or the run to be stopped. A VMM gone within [`BOOT_SETTLE`] is a
 /// failed boot; past it, a detached run hands the terminal back.
-async fn hold(ch: &mut Child, console: &Path, detach_log: Option<&Path>) -> Result<()> {
+async fn hold(ch: &mut Child, console: &Path, args: &crate::run::RunArgs) -> Result<()> {
     let spawned = Instant::now();
     let mut ready = false;
     // Handle foreground Ctrl-C too: isolated helpers leave it to this process alone.
@@ -1170,7 +1170,8 @@ async fn hold(ch: &mut Child, console: &Path, detach_log: Option<&Path>) -> Resu
         }
         if !ready && spawned.elapsed() >= BOOT_SETTLE {
             ready = true;
-            crate::detach::signal_ready(detach_log)?;
+            crate::run::publish_remembered(args);
+            crate::detach::signal_ready(args.detach_log.as_deref())?;
         }
         tokio::select! {
             () = &mut stop => {

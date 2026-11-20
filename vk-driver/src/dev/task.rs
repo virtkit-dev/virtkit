@@ -209,7 +209,7 @@ async fn run_ephemeral(
     over: &crate::dev::Overrides,
     args: crate::run::RunArgs,
 ) -> Result<Outcome> {
-    match crate::run::run(&args, cfg).await {
+    match crate::run::run_or_exit_on_stop(&args, cfg).await {
         Ok(()) => Ok(Outcome::Done),
         Err(e) => match (crate::run::guest_exit(&e), &env_plan.fallback_target) {
             (Some(result), _) => Ok(Outcome::Exit(result)),
@@ -228,7 +228,7 @@ async fn run_ephemeral(
                     Some(target),
                     args.state_dir.as_deref(),
                 )?;
-                match crate::run::run(&fallback, cfg).await {
+                match crate::run::run_or_exit_on_stop(&fallback, cfg).await {
                     Ok(()) => Ok(Outcome::Done),
                     Err(e) => match crate::run::guest_exit(&e) {
                         Some(result) => Ok(Outcome::Exit(result)),

@@ -551,8 +551,8 @@ are lost. `--images --storage` and `--all` select both categories.
 vk dev prune NAME --all             # prune another environment by its `vk dev list` name
 ```
 
-`NAME` is the name used by `vk dev list` and `vk dev gc`. It selects an environment
-host-wide from any directory, without a workspace config. Prune uses the storage
+Use the VM name from `vk dev list` or the state directory's name for `NAME`. Either
+selects an environment host-wide without a workspace config. Prune uses the storage
 recorded at its last boot, so workspace moves or changes do not affect selection.
 An environment booted by a `vk` from before
 this was recorded prunes its images and its fixed roots, overlays and editor storage,
@@ -591,8 +591,13 @@ vk dev gc
 `list`, `gc NAME` and `gc --all-stale` work from anywhere without a project
 config. A bare `gc`, like `stop`, reads the config and takes only this
 workspace's environment, not its task leftovers; if that environment has no
-state, it reports nothing to remove. Copy names from `list`; they identify state
-directories, not just the config's `dev` or `hook` selector. The `MEM` column
+state, it reports nothing to remove. At first boot, an environment gets a stable name
+from its workspace directory, with `-ENV` appended for environments other than `dev`.
+Collisions add `-2`, `-3`, and so on. A listing or name lookup assigns names to older
+environments. The state directory's name also works, including any leading `.` or `-`
+(e.g. `app-3f9c0d1e2a4b5c6d`, shown as `dir_name` in `--json`). A task's leftover
+state uses only its directory name. If `NAME` identifies two different directories,
+use the other name of the environment you want. The `MEM` column
 shows what a running environment's VM holds on the host now over the size it
 booted with (`1.2G/8G`), the same figure `vk list` reports; a stopped
 environment reads `-`, and `mem_used_bytes` in `--json` is null for it. `gc`
@@ -956,7 +961,7 @@ individual options.
 | `plan` | Inspect the resolved config; `--explain`, `--diff`, `--format`, `--show-secrets`. |
 | `stop` | Stop the environment and publishers; `--timeout SECONDS`. |
 | `storage list`, `storage reset NAME` | Inspect storage or destroy a durable item's data. |
-| `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. `NAME` prunes host-wide by its `vk dev list` name. Requires a stopped environment. |
+| `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. Select a stopped environment by name from any directory. |
 | `list` | Host-wide environment inventory (on-disk sizes by default); `--no-sizes`, `--json`. |
 | `gc [NAME…]` | Remove stopped state (bare: this workspace's environment); `--all-stale`, `--yes`. |
 | `schema` | Print the configuration JSON Schema. |
