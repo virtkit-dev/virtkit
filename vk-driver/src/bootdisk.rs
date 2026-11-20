@@ -152,11 +152,21 @@ fn newest_pair(entries: &[(String, FileType)]) -> Result<String> {
         .into_iter()
         .filter(|r| initrds.contains(r))
         .collect();
-    releases.sort_by(|a, b| version_cmp(a, b));
+    releases.sort_by(|a, b| release_cmp(a, b));
     match releases.pop() {
         Some(r) => Ok(r),
         None => bail!("no vmlinuz-<release> with a matching initrd.img-<release> in /boot"),
     }
+}
+
+/// Order kernel releases as `LC_ALL=C sort -V` does, which is how GRUB names a Debian
+/// machine's newest kernel: the whole release by [`version_cmp`], so `6.12.1-amd64` ranks
+/// above `6.12.1+deb13-amd64` (`-` after `+`), where `dpkg --compare-versions` would rank it
+/// below. Debian's `linux-version sort` agrees on stable and backports releases, not on
+/// `-rc`, `-trunk` or `~`. Two releases it holds equal (`1.0`, `1.00`) go by their bytes (the
+/// C locale's tie-break), so the pick never depends on the directory's order.
+fn release_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    version_cmp(a, b).then_with(|| a.cmp(b))
 }
 
 /// Compare whole release suffixes using dpkg's `verrevcmp` ordering. Compare digit runs
@@ -223,7 +233,7 @@ mod tests {
             "6.1.0-9-amd64",
             "6.12.48+deb13-amd64~rc1",
         ];
-        v.sort_by(|a, b| version_cmp(a, b));
+        v.sort_by(|a, b| release_cmp(a, b));
         assert_eq!(
             v,
             [
@@ -234,6 +244,38 @@ mod tests {
                 "6.12.48+deb13-amd64",
             ]
         );
+    }
+
+    /// As `LC_ALL=C sort -V` orders them, not as dpkg does.
+    #[test]
+    fn releases_sort_as_sort_v_does() {
+        use std::cmp::Ordering::*;
+        assert_eq!(release_cmp("6.12.1-amd64", "6.12.1+deb13-amd64"), Greater);
+        assert_eq!(
+            release_cmp("6.12.9+deb13-amd64", "6.12.10+deb13-amd64"),
+            Less
+        );
+        // Held equal by the version order, still ordered.
+        assert_eq!(release_cmp("1.0-amd64", "1.00-amd64"), Less);
+        assert_eq!(release_cmp("6.1.0-9-amd64", "6.1.0-9-amd64"), Equal);
+        let e = |n: &str| (n.to_string(), FileType::Regular);
+        let entries = [
+            e("vmlinuz-6.12.1+deb13-amd64"),
+            e("initrd.img-6.12.1+deb13-amd64"),
+            e("vmlinuz-6.12.1-amd64"),
+            e("initrd.img-6.12.1-amd64"),
+        ];
+        assert_eq!(newest_pair(&entries).unwrap(), "6.12.1-amd64");
+        // Releases held equal: the directory's order does not matter.
+        let tied = [
+            e("vmlinuz-1.0-amd64"),
+            e("initrd.img-1.0-amd64"),
+            e("vmlinuz-1.00-amd64"),
+            e("initrd.img-1.00-amd64"),
+        ];
+        let reversed: Vec<_> = tied.iter().rev().cloned().collect();
+        assert_eq!(newest_pair(&tied).unwrap(), "1.00-amd64");
+        assert_eq!(newest_pair(&reversed).unwrap(), "1.00-amd64");
     }
 
     #[test]

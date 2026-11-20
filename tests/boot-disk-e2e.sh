@@ -127,7 +127,8 @@ gx 'for f in /var/data/vk-marker /home/vk-marker /var/log/vk-marker; do echo kep
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
       -t trixie-backports linux-image-amd64 >/dev/null'
-kernel_b=$(gx 'ls /boot | sed -n "s/^vmlinuz-//p" | sort -V | tail -1')
+# The newest release as GRUB orders them, which vk boots.
+kernel_b=$(gx 'ls /boot | sed -n "s/^vmlinuz-//p" | LC_ALL=C sort -V | tail -1')
 echo "kernel A: $kernel_a, kernel B: $kernel_b"
 [ "$kernel_b" != "$kernel_a" ] \
   || { echo "FAIL: trixie-backports has no kernel newer than $kernel_a"; exit 1; }
