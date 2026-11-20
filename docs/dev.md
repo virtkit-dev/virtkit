@@ -553,7 +553,8 @@ vk dev prune NAME --all             # prune another environment by its `vk dev l
 
 For `NAME`, use the environment name from `vk list` or `vk dev list`, or its state
 directory's name. Either works host-wide without a workspace config. Prune uses the storage
-recorded at the last boot, even if the workspace has moved or changed.
+recorded at the last boot, even if the workspace has moved or changed. `vk reset NAME`
+accepts the same options and requires a readable dev identity with no run recipe beside it.
 An environment booted by a `vk` from before
 this was recorded prunes its images and its fixed roots, overlays and editor storage,
 but a disk backing left loose in the state directory cannot be identified by name; prune
@@ -594,7 +595,7 @@ workspace's environment, not its task leftovers; if that environment has no
 state, it reports nothing to remove. At first boot, an environment gets a stable name
 from its workspace directory, with `-ENV` appended for environments other than `dev`.
 Collisions add `-2`, `-3`, and so on. A listing or name lookup assigns names to older
-environments. Use that name with `vk start`, `vk stop`, `vk delete`
+environments. Use `vk rename` to change an environment's name. Use that name with `vk start`, `vk stop`, `vk delete`
 and other VM commands. `vk list` shows the
 environment's active and previously started compose services under `NAME/SERVICE`. The state
 directory's name also works, including any leading `.` or `-`

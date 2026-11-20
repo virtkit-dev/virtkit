@@ -16,6 +16,8 @@ All notable changes to virtkit will be documented in this file.
 - `vk delete` (aliases `rm`, `remove`) removes a stopped VM's name and deletes state that
   `vk` recognizes as its own. It preserves other files in user-supplied run directories.
   Use `--dry-run` to preview or `-y` or `-f` to confirm without a terminal.
+- `vk rename` changes a VM's name, and `vk ls` lists VMs.
+- `vk reset` removes a stopped dev environment's boot images or persistent data by name.
 
 ### Changed
 

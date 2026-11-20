@@ -394,7 +394,7 @@ impl Index {
         }
         if let Some(other) = self.name_of(dir) {
             return Err(refuse(format!(
-                "{} is already named {other}",
+                "{} is already named {other} — `vk rename {other} {name}`",
                 dir.display()
             )));
         }
@@ -421,6 +421,78 @@ impl Index {
         std::os::unix::fs::symlink(&target, &path)
             .with_context(|| format!("naming {} {name}", target.display()))?;
         Ok(true)
+    }
+
+    /// Atomically move an existing index link under the claim lock. Even an interrupted
+    /// rename leaves at most one indexed name. Return the previous name, or `None`
+    /// when assigning the first name to a direct child of `dev_base` addressed by
+    /// its directory name.
+    ///
+    /// Recheck the source name under the lock. A starting run keeps its provisional
+    /// name until it commits it. Reject destinations that [`resolve_in`] maps to
+    /// another directory, including unindexed dev state directories.
+    pub fn rename(
+        &self,
+        dev_base: &Path,
+        dir: &Path,
+        was: &str,
+        new: &str,
+    ) -> Result<Option<String>> {
+        validate(new)?;
+        let _lock = self.lock()?;
+        if let Some(other) = resolve_in(self, dev_base, new)?
+            && crate::vms::canonical(&other) != crate::vms::canonical(dir)
+        {
+            return Err(refuse(format!(
+                "the name {new} is taken: it is {}",
+                other.display()
+            )));
+        }
+        let old = self.name_of(dir);
+        match &old {
+            Some(old) if old != was => {
+                return Err(refuse(format!("{was} was renamed {old} meanwhile")));
+            }
+            Some(old) if self.is_provisional(old) => {
+                return Err(refuse(format!(
+                    "{old} is still starting: rename it once it is up"
+                )));
+            }
+            Some(old) if old == new => return Ok(Some(old.clone())),
+            Some(_) => {}
+            None => {
+                let own = crate::vms::canonical(dir).parent()
+                    == Some(crate::vms::canonical(dev_base).as_path())
+                    && dir.file_name() == Some(OsStr::new(was))
+                    && std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir());
+                if !own {
+                    return Err(refuse(format!(
+                        "{was} is gone: it was deleted or renamed meanwhile"
+                    )));
+                }
+            }
+        }
+        // The claim lock keeps the destination free through rename(2).
+        if std::fs::symlink_metadata(self.dir.join(new)).is_ok() {
+            return Err(refuse(format!("the name {new} is taken")));
+        }
+        // An interrupted claim can leave a marker that would make the new name reclaimable.
+        let mark = self.dir.join(marker(new));
+        match std::fs::remove_file(&mark) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("removing {}", mark.display()));
+            }
+            _ => {}
+        }
+        let Some(old) = old else {
+            if !self.link(new, dir)? {
+                return Err(refuse(format!("the name {new} is taken")));
+            }
+            return Ok(None);
+        };
+        std::fs::rename(self.dir.join(&old), self.dir.join(new))
+            .with_context(|| format!("renaming {old} to {new}"))?;
+        Ok(Some(old))
     }
 
     /// Forget every name of `dir`, under the lock so no claim runs meanwhile.
@@ -776,18 +848,62 @@ mod tests {
     }
 
     #[test]
-    fn release_forgets_the_names_of_a_dir() {
-        let t = tmp("release");
+    fn rename_moves_the_link_and_release_forgets_it() {
+        let t = tmp("rename");
         let idx = Index::at(t.0.join("names"));
+        let dev = t.0.join("dev");
         let (a, b) = (t.0.join("a"), t.0.join("b"));
         for d in [&a, &b] {
             std::fs::create_dir(d).unwrap();
         }
         idx.claim(&a, "one").unwrap();
         idx.claim(&b, "two").unwrap();
+        assert!(idx.rename(&dev, &a, "one", "two").is_err());
+        assert_eq!(
+            idx.rename(&dev, &a, "one", "uno").unwrap().as_deref(),
+            Some("one")
+        );
+        assert_eq!(idx.lookup("one"), None);
+        assert_eq!(idx.lookup("uno").unwrap(), a);
+        let c = dev.join("c");
+        std::fs::create_dir_all(&c).unwrap();
+        assert_eq!(idx.rename(&dev, &c, "c", "three").unwrap(), None);
+        assert_eq!(idx.lookup("three").unwrap(), c);
+        let d = t.0.join("d");
+        idx.provisional().claim_exact(&d, "four").unwrap();
+        assert!(idx.rename(&dev, &d, "four", "five").is_err());
+        std::fs::create_dir_all(dev.join("shop")).unwrap();
+        let err = idx.rename(&dev, &a, "uno", "shop").unwrap_err();
+        assert!(err.to_string().contains("taken"), "{err}");
+        assert_eq!(idx.lookup("uno").unwrap(), a);
         idx.release(&a).unwrap();
         assert_eq!(idx.name_of(&a), None);
         assert_eq!(idx.lookup("two").unwrap(), b);
+    }
+
+    /// A stale marker must not make a renamed VM's name reclaimable.
+    #[test]
+    fn rename_commits_its_name_and_never_names_what_is_gone() {
+        let t = tmp("rename-stale");
+        let idx = Index::at(t.0.join("names"));
+        let dev = t.0.join("dev");
+        let (a, b) = (t.0.join("a"), t.0.join("b"));
+        for d in [&a, &b] {
+            std::fs::create_dir(d).unwrap();
+        }
+        idx.claim(&a, "app").unwrap();
+        std::fs::write(t.0.join("names").join(marker("web")), b"").unwrap();
+        idx.rename(&dev, &a, "app", "web").unwrap();
+        assert!(!idx.is_provisional("web"));
+        assert_eq!(idx.claim(&b, "web").unwrap(), ("web-2".to_string(), true));
+        assert_eq!(idx.lookup("web").unwrap(), a);
+        // A released run name and a missing dev state directory cannot acquire a new name.
+        idx.release(&a).unwrap();
+        std::fs::remove_dir(&a).unwrap();
+        let err = idx.rename(&dev, &a, "web", "www").unwrap_err();
+        assert!(err.to_string().contains("gone"), "{err}");
+        assert!(idx.rename(&dev, &dev.join("old"), "old", "www").is_err());
+        assert_eq!(idx.lookup("www"), None);
     }
 
     /// Automatic and exact claims reclaim committed names for missing managed directories.

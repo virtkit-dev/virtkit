@@ -704,6 +704,10 @@ async fn dev_action(
         options,
     } = &action
     {
+        eprintln!(
+            "vk: note: to prune a recorded dev environment, use `vk reset {name}{}`",
+            options.flags()
+        );
         return match super::prune::run_by_name(name, options) {
             Ok(report) => write_report(&report),
             Err(e) => fail(&e, 1),

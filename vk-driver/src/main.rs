@@ -2628,7 +2628,7 @@ enum Cmd {
     /// primary prints its full record. A service reference or `--running`, `--stopped` or
     /// `--kind` selects table rows instead. Use `--json` or `--field` for scripts. For example,
     /// `vk list --running --kind service --field name` prints names for `vk exec`.
-    #[command(display_order = 6)]
+    #[command(display_order = 6, visible_alias = "ls")]
     List {
         /// which VMs: a name, a pid, or those of a project directory (default: all)
         ///
@@ -2767,6 +2767,30 @@ enum Cmd {
         /// seconds to wait for a VM `--force` stops
         #[arg(long, default_value_t = 210, value_name = "SECS")]
         timeout: u64,
+    },
+    /// Remove a dev environment's boot images or persistent data, keeping the environment
+    ///
+    /// Stop the environment first. As with `vk dev prune`, the default is boot images.
+    /// Use `--storage` for persistent roots, overlays, disks, editor data and managed
+    /// directories in state, or `--all` for both selections.
+    #[command(display_order = 8)]
+    Reset {
+        /// the stopped dev environment's name or directory
+        #[arg(value_name = "REF")]
+        target: std::ffi::OsString,
+        #[command(flatten)]
+        options: crate::dev::prune::Options,
+    },
+    /// Give a VM another name
+    #[command(display_order = 8)]
+    Rename {
+        /// the VM's name, pid or directory
+        #[arg(value_name = "REF")]
+        old: std::ffi::OsString,
+        /// the name it takes: 1 to 40 of a-z, 0-9, `.`, `_`, `-`, starting with a-z or 0-9
+        ///
+        /// Not all digits, which would read as a pid.
+        new: String,
     },
     /// Reboot running vk VM(s) in place
     ///
@@ -3980,6 +4004,18 @@ async fn cli_main(cli: Cli) -> ExitCode {
             dry_run,
             timeout,
         } => return lifecycle::delete(targets, *force, *yes, *dry_run, opts(*timeout)),
+        Cmd::Reset { target, options } => {
+            return match lifecycle::reset(target, options) {
+                Ok(report) => write_report(&report),
+                Err(e) => fail(&e, 1),
+            };
+        }
+        Cmd::Rename { old, new } => {
+            return match lifecycle::rename(old, new) {
+                Ok(report) => write_report(&report),
+                Err(e) => fail(&e, 1),
+            };
+        }
         Cmd::Stop {
             target,
             recursive,
@@ -5940,6 +5976,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
         | Cmd::Start { .. }
         | Cmd::Restart { .. }
         | Cmd::Delete { .. }
+        | Cmd::Reset { .. }
+        | Cmd::Rename { .. }
         | Cmd::Stop { .. }
         | Cmd::Reboot { .. }
         | Cmd::Pause { .. }
@@ -8671,6 +8709,8 @@ mod tests {
                 "pause",
                 "publish",
                 "reboot",
+                "rename",
+                "reset",
                 "restart",
                 "resume",
                 "run",

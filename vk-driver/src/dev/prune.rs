@@ -14,7 +14,7 @@ use clap::Args;
 use super::plan::Plan;
 
 #[derive(Args, Default)]
-pub(super) struct Options {
+pub(crate) struct Options {
     /// remove local boot images and disposable boot media (the default selection)
     #[arg(long)]
     images: bool,
@@ -33,6 +33,21 @@ pub(super) struct Options {
 }
 
 impl Options {
+    /// Selected flags in long form, each prefixed with a space for the reset hint.
+    pub(super) fn flags(&self) -> String {
+        [
+            (self.images, " --images"),
+            (self.storage, " --storage"),
+            (self.all, " --all"),
+            (self.dry_run, " --dry-run"),
+            (self.yes, " --yes"),
+        ]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, flag)| *flag)
+        .collect()
+    }
+
     fn images(&self) -> bool {
         self.images || self.all || !self.storage
     }
@@ -423,6 +438,11 @@ pub(super) fn run_by_name(name: &str, opts: &Options) -> Result<String> {
     run_env(&env_of_state(&row.dir), opts, default_confirm)
 }
 
+/// Prune the state directory already resolved and checked by `vk reset`.
+pub(crate) fn run_in(dir: &Path, opts: &Options) -> Result<String> {
+    run_env(&env_of_state(dir), opts, default_confirm)
+}
+
 /// What [`reclaim_images`] did with an environment's boot images.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Reclaimed {
@@ -646,6 +666,17 @@ mod tests {
 
     /// What a prune says when it finds a state directory's lock held.
     const IN_USE: &str = "environment is in use";
+
+    #[test]
+    fn flags_repeat_what_was_given() {
+        assert_eq!(Options::default().flags(), "");
+        let o = Options {
+            storage: true,
+            dry_run: true,
+            ..Options::default()
+        };
+        assert_eq!(o.flags(), " --storage --dry-run");
+    }
 
     struct Fixture {
         _env: std::sync::MutexGuard<'static, ()>,

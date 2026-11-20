@@ -1,9 +1,10 @@
-//! `vk start`, `stop`, `restart` and `delete` operate on VMs named by `vk list`.
-//! Starting a dev environment uses its recorded workspace and config. Starting a run replays
-//! `run.json`. The primary's service manager starts and stops individual compose services.
+//! Lifecycle commands for VMs in `vk list`. Start and restart use the recorded dev
+//! workspace and config or a run's saved recipe (`run.json`). Dev service commands use
+//! `vk dev`. Run service commands go to the primary's service manager. Reset and rename
+//! act on host state.
 //!
-//! [`plan`] and [`plan_delete`] select steps without side effects. [`execute`] runs them
-//! and [`remove`] deletes the planned state.
+//! [`plan`] and [`plan_delete`] describe start, stop and delete without changing state.
+//! [`execute`] and [`remove`] carry out those steps.
 
 use std::ffi::{OsStr, OsString};
 use std::os::fd::AsFd;
@@ -1090,6 +1091,46 @@ pub fn delete(refs: &[OsString], force: bool, yes: bool, dry_run: bool, o: Opts)
     exit(ok)
 }
 
+/// Prune a stopped dev environment after checking ownership of its state directory.
+pub fn reset(r: &OsStr, options: &crate::dev::prune::Options) -> Result<String> {
+    let t = resolve(r, Among::One)?;
+    if let Some(service) = &t.service {
+        bail!(
+            "{}/{service} is a compose service: `vk reset` takes a dev environment \
+             (`vk delete {}/{service}` removes a service's state)",
+            t.name,
+            t.name
+        );
+    }
+    if t.kind != Kind::Dev {
+        bail!(
+            "{} is a run: `vk reset` takes a dev environment \
+             (`vk delete {}` removes it)",
+            t.name,
+            t.name
+        );
+    }
+    owned_dev(&t.dir).with_context(|| format!("{} is not reset", t.name))?;
+    crate::dev::prune::run_in(&t.dir, options)
+}
+
+/// Resolve one VM and change its indexed name.
+pub fn rename(old: &OsStr, new: &str) -> Result<String> {
+    let t = resolve(old, Among::One)?;
+    if let Some(service) = &t.service {
+        bail!(
+            "{}/{service} is a compose service: `vk rename` names a VM",
+            t.name
+        );
+    }
+    let dev_base = crate::dev::plan::dev_state_base()?;
+    let was = crate::names::Index::open()?.rename(&dev_base, &t.dir, &t.name, new)?;
+    Ok(format!(
+        "renamed {} to {new}\n",
+        was.unwrap_or(t.name.clone())
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1647,6 +1688,30 @@ mod tests {
         assert!(deleted(&[os("app")]));
         assert!(dir.join("notes.txt").exists() && !dir.join(crate::names::RECIPE).exists());
         assert_eq!(crate::names::Index::open().unwrap().name_of(&dir), None);
+    }
+
+    /// A run recipe or an unreadable dev identity prevents reset from removing data.
+    #[test]
+    fn reset_takes_only_a_dir_known_to_be_a_dev_environment() {
+        let homes = crate::dev::testutil::Homes::new("reset-own");
+        let dir = crate::dev::plan::dev_state_base().unwrap().join("scratch");
+        std::fs::create_dir_all(dir.join("editor")).unwrap();
+        let dir = vms::canonical(&dir);
+        let identity = serde_json::json!({ "digest": "d", "booted_secs": 0, "manifest": {} });
+        std::fs::write(dir.join("dev.json"), identity.to_string()).unwrap();
+        std::fs::write(dir.join(crate::names::RECIPE), b"{}").unwrap();
+        homes.name(&dir, "app");
+        let o = crate::dev::prune::Options::default();
+        let err = format!("{:#}", reset(&os("app"), &o).unwrap_err());
+        assert!(
+            err.contains("app is not reset") && err.contains("run's"),
+            "{err}"
+        );
+        std::fs::remove_file(dir.join(crate::names::RECIPE)).unwrap();
+        std::fs::write(dir.join("dev.json"), b"{}").unwrap();
+        let err = format!("{:#}", reset(&os("app"), &o).unwrap_err());
+        assert!(err.contains("app is not reset"), "{err}");
+        assert!(dir.join("editor").is_dir());
     }
 
     /// A dir put in place of the one planned on, after it was locked, loses nothing: the
