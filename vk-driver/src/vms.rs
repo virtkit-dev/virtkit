@@ -423,6 +423,8 @@ pub fn register(entry: VmEntry) -> Registration {
     // A copy beside the VM, read once it has stopped: what `vk list` shows of a VM that is
     // known but not running.
     let _ = record_last(&entry);
+    // Registered is running: the start is over.
+    crate::vmstate::clear(&entry.state_dir);
     REGISTERED.store(true, std::sync::atomic::Ordering::Relaxed);
     match registry_dir().and_then(|dir| record_in(&dir, &entry)) {
         Ok(()) => Registration {
@@ -1033,6 +1035,13 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
         let vm = listed_name(only).unwrap_or_else(|| only.pid.to_string());
         filter.name = Some(format!("{vm}/{service}"));
     }
+    use crate::vmstate::Standing;
+    let now = unix_now();
+    let listed = |e: &VmEntry| listed_name(e).unwrap_or_else(|| e.pid.to_string());
+    let transients: Vec<_> = vms
+        .iter()
+        .map(|e| crate::vmstate::peek(&e.state_dir))
+        .collect();
     let live: Vec<Live> = vms
         .iter()
         .enumerate()
@@ -1045,6 +1054,15 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
             published: published_by_vm[i].clone(),
             mem_used: mem_used[i],
             fresh: stale.then_some(fresh[i]),
+            // On record as under way or overdue: said as recorded. One that describes
+            // nothing any more is read past.
+            transient: transients[i]
+                .as_ref()
+                .filter(|(_, standing)| *standing != Standing::Gone)
+                .map(|(t, _)| t.state.label()),
+            attention: transients[i]
+                .as_ref()
+                .and_then(|(t, standing)| attention(t, *standing, &listed(e), now)),
         })
         .collect();
     let running_dirs: Vec<&Path> = vms.iter().map(|e| e.state_dir.as_path()).collect();
@@ -1060,9 +1078,21 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
             false => (name, dir, crate::vmlist::NEVER_BOOTED),
         }))
         .filter(|(_, dir, _)| dir.is_dir() && !running_dirs.contains(&canonical(dir).as_path()))
-        .filter_map(|(name, dir, status)| {
+        .filter_map(|(name, dir, at_rest)| {
             let kind = kind_of(dir);
             let last = last_entry(dir);
+            // Its run holds the dir and has no VM up yet: neither stopped nor running. A
+            // record that no longer holds is read past.
+            let transient = crate::vmstate::peek(dir);
+            let status = match &transient {
+                Some((_, Standing::Gone)) => at_rest,
+                // Under way or overdue: as its record words it.
+                Some((t, _)) => t.state.label(),
+                None => at_rest,
+            };
+            let attention = transient
+                .as_ref()
+                .and_then(|(t, standing)| attention(t, *standing, name, now));
             let (project, environment) = match kind {
                 Kind::Dev => dev_identity(dir),
                 _ => (
@@ -1078,6 +1108,7 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
                 dir: dir.clone(),
                 kind,
                 status,
+                attention,
                 last,
                 project,
                 environment,
@@ -1097,7 +1128,7 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
             keep.then_some(k)
         })
         .collect();
-    let rows: Vec<crate::vmlist::Row> = crate::vmlist::rows(&live, &known, unix_now())
+    let rows: Vec<crate::vmlist::Row> = crate::vmlist::rows(&live, &known, now)
         .into_iter()
         .filter(|r| filter.keeps(r))
         .collect();
@@ -1110,6 +1141,15 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
     }
     if opts.json {
         return Ok(serde_json::to_string_pretty(&rows).context("serializing VM list")? + "\n");
+    }
+    // What needs someone's attention is said in full, with what can be done about it: a
+    // listing shows it, and neither asks nor acts.
+    for r in rows.iter().filter(|r| r.attention.is_some()) {
+        eprintln!(
+            "vk: {}: {}",
+            r.name,
+            r.attention.as_deref().unwrap_or_default()
+        );
     }
     // One running VM asked for by name, pid or directory: its full record.
     if filter.name.is_none() && full_record(target.as_ref(), vms.len()) {
@@ -1139,6 +1179,38 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
         opts.wide,
         stale,
     ))
+}
+
+/// What to say of a VM whose recorded transient state is overdue — a stop that timed out
+/// while its run is still there — and what can be done about it; `None` for any other
+/// standing. Said by `vk list`, which leaves the doing to the user.
+fn attention(
+    t: &crate::vmstate::Transient,
+    standing: crate::vmstate::Standing,
+    name: &str,
+    now: u64,
+) -> Option<String> {
+    if standing != crate::vmstate::Standing::Overdue {
+        return None;
+    }
+    let pid = t.pid;
+    let ago = fmt_uptime(now.saturating_sub(t.deadline_secs.unwrap_or(t.since_secs)));
+    // With a deadline it ran out; without one, the command waiting on it went away.
+    let how = match t.deadline_secs {
+        Some(_) => "timed out",
+        None => "was interrupted, begun",
+    };
+    Some(match t.state {
+        crate::vmstate::State::Stopping => format!(
+            "a stop {how} {ago} ago and its run (pid {pid}) is still there — `vk logs \
+             {name}` and `vk list {name}` show it, `vk stop {name}` tries again, \
+             `vk stop --force {name}` insists then kills it"
+        ),
+        crate::vmstate::State::Starting => format!(
+            "its start is overdue by {ago} and its run (pid {pid}) is still there — `vk logs \
+             {name}` shows it, `kill {pid}` ends it"
+        ),
+    })
 }
 
 /// A dev environment's environment name, from its `dev.json`.
@@ -1321,6 +1393,22 @@ pub const FORCE_TERM_SECS: u64 = 5;
 /// and for a run it then had to kill itself to be gone.
 pub const KILL_WAIT_SECS: u64 = 5;
 
+impl StopHow {
+    /// How long a stop of this kind may take, given `--timeout` (`None`: as long as it
+    /// takes): what its `stopping` record carries as its deadline. A forced stop is bounded
+    /// by its own steps, and by the timeout when that is shorter.
+    pub fn budget_secs(self, timeout: Option<u64>) -> Option<u64> {
+        // A kill is two waits: for the run to tear down once its VMM is gone, then for a
+        // run that had to be killed itself.
+        let own = match self {
+            StopHow::Graceful => return timeout,
+            StopHow::Force => FORCE_TERM_SECS + 2 * KILL_WAIT_SECS,
+            StopHow::Kill => 2 * KILL_WAIT_SECS,
+        };
+        Some(timeout.map_or(own, |t| t.min(own)))
+    }
+}
+
 /// Send `signal` to the run `entry` records — if its pid is still that process. A SIGKILL
 /// must not land on a process the pid was handed to since: where the entry recorded its
 /// start time, a pid started at another is left alone. The result of `kill` is dropped
@@ -1381,13 +1469,16 @@ fn kill_vmms(entry: &VmEntry) {
 ///
 /// A VM whose VMM is killed is not powered off: what its guest had not written is lost. A
 /// run killed in turn cannot tidy after itself: its helpers, tied to it, go with it, and
-/// its registry entry is removed here.
+/// its registry entry and state record are removed here. A run still
+/// standing at the end keeps its `stopping` record, which `vk list` shows as overdue until
+/// the run is gone or a stop succeeds — what to do about it is the user's call.
 fn stop_many(entries: &[VmEntry], timeout: Option<u64>, how: StopHow) -> Vec<bool> {
     use std::time::{Duration, Instant};
     let down = |e: &VmEntry| {
         if let Ok(dir) = registry_dir() {
             remove_in(&dir, &e.state_dir);
         }
+        crate::vmstate::clear(&e.state_dir);
     };
     // Publishers detect an already-gone VM on their next probe. A dead entry is not
     // signalled: it may only be stale.
@@ -1412,8 +1503,16 @@ fn stop_many(entries: &[VmEntry], timeout: Option<u64>, how: StopHow) -> Vec<boo
     }
     let started = Instant::now();
     let overall = timeout.map(|t| started + Duration::from_secs(t));
-    // Every order goes out before any wait.
+    // Every order goes out before any wait. Each run is said to be stopping for as long as
+    // this command waits on it: the record lapses by itself, at its deadline or when this
+    // process is gone, should the wait be interrupted.
     for e in pending(&went) {
+        crate::vmstate::stopping(
+            &e.state_dir,
+            e.pid,
+            e.pid_start_ticks,
+            how.budget_secs(timeout),
+        );
         match how {
             StopHow::Kill => kill_vmms(e),
             StopHow::Graceful | StopHow::Force => signal_run(e, libc::SIGTERM),

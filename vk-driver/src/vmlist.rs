@@ -43,7 +43,7 @@ pub const STOPPED: &str = "stopped";
 /// never finished, or what a task run in a throwaway environment leaves.
 pub const NEVER_BOOTED: &str = "never booted";
 
-/// Whether a row with this status has no VM up: `--stopped` keeps these,
+/// Whether a row with this status has no VM up or on its way: `--stopped` keeps these,
 /// `--running` the rest.
 fn at_rest(status: &str) -> bool {
     status == STOPPED || status == NEVER_BOOTED
@@ -56,8 +56,10 @@ pub struct Row {
     /// the pid of a running VM that has no name
     pub name: String,
     pub kind: Kind,
-    /// `running` or `stopped`; `never booted` for a dev environment's state that recorded no
-    /// boot; `-` for a service whose VM could not be asked
+    /// `running` or `stopped`; `starting` while its run pulls, builds or boots, `stopping`
+    /// while a stop waits for it to go — either as its state record words it, and still so
+    /// once overdue, when `attention` says why; `never booted` for a dev environment's state that
+    /// recorded no boot; `-` for a service whose VM could not be asked
     pub status: String,
     /// the VM a compose service belongs to
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,15 +87,24 @@ pub struct Row {
     /// with `--stale`: whether a fresh `vk run` would rebuild its image (`null`: unknown)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale: Option<Option<bool>>,
+    /// what needs someone to look at this VM, and what can be done: a stop that timed out
+    /// while its run is still there. Nothing clears it but the run going, or a stop that
+    /// succeeds. Left out when there is nothing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attention: Option<String>,
 }
 
 /// A row's STATUS as printed: its status — `-` for state that never booted, which has no
-/// status to speak of; `--json` keeps the word.
+/// status to speak of; `--json` keeps the word — with `!` when the VM needs attention.
 fn status_cell(r: &Row) -> String {
-    match r.status.as_str() {
+    let mut cell = match r.status.as_str() {
         NEVER_BOOTED => "-".to_string(),
         status => status.to_string(),
+    };
+    if r.attention.is_some() {
+        cell.push('!');
     }
+    cell
 }
 
 /// A running VM, with what was read of it.
@@ -108,6 +119,11 @@ pub struct Live<'a> {
     pub mem_used: Option<u64>,
     /// with `--stale`, its freshness
     pub fresh: Option<Freshness>,
+    /// the transient state on record for it, under way or overdue, as its record words it
+    /// (`stopping`): what its STATUS reads instead of `running`
+    pub transient: Option<&'static str>,
+    /// what needs attention about it (see [`Row::attention`])
+    pub attention: Option<String>,
 }
 
 /// A named VM that is not running.
@@ -115,8 +131,11 @@ pub struct Known {
     pub name: String,
     pub dir: PathBuf,
     pub kind: Kind,
-    /// [`STOPPED`] or [`NEVER_BOOTED`]
+    /// [`STOPPED`], [`NEVER_BOOTED`], or the transient state on record for it, under way
+    /// or overdue, as its record words it (`starting` while its run has registered no VM)
     pub status: &'static str,
+    /// what needs attention about it (see [`Row::attention`])
+    pub attention: Option<String>,
     /// the registry entry it last ran with, if it left one
     pub last: Option<VmEntry>,
     pub project: Option<PathBuf>,
@@ -150,12 +169,13 @@ pub fn rows_with(
     for l in live {
         let e = l.entry;
         let name = l.name.clone().unwrap_or_else(|| e.pid.to_string());
+        let status = l.transient.unwrap_or("running");
         let (own, by_service): (Vec<&Published>, Vec<&Published>) =
             l.published.iter().partition(|(p, _)| p.service.is_none());
         out.push(Row {
             name: name.clone(),
             kind: l.kind,
-            status: "running".into(),
+            status: status.into(),
             parent: None,
             pid: Some(e.pid),
             uptime_secs: Some(now.saturating_sub(e.created_secs)),
@@ -170,6 +190,7 @@ pub fn rows_with(
             ip: e.guest_ip.map(|ip| ip.to_string()),
             published: own.into_iter().map(published_text).collect(),
             stale: l.fresh.map(Freshness::json),
+            attention: l.attention.clone(),
         });
         for s in &e.services {
             let unit = l
@@ -203,6 +224,7 @@ pub fn rows_with(
                     .map(|p| published_text(p))
                     .collect(),
                 stale: None,
+                attention: None,
             });
         }
     }
@@ -229,6 +251,7 @@ pub fn rows_with(
             ip: None,
             published: Vec::new(),
             stale: None,
+            attention: k.attention.clone(),
         });
         let project = out.last().and_then(|r| r.project.clone());
         for s in last.map(|e| e.services.as_slice()).unwrap_or_default() {
@@ -254,6 +277,7 @@ pub fn rows_with(
                 ip: None,
                 published: Vec::new(),
                 stale: None,
+                attention: None,
             });
         }
     }
@@ -406,6 +430,8 @@ mod tests {
             published: Vec::new(),
             mem_used: Some(1 << 30),
             fresh: None,
+            transient: None,
+            attention: None,
         }
     }
 
@@ -428,6 +454,7 @@ mod tests {
             dir: "/s/zeta".into(),
             kind: Kind::Run,
             status: STOPPED,
+            attention: None,
             last: Some(entry("/s/zeta", "/w/app", 13, &["cache"])),
             project: None,
             environment: None,
@@ -476,6 +503,7 @@ mod tests {
             dir: "/s/zeta".into(),
             kind: Kind::Run,
             status: STOPPED,
+            attention: None,
             last: Some(entry("/s/zeta", "/w/app", 13, &["cache", "never"])),
             project: None,
             environment: None,
@@ -503,26 +531,39 @@ mod tests {
         );
     }
 
-    /// State that never booted is named, and counts as stopped for the filters.
+    /// A VM on its way up or down says so, and counts as running for the filters; state
+    /// that never booted counts as stopped.
     #[test]
-    fn never_booted_state_is_named_and_filtered() {
+    fn transient_and_never_booted_states_are_named_and_filtered() {
         let app = entry("/s/app", "/w/app", 10, &[]);
+        let mut going = live(&app, "app", Kind::Run, vec![]);
+        going.transient = Some("stopping");
+        // A second VM whose stop timed out: still `stopping`, as recorded, and flagged.
+        let hung = entry("/s/hung", "/w/app", 11, &[]);
+        let mut stuck = live(&hung, "hung", Kind::Run, vec![]);
+        stuck.transient = Some("stopping");
+        stuck.attention = Some("a stop timed out".into());
         let known = |name: &str, status: &'static str| Known {
             name: name.into(),
             dir: format!("/s/{name}").into(),
             kind: Kind::Dev,
             status,
+            attention: None,
             last: None,
             project: None,
             environment: None,
         };
         let rows = rows(
-            &[live(&app, "app", Kind::Run, vec![])],
-            &[known("task-1a2b", NEVER_BOOTED)],
+            &[going, stuck],
+            &[
+                known("coming", "starting"),
+                known("task-1a2b", NEVER_BOOTED),
+            ],
             0,
         );
         let status = |n: &str| rows.iter().find(|r| r.name == n).unwrap().status.clone();
-        assert_eq!(status("app"), "running");
+        assert_eq!(status("app"), "stopping");
+        assert_eq!(status("coming"), "starting");
         assert_eq!(status("task-1a2b"), NEVER_BOOTED);
         let keep = |f: Filter| {
             let mut kept: Vec<&str> = rows
@@ -543,11 +584,13 @@ mod tests {
                 ..Filter::default()
             },
         );
-        assert_eq!(keep(running), ["app"]);
+        assert_eq!(keep(running), ["app", "coming", "hung"]);
         assert_eq!(keep(stopped), ["task-1a2b"]);
+        assert_eq!(status("hung"), "stopping");
         let table = render(&rows, None, false, false);
         // State that never booted has no status to print; `--json` still says which it is.
         assert!(!table.contains("never booted"), "{table}");
+        assert!(table.contains("stopping!"), "{table}");
         let json = serde_json::to_string(&rows).unwrap();
         assert!(json.contains("\"status\":\"never booted\""), "{json}");
     }
@@ -673,6 +716,7 @@ mod tests {
             dir: scratch.state_dir.clone(),
             kind: Kind::Run,
             status: STOPPED,
+            attention: None,
             last: Some(scratch.clone()),
             project: None,
             environment: None,

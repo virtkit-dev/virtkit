@@ -2,7 +2,7 @@
 //!
 //! A VM's state dir holds its control sockets — the exec channel is a root shell in the
 //! guest — so it is its owner's alone, and the records `vk` writes about a VM (the recipe
-//! with its full command line, its last registry entry, the name index)
+//! with its full command line, its last registry entry, its transient state, the name index)
 //! follow the same rule. Every such write goes through here, so opening them to the owner's
 //! group later is a change to [`FILE_MODE`] and [`DIR_MODE`], not a hunt for literals.
 
@@ -20,6 +20,12 @@ pub const DIR_MODE: u32 = 0o700;
 /// mode a file already there has.
 pub fn write(path: &Path, contents: &[u8]) -> Result<()> {
     vk_fs::write_atomic(path, contents, FILE_MODE)
+}
+
+/// [`write`] for a record nothing needs after a crash: no fsync, and a reader takes what it
+/// cannot parse as absent.
+pub fn write_unsynced(path: &Path, contents: &[u8]) -> Result<()> {
+    vk_fs::write_atomic_unsynced(path, contents, FILE_MODE)
 }
 
 /// Create `dir` and its missing parents at [`DIR_MODE`]. One already there keeps the mode
@@ -53,6 +59,8 @@ mod tests {
         write(&file, b"new").unwrap();
         assert_eq!(mode(&file), FILE_MODE);
         assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        write_unsynced(&file, b"newer").unwrap();
+        assert_eq!(mode(&file), FILE_MODE);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1201,8 +1201,10 @@ impl WorkDir {
         let lock = lock_state_dir(&path)?;
         remove_stale_sockets(&path)?;
         mark_active(&path);
-        // The dir is this run's from here on: leave the recipe `vk start` replays — only
-        // now, so a run refused the dir never rewrites the recipe of the one that holds it.
+        // The dir is this run's from here on: say that it is starting, until it registers
+        // its VM, and leave the recipe `vk start` replays — only now, so a run refused the
+        // dir never rewrites the recipe of the one that holds it.
+        crate::vmstate::starting(&path);
         crate::names::write_pending_recipe(&path)?;
         Ok(WorkDir {
             path,
@@ -1413,6 +1415,8 @@ impl Drop for WorkDir {
     fn drop(&mut self) {
         if self.pinned {
             mark_active(&self.path);
+            // At rest again, whether it ran, was stopped or never came up.
+            crate::vmstate::clear(&self.path);
         } else {
             let _ = std::fs::remove_dir_all(&self.path);
         }

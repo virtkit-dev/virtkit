@@ -285,9 +285,26 @@ pub fn plan(
     })
 }
 
-/// What `verb` does to `t` as it is now.
+/// What `verb` does to `t` as it is now. A VM whose run is still starting — it holds the
+/// state dir, with no VM registered yet — is neither up nor at rest: starting it again is
+/// nothing to do, and it can be neither stopped nor deleted until it is up or has failed.
 fn steps_for(verb: Verb, t: &Target) -> Result<Vec<Step>> {
     let entry = running_on(&t.dir);
+    if entry.is_none()
+        && let Some(now) = crate::vmstate::read(&t.dir)
+        && now.state == crate::vmstate::State::Starting
+    {
+        return match (verb, &t.service) {
+            (Verb::Start { .. }, None) => {
+                Ok(vec![Step::Nothing(format!("{} is starting", t.name))])
+            }
+            _ => bail!(
+                "{} is starting (pid {}): wait until it is up",
+                t.name,
+                now.pid
+            ),
+        };
+    }
     let up = service_up(entry.as_ref(), t.service.as_deref());
     plan(verb, t, entry.is_some(), up, managed(&t.dir))
 }
@@ -656,6 +673,11 @@ fn stopping(arg: &OsStr, recursive: bool) -> Result<Stopping> {
         }
         Some(entry) => Ok(Stopping::Vms(vec![entry], String::new())),
         None => {
+            if let Some(now) = crate::vmstate::read(&dir)
+                && now.state == crate::vmstate::State::Starting
+            {
+                bail!("{name} is starting (pid {}): wait until it is up", now.pid);
+            }
             // What an environment published can outlive it on record: cleared here, as
             // `vk dev stop` does for one that is already down.
             if kind_of(&dir)? == Kind::Dev {

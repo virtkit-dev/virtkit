@@ -116,6 +116,7 @@ mod vmm;
 mod vmmctl;
 mod vmmthreads;
 mod vms;
+mod vmstate;
 mod winbuild;
 mod wincache;
 mod wineval;
@@ -2677,7 +2678,7 @@ enum Cmd {
         ///
         /// One bound for the whole command, however many VMs it stops: every VM is told to
         /// stop at once, and the command waits for all of them together. One still up when
-        /// it runs out is reported stuck (exit 1). A
+        /// it runs out is reported stuck (exit 1) and shows as `stopping!` in `vk list`. A
         /// run allows a Linux guest one minute to power off and a Windows guest three, then
         /// 10 seconds to save its disks, so less than 210 can cut an orderly shutdown short.
         #[arg(long, value_name = "SECS")]
