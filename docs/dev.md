@@ -597,14 +597,16 @@ from removed mount declarations is not inferred; `vk dev gc` removes the whole
 environment state when it is no longer needed.
 
 ```sh
-vk dev list
+vk dev list                         # this workspace's environments
+vk dev list --all                   # every workspace's, from anywhere
 vk dev list --json
 vk dev gc --all-stale
 vk dev gc ENVIRONMENT_NAME --yes
 vk dev gc
 ```
 
-`list` and `gc --all-stale` work from anywhere without a project config. `gc`
+`list` shows the environments of this workspace; `list --all` and `gc --all-stale`
+cover every workspace's and work from anywhere, without a project config. `gc`
 reads the config: bare, like `stop`, it takes this workspace's environment, not its
 task leftovers (if that environment has no state, it reports nothing to remove), and
 `gc NAME` takes environments of this workspace only. `vk delete NAME` removes a VM of

@@ -405,10 +405,11 @@ enum DevAction {
         #[arg(long, default_value_t = super::boot::STOP_TIMEOUT_SECS)]
         timeout: u64,
     },
-    /// List every dev environment this host keeps state for
+    /// List this workspace's dev environments, or with `--all` every one on this host
     ///
-    /// Host-wide, and needs no config in the current directory: one row per state directory
-    /// under `$XDG_STATE_HOME/virtkit/dev` — which workspace and environment it belongs to,
+    /// One row per state directory under `$XDG_STATE_HOME/virtkit/dev` that this workspace
+    /// recorded a boot in; `--all` lists every workspace's, and those that recorded none,
+    /// and needs no workspace. Each row says which workspace and environment it belongs to,
     /// whether it is running, which vk created it, how long ago it last booted, what its VM
     /// holds in memory and what it holds on disk (`--no-sizes` skips the disk measure). MEM
     /// is the running VM's whole process tree over the size it booted with (`1.2G/8G`), as
@@ -416,6 +417,9 @@ enum DevAction {
     /// workspace is gone, or when it recorded no boot at all — the shape a task run in a
     /// throwaway environment leaves. Reads only.
     List {
+        /// every dev environment on this host, whatever its workspace
+        #[arg(long, short = 'a')]
+        all: bool,
         /// print the same facts as JSON
         #[arg(long)]
         json: bool,
@@ -424,6 +428,12 @@ enum DevAction {
         /// The `ON DISK` column then shows `-`.
         #[arg(long)]
         no_sizes: bool,
+        /// show each workspace's full path
+        ///
+        /// WORKSPACE otherwise reads the workspace's directory name, with as many parent
+        /// directories as tell it from the others listed. `--json` always has the path.
+        #[arg(short = 'w', long, conflicts_with = "json")]
+        wide: bool,
     },
     /// Remove the state of environments that are finished with
     ///
@@ -722,12 +732,47 @@ async fn dev_action(
             Err(e) => fail(&e, 2),
         };
     }
-    // Like `init`, these host-wide commands read the state base and need no config.
-    if let DevAction::List { json, no_sizes } = action {
-        let report = match crate::dev::list::state(!no_sizes).and_then(|rows| match json {
-            true => crate::dev::list::json(&rows),
-            false => Ok(crate::dev::list::render(&rows)),
+    // The list reads the state base and needs no config: only, unless `--all`, to know
+    // which workspace it is about.
+    if let DevAction::List {
+        all,
+        json,
+        no_sizes,
+        wide,
+    } = action
+    {
+        // Scoped to a workspace, the list also says what its config declares: each
+        // environment, brought up or not, and its compose services.
+        let here = match all {
+            true => None,
+            false => match config::discover(&cwd, workspace, config) {
+                Ok(files) => {
+                    let workspace = crate::vms::canonical(&files.workspace);
+                    Some((workspace, declared_environments(files)))
+                }
+                Err(e) => return no_workspace_or(e, 2, Some("vk dev list --all")),
+            },
+        };
+        let report = match crate::dev::list::state(!no_sizes).map(|mut rows| {
+            let Some((here, declared)) = &here else {
+                return rows;
+            };
+            rows.retain(|r| {
+                r.workspace.as_deref().map(crate::vms::canonical) == Some(here.clone())
+            });
+            crate::dev::list::with_services(rows, declared, !no_sizes, &reported_units)
         }) {
+            Ok(rows) => match (json, &here) {
+                (true, _) => crate::dev::list::json(&rows),
+                (false, Some((here, _))) if rows.is_empty() => Ok(format!(
+                    "no dev environment for {} (`vk dev list --all` lists every workspace's)\n",
+                    here.display()
+                )),
+                (false, _) => Ok(crate::dev::list::render(&rows, wide)),
+            },
+            Err(e) => Err(e),
+        };
+        let report = match report {
             Ok(report) => report,
             Err(e) => return fail(&e, 1),
         };
@@ -1342,6 +1387,66 @@ pub(crate) fn dev_gc(yes: bool, all_stale: bool, names: &[String], own: bool) ->
     }
 }
 
+/// What the config in `files` declares, for `vk dev list`: every environment — `dev`, then
+/// those under `[environments]` — with where its state goes and the compose services it
+/// runs beside its primary. A config that cannot be read, or an environment that does not
+/// resolve, is said on stderr and declares nothing: the list then shows what has state.
+fn declared_environments(files: config::Files) -> Vec<crate::dev::list::Declared> {
+    let loaded = match config::load(files) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("vk: note: listing only what has state, the config does not load: {e:#}");
+            return Vec::new();
+        }
+    };
+    let names = loaded
+        .schema
+        .dev
+        .iter()
+        .map(|_| "dev".to_string())
+        .chain(loaded.schema.environments.keys().cloned());
+    names
+        .filter_map(|environment| {
+            let plan = match plan::resolve(&loaded, &environment) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    eprintln!("vk: note: the {environment} environment does not resolve: {e:#}");
+                    return None;
+                }
+            };
+            let services = match &plan.source {
+                plan::Source::Compose { file, service, .. } => init::service_names(file)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|s| s != service)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            Some(crate::dev::list::Declared {
+                environment,
+                workspace: plan.workspace,
+                state_dir: plan.state_dir,
+                services,
+            })
+        })
+        .collect()
+}
+
+/// The units the service manager of the environment running on `state_dir` reports, as
+/// `(name, state)`; `None` when nothing runs there or it cannot be asked.
+fn reported_units(state_dir: &Path) -> Option<Vec<(String, String)>> {
+    let dir = crate::vms::canonical(state_dir);
+    let entry = crate::vms::running()
+        .into_iter()
+        .find(|e| e.state_dir == dir)?;
+    Some(
+        crate::vms::service_units(&entry)?
+            .into_iter()
+            .map(|u| (u.name, u.state))
+            .collect(),
+    )
+}
+
 /// The exit status of a `vk dev` command that needs a workspace and was given none: it is
 /// run outside any, with neither `--workspace` nor `$VIRTKIT_WORKSPACE`. Its own status, so
 /// a script can tell "not in a workspace" from a workspace whose config is wrong (2).
@@ -1366,7 +1471,7 @@ fn no_workspace_hint(host_wide: Option<&str>) -> String {
     let mut hint = format!(
         "vk: hint: `vk dev` works on one workspace, the project holding {file}:\n\
          \x20         cd into it, or name it with `vk dev --workspace DIR …` or {env}=DIR\n\
-         \x20         `vk dev list` lists every workspace's environments, `vk list` every VM\n",
+         \x20         `vk dev list --all` lists every workspace's environments, `vk list` every VM\n",
         file = config::CONFIG_FILE,
         env = config::WORKSPACE_ENV,
     );

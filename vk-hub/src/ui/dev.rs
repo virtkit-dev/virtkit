@@ -127,6 +127,7 @@ async fn dev_rows(local: &Local) -> Result<Vec<DevRow>, String> {
             &[
                 "dev".as_ref(),
                 "list".as_ref(),
+                "--all".as_ref(),
                 "--json".as_ref(),
                 "--no-sizes".as_ref(),
             ],

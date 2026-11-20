@@ -42,6 +42,8 @@ pub enum Status {
     Stopped,
     /// no identity recorded: an ephemeral run, or a boot that never completed
     NeverBooted,
+    /// declared by the workspace's config and never brought up: there is no state yet
+    NotBuilt,
 }
 
 impl Status {
@@ -50,6 +52,7 @@ impl Status {
             Status::Running => "running",
             Status::Stopped => "stopped",
             Status::NeverBooted => "never booted",
+            Status::NotBuilt => "-",
         }
     }
 }
@@ -122,6 +125,135 @@ pub struct Row {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
     pub flags: Vec<Flag>,
+    /// the environment's other compose services, as its workspace's config declares them:
+    /// one line each in the table. Filled for the workspace `vk dev list` is run in, and
+    /// left out of `--all`, which reads no config
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<Service>,
+}
+
+/// One compose service of an environment, beside its primary.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Service {
+    pub name: String,
+    /// `running` or `stopped`; `null` when the service has no VM — it was never built or
+    /// started
+    pub status: Option<String>,
+    /// where its VM keeps its state, `svc-<name>/` in the environment's state dir
+    pub dir: PathBuf,
+    /// how long ago it last booted, at the time of the scan; `null` when it never did
+    pub age_secs: Option<u64>,
+    /// what its directory holds; measured by default, omitted with `--no-sizes` and for a
+    /// service that has no VM
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+}
+
+/// One environment the workspace's config declares: where its state goes, and the compose
+/// services it runs beside its primary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Declared {
+    pub environment: String,
+    pub workspace: PathBuf,
+    pub state_dir: PathBuf,
+    pub services: Vec<String>,
+}
+
+/// What a running environment's service manager reports of its units, as `(name, state)`;
+/// `None` for an environment that is not running or cannot be asked.
+pub type UnitStates<'a> = dyn Fn(&Path) -> Option<Vec<(String, String)>> + 'a;
+
+/// `rows` — the workspace's environments that have state — laid out as its config declares
+/// them: every declared environment in order, one that was never brought up as a
+/// [`Status::NotBuilt`] row, each with its declared services; then the rows no declaration
+/// accounts for (an environment since dropped from the config). `states` gives the units a
+/// running environment's service manager reports, as `(name, state)`; `sizes` measures what
+/// each service's directory holds.
+pub fn with_services(
+    rows: Vec<Row>,
+    declared: &[Declared],
+    sizes: bool,
+    states: &UnitStates,
+) -> Vec<Row> {
+    let mut left = rows;
+    let mut out = Vec::new();
+    for d in declared {
+        let dir = crate::vms::canonical(&d.state_dir);
+        let found = left
+            .iter()
+            .position(|r| crate::vms::canonical(&r.dir) == dir);
+        let mut row = match found {
+            Some(i) => left.remove(i),
+            None => Row {
+                name: default_name(&d.workspace, &d.environment),
+                dir_name: d
+                    .state_dir
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into(),
+                dir: d.state_dir.clone(),
+                workspace: Some(d.workspace.clone()),
+                workspace_folder: None,
+                environment: Some(d.environment.clone()),
+                status: Status::NotBuilt,
+                created_by: None,
+                booted_secs: None,
+                age_secs: None,
+                mem_used_bytes: None,
+                mem: None,
+                size_bytes: None,
+                flags: Vec::new(),
+                services: Vec::new(),
+            },
+        };
+        let reported = match row.status {
+            Status::Running => states(&row.dir),
+            _ => None,
+        };
+        row.services = d
+            .services
+            .iter()
+            .map(|name| {
+                let dir = row.dir.join(format!("svc-{name}"));
+                service(name, dir, reported.as_deref(), sizes)
+            })
+            .collect();
+        out.push(row);
+    }
+    out.extend(left);
+    out
+}
+
+/// One service, read from its directory: it has a VM when its primary reports it in a
+/// state other than stopped, or when it booted before (its console log is there) — the
+/// rule `vk list` lists a service by.
+fn service(
+    name: &str,
+    dir: PathBuf,
+    reported: Option<&[(String, String)]>,
+    sizes: bool,
+) -> Service {
+    let console = dir.join(crate::run::CONSOLE_LOG);
+    let booted = console.exists();
+    let state = reported.and_then(|units| units.iter().find(|(n, _)| n == name).map(|(_, s)| s));
+    let status = match state {
+        Some(state) if state != "stopped" => Some(state.clone()),
+        _ if booted => Some("stopped".to_string()),
+        _ => None,
+    };
+    let age_secs = std::fs::metadata(&console)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|at| at.elapsed().ok())
+        .map(|d| d.as_secs());
+    Service {
+        name: name.to_string(),
+        size_bytes: (sizes && status.is_some()).then(|| crate::dev::storage::dir_size(&dir)),
+        status,
+        dir,
+        age_secs,
+    }
 }
 
 impl Row {
@@ -315,6 +447,7 @@ fn row(dir: &Path, running: &[Running], with_sizes: bool, with_flags: bool) -> R
         mem: live.and_then(|r| r.mem.clone()),
         size_bytes: with_sizes.then(|| crate::dev::storage::dir_size(dir)),
         flags,
+        services: Vec::new(),
     }
 }
 
@@ -375,37 +508,70 @@ pub(crate) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
     out
 }
 
-/// `vk dev list` as text: one line per state directory.
-pub fn render(rows: &[Row]) -> String {
+/// `vk dev list` as text: one line per state directory, and under each the lines of its
+/// compose services, as `NAME/SERVICE`. What is not built — an environment never brought
+/// up, a service that has no VM — reads `-` where a built one says which `vk` created it,
+/// when it last booted and what it holds. WORKSPACE is the workspace's directory name —
+/// with as much of its path as tells it from the others listed — or its full path with
+/// `wide`.
+pub fn render(rows: &[Row], wide: bool) -> String {
     if rows.is_empty() {
         return "no dev environment state on this host\n".into();
     }
-    let rows: Vec<Vec<String>> = rows
-        .iter()
-        .map(|r| {
-            vec![
-                r.name.clone(),
-                r.workspace
-                    .as_ref()
-                    .map(|w| w.display().to_string())
-                    .unwrap_or_else(|| "?".into()),
-                r.environment.clone().unwrap_or_else(|| "?".into()),
-                r.status.label().into(),
-                r.created_by
-                    .as_deref()
-                    .map(short_creator)
-                    .unwrap_or_default(),
-                r.age_secs.map(crate::vms::fmt_uptime).unwrap_or_default(),
-                crate::vms::mem_cell(r.mem_used_bytes, r.mem.as_deref()),
-                fmt_size(r.size_bytes),
-                r.flags
-                    .iter()
-                    .map(|f| f.label())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ]
-        })
-        .collect();
+    let dash = || "-".to_string();
+    let listed: Vec<&Path> = rows.iter().filter_map(|r| r.workspace.as_deref()).collect();
+    let short = short_paths(&listed);
+    let mut lines: Vec<Vec<String>> = Vec::new();
+    for r in rows {
+        let not_built = r.status == Status::NotBuilt;
+        let workspace = match (&r.workspace, wide) {
+            (None, _) => "?".to_string(),
+            (Some(w), true) => w.display().to_string(),
+            (Some(w), false) => short
+                .get(w.as_path())
+                .cloned()
+                .unwrap_or_else(|| w.display().to_string()),
+        };
+        let environment = r.environment.clone().unwrap_or_else(|| "?".into());
+        let created_by = r.created_by.as_deref().map(short_creator);
+        lines.push(vec![
+            r.name.clone(),
+            workspace.clone(),
+            environment.clone(),
+            r.status.label().into(),
+            match not_built {
+                true => dash(),
+                false => created_by.clone().unwrap_or_default(),
+            },
+            match not_built {
+                true => dash(),
+                false => r.age_secs.map(crate::vms::fmt_uptime).unwrap_or_default(),
+            },
+            crate::vms::mem_cell(r.mem_used_bytes, r.mem.as_deref()),
+            fmt_size(r.size_bytes),
+            r.flags
+                .iter()
+                .map(|f| f.label())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ]);
+        for s in &r.services {
+            let built = s.status.is_some();
+            lines.push(vec![
+                format!("{}/{}", r.name, s.name),
+                workspace.clone(),
+                environment.clone(),
+                s.status.clone().unwrap_or_else(dash),
+                // A service is created by the `vk` that boots its environment.
+                created_by.clone().filter(|_| built).unwrap_or_else(dash),
+                s.age_secs.map(crate::vms::fmt_uptime).unwrap_or_else(dash),
+                dash(),
+                fmt_size(s.size_bytes),
+                String::new(),
+            ]);
+        }
+    }
+    let rows = lines;
     table(
         &[
             "NAME",
@@ -420,6 +586,35 @@ pub fn render(rows: &[Row]) -> String {
         ],
         &rows,
     )
+}
+
+/// Each of `paths` by the end of it: its last component, or as many trailing components as
+/// it takes to tell it from every other path given — `shop` alone, `a/shop` and `b/shop`
+/// where two checkouts share a name. A path that no number of components sets apart (one
+/// that is the tail of another) stays whole.
+fn short_paths<'a>(paths: &[&'a Path]) -> std::collections::HashMap<&'a Path, String> {
+    let mut distinct: Vec<&Path> = paths.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let tail = |p: &Path, n: usize| -> Option<PathBuf> {
+        let parts: Vec<_> = p.components().collect();
+        // Not the whole of it: the root is no part of a short form.
+        (n < parts.len()).then(|| parts[parts.len() - n..].iter().collect())
+    };
+    distinct
+        .iter()
+        .map(|p| {
+            let short = (1..)
+                .map_while(|n| tail(p, n))
+                .find(|short| {
+                    !distinct
+                        .iter()
+                        .any(|other| other != p && other.ends_with(short))
+                })
+                .map_or_else(|| p.display().to_string(), |s| s.display().to_string());
+            (*p, short)
+        })
+        .collect()
 }
 
 /// A size the caller asked for, or `-` where there is none to show — either because the
@@ -662,6 +857,32 @@ mod tests {
         std::fs::write(dir.join("root.qcow2"), vec![0u8; 4096]).unwrap();
         std::fs::write(dir.join("console.log"), "boot\n").unwrap();
         dir
+    }
+
+    /// A workspace reads by its directory name, with as many parents as tell it from the
+    /// others listed.
+    #[test]
+    fn workspaces_are_shortened_to_what_tells_them_apart() {
+        let paths = [
+            Path::new("/home/me/code/shop"),
+            Path::new("/home/me/code/api"),
+            Path::new("/home/me/work/shop"),
+            Path::new("/srv/ci/builds/7/work/shop"),
+            Path::new("/home/me/code/shop"),
+        ];
+        let short = short_paths(&paths);
+        assert_eq!(short[paths[0]], "code/shop");
+        assert_eq!(short[paths[1]], "api");
+        assert_eq!(short[paths[2]], "me/work/shop");
+        assert_eq!(short[paths[3]], "7/work/shop");
+        assert_eq!(short.len(), 4, "the same workspace twice is one");
+        // Alone, a name is enough; a path that is another's tail stays whole.
+        let alone = Path::new("/a/b/shop");
+        assert_eq!(short_paths(&[alone])[alone], "shop");
+        let nested = [Path::new("/shop"), Path::new("/x/shop")];
+        let short = short_paths(&nested);
+        assert_eq!(short[nested[0]], "/shop");
+        assert_eq!(short[nested[1]], "x/shop");
     }
 
     #[test]
@@ -934,7 +1155,7 @@ mod tests {
             row.age_secs = row.age_secs.map(|_| 7200);
         }
 
-        let out = render(&rows);
+        let out = render(&rows, true);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("NAME"), "{out}");
         assert!(
@@ -967,7 +1188,10 @@ mod tests {
             lines[3].contains("never booted") && lines[3].ends_with("ephemeral"),
             "{out}"
         );
-        assert_eq!(render(&[]), "no dev environment state on this host\n");
+        assert_eq!(
+            render(&[], false),
+            "no dev environment state on this host\n"
+        );
     }
 
     #[test]
