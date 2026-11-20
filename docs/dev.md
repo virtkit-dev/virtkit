@@ -594,7 +594,8 @@ workspace's environment, not its task leftovers; if that environment has no
 state, it reports nothing to remove. At first boot, an environment gets a stable name
 from its workspace directory, with `-ENV` appended for environments other than `dev`.
 Collisions add `-2`, `-3`, and so on. A listing or name lookup assigns names to older
-environments. The state directory's name also works, including any leading `.` or `-`
+environments. The same name works with `vk stop` and every other VM command. The state
+directory's name also works, including any leading `.` or `-`
 (e.g. `app-3f9c0d1e2a4b5c6d`, shown as `dir_name` in `--json`). A task's leftover
 state uses only its directory name. If `NAME` identifies two different directories,
 use the other name of the environment you want. The `MEM` column

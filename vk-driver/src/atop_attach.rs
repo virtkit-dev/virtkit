@@ -10,6 +10,7 @@
 //! closing the sampler's stdin asks it for one final sample — the streaming counterpart
 //! of `--stop`'s SIGUSR2 — and it then exits on its own.
 
+use std::ffi::OsStr;
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::io::AsRawFd as _;
@@ -36,20 +37,41 @@ pub enum Target {
 
 /// Decide what `target` names. A running VM answers first — `vk atop` beside a VM means
 /// "watch it now" — but only for a target that selects VMs the way `vk exec`/`vk stop`
-/// do: nothing (the current directory), or a directory on disk. A target no running VM
+/// do: a VM name, nothing (the current directory), or a directory on disk. A target no running VM
 /// matches reads the archive, so every recorded-job lookup keeps answering as before.
 pub fn classify(target: Option<&str>) -> Result<Target> {
-    let dir = match target {
-        // No target asks about *here*, which only a running VM can answer.
-        None => None,
-        Some(t) => match Path::new(t).is_dir() {
-            true => Some(Path::new(t)),
-            // Not a directory, so no VM can match it: the registry is never consulted.
-            false => return Ok(Target::Recorded(t.to_string())),
-        },
+    // No target asks about *here*, which only a running VM can answer.
+    let Some(t) = target else {
+        let (selected, matched) = vms::matching(None)?;
+        return decide(None, &selected, matched);
     };
-    let (selected, matched) = vms::matching(dir)?;
-    decide(target, &selected, matched)
+    let parsed = vms::Ref::parse(OsStr::new(t)).ok();
+    // A known name selects its running VM or falls back to the recording of that name.
+    // Digits select a recorded job unless a directory of that name matches running VMs.
+    if let Some(vms::Ref::Name { vm, service: None }) = &parsed
+        && let Some(dir) = crate::names::resolve(vm)?
+    {
+        let named = vms::Selector::Named {
+            name: vm.clone(),
+            dir,
+        };
+        return Ok(match vms::at_most_one(Some(named))? {
+            (_, Some(entry)) => Target::Live(Box::new(entry)),
+            (_, None) => Target::Recorded(t.to_string()),
+        });
+    }
+    // Expand `~/…` before checking for a directory or looking up its recording.
+    let path = match parsed {
+        Some(vms::Ref::Path(p)) => p,
+        _ => PathBuf::from(t),
+    };
+    let spelled = path.to_str().unwrap_or(t);
+    if !path.is_dir() {
+        // Not a directory, so no VM can match it: the registry is never consulted.
+        return Ok(Target::Recorded(spelled.to_string()));
+    }
+    let (selected, matched) = vms::matching(Some(&path))?;
+    decide(Some(spelled), &selected, matched)
 }
 
 /// What a directory's [`vms::matching`] result means, apart from reading the registry so a
@@ -296,11 +318,21 @@ mod tests {
     /// fragments and paths keep answering exactly as before.
     #[test]
     fn a_target_that_is_no_directory_reads_the_archive() {
+        let homes = crate::dev::testutil::Homes::new("atop");
         for t in ["42137", "test_unit", "no/such/path", "-", ""] {
             match classify(Some(t)) {
                 Ok(Target::Recorded(job)) => assert_eq!(job, t),
                 _ => panic!("{t:?} should read the archive"),
             }
+        }
+        // A `~/…` directory is the one it expands to: with no VM there, its recording.
+        let dir = std::fs::canonicalize(homes.dir()).unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let up = "../".repeat(home.components().count().saturating_sub(1));
+        let tilde = format!("~/{up}{}", dir.strip_prefix("/").unwrap().display());
+        match classify(Some(&tilde)) {
+            Ok(Target::Recorded(job)) => assert_eq!(PathBuf::from(job), home.join(&tilde[2..])),
+            _ => panic!("{tilde:?} should read the archive"),
         }
     }
 

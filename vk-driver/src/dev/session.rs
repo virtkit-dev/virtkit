@@ -983,7 +983,10 @@ pub fn stop(state_dir: &Path, timeout: u64) -> Result<Stopped> {
         });
     }
     let (report, all_down) = crate::vms::stop_cmd(
-        Some(crate::vms::Selector::Dir(state_dir.to_path_buf())),
+        Some(crate::vms::Selector::Dir {
+            dir: state_dir.to_path_buf(),
+            below: false,
+        }),
         false,
         timeout,
     )?;

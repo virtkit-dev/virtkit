@@ -115,13 +115,13 @@ pub struct Overrides {
 /// The fixtures every submodule's tests build on: a scratch directory that removes itself,
 /// the plan they run against, and a one-line hook.
 #[cfg(test)]
-pub(super) mod testutil {
+pub(crate) mod testutil {
     use std::path::{Path, PathBuf};
 
     use crate::dev::config::Freshness;
     use crate::dev::plan::{HookCommand, HookPlan, MountPlan, Plan, Source};
 
-    pub(super) struct TmpDir(pub(super) PathBuf);
+    pub(crate) struct TmpDir(pub(crate) PathBuf);
     impl Drop for TmpDir {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).ok();
@@ -131,7 +131,7 @@ pub(super) mod testutil {
     /// A directory of this test's own: the tag is not unique across modules (two of them
     /// use `"cache"`), and tests in one binary share a pid, so a counter keeps two of them
     /// from working in — and dropping — the same directory.
-    pub(super) fn scratch(tag: &str) -> TmpDir {
+    pub(crate) fn scratch(tag: &str) -> TmpDir {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("vk-dev-{tag}-{}-{n}", std::process::id()));
@@ -145,9 +145,60 @@ pub(super) mod testutil {
     /// `environ`, is undefined behaviour; a lock held here is inherited by any child forked
     /// meanwhile and stays held until that child execs, outliving its `drop`. Poison is taken
     /// back rather than failing every later test after one panics under it.
-    pub(super) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
         ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Isolates VM lookups with an empty name index and registry. Holds [`env_guard`]
+    /// until the original environment has been restored.
+    pub(crate) struct Homes {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        // Dropped after `drop` has put the variables back: the directory, then the guard.
+        dir: TmpDir,
+        _env: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Homes {
+        pub(crate) fn new(tag: &str) -> Homes {
+            let env = env_guard();
+            let dir = scratch(tag);
+            let vars = ["XDG_STATE_HOME", "XDG_DATA_HOME"];
+            let saved = vars.map(|v| (v, std::env::var_os(v))).to_vec();
+            for v in vars {
+                // SAFETY: serialized by env_guard, put back on drop.
+                unsafe { std::env::set_var(v, dir.0.join(v)) };
+            }
+            Homes {
+                saved,
+                dir,
+                _env: env,
+            }
+        }
+
+        pub(crate) fn dir(&self) -> &Path {
+            &self.dir.0
+        }
+
+        /// Name `state` `name` in this index.
+        pub(crate) fn name(&self, state: &Path, name: &str) {
+            crate::names::Index::open()
+                .unwrap()
+                .claim_exact(state, name)
+                .unwrap();
+        }
+    }
+
+    impl Drop for Homes {
+        fn drop(&mut self) {
+            for (v, val) in &self.saved {
+                // SAFETY: still under env_guard, which is released after this.
+                match val {
+                    Some(val) => unsafe { std::env::set_var(v, val) },
+                    None => unsafe { std::env::remove_var(v) },
+                }
+            }
+        }
     }
 
     pub(super) fn plan_in(dir: &Path) -> Plan {

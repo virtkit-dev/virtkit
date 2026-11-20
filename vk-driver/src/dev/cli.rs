@@ -1071,22 +1071,14 @@ async fn dev_action(
             if guest {
                 sources.push(consolelog::Source::Guest);
             }
-            let target = Some(plan.state_dir.as_path());
-            // A stopped environment is no longer registered, but its state directory still
-            // says where each service kept its console: `svc-<name>/`.
-            let path = console_log_path(target, service.as_deref()).or_else(|e| match &service {
-                Some(name) => {
-                    let log = plan
-                        .state_dir
-                        .join(format!("svc-{name}"))
-                        .join(crate::run::CONSOLE_LOG);
-                    if log.is_file() { Ok(log) } else { Err(e) }
-                }
-                None => Err(e),
-            });
+            // A stopped environment's console, and each service's under `svc-<name>/`, are
+            // still read from its state directory.
+            let path = console_log_path(Some(&plan.state_dir), service.as_deref());
             match path {
-                Ok(path) => {
-                    match show_console_log(&path, target, &sources, level, lines, follow).await {
+                Ok((path, writer)) => {
+                    match show_console_log(&path, writer.as_ref(), &sources, level, lines, follow)
+                        .await
+                    {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(e) => fail(&e, 1),
                     }

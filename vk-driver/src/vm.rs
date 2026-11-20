@@ -2608,11 +2608,7 @@ fn service_request(
         env,
         cmd,
     } = parsed.cmd;
-    let valid = !service.is_empty()
-        && service
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        && !service.starts_with('.');
+    let valid = crate::vms::is_service_name(&service);
     let svc_dir = dir.join(format!("svc-{service}"));
     // The service's own directory, not a link to some other one.
     let is_dir = std::fs::symlink_metadata(&svc_dir).is_ok_and(|m| m.is_dir());

@@ -6,9 +6,16 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
-- `vk dev list` shows stable workspace-based names for `vk dev stop`, `gc` and `prune`.
-  `vk run --name` sets an explicit name. Runs with `--state-dir` or `--detach` get a name
-  from what they boot. Services-only compose runs stay unnamed.
+- `vk dev list` shows stable workspace-based names. `vk run --name` sets an explicit
+  name. Runs with `--state-dir` or `--detach` get a name from what they boot.
+  Services-only compose runs stay unnamed. `vk stop`, `vk dev stop`, `gc`, `prune` and the
+  other VM commands take a name.
+
+### Changed
+
+- **A directory names exactly one project's VMs.** `vk list`, `stop`, `reboot`, `pause` and
+  `resume` take the VMs of the directories below it only with `--recursive` (`-r`). A bare
+  word is a VM name: write `./dir` for a directory.
 
 ### Fixed
 

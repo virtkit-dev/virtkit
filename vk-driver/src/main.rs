@@ -1295,12 +1295,12 @@ enum Cmd {
     ///
     /// Runs the system ssh against the client setup in the VM's state dir — that run's
     /// config, key and alias — so none of your own identities are involved and there is
-    /// nothing to configure. Arguments after the directory reach ssh as given:
-    /// `vk ssh DIR -- uname -a`.
+    /// nothing to configure. Arguments after the VM reach ssh as given:
+    /// `vk ssh NAME -- uname -a`.
     Ssh {
-        /// the run's state dir (`run --state-dir`)
-        #[arg(value_name = "DIR")]
-        state_dir: PathBuf,
+        /// the VM: its name, pid, project directory or state directory
+        #[arg(value_name = "REF")]
+        target: std::ffi::OsString,
         /// arguments passed to ssh verbatim, after the host
         #[arg(
             trailing_var_arg = true,
@@ -1315,9 +1315,9 @@ enum Cmd {
     /// an `Include` in your own config, Emacs TRAMP.
     #[command(name = "ssh-config")]
     SshConfig {
-        /// the run's state dir (`run --state-dir`)
-        #[arg(value_name = "DIR")]
-        state_dir: PathBuf,
+        /// the VM: its name, pid, project directory or state directory
+        #[arg(value_name = "REF")]
+        target: std::ffi::OsString,
     },
     /// plumbing: apply a built-in host-command policy, then exec what it allows
     ///
@@ -1379,21 +1379,22 @@ enum Cmd {
     ///
     /// Prints its reply, or exits non-zero if it does not answer — a liveness check that
     /// exercises the agent protocol, stronger than a socket stat. Selects the VM whose project
-    /// is the current directory by default; pass a DIR to select by project directory. A
-    /// raw agent address (`vsock-auto://DIR/vsock.sock:4444`) probes it directly, for
-    /// plumbing that already knows the socket.
+    /// is the current directory by default; pass a name, a pid or a directory to select
+    /// another. A raw agent address (`vsock-auto://DIR/vsock.sock:4444`) probes it directly,
+    /// for plumbing that already knows the socket.
     #[command(display_order = 7)]
     Status {
-        /// which VM: a directory, or a raw agent address
+        /// which VM: a name, a pid, a project directory, or a raw agent address
         ///
-        /// A directory (default: the current directory) resolves via the VM registry `vk list`
-        /// uses; a raw agent address (`scheme://…`) is dialed directly.
+        /// A REF (`NAME/SERVICE` for a compose service; default: the current directory's
+        /// VM); a raw agent address (`scheme://…`) is dialed directly.
+        #[arg(value_name = "REF")]
         target: Option<String>,
         /// print whether the VM's root image is `fresh`, `stale` or `unknown`
         ///
         /// A single scriptable token; `stale` means a fresh `vk run` would rebuild it. Skips
-        /// the agent probe but may resolve base image digests over the network; selects the VM
-        /// by directory (a raw address has no build recipe).
+        /// the agent probe but may resolve base image digests over the network; acts on a
+        /// whole VM, so it takes neither `NAME/SERVICE` nor a raw address (no build recipe).
         #[arg(long)]
         stale: bool,
     },
@@ -1409,11 +1410,11 @@ enum Cmd {
     /// console instead.
     #[command(display_order = 7)]
     Logs {
-        /// which VM: a project directory (default: the current directory)
+        /// which VM: a name, a pid or a project directory (default: the current directory's)
         ///
-        /// Resolves via the VM registry `vk list` uses. After the VM has exited it is no
-        /// longer registered — name the run's `--state-dir` itself and its console is read
-        /// straight from there.
+        /// `NAME/SERVICE` reads a compose service's console. After the VM has exited, its
+        /// name, or its state directory, still leads to the console it left.
+        #[arg(value_name = "REF")]
         target: Option<PathBuf>,
         /// read this compose sibling's console instead of the primary's
         #[arg(long, value_name = "NAME")]
@@ -1462,10 +1463,11 @@ enum Cmd {
     /// verbatim; a cmd built-in such as `call` expands `%` in them again.
     #[command(arg_required_else_help = true, display_order = 3)]
     Exec {
-        /// which VM: a directory, or a raw agent address
+        /// which VM: a name, a pid, a project directory, or a raw agent address
         ///
-        /// A directory (default: the current directory) resolves via the VM registry `vk list`
-        /// uses; a raw agent address (`scheme://…`) is dialed directly.
+        /// A REF (`NAME/SERVICE` for a compose service; default: the current directory's
+        /// VM); a raw agent address (`scheme://…`) is dialed directly.
+        #[arg(value_name = "REF")]
         target: Option<String>,
         /// run in this compose sibling service instead of the primary
         ///
@@ -1507,7 +1509,8 @@ enum Cmd {
     /// ends.
     #[command(display_order = 3)]
     Console {
-        /// which VM: a directory (default: the current directory), as `vk exec` resolves it
+        /// which VM: a name, a pid or a directory (default: the current one's)
+        #[arg(value_name = "REF")]
         target: Option<String>,
     },
     /// Copy a file into or out of a live Windows (UEFI) guest
@@ -1522,8 +1525,8 @@ enum Cmd {
         source: String,
         /// where to copy it: a host path, or `:` and a guest path
         destination: String,
-        /// which VM: a directory (default: the current directory), as `vk exec` resolves it
-        #[arg(long, value_name = "DIR")]
+        /// which VM: a name, a pid or a directory (default: the current one's)
+        #[arg(long, value_name = "REF")]
         target: Option<String>,
         /// copy to or from this Windows compose service instead, as `vk exec --service` does
         #[arg(long, value_name = "NAME")]
@@ -1534,20 +1537,21 @@ enum Cmd {
     /// Accepts connections on `--listen` and, for each one, asks the target VM's agent —
     /// over the same exec control channel `vk exec`/`vk status` use — to dial `--to` and
     /// splice raw bytes back, reusing that already-open channel for the relay. The VM is
-    /// selected as `vk exec` selects it (a directory or a raw agent address; a compose
-    /// sibling is `--via` here, where `vk exec` says `--service`), and `--to` can name any
-    /// address that VM's own network reaches — a
-    /// LAN peer's own compose hostname included, resolved through that VM's own DNS:
-    /// `vk publish --via devcontainer --listen tcp://127.0.0.1:8443 --to tcp://runner:443`.
+    /// selected as `vk exec` selects it (a name, a pid, a directory or a raw agent address;
+    /// a compose service with `NAME/SERVICE` or `--via`), and `--to` can name any
+    /// address that VM's own network reaches — a LAN peer's own compose hostname included,
+    /// resolved through that VM's own DNS:
+    /// `vk publish app/devcontainer --listen tcp://127.0.0.1:8443 --to tcp://runner:443`.
     ///
     /// That form runs in the foreground and goes with the terminal; `vk publish ensure` and
     /// its siblings keep one running in the background instead.
     #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Publish {
-        /// which VM's agent to ask: a directory, or a raw agent address
+        /// which VM's agent to ask: a name, a pid, a project directory, or a raw agent address
         ///
-        /// A directory (default: the current directory) resolves via the VM registry `vk list`
-        /// uses; a raw agent address (`scheme://…`) is dialed directly.
+        /// A REF (`NAME/SERVICE` for a compose service; default: the current directory's
+        /// VM); a raw agent address (`scheme://…`) is dialed directly.
+        #[arg(value_name = "REF")]
         target: Option<String>,
         /// have this compose sibling's agent dial instead of the primary's
         ///
@@ -1583,10 +1587,11 @@ enum Cmd {
     /// zstd-compressed).
     #[command(display_order = 10)]
     Atop {
-        /// A running VM's directory, or a recorded job
+        /// A running VM's name or directory, or a recorded job
         ///
-        /// A directory selects a running VM as `vk exec` does (default: the current directory).
-        /// A recorded job is a job id, any part of a recorded job's directory name (its project
+        /// A VM's name, or a directory, selects a running VM as `vk exec` does (default: the
+        /// current directory); a name wins over a recorded job spelled the same, and over a
+        /// directory without a `./`. A recorded job is a job id, any part of a recorded job's directory name (its project
         /// or job name, with anything outside [A-Za-z0-9._-] replaced) with the newest run
         /// matching answering, or a path holding a `/`, so the path a job's trace printed works
         /// too.
@@ -2602,20 +2607,22 @@ enum Cmd {
     /// with (`1.2G/8G`) — the guest, its service VMs and their helpers, counted
     /// proportionally so pages they share are charged once. The table folds `$HOME` to `~`
     /// and names at most three services; `--wide` shows every service, the project directory
-    /// in full and the exec-channel address. With PID or DIR, only the VM with that pid, or
-    /// the VMs whose project is DIR or below it (or whose state dir is DIR); a selector that
+    /// in full and the exec-channel address. With a REF, only the VMs it names; one that
     /// names exactly one VM prints its full record instead of a table row. The record folds
     /// nothing, so `--wide` has nothing to add there. Use `--json` or `--field` for scripts;
     /// neither takes `--wide`, since both already report every field.
     #[command(display_order = 6)]
     List {
-        /// which VMs: a PID, or those whose project is DIR or below it (default: all)
+        /// which VMs: a name, a pid, or those of a project directory (default: all)
         ///
-        /// An all-digit argument is a pid, as the PID column prints; anything else a
-        /// directory (a digit-only name needs a `./`). Exactly one match is shown in full,
-        /// several as a table.
-        #[arg(value_name = "PID|DIR")]
+        /// A VM's name; an all-digit argument is a pid; a path (`/…`,
+        /// `./…`, `../…`, `~…`) a project or state directory, matched exactly unless
+        /// `--recursive`.
+        #[arg(value_name = "REF")]
         target: Option<std::ffi::OsString>,
+        /// with a directory (default: the current one), also every VM whose project is below it
+        #[arg(short = 'r', long)]
+        recursive: bool,
         /// the full table: every service named, the project path in full, and EXEC ADDRESS
         #[arg(short = 'w', long, conflicts_with_all = ["json", "field"])]
         wide: bool,
@@ -2643,16 +2650,18 @@ enum Cmd {
     ///
     /// SIGTERMs the managing `vk run` (which tears down the VM and any compose siblings),
     /// then waits for it to exit. Selects the VM whose project is the current directory by
-    /// default; pass a pid or a project directory to select one, or `--all`.
+    /// default; pass a name, a pid or a project directory to select one, or `--all`.
     #[command(display_order = 8)]
     Stop {
-        /// the VM to stop: a PID or a project directory (default: the current directory)
+        /// the VM to stop: a name, a pid or a directory (default: the current one's)
         ///
-        /// An all-digit argument is a pid, as `vk list` prints; anything else a directory —
-        /// whose VM(s), and those of every directory below it, are stopped. A directory
-        /// named only by digits therefore needs a `./` in front of it.
-        #[arg(value_name = "PID|DIR")]
+        /// A VM's name; an all-digit argument is a pid; a path (`/…`, `./…`, `../…`,
+        /// `~…`) a project or state directory, matched exactly unless `--recursive`.
+        #[arg(value_name = "REF")]
         target: Option<std::ffi::OsString>,
+        /// with a directory (default: the current one), also every VM whose project is below it
+        #[arg(short = 'r', long, conflicts_with = "all")]
+        recursive: bool,
         /// stop every running vk VM
         #[arg(long, conflicts_with = "target")]
         all: bool,
@@ -2668,13 +2677,16 @@ enum Cmd {
     ///
     /// Asks the guest to reboot (`vk-agent reboot` over vsock); the VM comes back on the
     /// same disks, keeping its pid. Selects the VM whose project is the current directory by
-    /// default; pass a pid or a project directory, or `--all`. `--force` skips the agent and
-    /// hard-resets through the VMM (for a hung or agent-less guest).
+    /// default; pass a name, a pid or a project directory, or `--all`. `--force` skips the
+    /// agent and hard-resets through the VMM (for a hung or agent-less guest).
     #[command(display_order = 8)]
     Reboot {
-        /// the VM to reboot: a PID or a project directory (default: the current directory)
-        #[arg(value_name = "PID|DIR")]
+        /// the VM to reboot: a name, a pid or a directory (default: the current one's)
+        #[arg(value_name = "REF")]
         target: Option<std::ffi::OsString>,
+        /// with a directory (default: the current one), also every VM whose project is below it
+        #[arg(short = 'r', long, conflicts_with = "all")]
+        recursive: bool,
         /// reboot every running vk VM
         #[arg(long, conflicts_with = "target")]
         all: bool,
@@ -2685,13 +2697,16 @@ enum Cmd {
     /// Freeze a running UEFI VM's vCPUs
     ///
     /// The guest stops where it is, its memory and devices kept, until `vk resume`. Selects
-    /// the VM whose project is the current directory by default; pass a pid or a project
-    /// directory, or `--all`.
+    /// the VM whose project is the current directory by default; pass a name, a pid or a
+    /// project directory, or `--all`.
     #[command(display_order = 8)]
     Pause {
-        /// the VM to pause: a PID or a project directory (default: the current directory)
-        #[arg(value_name = "PID|DIR")]
+        /// the VM to pause: a name, a pid or a directory (default: the current one's)
+        #[arg(value_name = "REF")]
         target: Option<std::ffi::OsString>,
+        /// with a directory (default: the current one), also every VM whose project is below it
+        #[arg(short = 'r', long, conflicts_with = "all")]
+        recursive: bool,
         /// pause every running vk VM that can be
         #[arg(long, conflicts_with = "target")]
         all: bool,
@@ -2701,9 +2716,9 @@ enum Cmd {
     /// The bundle at `--out` holds the VM's memory, its CPU and device state and its disks as
     /// they were; `vk run <bundle>` starts from there instead of booting, as often as wanted,
     /// each time on fresh overlays. Selects the VM whose project is the current directory by
-    /// default; pass a pid or a project directory. With `--run-dir`, every Windows service of
-    /// the compose run with that state directory is paused, then saved into `--out/<service>`,
-    /// for `vk run --compose … --from-snapshot`.
+    /// default; pass a name, a pid or a project directory. With `--run-dir`, every Windows
+    /// service of the compose run with that state directory is paused, then saved into
+    /// `--out/<service>`, for `vk run --compose … --from-snapshot`.
     ///
     /// A snapshot's disks are overlays of the bundle the VM ran (and of any snapshot that one
     /// came from), named by path: moving or deleting that bundle breaks the snapshot. A
@@ -2711,8 +2726,8 @@ enum Cmd {
     /// fails, Kerberos may fail.
     #[command(display_order = 8)]
     Snapshot {
-        /// the VM to snapshot: a PID or a project directory (default: the current directory)
-        #[arg(value_name = "PID|DIR", conflicts_with = "run_dir")]
+        /// the VM to snapshot: a name, a pid or a directory (default: the current one's)
+        #[arg(value_name = "REF", conflicts_with = "run_dir")]
         target: Option<std::ffi::OsString>,
         /// snapshot the Windows services of the compose run with this state directory
         #[arg(long, value_name = "DIR")]
@@ -2724,9 +2739,12 @@ enum Cmd {
     /// Run a VM `vk pause` froze again
     #[command(display_order = 8)]
     Resume {
-        /// the VM to resume: a PID or a project directory (default: the current directory)
-        #[arg(value_name = "PID|DIR")]
+        /// the VM to resume: a name, a pid or a directory (default: the current one's)
+        #[arg(value_name = "REF")]
         target: Option<std::ffi::OsString>,
+        /// with a directory (default: the current one), also every VM whose project is below it
+        #[arg(short = 'r', long, conflicts_with = "all")]
+        recursive: bool,
         /// resume every paused vk VM
         #[arg(long, conflicts_with = "target")]
         all: bool,
@@ -3802,13 +3820,14 @@ async fn cli_main(cli: Cli) -> ExitCode {
     }
     if let Cmd::List {
         target,
+        recursive,
         wide,
         json,
         field,
         stale,
     } = &cli.cmd
     {
-        let target = match target.as_deref().map(vms::Selector::parse).transpose() {
+        let target = match vms::selector_of(target.as_deref(), *recursive) {
             Ok(sel) => sel,
             Err(e) => return fail(&e, 2),
         };
@@ -3819,14 +3838,25 @@ async fn cli_main(cli: Cli) -> ExitCode {
     }
     if let Cmd::Stop {
         target,
+        recursive,
         all,
         timeout,
     } = &cli.cmd
     {
-        return act_on_vms(target.as_deref(), |sel| vms::stop_cmd(sel, *all, *timeout));
+        return act_on_vms(target.as_deref(), *recursive, |sel| {
+            vms::stop_cmd(sel, *all, *timeout)
+        });
     }
-    if let Cmd::Reboot { target, all, force } = &cli.cmd {
-        return act_on_vms(target.as_deref(), |sel| vms::reboot_cmd(sel, *all, *force));
+    if let Cmd::Reboot {
+        target,
+        recursive,
+        all,
+        force,
+    } = &cli.cmd
+    {
+        return act_on_vms(target.as_deref(), *recursive, |sel| {
+            vms::reboot_cmd(sel, *all, *force)
+        });
     }
     if let Cmd::Snapshot {
         run_dir: Some(run_dir),
@@ -3852,13 +3882,25 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Err(e) => fail(&e, 1),
         };
     }
-    if let Cmd::Pause { target, all } | Cmd::Resume { target, all } = &cli.cmd {
+    if let Cmd::Pause {
+        target,
+        recursive,
+        all,
+    }
+    | Cmd::Resume {
+        target,
+        recursive,
+        all,
+    } = &cli.cmd
+    {
         let req = if matches!(cli.cmd, Cmd::Pause { .. }) {
             vms::PauseRequest::Pause
         } else {
             vms::PauseRequest::Resume
         };
-        return act_on_vms(target.as_deref(), |sel| vms::pause_cmd(sel, *all, req));
+        return act_on_vms(target.as_deref(), *recursive, |sel| {
+            vms::pause_cmd(sel, *all, req)
+        });
     }
     if let Cmd::Gc {
         idle_secs,
@@ -5409,14 +5451,18 @@ async fn cli_main(cli: Cli) -> ExitCode {
             },
         },
         // Replace vk so the SSH session's exit status reaches the caller.
-        Cmd::Ssh { state_dir, args } => match sshclient::exec_ssh(&state_dir, &args) {
-            Ok(never) => match never {},
-            Err(e) => fail(&e, 1),
-        },
-        Cmd::SshConfig { state_dir } => match sshclient::print_config(&state_dir) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => fail(&e, 1),
-        },
+        Cmd::Ssh { target, args } => {
+            match state_dir_of(&target).and_then(|dir| sshclient::exec_ssh(&dir, &args)) {
+                Ok(never) => match never {},
+                Err(e) => fail(&e, 1),
+            }
+        }
+        Cmd::SshConfig { target } => {
+            match state_dir_of(&target).and_then(|dir| sshclient::print_config(&dir)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            }
+        }
         // stdio↔socket splice for an SSH ProxyCommand; returns when either side closes.
         Cmd::Connect { addr } => match vk_core::forward::run_connect(&addr).await {
             Ok(()) => ExitCode::SUCCESS,
@@ -5430,7 +5476,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             stale: true,
         } => match target.as_deref() {
             Some(s) if is_agent_addr(s) => fail(
-                &anyhow::anyhow!("--stale selects a VM by directory, not a raw agent address"),
+                &anyhow::anyhow!("--stale selects a VM by REF, not a raw agent address"),
                 2,
             ),
             other => match vms::resolve_one(other.map(Path::new)) {
@@ -5443,15 +5489,18 @@ async fn cli_main(cli: Cli) -> ExitCode {
             },
         },
         // Agent liveness probe: round-trip the status request (same client the boot readiness
-        // wait uses) so a caller can check a VM is up with vk alone. The target is a directory
-        // (default: cwd) resolved to its VM via the registry, or a raw agent address for plumbing.
+        // wait uses) so a caller can check a VM is up with vk alone. The target is a REF
+        // (default: cwd), `NAME/SERVICE` probing that service's agent, or a raw agent address
+        // for plumbing.
         Cmd::Status {
             target,
             stale: false,
         } => {
             // Resolution/usage errors exit 2, matching `vk list`/`vk stop`; the code-1
             // result below is reserved for a resolved VM whose agent does not answer.
-            let addr = match resolve_agent_addr(target.as_deref()) {
+            let addr = match exec_target(target.as_deref(), None, "--service")
+                .and_then(|t| resolve_exec_addr(&t))
+            {
                 Ok(a) => a,
                 Err(e) => return fail(&e, 2),
             };
@@ -5492,12 +5541,13 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 sources.push(consolelog::Source::Guest);
             }
             let path = match (exact, &target) {
-                (true, Some(dir)) => exact_console_log_path(dir),
+                // `--exact` cannot follow, so there is no VM to watch.
+                (true, Some(dir)) => exact_console_log_path(dir).map(|p| (p, None)),
                 _ => console_log_path(target.as_deref(), service.as_deref()),
             };
             match path {
-                Ok(path) => {
-                    match show_console_log(&path, target.as_deref(), &sources, level, lines, follow)
+                Ok((path, writer)) => {
+                    match show_console_log(&path, writer.as_ref(), &sources, level, lines, follow)
                         .await
                     {
                         Ok(()) => ExitCode::SUCCESS,
@@ -5508,7 +5558,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             }
         }
         // Run a command in a live guest, reproducing its exit status as our own. The target
-        // selects the VM the same way `vk status` does (directory via the registry, default cwd,
+        // selects the VM the same way `vk status` does (a name, pid or directory, default cwd,
         // or a raw agent address); the command is the trailing `-- …` group.
         Cmd::Exec {
             target,
@@ -5521,8 +5571,13 @@ async fn cli_main(cli: Cli) -> ExitCode {
             user,
             command,
         } => {
+            // Resolved once, for both the Windows check and the agent address below.
+            let target = match exec_target(target.as_deref(), service.as_deref(), "--service") {
+                Ok(t) => t,
+                Err(e) => return fail(&e, 2),
+            };
             // A Windows (UEFI) guest has no vk-agent: its qemu-ga runs the command instead.
-            let socket = match windows_exec_socket(target.as_deref(), service.as_deref()) {
+            let socket = match windows_exec_socket(&target) {
                 Ok(socket) => socket,
                 Err(e) => return fail(&e, 2),
             };
@@ -5558,7 +5613,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             // clap's own usage-error exit. Any vk-chosen code can collide with the remote
             // command's status vk reproduces below; 2 matches what the old CLI returned
             // when the positional address failed to parse.
-            let addr = match resolve_exec_addr(target.as_deref(), service.as_deref(), "--service") {
+            let addr = match resolve_exec_addr(&target) {
                 Ok(a) => a,
                 Err(e) => return fail(&e, 2),
             };
@@ -5608,12 +5663,16 @@ async fn cli_main(cli: Cli) -> ExitCode {
             target,
             service,
         } => {
-            let socket = match windows_exec_socket(target.as_deref(), service.as_deref()) {
-                Ok(Some(s)) => s,
-                Ok(None) => {
-                    let not = service.map_or("this VM runs vk-agent".into(), |s| {
-                        format!("no Windows service {s} runs here")
-                    });
+            let target = exec_target(target.as_deref(), service.as_deref(), "--service");
+            let socket = match target.and_then(|t| Ok((windows_exec_socket(&t)?, t))) {
+                Ok((Some(s), _)) => s,
+                Ok((None, t)) => {
+                    let not = match t {
+                        ExecTarget::Ref {
+                            service: Some(s), ..
+                        } => format!("no Windows service {s} runs here"),
+                        _ => "this VM runs vk-agent".into(),
+                    };
                     return fail(
                         &anyhow::anyhow!("vk cp copies to a Windows (UEFI) guest; {not}"),
                         2,
@@ -5696,7 +5755,9 @@ async fn cli_main(cli: Cli) -> ExitCode {
             let (Some(listen), Some(to)) = (listen, to) else {
                 return fail(&anyhow::anyhow!("--listen and --to are required"), 2);
             };
-            let addr = match resolve_exec_addr(target.as_deref(), via.as_deref(), "--via") {
+            let addr = match exec_target(target.as_deref(), via.as_deref(), "--via")
+                .and_then(|t| resolve_exec_addr(&t))
+            {
                 Ok(a) => a,
                 Err(e) => return fail(&e, 2),
             };
@@ -5998,9 +6059,10 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
 /// unless every VM did it, 2 on a bad TARGET or an error.
 fn act_on_vms(
     target: Option<&std::ffi::OsStr>,
+    recursive: bool,
     run: impl FnOnce(Option<vms::Selector>) -> anyhow::Result<(String, bool)>,
 ) -> ExitCode {
-    let selector = match target.map(vms::Selector::parse).transpose() {
+    let selector = match vms::selector_of(target, recursive) {
         Ok(sel) => sel,
         Err(e) => {
             eprintln!("vk: {e:#}");
@@ -6196,40 +6258,92 @@ fn is_agent_addr(s: &str) -> bool {
         .any(|scheme| s.starts_with(scheme))
 }
 
-/// The console log of the VM `target` selects (a project directory, default cwd), or of its
-/// compose sibling `service`: `<state dir>/console.log` — the file the run's VMM writes the
-/// serial console to. A sibling's runtime dir is what its exec address names.
-fn console_log_path(target: Option<&Path>, service: Option<&str>) -> anyhow::Result<PathBuf> {
-    use anyhow::Context;
-    let dir = match vms::resolve_one(target) {
-        Ok(entry) => match service {
-            None => entry.state_dir,
-            // `vsock-auto://<svc-dir>/vsock.sock:4444`: the directory is the socket's parent.
-            Some(name) => match resolve_service_addr(&entry, name)? {
-                SocketAddr::VsockAuto { path, .. } => path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .ok_or_else(|| anyhow::anyhow!("service {name:?}: odd exec address"))?,
-                other => anyhow::bail!("service {name:?}: exec address {other} names no directory"),
-            },
-        },
+/// The console log of the VM `target` selects (a REF, default cwd), or of its compose
+/// sibling `service`: `<state dir>/console.log` — the file the run's VMM writes the serial
+/// console to. A sibling's runtime dir is what its exec address names. Also returns what
+/// still writes it, for a follow to watch; `None` for a stopped VM's.
+fn console_log_path(
+    target: Option<&Path>,
+    service: Option<&str>,
+) -> anyhow::Result<(PathBuf, Option<Writer>)> {
+    let (sel, service) = vms::resolve_target(target.map(Path::as_os_str), service)?;
+    let (sel, entry) = vms::at_most_one(sel)?;
+    let Some(entry) = entry else {
         // The registry only lists live VMs, but the console of one that just died is exactly
-        // what a reader reaches for, and `--state-dir` keeps it. Fall back to reading the
-        // target as a state directory when it holds a console — but only for the primary's:
-        // a sibling's directory is named by an exec address the registry no longer has.
-        Err(e) => {
-            let dir = match target {
-                Some(t) => t.to_path_buf(),
-                None => std::env::current_dir().context("resolving the current directory")?,
-            };
-            if service.is_none() && dir.join(run::CONSOLE_LOG).is_file() {
-                dir
-            } else {
-                return Err(e);
-            }
-        }
+        // what a reader reaches for, and its state dir keeps it: a name still leads there, as
+        // does the state directory itself. A stopped service's console is in its `svc-*` dir.
+        // A services-only run registers no VM: its lock on the state dir says it still runs.
+        let not_found = || anyhow::anyhow!("{}", sel.not_found().trim_end());
+        let state = stopped_dir(&sel).ok_or_else(not_found)?;
+        let dir = match service {
+            Some(name) => state.join(format!("svc-{name}")),
+            None => state.to_path_buf(),
+        };
+        let log = dir.join(run::CONSOLE_LOG);
+        let writer = vms::dir_locked(state).then(|| Writer::Run(state.to_path_buf()));
+        return if log.is_file() {
+            Ok((log, writer))
+        } else {
+            Err(not_found())
+        };
     };
-    Ok(dir.join(run::CONSOLE_LOG))
+    let dir = match service {
+        None => entry.state_dir.clone(),
+        // `vsock-auto://<svc-dir>/vsock.sock:4444`: the directory is the socket's parent.
+        Some(name) => match resolve_service_addr(&entry, &name)? {
+            SocketAddr::VsockAuto { path, .. } => path
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| anyhow::anyhow!("service {name:?}: odd exec address"))?,
+            other => anyhow::bail!("service {name:?}: exec address {other} names no directory"),
+        },
+    };
+    Ok((
+        dir.join(run::CONSOLE_LOG),
+        Some(Writer::Vm(Box::new(entry))),
+    ))
+}
+
+/// What still writes a console a follow reads.
+#[derive(Debug)]
+enum Writer {
+    /// a registered VM, the same `vk run` as when the console was found
+    Vm(Box<vms::VmEntry>),
+    /// a run that registers no VM (a services-only compose run), by the state dir it locks
+    Run(PathBuf),
+}
+
+impl Writer {
+    fn alive(&self) -> bool {
+        match self {
+            Writer::Vm(entry) => vms::still_registered(entry),
+            Writer::Run(dir) => vms::dir_locked(dir),
+        }
+    }
+}
+
+/// Where a VM that no longer runs left its state, by the selector its REF resolved to: a
+/// name's state dir, or a directory taken as the state dir itself. A pid leads nowhere.
+fn stopped_dir(sel: &vms::Selector) -> Option<&Path> {
+    match sel {
+        vms::Selector::Named { dir, .. } | vms::Selector::Dir { dir, .. } => Some(dir),
+        vms::Selector::Pid(_) | vms::Selector::Here { .. } => None,
+    }
+}
+
+/// The state dir a REF stands for, running or not: a running VM's, a name's, or a path
+/// taken as the state dir itself. Several running VMs matching is an error, not a fallback.
+fn state_dir_of(target: &std::ffi::OsStr) -> anyhow::Result<PathBuf> {
+    let (sel, service) = vms::resolve_target(Some(target), None)?;
+    if service.is_some() {
+        anyhow::bail!("ssh reaches a VM, not one of its compose services");
+    }
+    match vms::at_most_one(sel)? {
+        (_, Some(entry)) => Ok(entry.state_dir),
+        (sel, None) => stopped_dir(&sel)
+            .map(Path::to_path_buf)
+            .ok_or_else(|| anyhow::anyhow!("{}", sel.not_found().trim_end())),
+    }
 }
 
 /// Find the console log in the named state or CI job `dir` without consulting the registry.
@@ -6260,11 +6374,12 @@ const TAIL_WINDOW: u64 = 1 << 20;
 
 /// Print `path`'s console lines from `sources` (all when empty) at least `level` severe, the
 /// last `lines` of them (all when 0); with `follow`, keep printing what is appended until
-/// Ctrl-C, until the VM this console belongs to leaves the registry, or until the reader
-/// stops listening (`… | head`).
+/// Ctrl-C or a closed pipe (`… | head`). Following also ends when the registry no longer
+/// lists the writer or a services-only run releases its state-dir lock. With no writer,
+/// print the console once.
 async fn show_console_log(
     path: &Path,
-    target: Option<&Path>,
+    writer: Option<&Writer>,
     sources: &[consolelog::Source],
     level: Option<consolelog::Level>,
     lines: usize,
@@ -6308,9 +6423,9 @@ async fn show_console_log(
         }
         (offset, pieces)
     };
-    if !follow {
+    let Some(writer) = writer.filter(|_| follow) else {
         return broken_pipe(out.flush()).map(|_| ());
-    }
+    };
     // A fresh `ctrl_c()` future per iteration would miss a signal delivered while the loop
     // was reading or writing; one stream, polled every pass, does not.
     // Registering this replaces SIGINT's default disposition for the rest of the process,
@@ -6326,12 +6441,12 @@ async fn show_console_log(
             _ = interrupt.recv() => return Ok(()),
         }
         // The console outlives its VM, so the file going quiet says nothing: the registry is
-        // what says the writer is gone for good. Checked on its own slower beat — resolving
+        // what says the writer is gone (an unreadable registry counts as gone). Checked on its own slower beat — resolving
         // walks and locks every registered VM's state dir, which a run starting up races
         // against.
         if registry_check.elapsed() >= REGISTRY_POLL {
             registry_check = std::time::Instant::now();
-            if !vms::still_registered(target) {
+            if !writer.alive() {
                 eprintln!("virtkit: the VM ended");
                 return Ok(());
             }
@@ -6479,19 +6594,6 @@ fn broken_pipe(r: std::io::Result<()>) -> anyhow::Result<bool> {
     }
 }
 
-/// Resolve a `vk status`/`vk exec` target to the agent address to dial: a raw `scheme://…`
-/// address is used as-is; anything else (or nothing) is a directory selecting the VM through the
-/// registry, defaulting to the current directory.
-fn resolve_agent_addr(target: Option<&str>) -> anyhow::Result<SocketAddr> {
-    match target {
-        Some(s) if is_agent_addr(s) => s.parse::<SocketAddr>(),
-        other => {
-            let entry = vms::resolve_one(other.map(Path::new))?;
-            entry.exec_addr.parse::<SocketAddr>()
-        }
-    }
-}
-
 /// Make each action's state dir absolute, so nothing downstream depends on the caller's
 /// working directory.
 fn resolve_state_dir(action: PublishAction) -> anyhow::Result<PublishAction> {
@@ -6530,42 +6632,98 @@ fn resolve_state_dir(action: PublishAction) -> anyhow::Result<PublishAction> {
     })
 }
 
-/// The agent to speak to: a compose sibling's when `sibling` names one, else the target's
-/// own. `flag` is the option the name came from (`--service` for `vk exec`, `--via` for
-/// `vk publish`), so the error names what the caller actually typed.
-fn resolve_exec_addr(
+/// `vk exec`, `cp`, `status` and `publish` resolve their target once so every check uses
+/// the same VM. A REF defaults to the current directory. Either the REF or the service
+/// option can select a compose service.
+enum ExecTarget {
+    Addr(SocketAddr),
+    /// a Windows service's live qemu-ga socket, right under the directory the REF names
+    Qga(PathBuf),
+    Ref {
+        sel: vms::Selector,
+        vm: Option<Box<vms::VmEntry>>,
+        service: Option<String>,
+    },
+}
+
+/// Resolve `target` and `sibling`, given by `flag` (`--service` for `vk exec`, `--via` for
+/// `vk publish`, so the error names what the caller actually typed).
+fn exec_target(
     target: Option<&str>,
     sibling: Option<&str>,
     flag: &str,
-) -> anyhow::Result<SocketAddr> {
-    let Some(svc) = sibling else {
-        return resolve_agent_addr(target);
-    };
-    if target.is_some_and(is_agent_addr) {
-        anyhow::bail!("{flag} selects a VM by directory, not a raw agent address");
+) -> anyhow::Result<ExecTarget> {
+    if let Some(addr) = target.filter(|t| is_agent_addr(t)) {
+        if sibling.is_some() {
+            anyhow::bail!("{flag} selects a VM by REF, not a raw agent address");
+        }
+        return Ok(ExecTarget::Addr(addr.parse::<SocketAddr>()?));
     }
-    let entry = vms::resolve_one(target.map(Path::new))?;
-    resolve_service_addr(&entry, svc)
+    let (sel, service) = vms::resolve_target(target.map(std::ffi::OsStr::new), sibling)?;
+    // A directory's own service socket answers first: a services-only run registers no VM,
+    // and other VMs of the same project must not make the service it names ambiguous.
+    let dir = match &sel {
+        None => Some(Path::new(".")),
+        Some(vms::Selector::Dir { dir, .. }) => Some(dir.as_path()),
+        Some(_) => None,
+    };
+    if let (Some(dir), Some(svc)) = (dir, &service)
+        && let Some(socket) = service_qga_socket(Some(dir), svc, || Ok(dir.to_path_buf()))?
+    {
+        return Ok(ExecTarget::Qga(socket));
+    }
+    let (sel, vm) = vms::at_most_one(sel)?;
+    let vm = vm.map(Box::new);
+    Ok(ExecTarget::Ref { sel, vm, service })
 }
 
-/// The qemu-ga socket for `vk exec`/`vk cp`: the VM's own, or with `service`, under
-/// `svc-<service>/` in the named directory, then its registered run. The named directory
-/// comes first because a siblings-only run registers no VM. `None` for a raw agent address
-/// or a guest with vk-agent, including Linux services. Errors when `target` resolves to no
-/// VM, or the service's socket is stale.
-fn windows_exec_socket(
-    target: Option<&str>,
-    service: Option<&str>,
-) -> anyhow::Result<Option<PathBuf>> {
-    if target.is_some_and(is_agent_addr) {
-        return Ok(None);
+/// The running VM `vm` a REF's `sel` selected, or the error saying none runs there.
+fn running_vm<'a>(
+    sel: &vms::Selector,
+    vm: &'a Option<Box<vms::VmEntry>>,
+) -> anyhow::Result<&'a vms::VmEntry> {
+    vm.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("{}", sel.not_found().trim_end()))
+}
+
+/// The agent to speak to: a compose service's when the target names one, else the VM's own.
+fn resolve_exec_addr(target: &ExecTarget) -> anyhow::Result<SocketAddr> {
+    match target {
+        ExecTarget::Addr(addr) => Ok(addr.clone()),
+        ExecTarget::Qga(socket) => anyhow::bail!(
+            "that service is a Windows guest: it has no vk-agent, only qemu-ga at {}",
+            socket.display()
+        ),
+        ExecTarget::Ref { sel, vm, service } => {
+            let entry = running_vm(sel, vm)?;
+            match service {
+                None => entry.exec_addr.parse::<SocketAddr>(),
+                Some(svc) => resolve_service_addr(entry, svc),
+            }
+        }
     }
-    let resolve = || vms::resolve_one(target.map(Path::new));
-    match service {
-        None => Ok(resolve()?.guest_agent),
-        Some(svc) => service_qga_socket(Path::new(target.unwrap_or(".")), svc, || {
-            Ok(resolve()?.state_dir)
-        }),
+}
+
+/// The VM's qemu-ga socket, or a service's socket under `svc-<service>/` in its state dir.
+/// [`exec_target`] checks a directory REF (default cwd) first. A name or pid selects only
+/// its own run. Raw addresses and vk-agent guests, including Linux services, yield `None`.
+/// A stale socket or a lookup that requires a missing running VM is an error.
+fn windows_exec_socket(target: &ExecTarget) -> anyhow::Result<Option<PathBuf>> {
+    let (sel, vm, service) = match target {
+        ExecTarget::Addr(_) => return Ok(None),
+        ExecTarget::Qga(socket) => return Ok(Some(socket.clone())),
+        ExecTarget::Ref { sel, vm, service } => (sel, vm, service),
+    };
+    let registered = || Ok(running_vm(sel, vm)?.state_dir.clone());
+    let Some(svc) = service else {
+        return Ok(running_vm(sel, vm)?.guest_agent.clone());
+    };
+    match sel {
+        vms::Selector::Dir { .. } | vms::Selector::Pid(_) | vms::Selector::Here { .. } => {
+            service_qga_socket(None, svc, registered)
+        }
+        // A name's state dir is its run's, running or not: there is nowhere else to look.
+        vms::Selector::Named { dir, .. } => service_qga_socket(Some(dir), svc, || Ok(dir.clone())),
     }
 }
 
@@ -6573,7 +6731,7 @@ fn windows_exec_socket(
 /// `registered` returns. A socket nobody listens on is left from a run that ended (`vk stop`,
 /// a crash) and is refused here, rather than waited on as a booting guest's would be.
 fn service_qga_socket(
-    named: &Path,
+    named: Option<&Path>,
     service: &str,
     registered: impl FnOnce() -> anyhow::Result<PathBuf>,
 ) -> anyhow::Result<Option<PathBuf>> {
@@ -6581,8 +6739,8 @@ fn service_qga_socket(
         run.join(format!("svc-{service}"))
             .join(uefi::GUEST_AGENT_SOCKET)
     };
-    let socket = match at(named) {
-        s if s.exists() => s,
+    let socket = match named.map(at) {
+        Some(s) if s.exists() => s,
         _ => match at(&registered()?) {
             s if s.exists() => s,
             _ => return Ok(None),
@@ -6612,7 +6770,7 @@ fn resolve_exec_addr_at(state_dir: &Path, via: Option<&str>) -> anyhow::Result<S
     };
     // `ensure` canonicalizes the state dir, so only a hand-run `serve` reaches this
     // message — and `--via` is the right name there too.
-    resolve_exec_addr(Some(target), via, "--via")
+    resolve_exec_addr(&exec_target(Some(target), via, "--via")?)
 }
 
 /// The managed half of `vk publish`. Each action names its VM by state dir — the same
@@ -7961,9 +8119,13 @@ mod tests {
         );
 
         // The error names the flag the caller typed, not whichever one the helper prefers.
-        let err = resolve_exec_addr(Some("vsock://3:4444"), Some("db"), "--service").unwrap_err();
+        let err = exec_target(Some("vsock://3:4444"), Some("db"), "--service")
+            .err()
+            .unwrap();
         assert!(err.to_string().starts_with("--service selects"), "{err}");
-        let err = resolve_exec_addr(Some("vsock://3:4444"), Some("db"), "--via").unwrap_err();
+        let err = exec_target(Some("vsock://3:4444"), Some("db"), "--via")
+            .err()
+            .unwrap();
         assert!(err.to_string().starts_with("--via selects"), "{err}");
     }
 
@@ -8083,26 +8245,209 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `path` spelled relative to `from`, as `../../…/path`.
+    fn relative_to(from: &Path, path: &Path) -> String {
+        let up = "../".repeat(from.components().count().saturating_sub(1));
+        format!("{up}{}", path.strip_prefix("/").unwrap().display())
+    }
+
     // `vk logs` on a directory the registry does not know reads its console anyway — a VM
-    // that just exited is exactly the one whose console is wanted, and --state-dir keeps it.
+    // that just exited is exactly the one whose console is wanted, and its state dir keeps it.
     #[test]
     fn a_console_is_read_from_a_state_dir_the_registry_has_dropped() {
-        let dir = std::env::temp_dir().join(format!("vk-logs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let homes = crate::dev::testutil::Homes::new("logs");
+        std::fs::create_dir_all(homes.dir().join("saved/svc-db")).unwrap();
+        let dir = std::fs::canonicalize(homes.dir().join("saved")).unwrap();
         // Nothing there yet: the registry's own error is what the caller gets.
         let err = console_log_path(Some(&dir), None).unwrap_err();
         assert!(err.to_string().contains("no running vk VM"), "{err}");
-        // With a console in it, the directory is read as the state dir it is.
+        // With a console in it, the directory is read as the state dir it is, and there is
+        // no VM left to follow.
         std::fs::write(dir.join(run::CONSOLE_LOG), b"13:46:39 [INFO] hi\n").unwrap();
-        assert_eq!(
-            console_log_path(Some(&dir), None).unwrap(),
-            dir.join(run::CONSOLE_LOG)
-        );
-        // A sibling's directory is named by an exec address the registry no longer has, so
-        // the fallback does not apply to `--service`.
+        let log = dir.join(run::CONSOLE_LOG);
+        let found = console_log_path(Some(&dir), None).unwrap();
+        assert!(found.0 == log && found.1.is_none());
+        // The same through a nested relative path, a quoted `~/…` and a name.
+        let cwd = std::env::current_dir().unwrap();
+        let rel = PathBuf::from(relative_to(&cwd, &dir));
+        assert_eq!(console_log_path(Some(&rel), None).unwrap().0, log);
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let tilde = PathBuf::from(format!("~/{}", relative_to(&home, &dir)));
+        assert_eq!(console_log_path(Some(&tilde), None).unwrap().0, log);
+        homes.name(&dir, "saved");
+        let found = console_log_path(Some(Path::new("saved")), None).unwrap();
+        assert!(found.0 == log && found.1.is_none());
+        // A stopped service's console is in its own directory, by `--service` or the REF.
         assert!(console_log_path(Some(&dir), Some("db")).is_err());
-        std::fs::remove_dir_all(&dir).unwrap();
+        let db = dir.join("svc-db").join(run::CONSOLE_LOG);
+        std::fs::write(&db, b"").unwrap();
+        assert_eq!(console_log_path(Some(&dir), Some("db")).unwrap().0, db);
+        assert_eq!(
+            console_log_path(Some(Path::new("saved/db")), None)
+                .unwrap()
+                .0,
+            db
+        );
+        // A service is one name, never a way out of the state dir.
+        let err = console_log_path(Some(Path::new("saved/../x")), None).unwrap_err();
+        assert!(
+            err.to_string().contains("not a compose service name"),
+            "{err}"
+        );
+        assert!(console_log_path(Some(&dir), Some("../saved")).is_err());
+    }
+
+    // `vk ssh`/`vk ssh-config` reach a stopped VM's state dir however the REF spells it.
+    #[test]
+    fn a_stopped_state_dir_is_found_by_any_ref() {
+        let homes = crate::dev::testutil::Homes::new("ssh");
+        let dir = homes.dir().join("saved");
+        std::fs::create_dir_all(&dir).unwrap();
+        let canon = std::fs::canonicalize(&dir).unwrap();
+        let of = |t: &str| state_dir_of(std::ffi::OsStr::new(t));
+        // A bare word that names nothing but is a directory where the tests run.
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(of("src").unwrap(), std::fs::canonicalize("src").unwrap());
+        assert_eq!(of(&relative_to(&cwd, &dir)).unwrap(), canon);
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(
+            of(&format!("~/{}", relative_to(&home, &dir))).unwrap(),
+            canon
+        );
+        homes.name(&dir, "saved");
+        assert_eq!(of("saved").unwrap(), canon);
+        assert!(of("saved/db").is_err());
+        assert!(of("4294967295").is_err());
+    }
+
+    // A REF is resolved once, a name ahead of a directory spelled the same, and the service
+    // a Windows guest's socket is looked for under is one name.
+    #[test]
+    fn a_windows_service_is_looked_for_in_the_named_run() {
+        let homes = crate::dev::testutil::Homes::new("win");
+        let (run, _live) = run_with_sockets("by-name", &[("win", true)]);
+        let run = std::fs::canonicalize(run).unwrap();
+        // `src` is also a directory where the tests run: the name wins.
+        assert!(Path::new("src").is_dir());
+        homes.name(&run, "src");
+        let target = exec_target(Some("src/win"), None, "--service").unwrap();
+        assert!(matches!(
+            &target,
+            ExecTarget::Ref {
+                sel: vms::Selector::Named { dir, .. },
+                service: Some(s),
+                ..
+            }
+                if *dir == run && s == "win"
+        ));
+        assert_eq!(
+            windows_exec_socket(&target).unwrap(),
+            Some(run.join("svc-win").join(uefi::GUEST_AGENT_SOCKET))
+        );
+        // No socket under the name's own run: a Linux service, left to vk-agent.
+        let target = exec_target(Some("src"), Some("db"), "--service").unwrap();
+        assert_eq!(windows_exec_socket(&target).unwrap(), None);
+        // A service with a path in it never reaches the filesystem.
+        for bad in ["src/../win", "src/win/x"] {
+            let err = exec_target(Some(bad), None, "--service").err().unwrap();
+            assert!(
+                err.to_string().contains("not a compose service name"),
+                "{err}"
+            );
+        }
+        assert!(exec_target(Some("src"), Some("../win"), "--service").is_err());
+        // A word naming two directories is refused, not read as either.
+        std::fs::create_dir_all(homes.dir().join("XDG_STATE_HOME/virtkit/dev/amb")).unwrap();
+        let other = homes.dir().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        homes.name(&other, "amb");
+        let err = exec_target(Some("amb/win"), None, "--service")
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+        std::fs::remove_dir_all(&run).unwrap();
+    }
+
+    // `-r` with no REF means the current directory and every one below it, through the
+    // same dispatch `vk stop`, `reboot`, `pause` and `resume` take.
+    #[test]
+    fn recursive_without_a_ref_is_the_current_directory_and_below() {
+        let _homes = crate::dev::testutil::Homes::new("recursive");
+        let stop = |sel: Option<vms::Selector>| vms::stop_cmd(sel, false, 1);
+        // Nothing running: `-r` alone is done already, as plain `vk stop` is; `-r .` names
+        // a directory and says nothing was there.
+        assert_eq!(act_on_vms(None, true, stop), ExitCode::SUCCESS);
+        assert_eq!(act_on_vms(None, false, stop), ExitCode::SUCCESS);
+        let here = Some(std::ffi::OsStr::new("."));
+        assert_eq!(act_on_vms(here, true, stop), exit_code(1));
+        let mut seen = None;
+        let code = act_on_vms(None, true, |sel| {
+            seen = Some(sel);
+            Ok((String::new(), true))
+        });
+        assert_eq!(code, ExitCode::SUCCESS);
+        let here = Some(vms::Selector::Here { below: true });
+        assert_eq!(seen, Some(here.clone()));
+        let cli = Cli::try_parse_from(["vk", "list", "-r"]).unwrap();
+        let Cmd::List {
+            target, recursive, ..
+        } = cli.cmd
+        else {
+            panic!("not list");
+        };
+        assert_eq!(
+            vms::selector_of(target.as_deref(), recursive).unwrap(),
+            here
+        );
+        assert_eq!(vms::selector_of(None, false).unwrap(), None);
+    }
+
+    // A directory's own live service socket is the one meant, before the registry is asked:
+    // a services-only run registers no VM, and other VMs of the project must not stand in
+    // its way.
+    #[test]
+    fn a_directory_s_service_socket_answers_before_the_registry() {
+        let _homes = crate::dev::testutil::Homes::new("direct");
+        let (run, _live) = run_with_sockets("direct", &[("win", true)]);
+        let socket = run.join("svc-win").join(uefi::GUEST_AGENT_SOCKET);
+        let target = exec_target(run.to_str(), Some("win"), "--service").unwrap();
+        assert!(matches!(&target, ExecTarget::Qga(s) if *s == socket));
+        assert_eq!(windows_exec_socket(&target).unwrap(), Some(socket));
+        assert!(resolve_exec_addr(&target).is_err());
+        // No socket for that service: the registry decides, and nothing runs there.
+        let target = exec_target(run.to_str(), Some("db"), "--service").unwrap();
+        assert!(matches!(&target, ExecTarget::Ref { vm: None, .. }));
+        assert!(windows_exec_socket(&target).is_err());
+        std::fs::remove_dir_all(&run).unwrap();
+    }
+
+    // A services-only run registers no VM, so its state dir's lock is what says a follow of
+    // one of its consoles still has a writer; released, the follow ends.
+    #[tokio::test]
+    async fn a_services_only_console_is_followed_while_its_run_holds_the_lock() {
+        let homes = crate::dev::testutil::Homes::new("follow");
+        let dir = std::fs::canonicalize(homes.dir()).unwrap();
+        std::fs::create_dir_all(dir.join("svc-db")).unwrap();
+        let log = dir.join("svc-db").join(run::CONSOLE_LOG);
+        std::fs::write(&log, b"before\n").unwrap();
+        // Stopped: printed, then done.
+        let (_, writer) = console_log_path(Some(&dir), Some("db")).unwrap();
+        assert!(writer.is_none());
+        let lock = run::lock_state_dir(&dir).unwrap();
+        let (path, writer) = console_log_path(Some(&dir), Some("db")).unwrap();
+        assert!(matches!(&writer, Some(Writer::Run(d)) if *d == dir));
+        let follow = show_console_log(&path, writer.as_ref(), &[], None, 0, true);
+        tokio::pin!(follow);
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(f, "after").unwrap();
+        let held = tokio::time::timeout(REGISTRY_POLL + FOLLOW_POLL * 2, &mut follow).await;
+        assert!(held.is_err(), "the run still holds its lock");
+        drop(lock);
+        tokio::time::timeout(REGISTRY_POLL * 3, follow)
+            .await
+            .expect("the follow ends once the run lets go")
+            .unwrap();
     }
 
     // `vk --help` is a curated list: a new Cmd variant must either join it
@@ -8702,7 +9047,7 @@ mod tests {
     #[test]
     fn a_service_socket_is_found_in_the_named_dir_before_the_registered_run() {
         let (run, _live) = run_with_sockets("named", &[("win", true)]);
-        let found = service_qga_socket(&run, "win", || panic!("the registry is not asked"));
+        let found = service_qga_socket(Some(&run), "win", || panic!("the registry is not asked"));
         assert_eq!(
             found.unwrap(),
             Some(run.join("svc-win").join(uefi::GUEST_AGENT_SOCKET))
@@ -8715,13 +9060,13 @@ mod tests {
         let (run, _live) = run_with_sockets("registered", &[("win", true)]);
         let project = run.join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let found = service_qga_socket(&project, "win", || Ok(run.clone()));
+        let found = service_qga_socket(Some(&project), "win", || Ok(run.clone()));
         assert_eq!(
             found.unwrap(),
             Some(run.join("svc-win").join(uefi::GUEST_AGENT_SOCKET))
         );
         // Nothing registered for the named directory is the registry's error.
-        let err = service_qga_socket(&project, "win", || anyhow::bail!("no running vk VM"));
+        let err = service_qga_socket(Some(&project), "win", || anyhow::bail!("no running vk VM"));
         assert!(err.unwrap_err().to_string().contains("no running vk VM"));
         std::fs::remove_dir_all(&run).unwrap();
     }
@@ -8731,7 +9076,7 @@ mod tests {
         let (run, _live) = run_with_sockets("linux", &[]);
         std::fs::create_dir_all(run.join("svc-db")).unwrap();
         assert_eq!(
-            service_qga_socket(&run, "db", || Ok(run.clone())).unwrap(),
+            service_qga_socket(Some(&run), "db", || Ok(run.clone())).unwrap(),
             None
         );
         std::fs::remove_dir_all(&run).unwrap();
@@ -8740,7 +9085,7 @@ mod tests {
     #[test]
     fn a_stale_service_socket_is_refused_at_once() {
         let (run, _live) = run_with_sockets("stale", &[("win", false)]);
-        let err = service_qga_socket(&run, "win", || Ok(run.clone())).unwrap_err();
+        let err = service_qga_socket(Some(&run), "win", || Ok(run.clone())).unwrap_err();
         assert!(
             err.to_string()
                 .contains("service win is not running (stale"),

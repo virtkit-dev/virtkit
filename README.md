@@ -619,23 +619,29 @@ dials the target and `(unconfirmed)` when the publisher's liveness could not be 
 directory in full and adds EXEC ADDRESS, recorded as given (a relative `--state-dir` lists a
 relative path). `--json` and `--field` already report every field, so neither takes `--wide`.
 
-An optional pid or directory scopes the list. A pid selects one VM, as with `vk stop`.
-A directory selects VMs whose project is that directory or below it, or whose state dir
-matches it exactly. If no VM matches, the message names the target:
-`no running vk VM with pid 99999`, or `no running vk VM under <dir>`.
+**Naming a VM.** Use these references to select running VMs. `vk atop` also accepts recorded jobs.
 
-When a selector names exactly one VM, `vk list` prints its full record instead of a table
-row: every field `--json` carries, then each compose service as name, state, LAN address and
+| REF | Means |
+|---|---|
+| `app`, `shop/db`, `41877/db` | a VM name, or a compose service selected by `NAME/SERVICE` or `PID/SERVICE` with `exec`, `cp`, `logs`, `status` or `publish` |
+| `41877` | the pid of a running VM's `vk run`. `vk atop` looks up the recorded job only if no running VM matches a directory named `41877`. |
+| `.`, `./x`, `../x`, `/abs`, `~/x` | a project or state directory, matched exactly. `list`, `stop`, `reboot`, `pause` and `resume` also match projects below it with `--recursive` (`-r`). |
+| (none) | the current directory where the command accepts a default target. `-r` includes projects below it. `vk list` alone lists every running VM. |
+
+A bare word is a name: write `./app` for a directory called `app`. A dev environment's state
+dir name (`app-3f9c0d1e2a4b5c6d`) still works.
+
+A REF that names exactly one running VM makes `vk list` print its full record instead of a
+table row: every field `--json` carries, then each compose service as name, state, LAN address and
 exec address, and each published port as name, `listen->to` (with `@NAME` when a compose
 sibling dials) and the publisher's pid. When liveness is unconfirmed, `(unconfirmed)`
 marks the pid; in the table it marks the address. Nothing is folded in a full record,
 so `--wide` has no effect.
 
 ```sh
-vk list ~/work               # every VM under a tree (a table when several match)
-vk list .                    # VMs for this tree or below; one VM prints in full
+vk list shop                 # one VM, in full
 vk list 41877                # one VM, by pid
-vk list /home/me/app/.vk     # one VM, by its state dir
+vk list -r ~/work            # every VM under a tree
 ```
 
 ```
@@ -952,8 +958,8 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk run` | Boot an image, Dockerfile target, or compose fleet; run a command or shell. |
 | `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk, or a Windows Dockerfile into a bundle. |
 | `vk exec` | Run a command in an existing guest and return the command's exit status. |
-| `vk list` | List running `--state-dir` VMs and UEFI bundle runs, and their compose services; scope by pid or directory, `-w` for the full table, `--json`/`--field` for scripts. |
-| `vk stop` | Stop a VM selected by pid or project directory, or stop all registered VMs. |
+| `vk list` | List running `--state-dir` VMs and UEFI bundle runs, and their compose services; scope by name, pid or directory (`-r` for directories below), `-w` for the full table, `--json`/`--field` for scripts. |
+| `vk stop` | Stop a running VM by name, pid or project directory, or every one with `--all`. |
 | `vk reboot` | Reboot a running VM in place through its guest, or power-cycle it with `--force`. |
 | `vk status` | Probe a guest agent, or report whether its root image is stale. |
 | `vk logs` | Show a VM's console log, telling kernel, agent and guest output apart; `--level warn`, `--agent`, `--service NAME`, `-f`. |

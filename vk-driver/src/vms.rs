@@ -337,7 +337,13 @@ fn load_all_in(dir: &Path) -> Vec<VmEntry> {
 /// is stale). A missing state dir also counts as dead. Pid-reuse-proof, unlike signalling the
 /// recorded pid blind.
 pub fn alive(entry: &VmEntry) -> bool {
-    let Ok(f) = std::fs::File::open(&entry.state_dir) else {
+    dir_locked(&entry.state_dir)
+}
+
+/// Whether a run holds `dir`'s state-dir lock — the one [`alive`] reads — including a run that
+/// registers no VM, such as a services-only compose run.
+pub fn dir_locked(dir: &Path) -> bool {
+    let Ok(f) = std::fs::File::open(dir) else {
         return false;
     };
     // SAFETY: the fd is owned by `f` and kept alive across the call; flock returns 0/-1 and
@@ -477,19 +483,19 @@ pub(crate) fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// Does `entry` belong to the directory `filter` — i.e. is `filter` the VM's project dir (or
-/// an ancestor of it), or the VM's own state dir?
-fn matches_dir(entry: &VmEntry, filter: &Path) -> bool {
+/// Does `entry` belong to the directory `filter` — i.e. is `filter` the VM's state dir, its
+/// project dir, or (with `below`) an ancestor of its project dir?
+fn matches_dir(entry: &VmEntry, filter: &Path, below: bool) -> bool {
     if entry.state_dir == filter {
         return true;
     }
     match &entry.project_dir {
-        Some(p) => p == filter || p.starts_with(filter),
+        Some(p) => p == filter || (below && p.starts_with(filter)),
         None => false,
     }
 }
 
-/// The running VMs a directory selects (default: the current directory), and the
+/// The running VMs a directory selects exactly (default: the current directory), and the
 /// canonical directory that did the selecting — for callers that decide for themselves
 /// what zero or several matches mean, where [`resolve_one`] would refuse.
 pub fn matching(dir: Option<&Path>) -> Result<(PathBuf, Vec<VmEntry>)> {
@@ -499,31 +505,30 @@ pub fn matching(dir: Option<&Path>) -> Result<(PathBuf, Vec<VmEntry>)> {
     };
     let matched = running()
         .into_iter()
-        .filter(|e| matches_dir(e, &target))
+        .filter(|e| matches_dir(e, &target, false))
         .collect();
     Ok((target, matched))
 }
 
-/// Resolve the single running VM for a directory (default: the current directory) — the
-/// selector `vk status`/`vk stop <dir>` use. Errors when none match, or when more than one does
-/// (an ambiguous parent directory), so a by-directory command never acts on the wrong VM.
-pub fn resolve_one(dir: Option<&Path>) -> Result<VmEntry> {
-    let (target, mut matched) = matching(dir)?;
-    match matched.len() {
-        0 => bail!("no running vk VM for {}", target.display()),
-        1 => Ok(matched.pop().unwrap()),
-        n => bail!(
-            "{n} running vk VMs match {} — name a more specific directory",
-            target.display()
-        ),
+/// The single running VM a REF names (default: the current directory) — see
+/// [`resolve_ref`]; a `NAME/SERVICE` here is refused, the caller acting on whole VMs.
+pub fn resolve_one(target: Option<&Path>) -> Result<VmEntry> {
+    match resolve_ref(target.map(Path::as_os_str), None)? {
+        (entry, None) => Ok(entry),
+        (_, Some(service)) => {
+            bail!("that names the compose service {service}: this command acts on whole VMs")
+        }
     }
 }
 
-/// Whether a VM still answers to `dir`. Anything short of a definite "nothing matches" —
-/// an unreadable registry, two VMs matching — counts as still there: `vk logs -f` ends its
-/// stream on a `false` and must not do that over a transient.
-pub fn still_registered(dir: Option<&Path>) -> bool {
-    !matches!(matching(dir), Ok((_, m)) if m.is_empty())
+/// `vk logs -f` follows a registered writer while the registry lists its pid with the
+/// same recorded start time (if any). An unreadable registry yields an empty list and
+/// ends the follow.
+pub fn still_registered(entry: &VmEntry) -> bool {
+    match select_running(Some(Selector::Pid(entry.pid))) {
+        Ok((_, m)) => m.iter().any(|e| e.pid_start_ticks == entry.pid_start_ticks),
+        Err(_) => true,
+    }
 }
 
 fn uptime(created_secs: u64) -> String {
@@ -1430,38 +1435,174 @@ fn empty_selection_ok(explicit_target: bool) -> bool {
     !explicit_target
 }
 
-/// A `vk list`/`vk stop`/`vk reboot` TARGET: either the pid shown by `vk list` or a project
-/// directory.
+/// A VM reference (see [`Ref::parse`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ref {
+    /// the pid of a VM's managing `vk run`, as `vk list` prints it; with a compose service
+    /// of that VM, for `PID/SERVICE`
+    Pid(u32, Option<String>),
+    /// a project directory or a state directory
+    Path(PathBuf),
+    /// a VM name, or a bare word that may still be a directory (see [`Selector::from_ref`]);
+    /// `NAME/SERVICE` names one of its compose services
+    Name { vm: String, service: Option<String> },
+}
+
+impl Ref {
+    /// ASCII digits within `u32` name a pid. `+5` and numbers above `u32::MAX` are words.
+    /// `/…`, `./…`, `../…`, `~…`, `.` and `..` are paths, as is any non-UTF-8 argument.
+    /// Paths retain their original bytes. Other words are names. `NAME/SERVICE` and
+    /// `PID/SERVICE` select compose services, including by pid when the VM is unnamed.
+    pub fn parse(arg: &OsStr) -> Result<Self> {
+        let bytes = arg.as_bytes();
+        if bytes.is_empty() {
+            bail!("empty target — pass a name, a pid or a directory");
+        }
+        if bytes.iter().all(u8::is_ascii_digit)
+            && let Some(pid) = arg.to_str().and_then(|s| s.parse::<u32>().ok())
+        {
+            return Ok(Ref::Pid(pid, None));
+        }
+        let pathlike = bytes.starts_with(b"/")
+            || bytes.starts_with(b"./")
+            || bytes.starts_with(b"../")
+            || bytes == b"."
+            || bytes == b"..";
+        if pathlike {
+            return Ok(Ref::Path(PathBuf::from(arg)));
+        }
+        if bytes.starts_with(b"~") {
+            return Ok(Ref::Path(expand_tilde(arg)));
+        }
+        let Some(text) = arg.to_str() else {
+            // Not UTF-8, so no name: only a directory can be meant.
+            return Ok(Ref::Path(PathBuf::from(arg)));
+        };
+        Ok(match text.split_once('/') {
+            Some((vm, service)) => {
+                let service =
+                    Some(service.trim_end_matches('/').to_string()).filter(|s| !s.is_empty());
+                // No name is all digits, so digits before the slash are a pid.
+                match vm.parse::<u32>() {
+                    Ok(pid) if vm.bytes().all(|b| b.is_ascii_digit()) => Ref::Pid(pid, service),
+                    _ => Ref::Name {
+                        vm: vm.to_string(),
+                        service,
+                    },
+                }
+            }
+            None => Ref::Name {
+                vm: text.to_string(),
+                service: None,
+            },
+        })
+    }
+}
+
+/// `~` or `~/rest` with `$HOME` put in; any other `~…` as it is.
+fn expand_tilde(arg: &OsStr) -> PathBuf {
+    let bytes = arg.as_bytes();
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+    match (home, bytes) {
+        (Some(home), b"~") => PathBuf::from(home),
+        (Some(home), _) if bytes.starts_with(b"~/") => {
+            // `~//x` is `$HOME/x`: a rest still starting with `/` would replace `$HOME`.
+            let mut rest = bytes.get(1..).unwrap_or_default();
+            while let [b'/', tail @ ..] = rest {
+                rest = tail;
+            }
+            PathBuf::from(home).join(OsStr::from_bytes(rest))
+        }
+        _ => PathBuf::from(arg),
+    }
+}
+
+/// Which running VMs a command means: a pid, a directory (exactly, or with `below` every VM
+/// whose project is that directory or under it), or the state dir a name stands for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selector {
     Pid(u32),
-    Dir(PathBuf),
+    Dir {
+        dir: PathBuf,
+        below: bool,
+    },
+    Named {
+        name: String,
+        dir: PathBuf,
+    },
+    /// the current directory no REF stands for — `-r` alone — which, unlike an explicit
+    /// directory, may select nothing (see [`empty_selection_ok`]); a [`Selector::Dir`] once
+    /// [`Selector::resolved`]
+    Here {
+        below: bool,
+    },
 }
 
 impl Selector {
-    /// An all-digit argument that fits `u32` is a pid; anything else is a directory. Prefix a
-    /// digit-only directory such as `123` with `./`.
-    ///
-    /// Parse paths as bytes so non-UTF-8 names remain valid. The digit check prevents
-    /// `u32::from_str` from treating `+5` as a pid; digit strings larger than `u32` also remain
-    /// paths.
+    /// [`Ref::parse`] then [`Selector::from_ref`], for a command that has no service form.
     pub fn parse(arg: &OsStr) -> Result<Self> {
-        if arg.is_empty() {
-            // Omit `--all`: this parser also serves `vk list`, which has no such flag.
-            bail!("empty target — pass a pid or a project directory");
+        Self::parse_below(arg, false)
+    }
+
+    /// [`Selector::parse`] with `--recursive`'s `below`.
+    pub fn parse_below(arg: &OsStr, below: bool) -> Result<Self> {
+        match Self::from_ref(Ref::parse(arg)?, below)? {
+            (sel, None) => Ok(sel),
+            (_, Some(service)) => bail!(
+                "{} names the compose service {service}: this command acts on whole VMs",
+                arg.to_string_lossy()
+            ),
         }
-        if arg.as_bytes().iter().all(u8::is_ascii_digit)
-            && let Some(pid) = arg.to_str().and_then(|s| s.parse::<u32>().ok())
-        {
-            return Ok(Selector::Pid(pid));
+    }
+
+    /// Look up the VM name or dev state directory name first. From its parent, a dev
+    /// checkout can have the same name as its VM. `./word` selects the directory.
+    /// For compatibility with `vk stop DIR`, an unmatched word can select an existing
+    /// directory with a note. [`check_service`] validates any selected service.
+    pub fn from_ref(r: Ref, below: bool) -> Result<(Self, Option<String>)> {
+        let (sel, service) = match r {
+            Ref::Pid(pid, service) => (Selector::Pid(pid), service),
+            Ref::Path(dir) => (Selector::Dir { dir, below }, None),
+            Ref::Name { vm, service } => match crate::names::resolve(&vm)? {
+                Some(dir) => (Selector::Named { name: vm, dir }, service),
+                None => {
+                    let word = match &service {
+                        Some(s) => format!("{vm}/{s}"),
+                        None => vm.clone(),
+                    };
+                    if !Path::new(&word).is_dir() {
+                        bail!("no VM is named {vm}");
+                    }
+                    eprintln!(
+                        "vk: note: reading {word} as a directory; write ./{word} — a bare \
+                         word is a VM name"
+                    );
+                    let dir = PathBuf::from(word);
+                    (Selector::Dir { dir, below }, None)
+                }
+            },
+        };
+        if let Some(s) = &service {
+            check_service(s)?;
         }
-        Ok(Selector::Dir(PathBuf::from(arg)))
+        Ok((sel, service))
     }
 
     /// Resolve a directory once so every entry is matched against the same path.
     fn resolved(self) -> Self {
         match self {
-            Selector::Dir(dir) => Selector::Dir(canonical(&dir)),
+            Selector::Dir { dir, below } => Selector::Dir {
+                dir: canonical(&dir),
+                below,
+            },
+            Selector::Named { name, dir } => Selector::Named {
+                name,
+                dir: canonical(&dir),
+            },
+            Selector::Here { below } => Selector::Dir {
+                dir: canonical(Path::new(".")),
+                below,
+            },
             pid => pid,
         }
     }
@@ -1470,16 +1611,140 @@ impl Selector {
     fn matches(&self, entry: &VmEntry) -> bool {
         match self {
             Selector::Pid(pid) => entry.pid == *pid,
-            Selector::Dir(dir) => matches_dir(entry, dir),
+            Selector::Dir { dir, below } => matches_dir(entry, dir, *below),
+            Selector::Named { dir, .. } => entry.state_dir == *dir,
+            Selector::Here { below } => matches_dir(entry, &canonical(Path::new(".")), *below),
         }
     }
 
     /// What to report when it picks nothing.
-    fn not_found(&self) -> String {
+    pub fn not_found(&self) -> String {
         match self {
             Selector::Pid(pid) => format!("no running vk VM with pid {pid}\n"),
-            Selector::Dir(dir) => format!("no running vk VM under {}\n", dir.display()),
+            Selector::Dir { dir, below: true } => {
+                format!("no running vk VM under {}\n", dir.display())
+            }
+            Selector::Dir { dir, below: false } => {
+                format!("no running vk VM for {}\n", dir.display())
+            }
+            Selector::Named { name, .. } => format!("{name} is not running\n"),
+            Selector::Here { .. } => "no matching running vk VM\n".to_string(),
         }
+    }
+}
+
+/// The running VMs `target` selects, the current directory's (exactly) when it is `None`.
+fn select_running(target: Option<Selector>) -> Result<(Selector, Vec<VmEntry>)> {
+    let sel = match target {
+        Some(sel) => sel.resolved(),
+        None => Selector::Dir {
+            dir: std::env::current_dir().context("resolving the current directory")?,
+            below: false,
+        },
+    };
+    let matched = running().into_iter().filter(|e| sel.matches(e)).collect();
+    Ok((sel, matched))
+}
+
+/// The one running VM a REF names (default: the current directory's), and the compose
+/// service it names, merged with a `--service` given beside it. Errors when nothing runs
+/// there, or when several VMs match a directory.
+pub fn resolve_ref(
+    target: Option<&OsStr>,
+    service: Option<&str>,
+) -> Result<(VmEntry, Option<String>)> {
+    let (sel, service) = resolve_target(target, service)?;
+    Ok((one_running(sel)?, service))
+}
+
+/// Resolve a REF once (`None`: the current directory's VM) into what it selects and the
+/// compose service it names, merged with a `--service` given beside it and checked by
+/// [`check_service`].
+pub fn resolve_target(
+    target: Option<&OsStr>,
+    service: Option<&str>,
+) -> Result<(Option<Selector>, Option<String>)> {
+    let (sel, named) = match target {
+        Some(t) => {
+            let (sel, named) = Selector::from_ref(Ref::parse(t)?, false)?;
+            (Some(sel), named)
+        }
+        None => (None, None),
+    };
+    let service = match (named, service) {
+        (Some(a), Some(b)) if a != b => {
+            bail!("the REF selects the service {a} and the option selects {b}: choose one")
+        }
+        (a, b) => a.or(b.map(str::to_string)),
+    };
+    if let Some(s) = &service {
+        check_service(s)?;
+    }
+    Ok((sel, service))
+}
+
+/// Require one service name before joining `svc-<service>` to the state directory.
+/// A slash could introduce another path component. Leading dots are also disallowed.
+pub fn check_service(service: &str) -> Result<()> {
+    if !is_service_name(service) {
+        bail!("{service:?} is not a compose service name");
+    }
+    Ok(())
+}
+
+/// Whether `s` can be a compose service's name: `[A-Za-z0-9_.-]+`, not starting with `.`.
+pub fn is_service_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('.')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// The one running VM `sel` selects (default: the current directory's). Errors when nothing
+/// runs there, or when several VMs match a directory.
+pub fn one_running(sel: Option<Selector>) -> Result<VmEntry> {
+    let (sel, entry) = at_most_one(sel)?;
+    entry.ok_or_else(|| anyhow::anyhow!("{}", sel.not_found().trim_end()))
+}
+
+/// The running VM `sel` selects (default: the current directory's), `None` when nothing
+/// runs there, with the selector resolved — a caller falling back to a stopped VM's state
+/// dir takes it from there. Errors when several VMs match.
+pub fn at_most_one(sel: Option<Selector>) -> Result<(Selector, Option<VmEntry>)> {
+    let (sel, matched) = select_running(sel)?;
+    Ok((sel, single(matched)?))
+}
+
+/// The one VM of `matched`, if any; several is an error that lists each as a REF to pass.
+fn single(mut matched: Vec<VmEntry>) -> Result<Option<VmEntry>> {
+    match matched.len() {
+        0 | 1 => Ok(matched.pop()),
+        n => bail!(
+            "{n} running vk VMs match: {} — name one",
+            matched
+                .iter()
+                .map(display_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// How a VM is named in a message, as a REF to pass back: its name, else its pid.
+pub fn display_name(entry: &VmEntry) -> String {
+    crate::names::Index::open()
+        .ok()
+        .and_then(|idx| idx.name_of(&entry.state_dir))
+        .unwrap_or_else(|| entry.pid.to_string())
+}
+
+/// The selector a list/stop/reboot/pause/resume REF stands for; with `recursive` and no REF,
+/// every VM at or below the current directory.
+pub fn selector_of(target: Option<&OsStr>, recursive: bool) -> Result<Option<Selector>> {
+    match target {
+        Some(t) => Selector::parse_below(t, recursive).map(Some),
+        None if recursive => Ok(Some(Selector::Here { below: true })),
+        None => Ok(None),
     }
 }
 
@@ -1494,19 +1759,22 @@ enum Selection {
 /// the running VMs to act on. Shared by [`stop_cmd`] and [`reboot_cmd`].
 fn select_vms(target: Option<Selector>, all: bool) -> Result<Selection> {
     let vms = running();
+    let explicit = matches!(&target, Some(sel) if !matches!(sel, Selector::Here { .. }));
     let target = target.map(Selector::resolved);
     let selected: Vec<VmEntry> = match (all, &target) {
         (true, _) => vms,
         (false, Some(sel)) => vms.into_iter().filter(|e| sel.matches(e)).collect(),
         (false, None) => {
             let cwd = std::env::current_dir().context("resolving the current directory")?;
-            vms.into_iter().filter(|e| matches_dir(e, &cwd)).collect()
+            vms.into_iter()
+                .filter(|e| matches_dir(e, &cwd, false))
+                .collect()
         }
     };
     if selected.is_empty() {
         return Ok(match &target {
-            Some(sel) => Selection::Empty(sel.not_found(), empty_selection_ok(true)),
-            None => Selection::Empty(
+            Some(sel) if explicit => Selection::Empty(sel.not_found(), empty_selection_ok(true)),
+            _ => Selection::Empty(
                 "no matching running vk VM\n".to_string(),
                 empty_selection_ok(false),
             ),
@@ -2004,12 +2272,13 @@ mod tests {
             Some(PathBuf::from("/home/vince/repo")),
         );
         // exact project dir, an ancestor of it, and the state dir all select the VM
-        assert!(matches_dir(&e, Path::new("/home/vince/repo")));
-        assert!(matches_dir(&e, Path::new("/home/vince")));
-        assert!(matches_dir(&e, Path::new("/state/vm1")));
+        assert!(matches_dir(&e, Path::new("/home/vince/repo"), false));
+        assert!(!matches_dir(&e, Path::new("/home/vince"), false));
+        assert!(matches_dir(&e, Path::new("/home/vince"), true));
+        assert!(matches_dir(&e, Path::new("/state/vm1"), false));
         // an unrelated dir, and a *descendant* of the project, do not
-        assert!(!matches_dir(&e, Path::new("/home/other")));
-        assert!(!matches_dir(&e, Path::new("/home/vince/repo/sub")));
+        assert!(!matches_dir(&e, Path::new("/home/other"), true));
+        assert!(!matches_dir(&e, Path::new("/home/vince/repo/sub"), true));
     }
 
     #[test]
@@ -2060,66 +2329,148 @@ mod tests {
         assert!(!empty_selection_ok(true));
     }
 
-    fn parse(arg: &str) -> Selector {
-        Selector::parse(OsStr::new(arg)).unwrap()
+    fn parse(arg: &str) -> Ref {
+        Ref::parse(OsStr::new(arg)).unwrap()
+    }
+
+    fn name(vm: &str, service: Option<&str>) -> Ref {
+        Ref::Name {
+            vm: vm.into(),
+            service: service.map(Into::into),
+        }
     }
 
     #[test]
-    fn a_target_parses_digits_as_a_pid() {
-        // Digits that fit u32 select the pid shown by `vk list`; `./` makes a digit-only name a
-        // directory.
-        assert_eq!(parse("2144802"), Selector::Pid(2144802));
-        assert_eq!(parse("007"), Selector::Pid(7));
+    fn a_ref_reads_digits_as_a_pid_paths_as_paths_and_words_as_names() {
+        assert_eq!(parse("2144802"), Ref::Pid(2144802, None));
+        assert_eq!(parse("007"), Ref::Pid(7, None));
+        // A service of a VM that has no name.
+        assert_eq!(parse("4242/db"), Ref::Pid(4242, Some("db".into())));
+        assert_eq!(parse("4242/"), Ref::Pid(4242, None));
+        assert_eq!(parse("42a/db"), name("42a", Some("db")));
         assert_eq!(
             parse("/home/vince/repo"),
-            Selector::Dir(PathBuf::from("/home/vince/repo"))
+            Ref::Path("/home/vince/repo".into())
         );
-        assert_eq!(parse("./123"), Selector::Dir(PathBuf::from("./123")));
-        // A signed number and a value past u32 remain directories.
-        assert_eq!(parse("+5"), Selector::Dir(PathBuf::from("+5")));
-        assert_eq!(
-            parse("99999999999"),
-            Selector::Dir(PathBuf::from("99999999999"))
-        );
-        // A non-UTF-8 path still names a VM and cannot be mistaken for a pid.
-        let raw = OsStr::from_bytes(b"/tmp/\xff");
-        assert_eq!(
-            Selector::parse(raw).unwrap(),
-            Selector::Dir(PathBuf::from(raw))
-        );
-        // Refuse an empty argument because `Path::starts_with("")` accepts every path. The
-        // advice names no flag, since `vk list` shares this parser and has no `--all`.
-        let empty = Selector::parse(OsStr::new("")).unwrap_err().to_string();
+        assert_eq!(parse("./123"), Ref::Path("./123".into()));
+        assert_eq!(parse("../x"), Ref::Path("../x".into()));
+        assert_eq!(parse("."), Ref::Path(".".into()));
+        assert_eq!(parse(".."), Ref::Path("..".into()));
+        assert_eq!(parse("app"), name("app", None));
+        assert_eq!(parse("app/db"), name("app", Some("db")));
+        assert_eq!(parse("app/db/"), name("app", Some("db")));
+        assert_eq!(parse("app/"), name("app", None));
+        // A signed number and a value past u32 are words, not pids.
+        assert_eq!(parse("+5"), name("+5", None));
+        assert_eq!(parse("99999999999"), name("99999999999", None));
+        // A non-UTF-8 argument can only be a directory.
+        let raw = OsStr::from_bytes(b"\xffdir");
+        assert_eq!(Ref::parse(raw).unwrap(), Ref::Path(PathBuf::from(raw)));
+        // An empty argument names nothing; the advice names no flag `vk list` lacks.
+        let empty = Ref::parse(OsStr::new("")).unwrap_err().to_string();
         assert!(!empty.contains("--all"), "{empty}");
     }
 
     #[test]
-    fn a_target_selects_by_pid_or_by_directory() {
+    fn a_tilde_is_the_home_directory() {
+        let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+            return;
+        };
+        assert_eq!(parse("~"), Ref::Path(PathBuf::from(&home)));
+        assert_eq!(parse("~/x/y"), Ref::Path(PathBuf::from(&home).join("x/y")));
+        assert_eq!(parse("~other"), Ref::Path("~other".into()));
+        // Repeated separators stay under `$HOME`, never at the root.
+        assert_eq!(
+            parse("~//work"),
+            Ref::Path(PathBuf::from(&home).join("work"))
+        );
+        assert_eq!(parse("~///"), Ref::Path(PathBuf::from(&home)));
+    }
+
+    #[test]
+    fn several_matches_are_refused_naming_each_as_a_ref() {
+        let a = entry(PathBuf::from("/state/vk-test-a"), None);
+        let mut b = entry(PathBuf::from("/state/vk-test-b"), None);
+        b.pid = a.pid.wrapping_add(1);
+        assert!(single(vec![]).unwrap().is_none());
+        assert_eq!(single(vec![a.clone()]).unwrap().unwrap().pid, a.pid);
+        let err = single(vec![a.clone(), b.clone()]).unwrap_err().to_string();
+        assert!(err.starts_with("2 running vk VMs match: "), "{err}");
+        assert!(err.contains(&format!("{}, {} —", a.pid, b.pid)), "{err}");
+        assert!(!err.contains("pid "), "{err}");
+    }
+
+    #[test]
+    fn a_service_is_one_name() {
+        for ok in ["db", "win-2", "a_b.c"] {
+            assert!(is_service_name(ok), "{ok}");
+        }
+        for bad in ["", ".", "..", ".x", "../x", "a/b", "a\\b"] {
+            assert!(!is_service_name(bad), "{bad}");
+        }
+        // `PID/SERVICE` and `--service` are checked alike, before any path is built.
+        assert!(Selector::from_ref(Ref::Pid(1, Some("../x".into())), false).is_err());
+        assert!(resolve_target(Some(OsStr::new("1/../x")), None).is_err());
+        assert!(resolve_target(None, Some("a/b")).is_err());
+        let (sel, svc) = resolve_target(Some(OsStr::new("1/db")), None).unwrap();
+        assert_eq!((sel, svc.as_deref()), (Some(Selector::Pid(1)), Some("db")));
+    }
+
+    #[test]
+    fn recursive_with_no_ref_is_the_current_directory_and_below() {
+        let here = Selector::Here { below: true };
+        assert_eq!(selector_of(None, true).unwrap(), Some(here));
+        assert_eq!(selector_of(None, false).unwrap(), None);
+        assert_eq!(
+            selector_of(Some(OsStr::new("/x")), true).unwrap(),
+            Some(Selector::Dir {
+                dir: "/x".into(),
+                below: true
+            })
+        );
+    }
+
+    #[test]
+    fn a_selector_matches_by_pid_by_exact_directory_below_on_request_and_by_name() {
         let e = entry(
             PathBuf::from("/state/vm1"),
             Some(PathBuf::from("/home/vince/repo")),
         );
+        let dir = |d: &str, below| Selector::Dir {
+            dir: d.into(),
+            below,
+        };
         assert!(Selector::Pid(e.pid).matches(&e));
         assert!(!Selector::Pid(e.pid.wrapping_add(1)).matches(&e));
-        // Directory selection matches `vk list DIR`: the project, its ancestor, or the state
-        // directory.
-        assert!(Selector::Dir(PathBuf::from("/home/vince")).matches(&e));
-        assert!(Selector::Dir(PathBuf::from("/state/vm1")).matches(&e));
-        assert!(!Selector::Dir(PathBuf::from("/home/other")).matches(&e));
-        // A pid selector never falls back to the directory that spells it; use `./123` for the
-        // directory.
+        assert!(dir("/home/vince/repo", false).matches(&e));
+        assert!(dir("/state/vm1", false).matches(&e));
+        assert!(!dir("/home/vince", false).matches(&e));
+        assert!(dir("/home/vince", true).matches(&e));
+        assert!(!dir("/home/other", true).matches(&e));
+        let named = |d: &str| Selector::Named {
+            name: "x".into(),
+            dir: d.into(),
+        };
+        assert!(named("/state/vm1").matches(&e));
+        assert!(!named("/home/vince/repo").matches(&e));
+        // A pid selector never falls back to the directory that spells it.
         let digits = entry(PathBuf::from("/state/vm2"), Some(PathBuf::from("/123")));
         assert!(!Selector::Pid(123).matches(&digits));
-        assert!(Selector::Dir(PathBuf::from("/123")).matches(&digits));
+        assert!(dir("/123", false).matches(&digits));
         // Each says what it looked for when it finds nothing.
         assert_eq!(
             Selector::Pid(4242).not_found(),
             "no running vk VM with pid 4242\n"
         );
         assert_eq!(
-            Selector::Dir(PathBuf::from("/home/other")).not_found(),
+            dir("/home/other", true).not_found(),
             "no running vk VM under /home/other\n"
         );
+        assert_eq!(
+            dir("/home/other", false).not_found(),
+            "no running vk VM for /home/other\n"
+        );
+        assert_eq!(named("/s").not_found(), "x is not running\n");
     }
 
     #[test]
