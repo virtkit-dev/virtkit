@@ -25,6 +25,31 @@ pub const BOOT_SPEC_ENV: &str = "VIRTKIT_BOOT_SPEC";
 /// stage, an image, or a compose service).
 pub const DEFAULT_VM_NAME_TEMPLATE: &str = "vk:{name}";
 
+/// Whether `environ` — a process's environment as `/proc/<pid>/environ` holds it — is a
+/// VMM's: it carries [`BOOT_SPEC_ENV`], which [`Libkrun::command`] sets on the processes it
+/// makes VMMs of and on nothing else. Their names say nothing: `--vm-name` chooses them.
+fn is_vmm_environ(environ: &[u8]) -> bool {
+    environ.split(|b| *b == 0).any(|var| {
+        var.strip_prefix(BOOT_SPEC_ENV.as_bytes())
+            .is_some_and(|rest| rest.first() == Some(&b'='))
+    })
+}
+
+/// The VMM processes under the process `root`, each after its parent, told from its other
+/// descendants by what they were launched with, not by a record: the primary's, every
+/// compose service's and any stage build's. A VMM is two processes — the keeper `root`
+/// spawned, and under it the boot child that is the VM itself (see `libkrun_sys::keep`) —
+/// and both are returned, the keeper first. A process whose environment cannot be read
+/// (gone, or another user's) is left out.
+pub fn processes_under(root: i32) -> Vec<i32> {
+    crate::usage::descendants_of(root)
+        .into_iter()
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| is_vmm_environ(&env))
+        })
+        .collect()
+}
+
 /// The `--vm-name` template, set once per process from the CLI. Booting happens across
 /// several call sites (run, compose siblings, stage builds) that all share this process,
 /// so a process-global spares threading the template through every signature. Separate
@@ -1015,6 +1040,22 @@ mod tests {
         assert!(format!("{err:#}").contains("not a disk"), "{err:#}");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_vmm_is_told_by_the_boot_spec_in_its_environment() {
+        assert!(is_vmm_environ(
+            b"PATH=/bin\0VIRTKIT_BOOT_SPEC={}\0HOME=/h\0"
+        ));
+        assert!(is_vmm_environ(b"VIRTKIT_BOOT_SPEC=\0"));
+        // Its name alone, a variable merely starting with it, or its value elsewhere: no.
+        assert!(!is_vmm_environ(b"PATH=/bin\0HOME=/h\0"));
+        assert!(!is_vmm_environ(b"VIRTKIT_BOOT_SPEC_PATH=/x\0"));
+        assert!(!is_vmm_environ(b"NOTE=VIRTKIT_BOOT_SPEC=1\0"));
+        assert!(!is_vmm_environ(b""));
+        // This test process is no VMM, and neither is anything under it.
+        let me = i32::try_from(std::process::id()).unwrap();
+        assert!(processes_under(me).is_empty());
     }
 
     #[test]

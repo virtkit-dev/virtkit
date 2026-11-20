@@ -1302,42 +1302,169 @@ fn block(lines: &[String]) -> String {
     }
 }
 
-/// SIGTERM the run managing `entry` and wait up to `timeout` seconds for it to exit (the
-/// state-dir lock frees). Prunes the entry once it is down. Returns whether it went down.
-/// A no-op success if already dead. Stop managed publishers first on a separate short
-/// budget.
-fn stop_one(entry: &VmEntry, timeout: u64) -> bool {
-    if !alive(entry) {
-        // Publishers detect an already-gone VM on their next probe. Do not signal here
-        // because the entry may only be stale.
-        if let Ok(dir) = registry_dir() {
-            remove_in(&dir, &entry.state_dir);
-        }
-        return true;
+/// How `vk stop` goes about stopping a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StopHow {
+    /// SIGTERM once, then wait for the timeout: the guest powers off cleanly
+    #[default]
+    Graceful,
+    /// `--force`: SIGTERM once a second for [`FORCE_TERM_SECS`], then kill
+    Force,
+    /// `--kill`: kill right away — the VMM first, the run only if it does not follow
+    Kill,
+}
+
+/// How long `--force` keeps asking with SIGTERM before it kills.
+pub const FORCE_TERM_SECS: u64 = 5;
+
+/// How long a stop waits after each kill: for the run to tear down once its VMM is killed,
+/// and for a run it then had to kill itself to be gone.
+pub const KILL_WAIT_SECS: u64 = 5;
+
+/// Send `signal` to the run `entry` records — if its pid is still that process. A SIGKILL
+/// must not land on a process the pid was handed to since: where the entry recorded its
+/// start time, a pid started at another is left alone. The result of `kill` is dropped
+/// because neither failure changes what to do: ESRCH means it went down in the meantime,
+/// and EPERM that the pid is no longer the run we recorded — the wait that follows then
+/// reports it as still standing, which is the truth either way.
+fn signal_run(entry: &VmEntry, signal: libc::c_int) {
+    let Ok(pid) = i32::try_from(entry.pid) else {
+        return;
+    };
+    if entry
+        .pid_start_ticks
+        .is_some_and(|ticks| crate::usage::proc_starttime(pid) != Some(ticks))
+    {
+        return;
     }
-    // Stop publishers before their target disappears and they retain unusable bound
-    // addresses until the next probe. Give them at most five seconds each instead of the
-    // per-VM `--timeout`; publishers normally exit immediately on SIGTERM.
-    crate::publish::stop_all_quietly(
-        &entry.state_dir,
-        std::time::Duration::from_secs(timeout.min(5)),
-    );
-    // The result is dropped because neither failure changes what to do: ESRCH means it went
-    // down between the check above and here, and EPERM means the pid is no longer the run we
-    // recorded — the wait below then reports it as still standing, which is the truth either
-    // way. The state-dir lock was just held, so that window is a handful of instructions.
     // SAFETY: kill with a signal number is always safe.
-    unsafe { libc::kill(entry.pid as i32, libc::SIGTERM) };
-    for _ in 0..timeout.saturating_mul(2) {
-        if !alive(entry) {
-            if let Ok(dir) = registry_dir() {
-                remove_in(&dir, &entry.state_dir);
-            }
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+    unsafe { libc::kill(pid, signal) };
+}
+
+/// SIGKILL every VMM the run `entry` records has under it: its VM, its compose services'
+/// and any build's, cut off as by a power cut. They are found among the run's descendants
+/// by what they were launched with ([`crate::vmm::processes_under`]), not from the
+/// registry, which records only the primary's. Each VM itself — the boot child — goes
+/// before its keeper: a keeper killed first would leave its VM a power-button press, not a
+/// kill. The run then sees its VMs gone and tears down what is left.
+///
+/// Nothing is sent when the pid is no longer that run (where the entry recorded its start
+/// time to tell): [`stop_many`] then finds the run gone, or kills it after its wait.
+fn kill_vmms(entry: &VmEntry) {
+    let Ok(run) = i32::try_from(entry.pid) else {
+        return;
+    };
+    if entry
+        .pid_start_ticks
+        .is_some_and(|ticks| crate::usage::proc_starttime(run) != Some(ticks))
+    {
+        return;
     }
-    false
+    // Listed parents first, so killed in reverse.
+    for vmm in crate::vmm::processes_under(run).into_iter().rev() {
+        // SAFETY: kill with a signal number is always safe.
+        unsafe { libc::kill(vmm, libc::SIGKILL) };
+    }
+}
+
+/// Stop the runs managing `entries`, all at once, and wait for them to exit (their
+/// state-dir locks free): every stop order goes out before the first wait, and `timeout`
+/// — seconds, `None` for as long as it takes — bounds the whole of it, not each VM.
+///
+/// [`StopHow::Graceful`] sends SIGTERM once; [`StopHow::Force`] sends it once a second for
+/// [`FORCE_TERM_SECS`] to those still there, then kills; [`StopHow::Kill`] kills at once.
+/// A kill is SIGKILL to every VMM under the run ([`kill_vmms`]), [`KILL_WAIT_SECS`] for the run to tear
+/// down by itself, and only then SIGKILL to a run still there, with as long again for it
+/// to go. Each entry is pruned as its run goes. Returns,
+/// per entry, whether it went down; one already dead counts as down. Managed publishers
+/// are stopped first, on a short budget of their own.
+///
+/// A VM whose VMM is killed is not powered off: what its guest had not written is lost. A
+/// run killed in turn cannot tidy after itself: its helpers, tied to it, go with it, and
+/// its registry entry is removed here.
+fn stop_many(entries: &[VmEntry], timeout: Option<u64>, how: StopHow) -> Vec<bool> {
+    use std::time::{Duration, Instant};
+    let down = |e: &VmEntry| {
+        if let Ok(dir) = registry_dir() {
+            remove_in(&dir, &e.state_dir);
+        }
+    };
+    // Publishers detect an already-gone VM on their next probe. A dead entry is not
+    // signalled: it may only be stale.
+    let mut went: Vec<bool> = entries.iter().map(|e| !alive(e)).collect();
+    let pending = |went: &[bool]| -> Vec<&VmEntry> {
+        entries
+            .iter()
+            .zip(went)
+            .filter(|(_, gone)| !**gone)
+            .map(|(e, _)| e)
+            .collect()
+    };
+    for (e, _) in entries.iter().zip(&went).filter(|(_, gone)| **gone) {
+        down(e);
+    }
+    // Stop publishers before their targets disappear and they retain unusable bound
+    // addresses until the next probe. Give them at most five seconds each instead of the
+    // stop's own timeout; publishers normally exit immediately on SIGTERM.
+    let publishers = Duration::from_secs(timeout.map_or(5, |t| t.min(5)));
+    for e in pending(&went) {
+        crate::publish::stop_all_quietly(&e.state_dir, publishers);
+    }
+    let started = Instant::now();
+    let overall = timeout.map(|t| started + Duration::from_secs(t));
+    // Every order goes out before any wait.
+    for e in pending(&went) {
+        match how {
+            StopHow::Kill => kill_vmms(e),
+            StopHow::Graceful | StopHow::Force => signal_run(e, libc::SIGTERM),
+        }
+    }
+    let mut terms = 1u64;
+    // A kill goes to the VMMs first — the VM's, and its services' — found under the run:
+    // with them gone the run tears the rest down itself — helpers, its registry entry. Only a run still there [`KILL_WAIT_SECS`]
+    // later is killed in turn, which takes what is tied to it along.
+    let mut vmm_killed_at = (how == StopHow::Kill).then_some(started);
+    let mut run_killed_at = None;
+    let kill_wait = Duration::from_secs(KILL_WAIT_SECS);
+    loop {
+        for (i, e) in entries.iter().enumerate() {
+            if !went[i] && !alive(e) {
+                down(e);
+                went[i] = true;
+            }
+        }
+        let now = Instant::now();
+        if went.iter().all(|gone| *gone) || overall.is_some_and(|end| now >= end) {
+            break;
+        }
+        match (how, vmm_killed_at, run_killed_at) {
+            (StopHow::Graceful, ..) => {}
+            (StopHow::Force, None, _) => {
+                let elapsed = now.duration_since(started).as_secs();
+                if elapsed >= FORCE_TERM_SECS {
+                    pending(&went).into_iter().for_each(kill_vmms);
+                    vmm_killed_at = Some(now);
+                } else if elapsed >= terms {
+                    // Asked again each second: a run busy in a build or a boot may only
+                    // come to its signals between steps.
+                    pending(&went)
+                        .into_iter()
+                        .for_each(|e| signal_run(e, libc::SIGTERM));
+                    terms += 1;
+                }
+            }
+            (_, Some(at), None) if now >= at + kill_wait => {
+                pending(&went)
+                    .into_iter()
+                    .for_each(|e| signal_run(e, libc::SIGKILL));
+                run_killed_at = Some(now);
+            }
+            (_, _, Some(at)) if now >= at + kill_wait => break,
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    went
 }
 
 /// Whether an empty selection succeeds. An explicit `vk stop TARGET` returns not-found (exit 1)
@@ -1611,7 +1738,7 @@ enum Selection {
 }
 
 /// Resolve `--all`, a pid or project directory, or the current directory (the default) into
-/// the running VMs to act on. Shared by [`stop_cmd`] and [`reboot_cmd`].
+/// the running VMs to act on. Shared by [`stop_cmd_how`] and [`reboot_cmd`].
 fn select_vms(target: Option<Selector>, all: bool) -> Result<Selection> {
     let vms = running();
     let target = target.map(Selector::resolved);
@@ -1638,55 +1765,88 @@ fn select_vms(target: Option<Selector>, all: bool) -> Result<Selection> {
 }
 
 /// Stop VMs selected by `--all`, a pid or project directory, or the current directory by
-/// default. Returns the summary and whether every selected VM went down.
-pub fn stop_cmd(target: Option<Selector>, all: bool, timeout: u64) -> Result<(String, bool)> {
+/// default, as `how` says and all at once, `timeout` bounding the whole of it (`None`: as
+/// long as it takes). Returns the summary and whether every selected VM went down.
+pub fn stop_cmd_how(
+    target: Option<Selector>,
+    all: bool,
+    timeout: Option<u64>,
+    how: StopHow,
+) -> Result<(String, bool)> {
     let selected = match select_vms(target, all)? {
         Selection::Matched(v) => v,
         Selection::Empty(out, ok) => return Ok((out, ok)),
     };
+    Ok(stop_reports(&selected, timeout, how))
+}
+
+/// [`stop_many`] on `entries`, as its report: one line per VM, and whether every one went
+/// down.
+pub(crate) fn stop_reports(
+    entries: &[VmEntry],
+    timeout: Option<u64>,
+    how: StopHow,
+) -> (String, bool) {
+    let waited = std::time::Instant::now();
+    let went = stop_many(entries, timeout, how);
+    let waited = waited.elapsed().as_secs();
     let mut out = String::new();
-    let mut ok = true;
-    for e in &selected {
-        let (line, down) = stop_line(e, timeout);
-        out.push_str(&line);
-        ok &= down;
+    for (e, down) in entries.iter().zip(&went) {
+        out.push_str(&stop_line(e, *down, waited, how));
     }
-    Ok((out, ok))
+    (out, went.iter().all(|down| *down))
 }
 
-/// Stop the VM `entry` records, as [`stop_cmd`] stops each one it selects: the report line,
-/// and whether it went down.
-fn stop_line(entry: &VmEntry, timeout: u64) -> (String, bool) {
-    if stop_one(entry, timeout) {
-        (
-            format!("stopped {} (pid {})\n", entry.label, entry.pid),
-            true,
-        )
-    } else {
-        (
-            format!(
-                "{} (pid {}) did not stop after {timeout}s\n",
-                entry.label, entry.pid
-            ),
-            false,
-        )
+/// What to say of the stop of `entry`: `down` is whether it went, `waited` how many seconds
+/// the stop waited in all.
+fn stop_line(entry: &VmEntry, down: bool, waited: u64, how: StopHow) -> String {
+    if down {
+        return format!("stopped {} (pid {})\n", entry.label, entry.pid);
     }
+    let next = match how {
+        StopHow::Graceful => " (`vk stop --force` insists, then kills)",
+        StopHow::Force | StopHow::Kill => "",
+    };
+    format!(
+        "{} (pid {}) did not stop after {waited}s{next}\n",
+        entry.label, entry.pid
+    )
 }
 
-/// [`stop_line`] for `entry` only: `None`, with nothing stopped or signalled, when its
-/// state-dir lock is held by a process other than its `vk run` — a run that replaced it
-/// there. [`alive`] reads any holder of the lock as this VM, which is right for `vk stop`,
-/// asked about a directory, but not for a caller that means this one VM. A holder procfs
-/// cannot name (see [`crate::run::flock_holder`]) is taken to be its own run, as `alive`
-/// takes it.
-pub(crate) fn stop_entry(entry: &VmEntry, timeout: u64) -> Option<(String, bool)> {
-    let holder = std::fs::File::open(&entry.state_dir)
+/// Whether the state-dir lock of `entry` is held by a process other than its `vk run` — a
+/// run that replaced it there. [`alive`] reads any holder of the lock as this VM, which is
+/// right for `vk stop`, asked about a directory, but not for a caller that means this one
+/// VM. A holder procfs cannot name (see [`crate::run::flock_holder`]) is taken to be its
+/// own run, as `alive` takes it.
+pub(crate) fn held_by_another(entry: &VmEntry) -> bool {
+    std::fs::File::open(&entry.state_dir)
         .ok()
-        .and_then(|f| crate::run::flock_holder_pid(&f));
-    if holder.is_some_and(|pid| u32::try_from(pid) != Ok(entry.pid)) {
+        .and_then(|f| crate::run::flock_holder_pid(&f))
+        .is_some_and(|pid| u32::try_from(pid) != Ok(entry.pid))
+}
+
+/// Stop the VM `entry` records, and only it: `None`, with nothing stopped or signalled,
+/// when [`held_by_another`]. Otherwise the report line, and whether it went down.
+pub(crate) fn stop_entry(entry: &VmEntry, timeout: u64) -> Option<(String, bool)> {
+    stop_entry_how(entry, Some(timeout), StopHow::Graceful)
+}
+
+/// [`stop_entry`], stopping the VM as `how` says.
+pub(crate) fn stop_entry_how(
+    entry: &VmEntry,
+    timeout: Option<u64>,
+    how: StopHow,
+) -> Option<(String, bool)> {
+    if held_by_another(entry) {
         return None;
     }
-    Some(stop_line(entry, timeout))
+    Some(stop_reports(std::slice::from_ref(entry), timeout, how))
+}
+
+/// The running VMs `sel` selects, and what to say when it selects none.
+pub(crate) fn running_selected(sel: Selector) -> Result<(Vec<VmEntry>, String)> {
+    let (sel, matched) = select_running(Some(sel))?;
+    Ok((matched, sel.not_found()))
 }
 
 /// How a VM was rebooted, or why it was not.

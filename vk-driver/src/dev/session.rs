@@ -958,6 +958,16 @@ pub struct Stopped {
 /// Stop the environment at `state_dir` and its publishers. Taking a directory rather
 /// than a plan lets `vk dev stop NAME` work host-wide without a config.
 pub fn stop(state_dir: &Path, timeout: u64) -> Result<Stopped> {
+    stop_how(state_dir, Some(timeout), crate::vms::StopHow::Graceful)
+}
+
+/// [`stop`], stopping the VM as `how` says (`vk stop --force`, `--kill`), for `timeout`
+/// seconds or with `None` for as long as it takes.
+pub fn stop_how(
+    state_dir: &Path,
+    timeout: Option<u64>,
+    how: crate::vms::StopHow,
+) -> Result<Stopped> {
     // Stopping what is already stopped is the state asked for, not a failure — a script
     // that ends a session need not know whether the VM outlived it. Relays cannot outlive
     // the VM, but their records can; clear those too.
@@ -968,13 +978,14 @@ pub fn stop(state_dir: &Path, timeout: u64) -> Result<Stopped> {
             all_down: true,
         });
     }
-    let (report, all_down) = crate::vms::stop_cmd(
+    let (report, all_down) = crate::vms::stop_cmd_how(
         Some(crate::vms::Selector::Dir {
             dir: state_dir.to_path_buf(),
             below: false,
         }),
         false,
         timeout,
+        how,
     )?;
     Ok(Stopped { report, all_down })
 }

@@ -410,6 +410,15 @@ fn descendants(root: i32, skip: &HashSet<i32>) -> Vec<i32> {
     descendants_in(root, skip, &Links::read())
 }
 
+/// Every process descending from `root`, `root` itself left out, each after its parent.
+/// Empty when `root` is gone.
+pub(crate) fn descendants_of(root: i32) -> Vec<i32> {
+    descendants(root, &HashSet::new())
+        .into_iter()
+        .skip(1)
+        .collect()
+}
+
 /// How the walk from a process to its children goes: the kernel's own child lists, or —
 /// without them — the parent → children links of every process on the host, derived once
 /// from their ppids and shared by every walk made over one reading.

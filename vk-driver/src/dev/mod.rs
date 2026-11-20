@@ -51,6 +51,7 @@ pub(crate) use identity::write_compose_snapshot;
 pub use session::{
     LOGIN_SHELL, after_boot, ask_on_terminal, exec_in_guest, exec_in_guest_with, exec_in_service,
     exec_session, guest_cwd, launch_checks, launch_editor, on_terminal, running_vm, service, stop,
+    stop_how,
 };
 pub use status::{doctor, status};
 

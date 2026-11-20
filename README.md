@@ -959,7 +959,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk, or a Windows Dockerfile into a bundle. |
 | `vk exec` | Run a command in an existing guest and return the command's exit status. |
 | `vk list` | List every VM vk knows — running or stopped, dev environments, named runs and their compose services — one row each; `--running`/`--stopped`, `--kind`, `-w` for the full table, `--json`/`--field` for scripts. |
-| `vk start`, `vk stop`, `vk restart`, `vk delete`, `vk rename` | Start, stop, restart, delete or rename a VM by the name `vk list` prints (`NAME/SERVICE` for a service); `start`, `restart` and `delete` take several; `vk stop` also takes a pid or directory, or `--all`. |
+| `vk start`, `vk stop`, `vk restart`, `vk delete`, `vk rename` | Start, stop, restart, delete or rename a VM by the name `vk list` prints (`NAME/SERVICE` for a service); `start`, `stop`, `restart` and `delete` take several; `vk stop` also takes a pid or directory, or `--all`. |
 | `vk reboot` | Reboot a running VM in place through its guest, or power-cycle it with `--force`. |
 | `vk ping` | Probe a guest agent, or report whether its root image is stale (`vk status` is the same). |
 | `vk logs` | Show a VM's console log, telling kernel, agent and guest output apart; `--level warn`, `--agent`, `--service NAME`, `-f`. |

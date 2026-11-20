@@ -407,7 +407,13 @@ fn vk(args: &[String], cwd: Option<&Path>, from_recipe: bool) -> Result<()> {
 }
 
 /// Carry out `steps` on `t`. A start boots only what is already built, unless `build`.
-fn execute(t: &Target, steps: &[Step], timeout: u64, build: bool) -> Result<String> {
+fn execute(
+    t: &Target,
+    steps: &[Step],
+    timeout: Option<u64>,
+    build: bool,
+    how: vms::StopHow,
+) -> Result<String> {
     let start = if build { "up" } else { "start" };
     let mut out = String::new();
     for step in steps {
@@ -457,7 +463,7 @@ fn execute(t: &Target, steps: &[Step], timeout: u64, build: bool) -> Result<Stri
                     },
                     false => vk_core::fleetctl::Request::Stop { unit },
                 };
-                let timeout = (!up).then(|| std::time::Duration::from_secs(timeout));
+                let timeout = timeout.filter(|_| !up).map(std::time::Duration::from_secs);
                 let reply = vms::control(&ctl, &req, timeout, |line| eprintln!("{line}"))?;
                 if !reply.ok {
                     bail!("{}: {}", t.shown(), reply.message);
@@ -469,7 +475,7 @@ fn execute(t: &Target, steps: &[Step], timeout: u64, build: bool) -> Result<Stri
                 ));
             }
             Step::DevStop => {
-                let stopped = crate::dev::stop(&t.dir, timeout)?;
+                let stopped = crate::dev::stop_how(&t.dir, timeout, how)?;
                 out.push_str(&stopped.report);
                 if !stopped.all_down {
                     bail!("{out}{} did not stop", t.name);
@@ -480,7 +486,7 @@ fn execute(t: &Target, steps: &[Step], timeout: u64, build: bool) -> Result<Stri
                     out.push_str(&format!("{} is not running\n", t.name));
                     continue;
                 };
-                let (line, down) = vms::stop_entry(&entry, timeout)
+                let (line, down) = vms::stop_entry_how(&entry, timeout, how)
                     .with_context(|| format!("{} is held by another run", t.name))?;
                 out.push_str(&line);
                 if !down {
@@ -576,13 +582,32 @@ fn service_up(entry: Option<&VmEntry>, name: Option<&str>) -> bool {
 
 /// `vk start|stop` on each REF in turn; the exit status says whether every one did.
 pub fn run(verb: Verb, refs: &[std::ffi::OsString], timeout: u64) -> ExitCode {
+    run_how(verb, refs, Some(timeout), vms::StopHow::Graceful)
+}
+
+/// [`run`], a stop going about it as `how` says. Only a VM's own run is signalled: a
+/// compose service is stopped by its service manager, which has one way to do it.
+pub fn run_how(
+    verb: Verb,
+    refs: &[std::ffi::OsString],
+    timeout: Option<u64>,
+    how: vms::StopHow,
+) -> ExitCode {
     let build = matches!(verb, Verb::Start { build: true });
     let mut ok = true;
     for r in refs {
         // A project directory means its own VM: one REF starts or stops one VM at most.
         let result = resolve(r, Among::ProjectVm).and_then(|t| {
+            if how != vms::StopHow::Graceful && t.service.is_some() {
+                bail!(
+                    "{} is a compose service, stopped by its VM's service manager: --force \
+                     and --kill act on a VM's own run (`vk stop --force {}`)",
+                    t.shown(),
+                    t.name
+                );
+            }
             let steps = steps_for(verb, &t)?;
-            execute(&t, &steps, timeout, build)
+            execute(&t, &steps, timeout, build, how)
         });
         match result {
             Ok(report) => print!("{report}"),
@@ -596,6 +621,112 @@ pub fn run(verb: Verb, refs: &[std::ffi::OsString], timeout: u64) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+/// What one REF given to `vk stop` comes to.
+enum Stopping {
+    /// a compose service, stopped through its VM's service manager
+    Service(Target),
+    /// running VMs to stop, and what to say besides (a named VM that is not running)
+    Vms(Vec<VmEntry>, String),
+}
+
+/// What `vk stop` is to stop for one REF: a compose service, or the running VMs the REF
+/// selects — a name's own VM, or every VM a pid or a directory matches, below it too with
+/// `recursive`. `Err` when the REF selects nothing that can be stopped.
+fn stopping(arg: &OsStr, recursive: bool) -> Result<Stopping> {
+    let (sel, service) = vms::Selector::from_ref(Ref::parse(arg)?, recursive)?;
+    if service.is_some() {
+        return Ok(Stopping::Service(resolve(arg, Among::ProjectVm)?));
+    }
+    let (name, dir) = match sel {
+        vms::Selector::Named { name, dir } => (name, dir),
+        other => {
+            let (matched, none) = vms::running_selected(other)?;
+            if matched.is_empty() {
+                bail!("{}", none.trim_end());
+            }
+            return Ok(Stopping::Vms(matched, String::new()));
+        }
+    };
+    match running_on(&dir) {
+        Some(entry) if vms::held_by_another(&entry) => {
+            bail!("{name} is held by another run")
+        }
+        Some(entry) => Ok(Stopping::Vms(vec![entry], String::new())),
+        None => {
+            // What an environment published can outlive it on record: cleared here, as
+            // `vk dev stop` does for one that is already down.
+            if kind_of(&dir)? == Kind::Dev {
+                crate::publish::stop_all_quietly(&dir, std::time::Duration::from_secs(5));
+            }
+            Ok(Stopping::Vms(
+                Vec::new(),
+                format!("{name} is not running\n"),
+            ))
+        }
+    }
+}
+
+/// `vk stop REF…`: every REF is resolved first, then every VM is told to stop at once, and
+/// `timeout` — seconds, `None` for as long as it takes — bounds the whole command rather
+/// than each VM. Compose services go through their service managers, one after the other,
+/// within the same bound. Exits 2 when a REF selects nothing, 1 when a VM did not stop.
+pub fn stop_all(
+    refs: &[std::ffi::OsString],
+    recursive: bool,
+    timeout: Option<u64>,
+    how: vms::StopHow,
+) -> ExitCode {
+    let started = std::time::Instant::now();
+    let left = || timeout.map(|t| t.saturating_sub(started.elapsed().as_secs()));
+    let (mut found, mut all_down) = (true, true);
+    let mut entries: Vec<VmEntry> = Vec::new();
+    let mut services = Vec::new();
+    for r in refs {
+        match stopping(r, recursive) {
+            Ok(Stopping::Service(t)) => services.push(t),
+            Ok(Stopping::Vms(vms, note)) => {
+                print!("{note}");
+                for e in vms {
+                    if !entries.iter().any(|known| known.state_dir == e.state_dir) {
+                        entries.push(e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("vk: {e:#}");
+                found = false;
+            }
+        }
+    }
+    for t in &services {
+        let stopped = match how {
+            vms::StopHow::Graceful => {
+                steps_for(Verb::Stop, t).and_then(|steps| execute(t, &steps, left(), false, how))
+            }
+            _ => Err(anyhow::anyhow!(
+                "{} is a compose service, stopped by its VM's service manager: --force and \
+                 --kill act on a VM's own run (`vk stop --force {}`)",
+                t.shown(),
+                t.name
+            )),
+        };
+        match stopped {
+            Ok(report) => print!("{report}"),
+            Err(e) => {
+                eprintln!("vk: {e:#}");
+                all_down = false;
+            }
+        }
+    }
+    let (report, down) = vms::stop_reports(&entries, left(), how);
+    print!("{report}");
+    match (found, all_down && down) {
+        (false, _) => ExitCode::from(2),
+        (true, false) => ExitCode::from(1),
+        (true, true) => ExitCode::SUCCESS,
     }
 }
 
@@ -745,7 +876,7 @@ pub fn delete(
         Gate::Go | Gate::DryRun => {}
     }
     for (t, steps) in &planned {
-        match execute(t, steps, timeout, false) {
+        match execute(t, steps, Some(timeout), false, vms::StopHow::Graceful) {
             Ok(report) => print!("{report}"),
             Err(e) => {
                 eprintln!("vk: {e:#}");

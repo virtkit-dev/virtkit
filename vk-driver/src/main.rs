@@ -2645,26 +2645,43 @@ enum Cmd {
     /// default; pass a pid or a project directory to select one, or `--all`.
     #[command(display_order = 8)]
     Stop {
-        /// the VM to stop: a name, a pid or a directory (default: the current one's)
+        /// the VMs to stop: names, pids or directories (default: the current directory's)
         ///
         /// A name as `vk list` prints it (`NAME/SERVICE` for a compose service); an all-digit
         /// argument is a pid; a path (`/…`, `./…`, `../…`, `~…`) a project or state directory,
         /// matched exactly unless `--recursive`.
         #[arg(value_name = "REF")]
-        target: Option<std::ffi::OsString>,
+        targets: Vec<std::ffi::OsString>,
         /// with a directory, also every VM whose project is below it
         #[arg(short = 'r', long, conflicts_with = "all")]
         recursive: bool,
         /// stop every running vk VM
-        #[arg(long, conflicts_with = "target")]
+        #[arg(long, conflicts_with = "targets")]
         all: bool,
-        /// seconds to wait for each VM to go down before reporting it stuck
+        /// insist: SIGTERM once a second for 5 seconds, then kill
         ///
-        /// A run allows a Linux guest one minute to power off and a Windows guest three, then 10
-        /// seconds to save its disks; the default leaves time for either run to exit without
-        /// reporting an orderly shutdown as stuck.
-        #[arg(long, default_value_t = 210, value_name = "SECS")]
-        timeout: u64,
+        /// For a run that does not answer a plain stop. The kill is SIGKILL to the VMM
+        /// processes of the VM and of its compose services, as a power cut: what a guest
+        /// had not written to its disks is lost. The run then tears down the rest by
+        /// itself; only one still there 5 seconds later is sent SIGKILL too. Acts on a VM
+        /// with all its services, not on one compose service.
+        #[arg(short = 'f', long, conflicts_with = "kill")]
+        force: bool,
+        /// kill right away, asking nothing first
+        ///
+        /// As `--force` once its 5 seconds are over: SIGKILL to the VMMs, then to their
+        /// run only if that is still there 5 seconds later. No guest is powered off.
+        #[arg(long)]
+        kill: bool,
+        /// give up after this many seconds in all [default: wait until they are down]
+        ///
+        /// One bound for the whole command, however many VMs it stops: every VM is told to
+        /// stop at once, and the command waits for all of them together. One still up when
+        /// it runs out is reported stuck (exit 1). A
+        /// run allows a Linux guest one minute to power off and a Windows guest three, then
+        /// 10 seconds to save its disks, so less than 210 can cut an orderly shutdown short.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
     },
     /// Start a VM vk knows, or one of its compose services
     ///
@@ -3937,34 +3954,28 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 Err(e) => fail(&e, 1),
             };
         }
-        // A name — a VM's or a service's — stops through its kind: `vk dev stop` for a dev
-        // environment, its service manager for a service.
-        Cmd::Stop {
-            target: Some(target),
-            timeout,
-            ..
-        } if vms::names_a_vm(target)
-            || (matches!(vms::Ref::parse(target), Ok(vms::Ref::Name { .. }))
-                && !Path::new(target).is_dir()) =>
-        {
-            return lifecycle::run(
-                lifecycle::Verb::Stop,
-                std::slice::from_ref(target),
-                *timeout,
-            );
-        }
         _ => {}
     }
     if let Cmd::Stop {
-        target,
+        targets,
         recursive,
         all,
+        force,
+        kill,
         timeout,
     } = &cli.cmd
     {
-        return act_on_vms(target.as_deref(), *recursive, |sel| {
-            vms::stop_cmd(sel, *all, *timeout)
-        });
+        let how = match (*force, *kill) {
+            (_, true) => vms::StopHow::Kill,
+            (true, false) => vms::StopHow::Force,
+            (false, false) => vms::StopHow::Graceful,
+        };
+        if targets.is_empty() {
+            return act_on_vms(None, *recursive, |sel| {
+                vms::stop_cmd_how(sel, *all, *timeout, how)
+            });
+        }
+        return lifecycle::stop_all(targets, *recursive, *timeout, how);
     }
     if let Cmd::Reboot {
         target,
