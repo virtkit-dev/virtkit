@@ -136,6 +136,19 @@ pub struct Copy {
     pub chown: Option<String>,
     pub chmod: Option<String>,
     pub link: bool,
+    /// Set for `ADD`, which can download URLs and unpack archives.
+    pub add: Option<Add>,
+}
+
+/// `ADD` flags and staging state beyond those shared with `COPY`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Add {
+    /// `--checksum=sha256:<hex>` pins a single URL source.
+    pub checksum: Option<String>,
+    /// `--unpack[=bool]` defaults to unpacking local archives and copying remote ones.
+    pub unpack: Option<bool>,
+    /// Named context for staged sources. The build sets this when it keys the step.
+    pub staged: Option<String>,
 }
 
 /// A `RUN --mount=…` entry (we keep the raw key/values; the executor interprets them).
@@ -205,6 +218,7 @@ pub(crate) fn keyword_of(instr: &Instruction) -> &str {
     match instr {
         Instruction::From(_) => "FROM",
         Instruction::Run(_) => "RUN",
+        Instruction::Copy(c) if c.add.is_some() => "ADD",
         Instruction::Copy(_) => "COPY",
         Instruction::Arg { .. } => "ARG",
         Instruction::Env(_) => "ENV",
@@ -342,6 +356,7 @@ fn parse_instruction(line: &str) -> Result<Instruction> {
         "FROM" => Instruction::From(parse_from(rest)?),
         "RUN" => Instruction::Run(parse_run(rest)?),
         "COPY" => Instruction::Copy(parse_copy(rest)?),
+        "ADD" => Instruction::Copy(parse_add(rest)?),
         "ARG" => {
             let (name, default) = match rest.split_once('=') {
                 Some((n, v)) => (n.trim().to_string(), Some(unquote(v.trim()))),
@@ -365,8 +380,7 @@ fn parse_instruction(line: &str) -> Result<Instruction> {
 
 /// Known instructions passed to each build as [`Instruction::Other`]. Builds handle
 /// instructions such as EXPOSE and Windows SHELL and reject or skip the rest.
-const UNMODELLED: [&str; 8] = [
-    "ADD",
+const UNMODELLED: [&str; 7] = [
     "EXPOSE",
     "HEALTHCHECK",
     "MAINTAINER",
@@ -448,6 +462,11 @@ fn parse_run(rest: &str) -> Result<Run> {
 }
 
 fn parse_copy(rest: &str) -> Result<Copy> {
+    parse_copy_as(rest, "COPY")
+}
+
+/// Parse shared `COPY` syntax and use `keyword` in the missing-operand error.
+fn parse_copy_as(rest: &str, keyword: &str) -> Result<Copy> {
     let (flags, words) = split_flags(rest)?;
     let mut from = None;
     let mut chown = None;
@@ -470,7 +489,7 @@ fn parse_copy(rest: &str) -> Result<Copy> {
         words
     };
     if paths.len() < 2 {
-        bail!("COPY needs at least one source and a dest ({rest:?})");
+        bail!("{keyword} needs at least one source and a dest ({rest:?})");
     }
     let dest = paths.pop().unwrap();
     Ok(Copy {
@@ -480,7 +499,66 @@ fn parse_copy(rest: &str) -> Result<Copy> {
         chown,
         chmod,
         link,
+        add: None,
     })
+}
+
+/// `ADD [--chown] [--chmod] [--link] [--checksum=sha256:…] [--unpack[=bool]] <src>… <dest>`.
+/// Local archives unpack by default. URLs download. Git sources, `--from`, `--keep-git-dir`
+/// and `--exclude` are unsupported.
+fn parse_add(rest: &str) -> Result<Copy> {
+    let (flags, _) = split_flags(rest)?;
+    let mut add = Add::default();
+    for (k, v) in &flags {
+        match k.as_str() {
+            "checksum" => add.checksum = Some(v.clone()),
+            "unpack" => {
+                add.unpack = match v.as_str() {
+                    "" | "true" => Some(true),
+                    "false" => Some(false),
+                    other => bail!("ADD --unpack={other}: expected true or false"),
+                }
+            }
+            "chown" | "chmod" | "link" => {}
+            "from" => bail!("ADD does not take --from; use COPY --from"),
+            other => bail!("ADD --{other} is not supported"),
+        }
+    }
+    let mut copy = parse_copy_as(rest, "ADD")?;
+    // Validate literal sources now. `add::key` repeats the check after variable expansion.
+    if !copy.sources.iter().any(|s| s.contains('$')) {
+        check_add_sources(&copy.sources, add.checksum.as_deref())?;
+    }
+    copy.add = Some(add);
+    Ok(copy)
+}
+
+/// Reject Git sources and require exactly one URL when `--checksum` is set.
+pub(crate) fn check_add_sources(sources: &[String], checksum: Option<&str>) -> Result<()> {
+    if let Some(git) = sources.iter().find(|s| is_git_source(s)) {
+        bail!("ADD {git}: a git source is not supported; clone it in a RUN instead");
+    }
+    if let Some(sum) = checksum {
+        if sources.len() > 1 {
+            bail!("ADD --checksum={sum} applies to one source, and this ADD has several");
+        }
+        if !sources.iter().any(|s| is_url(s)) {
+            bail!("ADD --checksum={sum} applies to a URL source, and this ADD has none");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn is_url(src: &str) -> bool {
+    src.starts_with("http://") || src.starts_with("https://")
+}
+
+/// Git remotes use `git@`, `git://` or an HTTP(S) path ending in `.git` before `#ref`.
+fn is_git_source(src: &str) -> bool {
+    let bare = src.split('#').next().unwrap_or(src);
+    src.starts_with("git@")
+        || src.starts_with("git://")
+        || (is_url(src) && bare.trim_end_matches('/').ends_with(".git"))
 }
 
 /// `type=bind,from=builder,source=/a,target=/b,ro` → a [`Mount`].
@@ -812,6 +890,52 @@ mod tests {
             unreachable!()
         };
         assert_eq!(r.heredoc.as_deref(), Some("<<EOF"));
+    }
+
+    #[test]
+    fn add_is_a_copy_that_downloads_and_unpacks() {
+        let add = |src: &str| -> Result<Copy> {
+            match parse(&format!("FROM x\n{src}\n"))?.instructions.remove(1) {
+                Instruction::Copy(c) => Ok(c),
+                other => panic!("{other:?}"),
+            }
+        };
+        let c = add("ADD --chown=1:1 --link a.tgz https://x.org/b /d/").unwrap();
+        assert_eq!(c.sources, ["a.tgz", "https://x.org/b"]);
+        assert_eq!(c.dest, "/d/");
+        assert_eq!(c.chown.as_deref(), Some("1:1"));
+        assert!(c.link);
+        assert_eq!(c.add, Some(Add::default()));
+        assert_eq!(keyword_of(&Instruction::Copy(c)), "ADD");
+        let sum = format!("sha256:{}", "a".repeat(64));
+        let c = add(&format!(
+            "ADD --checksum={sum} --unpack=false https://x.org/b /b"
+        ))
+        .unwrap();
+        let a = c.add.unwrap();
+        assert_eq!(
+            (a.checksum.as_deref(), a.unpack),
+            (Some(sum.as_str()), Some(false))
+        );
+        for (src, want) in [
+            ("ADD --from=s /a /b", "use COPY --from"),
+            (
+                "ADD --keep-git-dir https://x.org/r.git /r",
+                "--keep-git-dir is not supported",
+            ),
+            ("ADD https://x.org/r.git /r", "git source"),
+            ("ADD git@github.com:o/r /r", "git source"),
+            ("ADD --unpack=maybe a /b", "expected true or false"),
+            ("ADD --checksum=sha256:00 a /b", "has none"),
+            (
+                "ADD --checksum=sha256:00 https://x/a https://x/b /d/",
+                "has several",
+            ),
+            ("ADD a", "ADD needs at least one source"),
+        ] {
+            let err = format!("{:#}", add(src).unwrap_err());
+            assert!(err.contains(want), "{src}: {err}");
+        }
     }
 
     #[test]

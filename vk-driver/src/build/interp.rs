@@ -152,6 +152,10 @@ pub fn expand_instruction(instr: &Instruction, vars: &Vars) -> Instruction {
             chown: c.chown.as_deref().map(e),
             chmod: c.chmod.as_deref().map(e),
             link: c.link,
+            add: c.add.as_ref().map(|a| parser::Add {
+                checksum: a.checksum.as_deref().map(e),
+                ..a.clone()
+            }),
         }),
         Instruction::Env(kvs) => {
             Instruction::Env(kvs.iter().map(|(k, v)| (k.clone(), e(v))).collect())
@@ -306,6 +310,7 @@ mod tests {
             chown: Some("$UID:$UID".into()),
             chmod: None,
             link: true,
+            add: None,
         });
         match expand_instruction(&copy, &v) {
             Instruction::Copy(c) => {

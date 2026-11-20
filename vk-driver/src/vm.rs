@@ -892,6 +892,12 @@ pub(crate) fn build_image_sources(
     let stage = stage.as_deref();
     let dockerfiles = vec![dockerfile];
     let contexts = vec![context];
+    let (net, audit) = effective_build_egress(cfg, ctx)?;
+    // Apply the job's build egress rules when fingerprinting `ADD` inputs.
+    let fetch = crate::build::Fetch::for_build(
+        net.clone(),
+        build_record(ctx, service.as_deref())?.as_ref(),
+    );
     let stage_key = crate::build::target_stage_key(
         &dockerfiles,
         &contexts,
@@ -899,9 +905,9 @@ pub(crate) fn build_image_sources(
         &build_args,
         stage,
         cfg.registry.as_ref(),
+        fetch,
     )
     .context("computing the image's stage fingerprint")?;
-    let (net, audit) = effective_build_egress(cfg, ctx)?;
     let job_cache = job_cache_dest(ctx);
     let recipe = crate::ensure::BuildRecipe {
         dockerfiles,

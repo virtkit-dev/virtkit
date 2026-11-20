@@ -3249,7 +3249,7 @@ impl Host {
             dirs: HashMap::new(),
         }
     }
-    fn stage_dir(&self, fs: &Rootfs) -> Result<PathBuf> {
+    pub(super) fn stage_dir(&self, fs: &Rootfs) -> Result<PathBuf> {
         self.dirs
             .get(&fs.label)
             .cloned()
@@ -4233,6 +4233,7 @@ mod tests {
             chown: None,
             chmod: None,
             link: false,
+            add: None,
         };
         h.copy(&app, &op, Some(&lib), "/").unwrap();
         let copied = std::fs::read_to_string(h.stage_dir(&app).unwrap().join("t2")).unwrap();
@@ -4258,6 +4259,7 @@ mod tests {
             chown: None,
             chmod: None,
             link: false,
+            add: None,
         };
         assert!(h.copy(&fs, &op, None, "/").is_err());
         h.stage_sources(&[], &stage).unwrap();
@@ -4296,6 +4298,7 @@ mod tests {
             chown: None,
             chmod: None,
             link: false,
+            add: None,
         };
         // A COPY from the named context reads that directory...
         h.copy(
@@ -4345,6 +4348,7 @@ mod tests {
             chown: None,
             chmod: None,
             link: false,
+            add: None,
         };
         h.copy(&fs, &op, None, "/").unwrap();
         let out = tmp.join("out.ext4");

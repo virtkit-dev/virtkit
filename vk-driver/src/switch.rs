@@ -342,7 +342,7 @@ impl Egress {
     }
     /// Direct (non-proxied) egress: allow only listed IPv4 ranges, each optionally scoped
     /// to a destination port (IPv6 denied under an allowlist).
-    fn allows_ip(&self, ip: IpAddr, port: u16) -> bool {
+    pub(crate) fn allows_ip(&self, ip: IpAddr, port: u16) -> bool {
         match self {
             Egress::AllowAll => true,
             Egress::Allow { ips, .. } => match ip {
@@ -1731,12 +1731,10 @@ fn unroutable(dst: Ipv4Addr) -> bool {
         || dst.is_broadcast()
 }
 
-/// Refuse [`unroutable`] destinations before the host dials. IPv6 checks cover loopback,
-/// unspecified, multicast, link-local (`fe80::/10`), and IPv4-mapped unroutable addresses
-/// as defence in depth: egress is IPv4-only. Log refusals without recording denials,
-/// since these are not policy decisions.
-fn refuse_unroutable(proto: &str, dst: SocketAddr) -> bool {
-    let refused = match dst.ip() {
+/// Guest egress and `ADD` reject [`unroutable`] IPv4 addresses. For IPv6, reject loopback,
+/// unspecified, multicast, link-local (`fe80::/10`) and IPv4-mapped unroutable addresses.
+pub(crate) fn unroutable_ip(ip: IpAddr) -> bool {
+    match ip {
         IpAddr::V4(v4) => unroutable(v4),
         IpAddr::V6(v6) => {
             v6.is_loopback()
@@ -1745,7 +1743,15 @@ fn refuse_unroutable(proto: &str, dst: SocketAddr) -> bool {
                 || v6.is_unicast_link_local()
                 || v6.to_ipv4_mapped().is_some_and(unroutable)
         }
-    };
+    }
+}
+
+/// Refuse [`unroutable`] destinations before the host dials. IPv6 checks cover loopback,
+/// unspecified, multicast, link-local (`fe80::/10`), and IPv4-mapped unroutable addresses
+/// as defence in depth: egress is IPv4-only. Log refusals without recording denials,
+/// since these are not policy decisions.
+fn refuse_unroutable(proto: &str, dst: SocketAddr) -> bool {
+    let refused = unroutable_ip(dst.ip());
     if refused {
         eprintln!("switch: unroutable destination ({proto}) {dst} — dropped");
     }

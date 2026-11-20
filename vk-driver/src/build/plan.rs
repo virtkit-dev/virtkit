@@ -74,6 +74,8 @@ pub struct Plan {
     /// resolves to this host directory, letting a stage read files outside its own build
     /// context. Set from the build options after planning; empty by default.
     pub named_contexts: BTreeMap<String, PathBuf>,
+    /// [`super::add::Fetch`] defaults to `BuildNet::All`. Build options supply the effective policy.
+    pub(crate) fetch: super::add::Fetch,
     by_name: BTreeMap<String, usize>,
 }
 
@@ -234,6 +236,7 @@ impl Plan {
             stages,
             global_args,
             named_contexts: BTreeMap::new(),
+            fetch: super::add::Fetch::default(),
             by_name: by_name.into_iter().map(|(k, (i, _))| (k, i)).collect(),
         })
     }
@@ -780,6 +783,7 @@ mod tests {
                 chown: None,
                 chmod: None,
                 link: false,
+                add: None,
             }));
         assert!(p.build_order_multi(&[0, 1]).is_err());
     }
@@ -969,6 +973,7 @@ mod tests {
                 chown: None,
                 chmod: None,
                 link: false,
+                add: None,
             }));
         assert!(p.build_order(1).is_err());
     }

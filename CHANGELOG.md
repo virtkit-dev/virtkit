@@ -16,6 +16,29 @@ All notable changes to virtkit will be documented in this file.
   With `--boot-cmdline root=…`, a Debian initramfs-tools initrd with a merged `/usr`
   can mount the root before handoff, including LVM on LUKS unlocked with a key file
   on `/boot`. Boot fails if the initrd requests `drop_capabilities=`.
+- **Linux `vk build` now runs `ADD`.** Earlier builds could succeed with `ADD` files missing.
+  HTTP(S) downloads apply the stage's configured egress allowlists, including a placed job's
+  hub allowlist.
+  Each request checks the host before DNS, including on redirects, and connects directly over
+  IPv4. Loopback and link-local addresses are blocked. `--build-net none` disables downloads.
+  `--checksum=sha256:…` verifies a single URL and allows a verified cached copy to work offline.
+  The download's SHA-256 identifies its cached copy and contributes to the build key. With a
+  destination ending in `/`, the file takes its name from the URL's last path segment. Its
+  default mode is 0600.
+
+  `ADD` detects tar archives by their contents after applying wildcards and `.dockerignore`.
+  It unpacks local archives (plain, gzip, bzip2, xz or zstd) unless `--unpack=false`.
+  Downloaded archives need `--unpack=true`. Other sources follow `COPY` rules.
+
+  Compared with Docker, unpacked entries take root ownership or `--chown`, and source
+  timestamps are lost. Each build fetches unpinned URLs again, leaving image freshness
+  unknown. `ADD` rejects archives containing device nodes or FIFOs, source patterns matching
+  both archives and directories or symlinks, Git sources, `--from`, `--keep-git-dir` and
+  `--exclude`. Windows builds reject `ADD`.
+
+  Downloads and staged archives stay in `$XDG_CACHE_HOME/virtkit/add` (by default
+  `~/.cache/virtkit/add`) without automatic eviction. Placed CI jobs use their own egress
+  record for this cache. Job egress reports omit `ADD` downloads.
 
 ## [0.113.1] - 2026-11-20
 

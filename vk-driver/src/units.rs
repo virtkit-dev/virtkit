@@ -164,6 +164,11 @@ fn build_recipe(
         &build_args,
         target.as_deref(),
         registry,
+        // Use the service's build egress for `ADD` downloads. A lookup without a build uses cached inputs.
+        match build {
+            Some(b) => crate::build::Fetch::for_build(b.net.clone(), b.record.as_ref()),
+            None => crate::build::Fetch::offline(),
+        },
     )?;
     let recipe = crate::ensure::BuildRecipe {
         dockerfiles: dockerfiles.clone(),

@@ -169,6 +169,8 @@ zstd = "0.14"
 # so it needs no C liblzma and the binary stays musl-static (zstd/gz are covered by the
 # crates above).
 lzma-rs = "0.3"
+# ADD unpacks bzip2-compressed archives (libkrun already builds it).
+bzip2 = "0.5"
 # The xz payload of a distribution kernel (bzImage) uses the x86 BCJ filter, which lzma-rs
 # does not decode: lzma-rust2 does, in pure Rust too. The decoder alone ("encoder" is for
 # tests).

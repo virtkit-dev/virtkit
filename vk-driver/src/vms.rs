@@ -191,6 +191,8 @@ fn freshness_of_recipe(r: &StaleRecipe) -> Freshness {
         &r.build_args,
         r.target.as_deref(),
         None,
+        // Freshness checks never download `ADD` inputs. An unpinned URL makes freshness unknown.
+        crate::build::Fetch::offline(),
     ) else {
         return Freshness::Unknown;
     };

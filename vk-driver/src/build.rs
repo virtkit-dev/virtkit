@@ -36,7 +36,9 @@
 //! busts the cache; the build driver applies the resolved steps, and `docker-hash` prints
 //! the same per-stage keys ([`stage_keys`]).
 
+mod add;
 mod exec;
+pub use add::Fetch;
 mod interp;
 pub(crate) mod parser;
 
@@ -1114,6 +1116,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     let t_plan = Instant::now();
     let mut plan = Plan::from_dockerfiles(&inputs, &build_args)?;
     plan.named_contexts = named_context_map(&opts.build_contexts)?;
+    plan.fetch = add::Fetch::for_build(opts.net.clone(), opts.record.as_ref());
     // Before anything is resolved or built: a mistyped stage name should cost nothing.
     let matched = apply_stage_overrides(&mut plan, &opts.stage_guests);
     unmatched_stage_overrides(&opts.stage_guests, &matched, &stage_names(&plan))?;
@@ -1482,6 +1485,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
             if let UnitInput::Build { build_contexts, .. } = &unit.input {
                 plan.named_contexts = named_context_map(build_contexts)?;
             }
+            plan.fetch = add::Fetch::for_build(opts.net.clone(), opts.record.as_ref());
             // A stage name addresses that stage in every unit declaring one: units are
             // separate Dockerfiles, and a name is wrong only if no unit has it at all.
             matched_overrides.extend(apply_stage_overrides(&mut plan, &opts.stage_guests));
@@ -1911,9 +1915,26 @@ fn resolve_stages(
             // config: any $VAR in them belongs to the *runtime* shell (a service's
             // env overrides must reach it), not to the build scope. Expanding here
             // would bake build-time values into the exported runtime config.
-            let instr = match raw {
+            let mut instr = match raw {
                 Instruction::Entrypoint(_) | Instruction::Cmd(_) => raw.clone(),
                 _ => interp::expand_instruction(raw, &vars),
+            };
+            // Key downloads and archive matches by the bytes staged for this step (see `add`).
+            let add_key = match &mut instr {
+                Instruction::Copy(c) if c.add.is_some() => {
+                    let meta = SourceMeta {
+                        mode: c.chmod.is_none(),
+                    };
+                    let context = stage.context.clone();
+                    add::key(
+                        &plan.fetch,
+                        stage.guest.egress.as_ref(),
+                        &stage.context,
+                        c,
+                        |srcs| context_files_hash(&context, srcs, meta),
+                    )?
+                }
+                _ => None,
             };
             // Content the key must track beyond the instruction text (Docker semantics —
             // the cache follows the bytes an instruction reads, not just its spelling):
@@ -1939,6 +1960,7 @@ fn resolve_stages(
                 );
             }
             let content = match &instr {
+                Instruction::Copy(_) if add_key.is_some() => add_key,
                 Instruction::Copy(c) => match &c.from {
                     None => {
                         let meta = SourceMeta {
@@ -2121,11 +2143,13 @@ pub fn target_stage_key(
     build_args: &[(String, String)],
     target: Option<&str>,
     registry: Option<&crate::config::Registry>,
+    fetch: Fetch,
 ) -> Result<String> {
     let inputs = load_inputs(dockerfiles, contexts)?;
     let ba: Vars = build_args.iter().cloned().collect();
     let mut plan = Plan::from_dockerfiles(&inputs, &ba)?;
     plan.named_contexts = named_context_map(build_contexts)?;
+    plan.fetch = fetch;
     let t = plan.resolve_target(target)?;
     let order = plan.build_order(t)?;
     let mut ex = exec::Planner::new(registry.cloned());
@@ -3821,6 +3845,9 @@ fn from_refs(instructions: &[Instruction]) -> Vec<&str> {
                 if let Some(f) = &c.from {
                     note(&mut refs, f);
                 }
+                if let Some(f) = c.add.as_ref().and_then(|a| a.staged.as_deref()) {
+                    note(&mut refs, f);
+                }
             }
             Instruction::Run(r) => {
                 for m in &r.mounts {
@@ -3884,6 +3911,11 @@ fn named_context_map(
 /// Resolve a `--from=<x>` that does not name a build stage: a named build context when one
 /// was declared under that name (`--build-context <x>=<dir>`), else an external image to pull.
 fn non_stage_source(plan: &Plan, ex: &mut dyn Executor, reference: &str) -> Result<Rootfs> {
+    // The build's staging names take precedence over user-defined contexts and images.
+    if add::is_staged(reference) {
+        let dir = add::materialize(reference)?;
+        return ex.context_source(reference, &dir);
+    }
     match plan.named_context(reference) {
         Some(dir) => ex.context_source(reference, dir),
         None => ex.pull(reference),
@@ -3907,7 +3939,8 @@ fn stage_input_rootfs(
 ) -> Result<Vec<Rootfs>> {
     let mut out: Vec<Rootfs> = Vec::new();
     for r in from_refs(instructions) {
-        let fs = match plan.stage_ref(r) {
+        let stage = (!add::is_staged(r)).then(|| plan.stage_ref(r)).flatten();
+        let fs = match stage {
             Some(si) => match committed.get(&si) {
                 Some(fs) => fs.clone(),
                 None => continue,
@@ -4053,8 +4086,17 @@ fn canonical(instr: &Instruction) -> String {
                 String::new()
             }
         ),
+        // Include the instruction kind and requested unpack mode in the cache key.
         I::Copy(c) => format!(
-            "COPY{US}from={}{US}chown={}{US}chmod={}{US}link={}{US}{}->{}",
+            "{}{US}from={}{US}chown={}{US}chmod={}{US}link={}{US}{}->{}",
+            match &c.add {
+                Some(a) => format!(
+                    "ADD{US}unpack={}",
+                    a.unpack
+                        .map_or("default", |u| if u { "true" } else { "false" })
+                ),
+                None => "COPY".into(),
+            },
             o(&c.from),
             o(&c.chown),
             o(&c.chmod),
@@ -4288,7 +4330,12 @@ fn instr_label(instr: &Instruction) -> String {
                 .as_deref()
                 .map(|f| format!("--from={f} "))
                 .unwrap_or_default();
-            format!("COPY {from}{} -> {}", c.sources.join(" "), c.dest)
+            format!(
+                "{} {from}{} -> {}",
+                parser::keyword_of(instr),
+                c.sources.join(" "),
+                c.dest
+            )
         }
         other => format!("{other:?}"),
     }
@@ -4468,6 +4515,31 @@ fn apply_fs(
                 })
                 .collect();
             ex.run(fs, &r.cmd, r.heredoc.as_deref(), &mounts, state)?;
+        }
+        // Preserve source order and keep the destination a directory across batches of a
+        // multi-source `ADD`. Unpacked entries retain their archive modes even with `--chmod`.
+        Instruction::Copy(c) if c.add.is_some() => {
+            let dest = if c.sources.len() > 1 && !c.dest.ends_with('/') {
+                format!("{}/", c.dest)
+            } else {
+                c.dest.clone()
+            };
+            for (batch, staged, sources) in add::batches(c) {
+                let from = staged
+                    .as_deref()
+                    .map(|name| non_stage_source(plan, ex, name))
+                    .transpose()?;
+                let op = parser::Copy {
+                    sources,
+                    dest: dest.clone(),
+                    from: staged,
+                    chmod: (batch != add::Batch::Unpacked)
+                        .then(|| c.chmod.clone())
+                        .flatten(),
+                    ..c.clone()
+                };
+                ex.copy(fs, &op, from.as_ref(), &state.workdir)?;
+            }
         }
         Instruction::Copy(c) => {
             let from = match &c.from {
@@ -6441,6 +6513,7 @@ mod tests {
                 &[],
                 None,
                 None,
+                Fetch::default(),
             )
             .unwrap()
         };
@@ -6906,6 +6979,74 @@ RUN --mount=type=bind,from=build,source=/src,target=/s /usr/bin/out --selftest
         }
     }
 
+    /// The host executor copies a plain file and a seeded download beside each other, and
+    /// merges a local archive into the destination with its executable mode intact.
+    #[test]
+    fn an_add_downloads_and_unpacks_into_the_stage() {
+        use std::io::Write;
+        let tmp = tmpdir("add-e2e");
+        add::use_test_cache();
+        let ctx = tmp.join("ctx");
+        std::fs::create_dir_all(&ctx).unwrap();
+        let tar = {
+            let mut b = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_gnu();
+            h.set_size(4);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "pkg/bin/tool", &b"tool"[..]).unwrap();
+            b.into_inner().unwrap()
+        };
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar).unwrap();
+        std::fs::write(ctx.join("t.tar.gz"), gz.finish().unwrap()).unwrap();
+        std::fs::write(ctx.join("plain.txt"), "plain").unwrap();
+        let url = "http://downloads.example/dl/r.bin";
+        let src = format!("FROM scratch\nADD t.tar.gz /opt/\nADD plain.txt {url} /d\n");
+        let ba = Vars::new();
+        let plan = Plan::from_dockerfiles(
+            &[PlanInput {
+                dockerfile: parser::parse(&src).unwrap(),
+                origin: "Dockerfile".into(),
+                context: ctx.clone(),
+            }],
+            &ba,
+        )
+        .unwrap();
+        add::seed_download(&plan.fetch, url, b"remote");
+        let order = plan
+            .build_order(plan.resolve_target(None).unwrap())
+            .unwrap();
+        let mut ex = exec::Host::new(tmp.join("scratch"));
+        let (committed, _) = drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            false,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+            &Arc::new(Timings::new()),
+        )
+        .unwrap();
+        let root = ex.stage_dir(&committed[&0]).unwrap();
+        let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap();
+        assert_eq!(read("opt/pkg/bin/tool"), "tool");
+        assert_eq!(read("d/plain.txt"), "plain");
+        assert_eq!(read("d/r.bin"), "remote");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &str| {
+            std::fs::metadata(root.join(p))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("opt/pkg/bin/tool"), 0o755);
+        assert_eq!(mode("d/r.bin"), 0o600);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn a_heredoc_under_the_base_images_shell_is_refused() {
         let ba = Vars::new();
@@ -7347,7 +7488,8 @@ ENTRYPOINT run me
         })
         .unwrap();
         // The stamped UUID must equal fingerprint([the target's stage key]).
-        let key = target_stage_key(&dockerfiles, &[], &[], &[], None, None).unwrap();
+        let key =
+            target_stage_key(&dockerfiles, &[], &[], &[], None, None, Fetch::default()).unwrap();
         let expected = crate::ensure::fingerprint(&[&key]);
         assert_eq!(
             crate::ext4::fs_uuid(&out).as_deref(),
@@ -7533,7 +7675,16 @@ ENTRYPOINT run me
             progress_sink: None,
         })
         .expect("a journaled export must not fail stamping its own UUID");
-        let key = target_stage_key(&[tmp.join("Dockerfile")], &[], &[], &[], None, None).unwrap();
+        let key = target_stage_key(
+            &[tmp.join("Dockerfile")],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            Fetch::default(),
+        )
+        .unwrap();
         let expected = crate::ensure::fingerprint(&[&key]);
         assert_eq!(
             crate::ext4::fs_uuid(&out).as_deref(),

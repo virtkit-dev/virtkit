@@ -539,6 +539,9 @@ fn check_stage(stage: &Stage, context: &Path, no_network: bool) -> Result<()> {
                 }
             }
             Instruction::Copy(copy) => {
+                if copy.add.is_some() {
+                    bail!("ADD is not supported in a Windows build");
+                }
                 if copy.from.is_some() {
                     bail!("COPY --from is not supported in a Windows build yet");
                 }
@@ -558,7 +561,7 @@ fn check_stage(stage: &Stage, context: &Path, no_network: bool) -> Result<()> {
             Instruction::Other { name, args } if name == "SHELL" => {
                 shell(args)?;
             }
-            Instruction::Other { name, .. } if matches!(name.as_str(), "ADD" | "ONBUILD") => {
+            Instruction::Other { name, .. } if name == "ONBUILD" => {
                 bail!("{name} is not supported in a Windows build")
             }
             Instruction::Arg { name, .. } => {
@@ -2302,6 +2305,7 @@ mod tests {
                 chown: None,
                 chmod: None,
                 link: false,
+                add: None,
             };
             let (targets, material) = copy_plan(&copy, &ctx, workdir).unwrap();
             let targets: Vec<String> = targets.into_iter().map(|(t, _)| t).collect();
