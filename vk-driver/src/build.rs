@@ -6177,6 +6177,7 @@ mod tests {
     // server it is rather than as a failure to resolve one.
     #[test]
     fn cache_store_follows_the_configured_cache() {
+        let _env = crate::dev::testutil::env_guard();
         let default = CacheStore::Dir(vk_registry::default_root().unwrap());
         assert_eq!(cache_store(None).unwrap(), default);
         assert_eq!(

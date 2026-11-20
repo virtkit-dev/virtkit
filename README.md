@@ -1083,7 +1083,7 @@ optional. With no configuration file, local `run` and `build` workflows use defa
 vk config             # print the effective TOML and its source
 vk config --example   # print the annotated reference configuration
 vk config --path      # print the resolved configuration path
-vk paths              # print resolved state, cache, and registry paths
+vk paths              # print the data dir, caches, VM state dirs and registry paths
 ```
 
 [`vk-driver/config.example.toml`](vk-driver/config.example.toml) documents every key.

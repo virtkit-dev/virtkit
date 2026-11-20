@@ -1,5 +1,5 @@
 //! Track root images built by `vk run --state-dir` for collection once their directories
-//! become idle, wherever they are. Each entry under `<data dir>/runs/` records a directory
+//! become idle, wherever they are. Each entry in the default data base's `runs/` directory records a directory
 //! and its built files by identity. `vk gc` removes only files that still match the record.
 
 use std::ffi::CString;
@@ -64,7 +64,8 @@ impl Artifact {
     }
 }
 
-fn ledger_dir() -> Result<PathBuf> {
+/// The runs ledger under the default data base, independent of the configured `state_dir`.
+pub(crate) fn ledger_dir() -> Result<PathBuf> {
     Ok(crate::run::default_data_base()?.join("runs"))
 }
 

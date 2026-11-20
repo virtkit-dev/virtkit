@@ -82,6 +82,8 @@ All notable changes to virtkit will be documented in this file.
   `vk start`, `stop`, `restart` and `delete` clean up stale run records for their targets.
 - **`vk status` is now `vk ping`.** The old name still works.
 - **`vk publish --via` is now `--service`.** `--via` still works.
+- `vk paths` labels the image cache root `data dir` and shows the dev and run state
+  directories, VM name index and runs ledger.
 
 ### Fixed
 

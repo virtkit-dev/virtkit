@@ -882,7 +882,8 @@ enum Cmd {
     },
     /// Print the effective host paths and where each comes from
     ///
-    /// The config file, state dir, image cache and registry store — with the override for each.
+    /// Show the config file, data dir, image caches, VM state dirs, runs ledger and registry
+    /// store, with overrides where available.
     #[command(hide = true)]
     Paths {
         /// also show the gitlab executor's paths (jobs dir, checkouts, tools dir)
@@ -3599,8 +3600,16 @@ fn executor_omitted_note(cfg: &Config) -> Option<String> {
     })
 }
 
-/// The `vk paths` report: each effective host path, where it comes from, and how
-/// to override it. Built as a string so tests can assert on the resolutions.
+/// Preserve UTF-8 paths verbatim and escape non-UTF-8 paths bytewise.
+fn shown_path(p: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    match p.to_str() {
+        Some(s) => s.to_owned(),
+        None => p.as_os_str().as_bytes().escape_ascii().to_string(),
+    }
+}
+
+/// Format effective host paths, their sources and available overrides for `vk paths`.
 fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
     use std::fmt::Write;
     let mut out = String::new();
@@ -3634,12 +3643,12 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
     let state_dir = effective_state_dir(cfg)?;
     writeln!(
         out,
-        "state dir       {} ({state_note})",
+        "data dir        {} ({state_note})",
         state_dir.display()
     )?;
     writeln!(
         out,
-        "                the root of everything vk stores on this host"
+        "                the root of the registry/, docker/ and build/ image caches"
     )?;
     writeln!(
         out,
@@ -3758,12 +3767,51 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
     )?;
     writeln!(
         out,
-        "                one entry per `vk run --state-dir` VM; `vk list`/`vk stop` read it"
+        "                VM registrations `vk list` and `vk stop` read; an entry is removed"
+    )?;
+    writeln!(out, "                when its VM exits cleanly")?;
+    writeln!(
+        out,
+        "runs ledger     {} (default: $XDG_DATA_HOME/virtkit/runs)",
+        shown_path(&crate::rundirs::ledger_dir()?)
     )?;
     writeln!(
         out,
-        "                (self-pruned as VMs exit — no `vk gc` needed)"
+        "                records the root images built in run state dirs so `vk gc` can reclaim them"
     )?;
+    writeln!(out)?;
+    // A GitLab executor may have only XDG_DATA_HOME. Its other paths still resolve.
+    match crate::names::state_base() {
+        Ok(base) => {
+            writeln!(
+                out,
+                "VM state        {} (default: $XDG_STATE_HOME/virtkit)",
+                shown_path(&base)
+            )?;
+            writeln!(
+                out,
+                "  dev/          dev environment and ephemeral task state dirs (`vk dev list --all`)"
+            )?;
+            writeln!(
+                out,
+                "  run/          state dirs for runs with a primary VM and --name or --detach,"
+            )?;
+            writeln!(out, "                unless they pass --state-dir")?;
+            writeln!(
+                out,
+                "  names/        indexed VM names used by `vk list`, each linked to its state dir"
+            )?;
+            writeln!(
+                out,
+                "                `.claim-NAME` marks a provisional name until its VM is ready"
+            )?;
+            writeln!(
+                out,
+                "                `.virtkit-state.json` records startup or a whole-VM stop in the VM's state dir"
+            )?;
+        }
+        Err(e) => writeln!(out, "VM state        unavailable: {e:#}")?,
+    }
     if let Some(repo) = cfg.registry.as_ref().and_then(|r| r.local_root()) {
         writeln!(
             out,
@@ -7636,11 +7684,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn paths_report_names_the_data_dir_and_where_vms_keep_state() {
+        let homes = crate::dev::testutil::Homes::new("paths");
+        let report = paths_report(&config::Config::default(), false).unwrap();
+        let data = homes.dir().join("XDG_DATA_HOME/virtkit");
+        let state = homes.dir().join("XDG_STATE_HOME/virtkit");
+        for line in [
+            format!("\ndata dir        {} (", data.display()),
+            format!("\nruns ledger     {} (", data.join("runs").display()),
+            format!("\nVM state        {} (", state.display()),
+            "\n  dev/  ".to_string(),
+            "\n  run/  ".to_string(),
+            "\n  names/  ".to_string(),
+        ] {
+            assert!(report.contains(&line), "{line}: {report}");
+        }
+        assert!(!report.contains("\nstate dir "), "{report}");
+    }
+
+    #[test]
+    fn paths_report_escapes_a_non_utf8_vm_state_base() {
+        use std::os::unix::ffi::OsStrExt;
+        let homes = crate::dev::testutil::Homes::new("paths-bytes");
+        let odd = homes.dir().join(std::ffi::OsStr::from_bytes(b"st\xffate"));
+        // SAFETY: serialized by the Homes guard, which puts XDG_STATE_HOME back.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &odd) };
+        let report = paths_report(&config::Config::default(), false).unwrap();
+        let want = format!(
+            "\nVM state        {}/st\\xffate/virtkit (",
+            homes.dir().display()
+        );
+        assert!(report.contains(&want), "{want}: {report}");
+    }
+
+    #[test]
+    fn paths_report_survives_a_missing_vm_state_base() {
+        let _homes = crate::dev::testutil::Homes::new("paths-nostate");
+        let home = std::env::var_os("HOME");
+        // SAFETY: serialized by the Homes guard; XDG_STATE_HOME is put back by its drop,
+        // HOME below.
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("HOME");
+        }
+        let report = paths_report(&config::Config::default(), true);
+        if let Some(home) = home {
+            // SAFETY: as above.
+            unsafe { std::env::set_var("HOME", home) };
+        }
+        let report = report.unwrap();
+        assert!(
+            report.contains("\nVM state        unavailable: "),
+            "{report}"
+        );
+        assert!(report.contains("\nruns ledger     "), "{report}");
+        assert!(report.contains("\n  jobs dir      "), "{report}");
+    }
+
     // `vk paths --gitlab` must report the jobs root the executor actually uses:
     // Config::state_dir() (/var/lib/virtkit when unset), not the XDG dev default
     // `vk run` caches under.
     #[test]
     fn paths_report_gitlab_matches_jobctx() {
+        let _homes = crate::dev::testutil::Homes::new("paths-gitlab");
         let ctx =
             jobctx::JobCtx::new_for_job(config::Config::default(), "job-1".to_string()).unwrap();
         let report = paths_report(&config::Config::default(), true).unwrap();
@@ -7654,6 +7761,7 @@ mod tests {
     // resolve the same store, so the report and the commands cannot disagree.
     #[test]
     fn paths_report_names_the_configured_registry_store() {
+        let _homes = crate::dev::testutil::Homes::new("paths-store");
         let mut cfg = config::Config::default();
         let report = paths_report(&cfg, false).unwrap();
         assert!(
