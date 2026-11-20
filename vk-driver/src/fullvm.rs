@@ -54,6 +54,33 @@ const WANTED_MODULES: &[&str] = &[
     "virtio_balloon",
 ];
 
+/// Root filesystem drivers to request alongside [`WANTED_MODULES`]. The pinned kernel
+/// lacks btrfs. For modular btrfs, [`resolve_module_paths`] includes its dependencies.
+pub fn root_fs_modules(fstype: &str) -> &'static [&'static str] {
+    match fstype {
+        "btrfs" => &["btrfs"],
+        _ => &[],
+    }
+}
+
+/// Identify an ext4 or btrfs filesystem in a raw `--root-image` disk.
+pub fn root_image_fstype(path: &Path) -> Result<&'static str> {
+    vk_core::fsprobe::fstype_of(path)
+        .with_context(|| format!("--root-image {}", path.display()))?
+        .with_context(|| format!("--root-image {}: neither ext4 nor btrfs", path.display()))
+}
+
+/// Only `--kernel image` supports a btrfs root.
+pub fn check_root_kernel(path: &Path, fstype: &str, kernel: &KernelSource) -> Result<()> {
+    if fstype == "btrfs" && *kernel != KernelSource::Image {
+        bail!(
+            "--root-image {}: a btrfs root needs --kernel image, whose btrfs module vk loads",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// The kernel + preinit initramfs a preinit boot runs on.
 pub struct FullVmBoot {
     pub kernel: PathBuf,
@@ -70,6 +97,7 @@ pub struct FullVmBoot {
 /// initramfs; with [`KernelSource::Default`] or [`KernelSource::Path`] the boot runs
 /// on `pinned_kernel` (the caller's resolved pinned/explicit kernel, virtio + ext4
 /// built in) and no modules are gathered.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare(
     ext4: &Path,
     agent: &Path,
@@ -78,6 +106,7 @@ pub fn prepare(
     boot_cfg: Option<&vk_core::runcfg::RunConfig>,
     kernel_source: &KernelSource,
     pinned_kernel: &Path,
+    extra_modules: &[&str],
 ) -> Result<FullVmBoot> {
     let reader =
         Ext4Reader::open(ext4).with_context(|| format!("opening image ext4 {}", ext4.display()))?;
@@ -102,7 +131,26 @@ pub fn prepare(
         let dep_path = format!("/lib/modules/{ver}/modules.dep");
         let dep_text = String::from_utf8(reader.read_file(&dep_path, MAX_TEXT_BYTES)?)
             .with_context(|| format!("{dep_path} is not UTF-8"))?;
-        let rel_paths = resolve_module_paths(&dep_text, WANTED_MODULES);
+        let wanted: Vec<&str> = WANTED_MODULES
+            .iter()
+            .chain(extra_modules)
+            .copied()
+            .collect();
+        let rel_paths = resolve_module_paths(&dep_text, &wanted);
+        // Check for root filesystem support before boot. Without modules.builtin,
+        // only drivers listed in modules.dep can be verified.
+        let builtin_path = format!("/lib/modules/{ver}/modules.builtin");
+        let builtin = match reader.lookup(&builtin_path)? {
+            Some(_) => String::from_utf8(reader.read_file(&builtin_path, MAX_TEXT_BYTES)?)
+                .with_context(|| format!("{builtin_path} is not UTF-8"))?,
+            None => String::new(),
+        };
+        for m in extra_modules {
+            let named = |p: &str| module_name(p) == Some(*m);
+            if !rel_paths.iter().any(|p| named(p)) && !builtin.lines().any(named) {
+                bail!("the image kernel {ver} has no {m} module, which its root needs");
+            }
+        }
 
         for rel in &rel_paths {
             let abs_in_image = format!("/lib/modules/{ver}/{rel}");
@@ -371,6 +419,19 @@ impl std::io::Write for CappedWriter {
     }
 }
 
+/// Module basename in `modules.dep` or `modules.builtin`. Strip `.ko` and any
+/// compression suffix (`.xz` on Debian, also `.zst` or `.gz`). Keep the suffixes
+/// in sync with `decompress_module`.
+fn module_name(path: &str) -> Option<&str> {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let stem = file
+        .strip_suffix(".xz")
+        .or_else(|| file.strip_suffix(".zst"))
+        .or_else(|| file.strip_suffix(".gz"))
+        .unwrap_or(file);
+    stem.strip_suffix(".ko")
+}
+
 /// Resolve wanted module basenames to their relative paths (under
 /// `/lib/modules/<ver>`) from `modules.dep`. Visit roots in wanted order, adding
 /// dependencies before each module, including dependencies not wanted themselves.
@@ -393,17 +454,8 @@ fn resolve_module_paths(dep_text: &str, wanted: &[&str]) -> Vec<String> {
         }
         deps.entry(path)
             .or_insert_with(|| needs.split_whitespace().collect());
-        let file = path.rsplit('/').next().unwrap_or(path);
-        // Accept an optional compression suffix (Debian .ko.xz, others .ko.zst/.ko.gz)
-        // so a modular distro kernel resolves; the compressed path is kept as the value
-        // and decompressed at extraction time by `decompress_module` (keep the two
-        // suffix lists in sync).
-        let stem = file
-            .strip_suffix(".xz")
-            .or_else(|| file.strip_suffix(".zst"))
-            .or_else(|| file.strip_suffix(".gz"))
-            .unwrap_or(file);
-        if let Some(base) = stem.strip_suffix(".ko") {
+        // The compressed path is kept as the value and decompressed at extraction time.
+        if let Some(base) = module_name(path) {
             by_name.entry(base).or_insert(path);
         }
     }
@@ -439,6 +491,45 @@ fn resolve_module_paths(dep_text: &str, wanted: &[&str]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_module_path_names_its_module() {
+        assert_eq!(module_name("kernel/fs/btrfs/btrfs.ko.xz"), Some("btrfs"));
+        assert_eq!(module_name("kernel/fs/btrfs/btrfs.ko"), Some("btrfs"));
+        assert_eq!(module_name("btrfs.ko.zst"), Some("btrfs"));
+        assert_eq!(module_name("modules.order"), None);
+    }
+
+    #[test]
+    fn a_btrfs_root_needs_the_image_kernel() {
+        assert_eq!(root_fs_modules("btrfs"), ["btrfs"]);
+        assert!(root_fs_modules("ext4").is_empty());
+        let dir = std::env::temp_dir().join(format!("vk-root-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = |name: &str, at: usize, magic: &[u8]| {
+            let mut v = vec![0u8; 0x11000];
+            v[at..at + magic.len()].copy_from_slice(magic);
+            let p = dir.join(name);
+            vk_fs::write_new(&p, &v, 0o600).unwrap();
+            p
+        };
+        let btrfs = image("btrfs", 0x10040, b"_BHRfS_M");
+        let ext4 = image("ext4", 1080, &[0x53, 0xef]);
+        let neither = image("neither", 0, b"");
+        assert_eq!(root_image_fstype(&btrfs).unwrap(), "btrfs");
+        assert_eq!(root_image_fstype(&ext4).unwrap(), "ext4");
+        assert!(root_image_fstype(&neither).is_err());
+        let path = KernelSource::Path("/k".into());
+        for kernel in [KernelSource::Default, path.clone()] {
+            let err = check_root_kernel(&btrfs, "btrfs", &kernel).unwrap_err();
+            assert!(format!("{err:#}").contains("--kernel image"), "{err:#}");
+        }
+        assert!(check_root_kernel(&btrfs, "btrfs", &KernelSource::Image).is_ok());
+        for kernel in [KernelSource::Default, path, KernelSource::Image] {
+            assert!(check_root_kernel(&ext4, "ext4", &kernel).is_ok());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn resolve_module_paths_orders_and_skips() {

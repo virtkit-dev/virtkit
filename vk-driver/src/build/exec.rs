@@ -1714,6 +1714,7 @@ impl MicroVm {
                 None,
                 &crate::run::KernelSource::Image,
                 &self.kernel,
+                &[],
             )
             .context(
                 "--kernel=image: extracting the base image's kernel — the base must install \

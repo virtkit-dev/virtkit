@@ -383,6 +383,8 @@ pub struct RunArgs {
     /// Which kernel the guest boots on: virtkit's pinned kernel (`Default`), the
     /// image's own kernel + modules (`Image`), or an explicit kernel file (`Path`).
     pub kernel: KernelSource,
+    /// `--root-image`: a raw disk image to boot as the root instead of the image's ext4
+    pub root_image: Option<PathBuf>,
     /// Keep `console=ttyS0` (don't rewrite to hvc0) for a BYO stock kernel whose
     /// virtio-console is modular (`vk run --console-serial`). See [`crate::vmm::VmSpec`].
     pub console_serial: bool,
@@ -601,6 +603,7 @@ impl Default for RunArgs {
             workdir: None,
             workdir_cache: crate::vmm::ShareCache::Auto,
             kernel: KernelSource::Default,
+            root_image: None,
             console_serial: false,
             pmu: false,
             nested: false,
@@ -747,6 +750,9 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
     // either way, so `vk list`, `vk stop` and the rest find it; a temporary directory has to
     // hold its lock here as a pinned one already does.
     if let Some(bundle) = crate::uefi::Bundle::detect(&args.image)? {
+        if args.root_image.is_some() {
+            bail!("--root-image boots a Linux root, not a UEFI bundle");
+        }
         work.lock()?;
         return crate::uefi::run(args, cfg, &work.path, bundle).await;
     }
@@ -791,6 +797,11 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
     // No primary (no image, no -f, no --primary) + a compose file = compose up:
     // services only, held until ctrl-c.
     let result = if args.image.is_empty() && args.dockerfiles.is_empty() && args.primary.is_none() {
+        if args.root_image.is_some() {
+            bail!(
+                "--root-image is the primary VM's root, and a services-only compose run boots none"
+            );
+        }
         if args.atop.is_some() {
             bail!("--atop records the primary VM, and a services-only compose run boots none");
         }
@@ -1553,6 +1564,11 @@ async fn build_and_boot(
     agent: &Path,
     kernel: &Path,
 ) -> Result<()> {
+    // Probe once on the host so incompatible kernels can be rejected before building.
+    let root_fstype = match &args.root_image {
+        Some(root) => Some(crate::fullvm::root_image_fstype(root)?),
+        None => None,
+    };
     // Both non-default axes boot the image from an ext4 (the modular image kernel
     // mounts /dev/vda; the image's init pivots into it), so they need an ext4 — a `-f`
     // build or a non-`--ram` image — never the pure-RAM cpio path.
@@ -1689,6 +1705,22 @@ async fn build_and_boot(
         bail!(
             "x-virtkit.persist_root needs a root disk; --ram boots the rootfs from RAM with none"
         );
+    }
+    if let (Some(root), Some(fstype)) = (&args.root_image, root_fstype) {
+        let kernel = match (&args.kernel, primary_unit) {
+            (KernelSource::Default, Some(unit)) => unit.kernel.clone(),
+            (kernel, _) => kernel.clone(),
+        };
+        // Only the preinit boot (an image init or an image kernel) mounts the root itself.
+        if !(eff_init.is_image() || kernel == KernelSource::Image) {
+            bail!("--root-image needs --init image|entrypoint or --kernel image");
+        }
+        // persist_root journals an ext4 disk and resets it when the primary image
+        // changes. Replacing the external root would leave that identity unchanged.
+        if primary_persist_root.is_some() {
+            bail!("--root-image replaces the root a persist_root primary keeps");
+        }
+        crate::fullvm::check_root_kernel(root, fstype, &kernel)?;
     }
     // `overlay,persist` is deliberately not refused under `--ram`: its upper is its own disk, so
     // an ephemeral RAM root with a persistent data volume is a coherent combination, unlike
@@ -1953,6 +1985,8 @@ async fn build_and_boot(
             };
             let kernel_medium = medium("vmlinuz")?;
             let preinit = medium("initramfs.cpio")?;
+            // With --kernel image, the image's ext4 supplies the kernel and modules
+            // even when the root filesystem comes from another disk.
             let boot = crate::fullvm::prepare(
                 &ext4,
                 agent,
@@ -1961,7 +1995,9 @@ async fn build_and_boot(
                 Some(&boot_cfg),
                 &eff_kernel,
                 &pinned_kernel,
+                crate::fullvm::root_fs_modules(root_fstype.unwrap_or("ext4")),
             )?;
+            let root = args.root_image.clone().unwrap_or_else(|| ext4.clone());
             boot_kernel = boot.kernel;
             // The root disk: a `persist_root` primary boots its standalone persistent qcow2 —
             // the very disk a `persist_root` sibling boots, kept across starts and reset when
@@ -1974,7 +2010,7 @@ async fn build_and_boot(
                 }
                 _ => {
                     let overlay = medium("overlay.qcow2")?;
-                    crate::qcow2::create_overlay(&overlay, &ext4)?;
+                    crate::qcow2::create_overlay(&overlay, &root)?;
                     overlay
                 }
             };

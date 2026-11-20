@@ -546,6 +546,7 @@ pub fn boot_unit(
             Some(&svc.config),
             &svc.kernel,
             kernel,
+            &[],
         )?;
         boot_kernel = boot.kernel;
         // Per-axis handoff tokens, mirroring the primary path: keep ttyS0 for a

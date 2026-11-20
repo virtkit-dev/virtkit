@@ -1901,6 +1901,13 @@ enum Cmd {
             help_heading = "Guest"
         )]
         kernel: run::KernelSource,
+        /// Boot a raw ext4 or btrfs disk image as the root, not the image's ext4 (experimental)
+        ///
+        /// The kernel stays this boot's own (--kernel, or the primary's). Needs
+        /// `--init image|entrypoint` or `--kernel image`; a btrfs root needs `--kernel image`,
+        /// whose btrfs module the preinit loads: the pinned kernel has none.
+        #[arg(long, value_name = "PATH", help_heading = "Guest")]
+        root_image: Option<PathBuf>,
         /// keep console=ttyS0 for a BYO stock kernel (`--kernel <path>`)
         ///
         /// For a kernel whose virtio-console (hvc0) is a module, so early boot output reaches
@@ -3618,6 +3625,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         workdir,
         workdir_cache,
         kernel,
+        root_image,
         console_serial,
         pmu,
         nested,
@@ -3863,6 +3871,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             workdir: workdir.clone(),
             workdir_cache: *workdir_cache,
             kernel: kernel.clone(),
+            root_image: root_image.clone(),
             console_serial: *console_serial,
             pmu: *pmu,
             nested: *nested,
