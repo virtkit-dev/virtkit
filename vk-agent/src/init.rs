@@ -171,9 +171,13 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     if std::path::Path::new("/virtkit-modules").exists() {
         load_preinit_modules();
     }
-    // The guest initrd provides modprobe, the modules and their dependencies.
-    if Path::new(&format!("/{}", vk_core::runcfg::MODPROBE_LIST)).exists() {
-        modprobe_listed();
+    // For `vk run --boot-disk`, vk's archive lists the module names. The guest initrd
+    // beneath it supplies the modules and the modprobe that resolves their dependencies.
+    if matches!(
+        cmdline.get("VIRTKIT_BOOT").map(String::as_str),
+        Some("disk" | "initrd")
+    ) {
+        modprobe_listed().context("vk-agent preinit: loading the disk boot's modules")?;
     }
 
     // Image init (`vk run --init image|entrypoint`): the IMAGE takes PID 1. Handled
@@ -440,19 +444,13 @@ fn root_from_distro_initrd(timeout: Duration) -> Result<()> {
     reopen_console();
     // A later `ro` can override vk's `rw`. Setup and `prepare` need a writable
     // root until the read-only handoff.
-    if root_is_read_only() {
-        mount("", "/", "", libc::MS_REMOUNT | mount_flags_of("/"))
+    let flags = statvfs_flags("/")?;
+    if flags & libc::ST_RDONLY != 0 {
+        mount("", "/", "", libc::MS_REMOUNT | ms_flags(flags))
             .context("remounting the root read-write")?;
     }
     info!("vk-agent init: took the root the initrd mounted at {root}");
     Ok(())
-}
-
-/// Whether `/` is mounted read-only.
-fn root_is_read_only() -> bool {
-    // SAFETY: statvfs is plain data, valid zeroed, and statvfs writes only the struct passed.
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    unsafe { libc::statvfs(c"/".as_ptr(), &mut st) == 0 && st.f_flag & libc::ST_RDONLY != 0 }
 }
 
 /// Remove initramfs files under `dir`, skipping other filesystems such as the new root and `/proc`.
@@ -507,18 +505,20 @@ fn reopen_console() {
     }
 }
 
-/// Preserve flags such as nosuid, nodev, noexec and the atime policy across
-/// remount. The caller sets read-only separately.
-fn mount_flags_of(path: &str) -> libc::c_ulong {
-    let Ok(c) = CString::new(path) else {
-        return 0;
-    };
+/// A remount clears omitted flags such as nosuid, nodev, noexec and the atime policy.
+/// The caller sets read-only separately.
+fn mount_flags_of(path: &str) -> Result<libc::c_ulong> {
+    Ok(ms_flags(statvfs_flags(path)?))
+}
+
+fn statvfs_flags(path: &str) -> Result<libc::c_ulong> {
+    let c = CString::new(path).context("a mountpoint with a NUL")?;
     // SAFETY: statvfs is plain data, valid zeroed, and statvfs writes only the struct passed.
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-        return 0;
+        return Err(io::Error::last_os_error()).with_context(|| format!("statvfs {path}"));
     }
-    ms_flags(st.f_flag)
+    Ok(st.f_flag)
 }
 
 // statvfs and mount flags the libc crate does not name for musl.
@@ -899,7 +899,7 @@ const RO_REMOUNT_WAIT: Duration = Duration::from_secs(5);
 /// open for writing, so retry EBUSY for up to [`RO_REMOUNT_WAIT`].
 fn remount_root_read_only(how: RoRemount) -> Result<()> {
     let flags = if how == RoRemount::Mount {
-        libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | mount_flags_of("/")
+        libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | mount_flags_of("/")?
     } else {
         libc::MS_REMOUNT | libc::MS_RDONLY
     };
@@ -1201,16 +1201,13 @@ fn mount_fstab() {
     }
 }
 
-/// Load [`vk_core::runcfg::MODPROBE_LIST`] with the guest initrd's `modprobe` and module tree.
-/// A built-in can succeed without loading a module. Warn on a failed lookup and continue.
-fn modprobe_listed() {
-    let list = match std::fs::read_to_string(format!("/{}", vk_core::runcfg::MODPROBE_LIST)) {
-        Ok(list) => list,
-        Err(e) => {
-            warn!("vk-agent preinit: reading the module list: {e} — loading no modules");
-            return;
-        }
-    };
+/// Load [`vk_core::runcfg::MODPROBE_LIST`] with the guest initrd's modprobe and kernel modules.
+/// The list spans boot configurations, so warn and continue when modprobe exits unsuccessfully.
+/// A missing required module fails later at the root mount or exec channel. An unreadable list
+/// or failure to run modprobe is fatal.
+fn modprobe_listed() -> Result<()> {
+    let path = format!("/{}", vk_core::runcfg::MODPROBE_LIST);
+    let list = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
     // modprobe reads parameters from /proc/cmdline and loaded-module state from /sys.
     // A sysfs mount failure still allows the load attempt.
     let _ = std::fs::create_dir_all("/sys");
@@ -1225,10 +1222,7 @@ fn modprobe_listed() {
         match std::process::Command::new("modprobe").arg(m).status() {
             Ok(st) if st.success() => loaded += 1,
             Ok(st) => warn!("vk-agent preinit: modprobe {m}: {st}"),
-            Err(e) => {
-                warn!("vk-agent preinit: running modprobe: {e} — loading no modules");
-                return;
-            }
+            Err(e) => return Err(e).context("running the initrd's modprobe"),
         }
     }
     info!(
@@ -1238,6 +1232,7 @@ fn modprobe_listed() {
     // Detach sysfs before the pivot hides it. The real root mounts its own.
     // SAFETY: a NUL-terminated literal path; a failure only leaves the mount in place.
     while unsafe { libc::umount2(c"/sys".as_ptr(), libc::MNT_DETACH) } == 0 {}
+    Ok(())
 }
 
 /// Load the boot-critical modules listed (one absolute `.ko` path per line) in the
