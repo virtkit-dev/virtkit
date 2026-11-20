@@ -94,7 +94,7 @@ pub fn boot_nonce() -> &'static str {
 /// A token no other invocation has: 16 bytes of `/dev/urandom`, hex — the clock and this
 /// pid where that cannot be read. What matters is that two runs differ, not that it is
 /// unguessable.
-fn nonce() -> String {
+pub(crate) fn nonce() -> String {
     use std::io::Read;
 
     let mut bytes = [0u8; 16];

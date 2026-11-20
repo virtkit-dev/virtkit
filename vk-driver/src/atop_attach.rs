@@ -44,6 +44,13 @@ pub fn classify(target: Option<&str>) -> Result<Target> {
         None => None,
         Some(t) => match Path::new(t).is_dir() {
             true => Some(Path::new(t)),
+            // A VM's name: that VM while it runs, else whatever was recorded under the word.
+            false if !t.contains('/') && crate::names::resolve(t).ok().flatten().is_some() => {
+                return match vms::resolve_ref(Some(std::ffi::OsStr::new(t)), None) {
+                    Ok((entry, _)) => Ok(Target::Live(Box::new(entry))),
+                    Err(_) => Ok(Target::Recorded(t.to_string())),
+                };
+            }
             // Not a directory, so no VM can match it: the registry is never consulted.
             false => return Ok(Target::Recorded(t.to_string())),
         },

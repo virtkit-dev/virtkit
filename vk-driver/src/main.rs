@@ -65,6 +65,7 @@ mod libkrun_sys;
 mod local;
 mod manager;
 mod mkoci;
+mod names;
 mod net;
 mod node;
 mod numa;
@@ -95,6 +96,7 @@ mod spawn;
 mod sshagent;
 mod sshclient;
 mod sshconf;
+mod statefile;
 mod switch;
 mod task;
 mod term;
@@ -108,6 +110,7 @@ mod units;
 mod usage;
 mod vm;
 mod vmdk;
+mod vmlist;
 mod vmm;
 mod vmmctl;
 mod vmmthreads;
@@ -1293,12 +1296,12 @@ enum Cmd {
     ///
     /// Runs the system ssh against the client setup in the VM's state dir — that run's
     /// config, key and alias — so none of your own identities are involved and there is
-    /// nothing to configure. Arguments after the directory reach ssh as given:
-    /// `vk ssh DIR -- uname -a`.
+    /// nothing to configure. Arguments after the VM reach ssh as given:
+    /// `vk ssh NAME -- uname -a`.
     Ssh {
-        /// the run's state dir (`run --state-dir`)
-        #[arg(value_name = "DIR")]
-        state_dir: PathBuf,
+        /// the VM: its name, pid, project directory or state directory
+        #[arg(value_name = "REF")]
+        state_dir: std::ffi::OsString,
         /// arguments passed to ssh verbatim, after the host
         #[arg(
             trailing_var_arg = true,
@@ -1313,9 +1316,9 @@ enum Cmd {
     /// an `Include` in your own config, Emacs TRAMP.
     #[command(name = "ssh-config")]
     SshConfig {
-        /// the run's state dir (`run --state-dir`)
-        #[arg(value_name = "DIR")]
-        state_dir: PathBuf,
+        /// the VM: its name, pid, project directory or state directory
+        #[arg(value_name = "REF")]
+        state_dir: std::ffi::OsString,
     },
     /// plumbing: apply a built-in host-command policy, then exec what it allows
     ///
@@ -1377,15 +1380,15 @@ enum Cmd {
     ///
     /// Prints its reply, or exits non-zero if it does not answer — a liveness check that
     /// exercises the agent protocol, stronger than a socket stat. Selects the VM whose project
-    /// is the current directory by default; pass a DIR to select by project directory. A
-    /// raw agent address (`vsock-auto://DIR/vsock.sock:4444`) probes it directly, for
-    /// plumbing that already knows the socket.
+    /// is the current directory by default; pass a name, a pid or a directory to select
+    /// another. A raw agent address (`vsock-auto://DIR/vsock.sock:4444`) probes it directly,
+    /// for plumbing that already knows the socket.
     #[command(display_order = 7)]
     Status {
-        /// which VM: a directory, or a raw agent address
+        /// which VM: a name, a pid, a project directory, or a raw agent address
         ///
-        /// A directory (default: the current directory) resolves via the VM registry `vk list`
-        /// uses; a raw agent address (`scheme://…`) is dialed directly.
+        /// A REF as `vk list` prints it (`NAME/SERVICE` for a compose service; default: the
+        /// current directory's VM); a raw agent address (`scheme://…`) is dialed directly.
         target: Option<String>,
         /// print whether the VM's root image is `fresh`, `stale` or `unknown`
         ///
@@ -1407,11 +1410,10 @@ enum Cmd {
     /// console instead.
     #[command(display_order = 7)]
     Logs {
-        /// which VM: a project directory (default: the current directory)
+        /// which VM: a name, a pid or a project directory (default: the current directory's)
         ///
-        /// Resolves via the VM registry `vk list` uses. After the VM has exited it is no
-        /// longer registered — name the run's `--state-dir` itself and its console is read
-        /// straight from there.
+        /// `NAME/SERVICE` reads a compose service's console. After the VM has exited, its
+        /// name, or its state directory, still leads to the console it left.
         target: Option<PathBuf>,
         /// read this compose sibling's console instead of the primary's
         #[arg(long, value_name = "NAME")]
@@ -1460,10 +1462,10 @@ enum Cmd {
     /// verbatim; a cmd built-in such as `call` expands `%` in them again.
     #[command(arg_required_else_help = true, display_order = 3)]
     Exec {
-        /// which VM: a directory, or a raw agent address
+        /// which VM: a name, a pid, a project directory, or a raw agent address
         ///
-        /// A directory (default: the current directory) resolves via the VM registry `vk list`
-        /// uses; a raw agent address (`scheme://…`) is dialed directly.
+        /// A REF as `vk list` prints it (`NAME/SERVICE` for a compose service; default: the
+        /// current directory's VM); a raw agent address (`scheme://…`) is dialed directly.
         target: Option<String>,
         /// run in this compose sibling service instead of the primary
         ///
@@ -1505,7 +1507,7 @@ enum Cmd {
     /// ends.
     #[command(display_order = 3)]
     Console {
-        /// which VM: a directory (default: the current directory), as `vk exec` resolves it
+        /// which VM: a name, a pid or a directory (default: the current one's)
         target: Option<String>,
     },
     /// Copy a file into or out of a live Windows (UEFI) guest
@@ -1520,7 +1522,7 @@ enum Cmd {
         source: String,
         /// where to copy it: a host path, or `:` and a guest path
         destination: String,
-        /// which VM: a directory (default: the current directory), as `vk exec` resolves it
+        /// which VM: a name, a pid or a directory (default: the current one's)
         #[arg(long, value_name = "DIR")]
         target: Option<String>,
         /// copy to or from this Windows compose service instead, as `vk exec --service` does
@@ -1532,11 +1534,11 @@ enum Cmd {
     /// Accepts connections on `--listen` and, for each one, asks the target VM's agent —
     /// over the same exec control channel `vk exec`/`vk status` use — to dial `--to` and
     /// splice raw bytes back, reusing that already-open channel for the relay. The VM is
-    /// selected as `vk exec` selects it (a directory or a raw agent address; a compose
-    /// sibling is `--via` here, where `vk exec` says `--service`), and `--to` can name any
-    /// address that VM's own network reaches — a
-    /// LAN peer's own compose hostname included, resolved through that VM's own DNS:
-    /// `vk publish --via devcontainer --listen tcp://127.0.0.1:8443 --to tcp://runner:443`.
+    /// selected as `vk exec` selects it (a name, a pid, a directory or a raw agent address;
+    /// a compose service with `NAME/SERVICE` or `--via`), and `--to` can name any
+    /// address that VM's own network reaches — a LAN peer's own compose hostname included,
+    /// resolved through that VM's own DNS:
+    /// `vk publish app/devcontainer --listen tcp://127.0.0.1:8443 --to tcp://runner:443`.
     ///
     /// That form runs in the foreground and goes with the terminal; `vk publish ensure` and
     /// its siblings keep one running in the background instead.
@@ -1787,7 +1789,10 @@ enum Cmd {
     /// interactive shell — runs in the guest. Without `--detach`, `vk` exits with the guest
     /// command's status, dying of its signal if it was killed; a run failure exits 1 and a
     /// `--require-cached` miss exits 3. A `--shell` session exits 0 whatever its status.
-    #[command(display_order = 1)]
+    ///
+    /// A run with `--name`, `--state-dir` or `--detach` is named and remembered: `vk list`
+    /// shows it after it stops.
+    #[command(display_order = 1, args_override_self = true)]
     Run {
         /// Image to boot, e.g. `alpine:3.20`
         ///
@@ -2377,6 +2382,14 @@ enum Cmd {
             help_heading = "Mounts and disks"
         )]
         state_dir: Option<PathBuf>,
+        /// name the VM, for `vk list`, `vk stop` and every other VM command
+        ///
+        /// Without `--state-dir`, the VM gets a state dir of its own under
+        /// `$XDG_STATE_HOME/virtkit/run`, kept after it stops.
+        /// A `--state-dir` or `--detach` run without a name gets one from what it boots;
+        /// compose up, which boots no primary VM, takes none.
+        #[arg(long, value_name = "NAME", help_heading = "Detach")]
+        name: Option<String>,
         /// with --compose, the workspace root it reads as `${VK_WORKSPACE}` [default: the cwd]
         ///
         /// The project the run is about. Naming it here lets the committed file say
@@ -2566,38 +2579,50 @@ enum Cmd {
         #[arg(last = true)]
         command: Vec<String>,
     },
-    /// List the running vk VMs
+    /// List every VM vk knows: running or stopped, primaries and their compose services
     ///
-    /// VMs started with `--state-dir`, with their pid, uptime, memory, name, compose
-    /// services, project directory (`--workspace`, then `--workdir`, then launch directory)
-    /// and published ports (`listen->to`; `@service` when a compose sibling dials). MEM is
-    /// what the VM's whole process tree holds on the host right now over the size it booted
-    /// with (`1.2G/8G`) — the guest, its service VMs and their helpers, counted
-    /// proportionally so pages they share are charged once. The table folds `$HOME` to `~`
-    /// and names at most three services; `--wide` shows every service, the project directory
-    /// in full and the exec-channel address. With PID or DIR, only the VM with that pid, or
-    /// the VMs whose project is DIR or below it (or whose state dir is DIR); a selector that
-    /// names exactly one VM prints its full record instead of a table row. The record folds
-    /// nothing, so `--wide` has nothing to add there. Use `--json` or `--field` for scripts;
-    /// neither takes `--wide`, since both already report every field.
+    /// One row per VM: dev environments, runs started with `--name`, `--state-dir` or
+    /// `--detach`, and each of their compose services, grouped by project — a dev
+    /// environment's workspace, a run's project directory (`--workspace`, then `--workdir`,
+    /// then launch directory) — the primary first, then its services by name. NAME is what
+    /// `vk stop` and every other VM command take (`NAME/SERVICE` for a
+    /// service; a running VM without a name shows its pid). MEM is what the VM's whole
+    /// process tree holds on the host right now over the size it booted with (`1.2G/8G`) —
+    /// the guest, its service VMs and their helpers, counted proportionally so pages they
+    /// share are charged once. The table folds `$HOME` to `~`; `--wide` shows the project
+    /// directory in full and the exec-channel address. With a REF, only the VMs it names; one
+    /// that names exactly one running VM prints its full record instead of a table row. Use
+    /// `--json` or `--field` for scripts.
     #[command(display_order = 6)]
     List {
-        /// which VMs: a PID, or those whose project is DIR or below it (default: all)
+        /// which VMs: a name, a pid, or those of a project directory (default: all)
         ///
-        /// An all-digit argument is a pid, as the PID column prints; anything else a
-        /// directory (a digit-only name needs a `./`). Exactly one match is shown in full,
-        /// several as a table.
-        #[arg(value_name = "PID|DIR")]
+        /// A name as the NAME column prints it; an all-digit argument is a pid; a path (`/…`,
+        /// `./…`, `../…`, `~…`) a project or state directory, matched exactly unless
+        /// `--recursive`.
+        #[arg(value_name = "REF")]
         target: Option<std::ffi::OsString>,
-        /// the full table: every service named, the project path in full, and EXEC ADDRESS
+        /// with a directory, also every VM whose project is below it
+        #[arg(short = 'r', long)]
+        recursive: bool,
+        /// only the VMs that are running (a service counts by its own state)
+        #[arg(long, conflicts_with = "stopped")]
+        running: bool,
+        /// only the VMs that are stopped
+        #[arg(long)]
+        stopped: bool,
+        /// only VMs of this kind
+        #[arg(long, value_name = "KIND")]
+        kind: Option<crate::vmlist::Kind>,
+        /// the full table: the project path in full, and EXEC ADDRESS
         #[arg(short = 'w', long, conflicts_with_all = ["json", "field"])]
         wide: bool,
-        /// emit the entries as a JSON array instead of a table
+        /// emit the rows as a JSON array instead of a table
         #[arg(long)]
         json: bool,
         /// print only this field of each VM (repeatable, one field per flag)
         ///
-        /// A `--json` key, or a dotted path into one: `guest_ip`, `services.0.ip`. Several
+        /// A `--json` key, or a dotted path into one: `ip`, `published.0`. Several
         /// fields take one `--field` each, not a list. One line per VM, the fields
         /// tab-separated, each as `jq -r` would print it: a string bare, anything else as
         /// JSON; as text, nothing running prints nothing. Values are not escaped, so a value
@@ -2619,13 +2644,16 @@ enum Cmd {
     /// default; pass a pid or a project directory to select one, or `--all`.
     #[command(display_order = 8)]
     Stop {
-        /// the VM to stop: a PID or a project directory (default: the current directory)
+        /// the VM to stop: a name, a pid or a directory (default: the current one's)
         ///
-        /// An all-digit argument is a pid, as `vk list` prints; anything else a directory —
-        /// whose VM(s), and those of every directory below it, are stopped. A directory
-        /// named only by digits therefore needs a `./` in front of it.
-        #[arg(value_name = "PID|DIR")]
+        /// A name as `vk list` prints it (`NAME/SERVICE` for a compose service); an all-digit
+        /// argument is a pid; a path (`/…`, `./…`, `../…`, `~…`) a project or state directory,
+        /// matched exactly unless `--recursive`.
+        #[arg(value_name = "REF")]
         target: Option<std::ffi::OsString>,
+        /// with a directory, also every VM whose project is below it
+        #[arg(short = 'r', long, conflicts_with = "all")]
+        recursive: bool,
         /// stop every running vk VM
         #[arg(long, conflicts_with = "target")]
         all: bool,
@@ -2645,9 +2673,12 @@ enum Cmd {
     /// hard-resets through the VMM (for a hung or agent-less guest).
     #[command(display_order = 8)]
     Reboot {
-        /// the VM to reboot: a PID or a project directory (default: the current directory)
-        #[arg(value_name = "PID|DIR")]
+        /// the VM to reboot: a name, a pid or a directory (default: the current one's)
+        #[arg(value_name = "REF")]
         target: Option<std::ffi::OsString>,
+        /// with a directory, also every VM whose project is below it
+        #[arg(short = 'r', long, conflicts_with = "all")]
+        recursive: bool,
         /// reboot every running vk VM
         #[arg(long, conflicts_with = "target")]
         all: bool,
@@ -2662,9 +2693,12 @@ enum Cmd {
     /// directory, or `--all`.
     #[command(display_order = 8)]
     Pause {
-        /// the VM to pause: a PID or a project directory (default: the current directory)
-        #[arg(value_name = "PID|DIR")]
+        /// the VM to pause: a name, a pid or a directory (default: the current one's)
+        #[arg(value_name = "REF")]
         target: Option<std::ffi::OsString>,
+        /// with a directory, also every VM whose project is below it
+        #[arg(short = 'r', long, conflicts_with = "all")]
+        recursive: bool,
         /// pause every running vk VM that can be
         #[arg(long, conflicts_with = "target")]
         all: bool,
@@ -2684,8 +2718,8 @@ enum Cmd {
     /// fails, Kerberos may fail.
     #[command(display_order = 8)]
     Snapshot {
-        /// the VM to snapshot: a PID or a project directory (default: the current directory)
-        #[arg(value_name = "PID|DIR", conflicts_with = "run_dir")]
+        /// the VM to snapshot: a name, a pid or a directory (default: the current one's)
+        #[arg(value_name = "REF", conflicts_with = "run_dir")]
         target: Option<std::ffi::OsString>,
         /// snapshot the Windows services of the compose run with this state directory
         #[arg(long, value_name = "DIR")]
@@ -2697,9 +2731,12 @@ enum Cmd {
     /// Run a VM `vk pause` froze again
     #[command(display_order = 8)]
     Resume {
-        /// the VM to resume: a PID or a project directory (default: the current directory)
-        #[arg(value_name = "PID|DIR")]
+        /// the VM to resume: a name, a pid or a directory (default: the current one's)
+        #[arg(value_name = "REF")]
         target: Option<std::ffi::OsString>,
+        /// with a directory, also every VM whose project is below it
+        #[arg(short = 'r', long, conflicts_with = "all")]
+        recursive: bool,
         /// resume every paused vk VM
         #[arg(long, conflicts_with = "target")]
         all: bool,
@@ -2968,11 +3005,18 @@ fn main() -> ExitCode {
     // Parsed here, before the fork below and before any runtime exists: what detaches is a
     // property of the command, and clap answers `--help`/`--version` by printing and
     // exiting — so neither is ever forked and printed twice.
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     // Before the fork, so the detaching parent is quiet too.
     if let Cmd::Run { quiet: true, .. } = &cli.cmd {
         quiet::set();
     }
+
+    // A named or detached run gets its name and state dir now, before the fork, so the
+    // parent and the daemon agree on them and a failure is reported in the foreground.
+    let prepared = match prepare_run_name(&mut cli.cmd) {
+        Ok(p) => p,
+        Err(e) => return fail(&e, 2),
+    };
 
     // `vk run … --detach`, and the `vk dev` actions that boot — daemonize once the guest is
     // ready. The fork must precede the Tokio runtime (forking a live multi-threaded runtime
@@ -2991,7 +3035,186 @@ fn main() -> ExitCode {
         return code;
     }
 
-    on_runtime(cli)
+    let code = on_runtime(cli);
+    // In the process that ran the run — the daemon, for `--detach` — which is the one that
+    // knows whether a VM ever came up.
+    prepared.settle();
+    code
+}
+
+/// What [`prepare_run_name`] made for this invocation, taken back when the run ends without
+/// ever having had a VM: a name that leads to nothing would otherwise stay listed as a
+/// stopped VM, and be refused to the corrected command that follows.
+#[derive(Debug, Default)]
+struct Prepared {
+    /// the run's state dir, when it is a remembered run
+    dir: Option<PathBuf>,
+    /// this invocation gave the dir its name
+    name_made: bool,
+    /// this invocation made the dir, under the run base
+    dir_made: bool,
+}
+
+impl Prepared {
+    /// Take back what was made if no VM was ever registered from this process.
+    fn settle(&self) {
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        if vms::ever_registered() || !(self.name_made || self.dir_made) {
+            return;
+        }
+        if self.name_made {
+            if let Ok(idx) = crate::names::Index::open() {
+                idx.release(dir);
+            }
+            let _ = std::fs::remove_file(dir.join(crate::names::RECIPE));
+        }
+        if self.dir_made {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Name a `vk run` that is remembered — one with `--name`, `--state-dir` or `--detach` — and
+/// give it a state dir when it has none. Its recipe (`run.json`) is set aside for the run to
+/// write once it holds that dir. A foreground run with neither stays nameless, in a
+/// temporary directory. Returns what was made, for [`Prepared::settle`].
+fn prepare_run_name(cmd: &mut Cmd) -> anyhow::Result<Prepared> {
+    let Cmd::Run {
+        name,
+        state_dir,
+        detach,
+        image,
+        file,
+        compose,
+        primary,
+        target,
+        workspace,
+        workdir,
+        ..
+    } = cmd
+    else {
+        return Ok(Prepared::default());
+    };
+    if boots_no_primary(image.as_deref(), file, primary.as_deref()) {
+        // Nothing to run at all: the run says so itself, and nothing is named for it.
+        if compose.is_none() {
+            return Ok(Prepared::default());
+        }
+        // Compose up registers nothing: a name would list it stopped while it runs.
+        if let Some(n) = name {
+            anyhow::bail!(
+                "--name {n}: compose up (no image, -f or --primary) boots no VM to name; \
+                 give it a primary, or leave the name out"
+            );
+        }
+        return Ok(Prepared::default());
+    }
+    if name.is_none() && state_dir.is_none() && !*detach {
+        return Ok(Prepared::default());
+    }
+    let project = workspace
+        .as_deref()
+        .or(workdir.as_deref())
+        .map(std::path::absolute)
+        .transpose()?;
+    let recipe = crate::names::Recipe::now(project)?;
+    let base = auto_name_base(
+        image.as_deref(),
+        primary.as_deref(),
+        target.as_deref(),
+        &recipe.project_dir,
+    );
+    let idx = crate::names::Index::open()?;
+    let mut made = Prepared::default();
+    let dir = match (name.as_deref(), state_dir.as_deref()) {
+        (Some(n), Some(d)) => {
+            let d = run_state_dir(d)?;
+            made.name_made = idx.name_of(&d).is_none();
+            idx.claim_exact(&d, n)?;
+            d
+        }
+        (Some(n), None) => {
+            crate::names::validate(n)?;
+            if let Some(taken) = idx.lookup(n) {
+                anyhow::bail!("the name {n} is taken by {}", taken.display());
+            }
+            let d = new_run_dir(n)?;
+            if let Err(e) = idx.claim_exact(&d, n) {
+                let _ = std::fs::remove_dir(&d);
+                return Err(e);
+            }
+            (made.name_made, made.dir_made) = (true, true);
+            d
+        }
+        (None, Some(d)) => {
+            let d = run_state_dir(d)?;
+            made.name_made = idx.name_of(&d).is_none();
+            *name = Some(idx.claim(&d, &base)?);
+            d
+        }
+        (None, None) => {
+            let d = new_run_dir(&crate::names::sanitize(&base))?;
+            *name = Some(idx.claim(&d, &base)?);
+            (made.name_made, made.dir_made) = (true, true);
+            d
+        }
+    };
+    *state_dir = Some(dir.clone());
+    // The run writes it once the dir is its own (`run::WorkDir::pinned`): one that is
+    // refused the dir must not rewrite the recipe of the run that holds it.
+    crate::names::set_pending_recipe(&dir, recipe);
+    made.dir = Some(dir);
+    Ok(made)
+}
+
+/// A `--state-dir` made absolute and created (mode 0700, as the run itself creates it), so
+/// the name links to the directory it will be.
+fn run_state_dir(dir: &Path) -> anyhow::Result<PathBuf> {
+    let dir = std::path::absolute(dir)?;
+    crate::statefile::create_dir_all(&dir)?;
+    Ok(vms::canonical(&dir))
+}
+
+/// A managed state dir for a run named from `base`: `$XDG_STATE_HOME/virtkit/run/<base>-<hex>`.
+fn new_run_dir(base: &str) -> anyhow::Result<PathBuf> {
+    let token = &detach::nonce()[..8];
+    run_state_dir(&crate::names::run_base()?.join(format!("{base}-{token}")))
+}
+
+/// Whether a run boots compose services only: no image, Dockerfile or `--primary` to make a
+/// primary VM of.
+fn boots_no_primary(image: Option<&str>, file: &[PathBuf], primary: Option<&str>) -> bool {
+    file.is_empty() && image.is_none() && primary.is_none()
+}
+
+/// What an unnamed run is called after: the compose primary, the Dockerfile target, the
+/// image's own name (no registry, no tag) — and for a Dockerfile with no target, which has
+/// none of these, its project directory's name, as a dev environment is named; else `vm`.
+fn auto_name_base(
+    image: Option<&str>,
+    primary: Option<&str>,
+    target: Option<&str>,
+    project: &Path,
+) -> String {
+    if let Some(p) = primary.or(target) {
+        return p.to_string();
+    }
+    let Some(image) = image else {
+        return project
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "vm".into());
+    };
+    let last = image
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(image);
+    let last = last.split('@').next().unwrap_or(last);
+    last.split(':').next().unwrap_or(last).to_string()
 }
 
 /// The CLI proper runs on a Tokio runtime (formerly `#[tokio::main]`).
@@ -3542,31 +3765,56 @@ async fn cli_main(cli: Cli) -> ExitCode {
     }
     if let Cmd::List {
         target,
+        recursive,
+        running,
+        stopped,
+        kind,
         wide,
         json,
         field,
         stale,
     } = &cli.cmd
     {
-        let target = match target.as_deref().map(vms::Selector::parse).transpose() {
-            Ok(sel) => sel,
-            Err(e) => return fail(&e, 2),
+        let opts = vms::ListOpts {
+            target: target.clone(),
+            recursive: *recursive,
+            json: *json,
+            stale: *stale,
+            fields: field.clone(),
+            wide: *wide,
+            filter: crate::vmlist::Filter {
+                running: *running,
+                stopped: *stopped,
+                kind: *kind,
+                name: None,
+            },
         };
-        return match vms::list_report(target, *json, *stale, field, *wide) {
+        return match vms::list_report(opts) {
             Ok(report) => write_report(&report),
             Err(e) => fail(&e, 2),
         };
     }
     if let Cmd::Stop {
         target,
+        recursive,
         all,
         timeout,
     } = &cli.cmd
     {
-        return act_on_vms(target.as_deref(), |sel| vms::stop_cmd(sel, *all, *timeout));
+        return act_on_vms(target.as_deref(), *recursive, |sel| {
+            vms::stop_cmd(sel, *all, *timeout)
+        });
     }
-    if let Cmd::Reboot { target, all, force } = &cli.cmd {
-        return act_on_vms(target.as_deref(), |sel| vms::reboot_cmd(sel, *all, *force));
+    if let Cmd::Reboot {
+        target,
+        recursive,
+        all,
+        force,
+    } = &cli.cmd
+    {
+        return act_on_vms(target.as_deref(), *recursive, |sel| {
+            vms::reboot_cmd(sel, *all, *force)
+        });
     }
     if let Cmd::Snapshot {
         run_dir: Some(run_dir),
@@ -3592,13 +3840,25 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Err(e) => fail(&e, 1),
         };
     }
-    if let Cmd::Pause { target, all } | Cmd::Resume { target, all } = &cli.cmd {
+    if let Cmd::Pause {
+        target,
+        recursive,
+        all,
+    }
+    | Cmd::Resume {
+        target,
+        recursive,
+        all,
+    } = &cli.cmd
+    {
         let req = if matches!(cli.cmd, Cmd::Pause { .. }) {
             vms::PauseRequest::Pause
         } else {
             vms::PauseRequest::Resume
         };
-        return act_on_vms(target.as_deref(), |sel| vms::pause_cmd(sel, *all, req));
+        return act_on_vms(target.as_deref(), *recursive, |sel| {
+            vms::pause_cmd(sel, *all, req)
+        });
     }
     if let Cmd::Gc {
         idle_secs,
@@ -3742,7 +4002,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         ..
     } = &cli.cmd
     {
-        let services_only = file.is_empty() && image.is_none() && primary.is_none();
+        let services_only = boots_no_primary(image.as_deref(), file, primary.as_deref());
         if services_only && compose.is_none() {
             return fail(
                 &anyhow::anyhow!("run needs an image, --file <Dockerfile>, or a --compose file"),
@@ -5136,14 +5396,18 @@ async fn cli_main(cli: Cli) -> ExitCode {
             },
         },
         // Replace vk so the SSH session's exit status reaches the caller.
-        Cmd::Ssh { state_dir, args } => match sshclient::exec_ssh(&state_dir, &args) {
-            Ok(never) => match never {},
-            Err(e) => fail(&e, 1),
-        },
-        Cmd::SshConfig { state_dir } => match sshclient::print_config(&state_dir) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => fail(&e, 1),
-        },
+        Cmd::Ssh { state_dir, args } => {
+            match state_dir_of(&state_dir).and_then(|dir| sshclient::exec_ssh(&dir, &args)) {
+                Ok(never) => match never {},
+                Err(e) => fail(&e, 1),
+            }
+        }
+        Cmd::SshConfig { state_dir } => {
+            match state_dir_of(&state_dir).and_then(|dir| sshclient::print_config(&dir)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            }
+        }
         // stdio↔socket splice for an SSH ProxyCommand; returns when either side closes.
         Cmd::Connect { addr } => match vk_core::forward::run_connect(&addr).await {
             Ok(()) => ExitCode::SUCCESS,
@@ -5235,7 +5499,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             }
         }
         // Run a command in a live guest, reproducing its exit status as our own. The target
-        // selects the VM the same way `vk status` does (directory via the registry, default cwd,
+        // selects the VM the same way `vk status` does (a name, pid or directory, default cwd,
         // or a raw agent address); the command is the trailing `-- …` group.
         Cmd::Exec {
             target,
@@ -5725,9 +5989,13 @@ async fn windows_build(cmd: &Cmd, cfg: &config::Config) -> ExitCode {
 /// unless every VM did it, 2 on a bad TARGET or an error.
 fn act_on_vms(
     target: Option<&std::ffi::OsStr>,
+    recursive: bool,
     run: impl FnOnce(Option<vms::Selector>) -> anyhow::Result<(String, bool)>,
 ) -> ExitCode {
-    let selector = match target.map(vms::Selector::parse).transpose() {
+    let selector = match target
+        .map(|t| vms::Selector::parse_below(t, recursive))
+        .transpose()
+    {
         Ok(sel) => sel,
         Err(e) => {
             eprintln!("vk: {e:#}");
@@ -5928,11 +6196,12 @@ fn is_agent_addr(s: &str) -> bool {
 /// serial console to. A sibling's runtime dir is what its exec address names.
 fn console_log_path(target: Option<&Path>, service: Option<&str>) -> anyhow::Result<PathBuf> {
     use anyhow::Context;
-    let dir = match vms::resolve_one(target) {
-        Ok(entry) => match service {
+    let resolved = vms::resolve_ref(target.map(Path::as_os_str), service);
+    let dir = match resolved {
+        Ok((entry, service)) => match service {
             None => entry.state_dir,
             // `vsock-auto://<svc-dir>/vsock.sock:4444`: the directory is the socket's parent.
-            Some(name) => match resolve_service_addr(&entry, name)? {
+            Some(name) => match resolve_service_addr(&entry, &name)? {
                 SocketAddr::VsockAuto { path, .. } => path
                     .parent()
                     .map(Path::to_path_buf)
@@ -5941,15 +6210,23 @@ fn console_log_path(target: Option<&Path>, service: Option<&str>) -> anyhow::Res
             },
         },
         // The registry only lists live VMs, but the console of one that just died is exactly
-        // what a reader reaches for, and `--state-dir` keeps it. Fall back to reading the
-        // target as a state directory when it holds a console — but only for the primary's:
-        // a sibling's directory is named by an exec address the registry no longer has.
+        // what a reader reaches for, and its state dir keeps it: a name still leads there, as
+        // does the state directory itself. A stopped service's console is in its `svc-*` dir.
         Err(e) => {
-            let dir = match target {
-                Some(t) => t.to_path_buf(),
-                None => std::env::current_dir().context("resolving the current directory")?,
+            let (vm, service) = split_service(target.and_then(Path::to_str), service)?;
+            let dir = match (vm, target) {
+                (Some(vm), _) if !is_pathlike(&vm) => match crate::names::resolve(&vm)? {
+                    Some(dir) => dir,
+                    None => return Err(e),
+                },
+                (_, Some(t)) => t.to_path_buf(),
+                (_, None) => std::env::current_dir().context("resolving the current directory")?,
             };
-            if service.is_none() && dir.join(run::CONSOLE_LOG).is_file() {
+            let dir = match service {
+                Some(name) => dir.join(format!("svc-{name}")),
+                None => dir,
+            };
+            if dir.join(run::CONSOLE_LOG).is_file() {
                 dir
             } else {
                 return Err(e);
@@ -5957,6 +6234,31 @@ fn console_log_path(target: Option<&Path>, service: Option<&str>) -> anyhow::Res
         }
     };
     Ok(dir.join(run::CONSOLE_LOG))
+}
+
+/// The state dir a REF stands for, running or not: a running VM's, a name's, or a path
+/// taken as the state dir itself.
+fn state_dir_of(target: &std::ffi::OsStr) -> anyhow::Result<PathBuf> {
+    if let Ok(entry) = vms::resolve_one(Some(Path::new(target))) {
+        return Ok(entry.state_dir);
+    }
+    match vms::Ref::parse(target)? {
+        vms::Ref::Name { vm, service: None } => crate::names::resolve(&vm)?
+            .ok_or_else(|| anyhow::anyhow!("no VM is named {vm} (`vk list` names them)")),
+        vms::Ref::Name {
+            service: Some(_), ..
+        } => anyhow::bail!("ssh reaches a VM, not one of its compose services"),
+        vms::Ref::Path(dir) => Ok(dir),
+        vms::Ref::Pid(pid, _) => anyhow::bail!("no running vk VM with pid {pid}"),
+    }
+}
+
+/// Whether a REF argument reads as a path rather than a name (see [`vms::Ref::parse`]).
+fn is_pathlike(arg: &str) -> bool {
+    matches!(
+        vms::Ref::parse(std::ffi::OsStr::new(arg)),
+        Ok(vms::Ref::Path(_))
+    )
 }
 
 /// Find the console log in the named state or CI job `dir` without consulting the registry.
@@ -6047,6 +6349,8 @@ async fn show_console_log(
         .context("watching for Ctrl-C")?;
     let mut pending = String::new();
     let mut registry_check = std::time::Instant::now();
+    // Resolved once: every round asks only whether a VM still answers to it.
+    let watched = vms::Watched::of(target.map(Path::as_os_str));
     loop {
         tokio::select! {
             _ = tokio::time::sleep(FOLLOW_POLL) => {}
@@ -6058,7 +6362,7 @@ async fn show_console_log(
         // against.
         if registry_check.elapsed() >= REGISTRY_POLL {
             registry_check = std::time::Instant::now();
-            if !vms::still_registered(target) {
+            if !vms::still_registered(&watched) {
                 eprintln!("virtkit: the VM ended");
                 return Ok(());
             }
@@ -6265,14 +6569,41 @@ fn resolve_exec_addr(
     sibling: Option<&str>,
     flag: &str,
 ) -> anyhow::Result<SocketAddr> {
-    let Some(svc) = sibling else {
-        return resolve_agent_addr(target);
-    };
-    if target.is_some_and(is_agent_addr) {
-        anyhow::bail!("{flag} selects a VM by directory, not a raw agent address");
+    if let Some(addr) = target.filter(|t| is_agent_addr(t)) {
+        if sibling.is_some() {
+            anyhow::bail!("{flag} selects a VM by name or directory, not a raw agent address");
+        }
+        return addr.parse::<SocketAddr>();
     }
-    let entry = vms::resolve_one(target.map(Path::new))?;
-    resolve_service_addr(&entry, svc)
+    match vms::resolve_ref(target.map(std::ffi::OsStr::new), sibling)? {
+        (entry, None) => entry.exec_addr.parse::<SocketAddr>(),
+        (entry, Some(svc)) => resolve_service_addr(&entry, &svc),
+    }
+}
+
+/// A REF's `NAME/SERVICE` split into the VM and the service, merged with a `--service` given
+/// beside it: what a caller that needs the two apart passes on.
+fn split_service(
+    target: Option<&str>,
+    service: Option<&str>,
+) -> anyhow::Result<(Option<String>, Option<String>)> {
+    let Some(t) = target else {
+        return Ok((None, service.map(str::to_string)));
+    };
+    let (vm, named) = match vms::Ref::parse(std::ffi::OsStr::new(t))? {
+        vms::Ref::Name {
+            vm,
+            service: Some(named),
+        } if vms::names_a_vm(std::ffi::OsStr::new(t)) || !Path::new(t).is_dir() => (vm, named),
+        vms::Ref::Pid(pid, Some(named)) => (pid.to_string(), named),
+        _ => return Ok((Some(t.to_string()), service.map(str::to_string))),
+    };
+    match service {
+        Some(s) if s != named => {
+            anyhow::bail!("the target names the service {named} and --service names {s}: give one")
+        }
+        _ => Ok((Some(vm), Some(named))),
+    }
 }
 
 /// The qemu-ga socket for `vk exec`/`vk cp`: the VM's own, or with `service`, under
@@ -6287,10 +6618,11 @@ fn windows_exec_socket(
     if target.is_some_and(is_agent_addr) {
         return Ok(None);
     }
-    let resolve = || vms::resolve_one(target.map(Path::new));
+    let (target, service) = split_service(target, service)?;
+    let resolve = || vms::resolve_one(target.as_deref().map(Path::new));
     match service {
         None => Ok(resolve()?.guest_agent),
-        Some(svc) => service_qga_socket(Path::new(target.unwrap_or(".")), svc, || {
+        Some(svc) => service_qga_socket(Path::new(target.as_deref().unwrap_or(".")), &svc, || {
             Ok(resolve()?.state_dir)
         }),
     }
@@ -7880,6 +8212,94 @@ mod tests {
     // catches that. It also catches the opposite slip, an entry with no help at all.
     // Short is not the same as one rendered line: clap appends `[default: …]` and
     // `[possible values: …]`, and lays wide groups out on a second line regardless.
+    #[test]
+    fn an_unnamed_run_is_named_after_what_it_boots() {
+        let p = Path::new("/home/me/shop");
+        assert_eq!(auto_name_base(Some("alpine:3.20"), None, None, p), "alpine");
+        assert_eq!(
+            auto_name_base(Some("ghcr.io/org/tool@sha256:ab"), None, None, p),
+            "tool"
+        );
+        assert_eq!(
+            auto_name_base(Some("./bundles/win11/"), None, None, p),
+            "win11"
+        );
+        assert_eq!(
+            auto_name_base(Some("x"), Some("devcontainer"), None, p),
+            "devcontainer"
+        );
+        assert_eq!(auto_name_base(None, None, Some("dev"), p), "dev");
+        // A Dockerfile with no target: the project it is about.
+        assert_eq!(auto_name_base(None, None, None, p), "shop");
+        assert_eq!(auto_name_base(None, None, None, Path::new("/")), "vm");
+    }
+
+    /// A run with nothing to boot is refused by the run itself: nothing is named for it, so
+    /// the corrected command that follows finds its name free.
+    #[test]
+    fn a_run_with_nothing_to_boot_claims_no_name() {
+        let mut cli = Cli::try_parse_from(["vk", "run", "--name", "nothing-to-boot"]).unwrap();
+        let made = prepare_run_name(&mut cli.cmd).unwrap();
+        assert!(made.dir.is_none() && !made.name_made && !made.dir_made);
+        let Cmd::Run { state_dir, .. } = cli.cmd else {
+            panic!("not a run");
+        };
+        assert_eq!(state_dir, None);
+    }
+
+    /// Compose up registers no VM, so it gets no name: detached it stays unnamed, and an
+    /// explicit name is refused rather than left listed as a stopped VM.
+    #[test]
+    fn compose_up_is_never_named() {
+        let cmd = |args: &[&str]| {
+            let mut cli = Cli::try_parse_from(["vk", "run"].iter().chain(args)).unwrap();
+            prepare_run_name(&mut cli.cmd).map(|_| cli.cmd)
+        };
+        let Cmd::Run {
+            name, state_dir, ..
+        } = cmd(&["--compose", "c.yml", "--detach"]).unwrap()
+        else {
+            panic!("not a run");
+        };
+        assert_eq!((name, state_dir), (None, None));
+        let Err(err) = cmd(&["--compose", "c.yml", "--name", "x"]) else {
+            panic!("named");
+        };
+        assert!(format!("{err}").contains("compose up"), "{err}");
+        assert!(boots_no_primary(None, &[], None));
+        assert!(!boots_no_primary(None, &[], Some("web")));
+        assert!(!boots_no_primary(Some("alpine"), &[], None));
+        assert!(!boots_no_primary(None, &["Dockerfile".into()], None));
+    }
+
+    #[test]
+    fn run_takes_name_and_the_last_of_a_repeated_option() {
+        let cli = Cli::try_parse_from([
+            "vk",
+            "run",
+            "--state-dir",
+            "/a",
+            "--name",
+            "x",
+            "alpine",
+            "--state-dir",
+            "/b",
+            "--detach",
+            "--detach",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let Cmd::Run {
+            state_dir, name, ..
+        } = cli.cmd
+        else {
+            panic!("not a run");
+        };
+        assert_eq!(state_dir.as_deref(), Some(Path::new("/b")));
+        assert_eq!(name.as_deref(), Some("x"));
+    }
+
     #[test]
     fn help_summaries_stay_short() {
         // An 80-column terminal plus a little slack: the longest entry today is 81

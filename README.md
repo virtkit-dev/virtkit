@@ -563,64 +563,73 @@ setup, lifecycle hooks and isolated tasks are covered in the
 [project development guide](docs/dev.md). It includes a complete workflow and a
 service layout with on-demand test appliances.
 
-### Manage running VMs
+### Manage VMs
 
-A `vk run --state-dir DIR` boots a VM that outlives a single command: its sockets and
-console log live in DIR, and the run is recorded in a host-side registry. `vk list` reads
-that registry, dropping entries whose run has died, and is what `vk exec`, `vk status`,
-`vk logs`, `vk stop` and `vk reboot` resolve a directory against — `vk logs` also reads the
-console of a VM the registry has already dropped, since DIR keeps it. A run without
-`--state-dir` is not listed, unless it boots a UEFI bundle; pair `--state-dir` with
-`--detach` for a background VM. The root image a `-f` run builds into DIR is removed by
-`vk gc` once no run has used DIR for 14 days, and built again by the next.
+Every VM `vk` remembers has a **name**: a dev environment (named after its workspace, `-ENV`
+added for an environment other than `dev`), and a `vk run` started with `--name`,
+`--state-dir` or `--detach` (named with `--name`, else after what it boots). A name is
+given once and kept; a second `app` becomes `app-2`. A
+foreground `vk run` without `--state-dir` stays nameless and is forgotten when it ends, as
+does compose up (`--compose` with no image, `-f` or `--primary`), which boots no VM to name.
 
 ```sh
-vk run --state-dir "$PWD/.vk" --detach --ssh -f Dockerfile --target dev
+vk run --name app --detach --ssh -f Dockerfile --target dev
 vk list
 ```
 
 ```
-PID    UPTIME  MEM       NAME                SERVICES            PROJECT  PUBLISHED
-41230  2h14m   1.2G/8G   app/Dockerfile:dev  -                   ~/app    127.0.0.1:8443->localhost:443
-41877  35m     5.9G/16G  shop                db, redis, web, +4  ~/shop   127.0.0.1:5432->127.0.0.1:5432@db
+NAME        KIND     STATUS   PID    UPTIME  MEM       IMAGE               PROJECT  PUBLISHED
+app         run      running  41230  2h14m   1.2G/8G   app/Dockerfile:dev  ~/app    -
+shop        dev      running  41877  35m     5.9G/16G  devcontainer        ~/shop   -
+shop/db     service  running  -      -       -         -                   ~/shop   127.0.0.1:5432->127.0.0.1:5432@db
+shop/redis  service  stopped  -      -       -         -                   ~/shop   -
+scratch     run      stopped  -      -       -         alpine              ~/tmp    -
 ```
+
+`vk list` has one row per VM: running or stopped, primary or compose service (`NAME/SERVICE`).
+A service shows once it has a VM: while it runs, or after it has booted once; a declared
+service that never started is not listed.
+Rows are grouped by PROJECT — a dev environment's workspace, a run's `--workspace`, then
+`--workdir`, then launch directory, with `$HOME` shown as `~` — a primary first, then its
+services by name. `--running` and `--stopped` keep one state, `--kind dev|run|service` one
+kind. NAME is what every VM command takes. A running VM started before names existed shows
+its pid there.
 
 MEM is what the VM is costing the host now over the size it booted with: the resident
 memory of its whole process tree — the guest, its service VMs, the switch and the
 forwards — counted proportionally so a page several of them map is charged once, over the
 `--mem` token as the run recorded it. When proportional usage is unavailable,
 resident usage is used instead and may count shared pages more than once. The total includes
-service VMs and helpers, so it is not the primary guest's memory utilization.
-Either half is `-` on its own when unknown,
-and the cell is a bare `-` when neither is. NAME is the built Dockerfile with its target
-stage, the compose primary, or the image ref.
-SERVICES lists the compose services running beside the primary, or every declared one when
-the VM cannot be asked; `-` for none. Past three names, the rest are counted (`+4`).
-PROJECT is the run's `--workspace`, then its `--workdir`, then its launch directory, with
-`$HOME` shown as `~`. PUBLISHED is every port `vk publish ensure` holds open on the host
-for the VM, as `listen->to`, with `@NAME` when a compose sibling rather than the primary
-dials the target and `(unconfirmed)` when the publisher's liveness could not be checked;
-`-` when nothing is published. `--wide` (`-w`) names every service, prints the project
-directory in full and adds EXEC ADDRESS, recorded as given (a relative `--state-dir` lists a
-relative path). `--json` and `--field` already report every field, so neither takes `--wide`.
+service VMs and helpers, so a service's own row shows `-`. Either half is `-` on its own
+when unknown, and the cell is a bare `-` when neither is. IMAGE is the built Dockerfile with
+its target stage, the compose primary, or the image ref. PUBLISHED is every port
+`vk publish ensure` holds open on the host for the VM, as `listen->to`, with `@NAME` on the
+service that dials the target and `(unconfirmed)` when the publisher's liveness could not
+be checked. `--wide` (`-w`) prints the project directory in full and adds EXEC ADDRESS.
 
-An optional pid or directory scopes the list. A pid selects one VM, as with `vk stop`.
-A directory selects VMs whose project is that directory or below it, or whose state dir
-matches it exactly. If no VM matches, the message names the target:
-`no running vk VM with pid 99999`, or `no running vk VM under <dir>`.
+**Naming a VM.** Every VM command takes the same REF:
 
-When a selector names exactly one VM, `vk list` prints its full record instead of a table
-row: every field `--json` carries, then each compose service as name, state, LAN address and
+| REF | Means |
+|---|---|
+| `app`, `shop/db` | a name as `vk list` prints it; `NAME/SERVICE` for a compose service |
+| `41877` | the pid of a running VM's `vk run` |
+| `.`, `./x`, `../x`, `/abs`, `~/x` | a project or state directory, matched exactly; `--recursive` (`-r`) on `list`, `stop`, `reboot`, `pause` and `resume` also takes every VM below it |
+| (none) | the VM whose project is the current directory |
+
+A bare word is a name: write `./app` for a directory called `app`. A dev environment's state
+dir name (`app-3f9c0d1e2a4b5c6d`) still works.
+
+A REF that names exactly one running VM makes `vk list` print its full record instead of a
+table row: every recorded fact, then each compose service as name, state, LAN address and
 exec address, and each published port as name, `listen->to` (with `@NAME` when a compose
-sibling dials) and the publisher's pid. When liveness is unconfirmed, `(unconfirmed)`
-marks the pid; in the table it marks the address. Nothing is folded in a full record,
-so `--wide` has no effect.
+sibling dials) and the publisher's pid. Nothing is folded in a full record, so `--wide` has
+no effect.
 
 ```sh
-vk list ~/work               # every VM under a tree (a table when several match)
-vk list .                    # VMs for this tree or below; one VM prints in full
+vk list shop                 # one VM, in full
 vk list 41877                # one VM, by pid
-vk list /home/me/app/.vk     # one VM, by its state dir
+vk list -r ~/work            # every VM under a tree
+vk list --stopped            # what is not running
 ```
 
 ```
@@ -628,45 +637,33 @@ NAME          shop
 PID           41877
 UPTIME        35m (since 2026/09/04 08:12:03 UTC)
 PROJECT       /home/me/shop
-STATE DIR     /home/me/shop/.vk
-EXEC ADDRESS  vsock-auto:///home/me/shop/.vk/vsock.sock:4444
+STATE DIR     /home/me/.local/state/virtkit/dev/shop-1a2b
+EXEC ADDRESS  vsock-auto:///home/me/.local/state/virtkit/dev/shop-1a2b/vsock.sock:4444
 SSH           127.0.0.1:2222
 GUEST IP      10.0.0.2
 VMM           libkrun (pid 41902)
 CPUS          4
-MEM           8G
+MEM           16G
 MEM USED      5.9 GiB
 NESTED        no
 ATOP LOG      -
-SERVICES      db      running  10.0.0.3   vsock-auto:///home/me/shop/.vk/svc-db/vsock.sock:4444
-              redis   running  10.0.0.4   vsock-auto:///home/me/shop/.vk/svc-redis/vsock.sock:4444
-              web     running  10.0.0.5   vsock-auto:///home/me/shop/.vk/svc-web/vsock.sock:4444
-              worker  running  10.0.0.6   vsock-auto:///home/me/shop/.vk/svc-worker/vsock.sock:4444
-              mailer  running  10.0.0.7   vsock-auto:///home/me/shop/.vk/svc-mailer/vsock.sock:4444
-              queue   running  10.0.0.8   vsock-auto:///home/me/shop/.vk/svc-queue/vsock.sock:4444
-              minio   running  10.0.0.9   vsock-auto:///home/me/shop/.vk/svc-minio/vsock.sock:4444
-              search  stopped  10.0.0.10  vsock-auto:///home/me/shop/.vk/svc-search/vsock.sock:4444
+SERVICES      db      running  10.0.0.3   vsock-auto:///home/me/.local/state/virtkit/dev/shop-1a2b/svc-db/vsock.sock:4444
+              redis   stopped  10.0.0.4   vsock-auto:///home/me/.local/state/virtkit/dev/shop-1a2b/svc-redis/vsock.sock:4444
 PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 42011
 ```
 
-`--json` gives an array of objects, one per VM, with `pid`, `label`, `project_dir`,
-`exec_addr`, `state_dir`, `vmm`, `vmm_pid`, `cpus`, `mem`, `mem_used_bytes` (what the VM's
-process tree holds on the host now, in bytes — `null` when it could not be read),
-`nested`, `guest_ip` (the eth0 address on a `--net` LAN), `ssh_addr`, `atop_log`,
-`created_secs`, `uptime_secs`, `services` (every declared compose service with its
-`name`, `exec_addr`, `state` and LAN `ip`), and `published` (each publisher's `name`,
-`listen`, `to` and `pid`, plus `via` when a compose sibling dials — the one
-`vk publish ensure --via` named — and `"unconfirmed": true` when its liveness could not
-be checked). `--field` picks fields without jq, one `--field` per field: one line per VM
+`--json` gives an array with one object per row: `name`, `kind`, `status`, `parent` (a
+service's VM), `pid`, `uptime_secs`, `mem_used_bytes`, `mem`, `image`, `project`,
+`environment`, `state_dir`, `exec_addr`, `ssh_addr`, `ip` and `published` (`listen->to`
+strings). `--field` picks fields without jq, one `--field` per field: one line per row
 and tab-separated in flag order, or with `--json` objects holding only those fields; a
 dotted path reaches into nested values, and a key a record omits reads `null`:
 
 ```sh
-vk list . --field pid                   # the pid to hand to vk stop
-vk list . --field guest_ip              # the VM's address on the --net LAN
-vk list . --field label --field services.0.ip
-vk list . --field published.0.listen    # where the first published port listens
-vk list --json | jq '.[] | select(.label == "ci")'
+vk list app --field pid                 # the pid of a VM
+vk list shop/db --field ip              # a service's address on the run's LAN
+vk list --stopped --field name          # the names of what is stopped
+vk list --json | jq '.[] | select(.image == "ci")'
 ```
 
 `--stale` adds a column to the table, and a `STALE` row to a full record, reading `yes`,
@@ -937,8 +934,8 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk run` | Boot an image, Dockerfile target, or compose fleet; run a command or shell. |
 | `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk, or a Windows Dockerfile into a bundle. |
 | `vk exec` | Run a command in an existing guest and return the command's exit status. |
-| `vk list` | List running `--state-dir` VMs and UEFI bundle runs, and their compose services; scope by pid or directory, `-w` for the full table, `--json`/`--field` for scripts. |
-| `vk stop` | Stop a VM selected by pid or project directory, or stop all registered VMs. |
+| `vk list` | List every VM vk knows — running or stopped, dev environments, named runs and their compose services — one row each; `--running`/`--stopped`, `--kind`, `-w` for the full table, `--json`/`--field` for scripts. |
+| `vk stop` | Stop a running VM by the name `vk list` prints, its pid or project directory, or every one with `--all`. |
 | `vk reboot` | Reboot a running VM in place through its guest, or power-cycle it with `--force`. |
 | `vk status` | Probe a guest agent, or report whether its root image is stale. |
 | `vk logs` | Show a VM's console log, telling kernel, agent and guest output apart; `--level warn`, `--agent`, `--service NAME`, `-f`. |

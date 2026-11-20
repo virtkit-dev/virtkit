@@ -429,7 +429,7 @@ grep -q refresh <<<"$dry" && ok "the preview says what a refresh would do" || { 
 vkd stop >/dev/null && ok "dev stop stopped it" || bad "dev stop failed"
 status_is "not running" && ok "status: not running" || bad "status still reports a running VM"
 grep -q "not published" <<<"$(vkd endpoints)" && ok "the endpoint is no longer published" || bad "the endpoint outlived the VM"
-"$VK" list | grep -F "$WS" >/dev/null && bad "vk list still shows a VM for this workspace" || ok "vk list has no VM from this environment"
+"$VK" list --running | grep -F "$WS" >/dev/null && bad "vk list still shows a VM for this workspace" || ok "vk list has no VM from this environment"
 # Stopping what is already stopped is what it asked for, so it succeeds; only a stop that
 # could not do its job exits non-zero.
 rc=0; second=$(vkd stop 2>&1) || rc=$?
@@ -442,7 +442,7 @@ out=$(vkd task scratch) && rc=0 || rc=$?
 [ "$rc" -eq 0 ] && ok "the ephemeral task ran and tore its VM down" || { bad "the ephemeral task returned $rc"; echo "$out"; }
 grep -q '^MARK:.*ephemeral-marker' <<<"$out" && ok "it wrote /w/ephemeral-marker in its own overlay" || { bad "the task never wrote its marker"; echo "$out"; }
 [ -e "$WS/ephemeral-marker" ] && bad "the overlay write reached the host workspace" || ok "the host workspace is untouched"
-"$VK" list | grep -F "$WS" >/dev/null && bad "the ephemeral VM is still running" || ok "vk list has no leftover VM"
+"$VK" list --running | grep -F "$WS" >/dev/null && bad "the ephemeral VM is still running" || ok "vk list has no leftover VM"
 
 echo
 echo "== 10. a compose source brings its services, their endpoints and their disks =="

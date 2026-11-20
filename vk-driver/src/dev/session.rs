@@ -234,7 +234,26 @@ async fn ready_booted(plan: &Plan, readying: &Readying) -> Result<()> {
             storage_backings,
             readied_by_its_boot: by_its_boot,
         },
-    )
+    )?;
+    name_environment(plan);
+    Ok(())
+}
+
+/// Give the environment its VM name the moment it has an identity, so every command knows
+/// it by the same name from its first boot on, and none has to hand names out while it
+/// lists. An environment that has one keeps it. Best-effort, like the registry: one left
+/// unnamed is still reached by its state dir's own name, and named by the next listing.
+fn name_environment(plan: &Plan) {
+    let named = crate::names::Index::open().and_then(|idx| {
+        let base = crate::dev::list::default_name(&plan.workspace, &plan.environment);
+        idx.claim(&plan.state_dir, &base)
+    });
+    if let Err(e) = named {
+        eprintln!(
+            "vk: warning: naming the {} environment: {e:#}",
+            plan.environment
+        );
+    }
 }
 
 /// Serialize `exec-env` for the guest's SSH server as one `NAME=value` per line. Skip names
@@ -950,7 +969,10 @@ pub fn stop(state_dir: &Path, timeout: u64) -> Result<Stopped> {
         });
     }
     let (report, all_down) = crate::vms::stop_cmd(
-        Some(crate::vms::Selector::Dir(state_dir.to_path_buf())),
+        Some(crate::vms::Selector::Dir {
+            dir: state_dir.to_path_buf(),
+            below: false,
+        }),
         false,
         timeout,
     )?;

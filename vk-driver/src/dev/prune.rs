@@ -420,7 +420,7 @@ pub(super) fn run_by_name(name: &str, opts: &Options) -> Result<String> {
     // fails here the way it does there.
     let Some(row) = super::list::state(false)?
         .into_iter()
-        .find(|r| r.name == name)
+        .find(|r| r.name == name || r.dir_name == name)
     else {
         bail!("no dev environment state named {name} (`vk dev list` names them)");
     };

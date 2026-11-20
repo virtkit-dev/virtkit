@@ -1188,20 +1188,22 @@ impl WorkDir {
         // Make the path absolute so the registered run and derived paths work from any cwd.
         let path =
             std::path::absolute(&path).with_context(|| format!("resolving {}", path.display()))?;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&path)
-            .with_context(|| format!("creating {}", path.display()))?;
+        crate::statefile::create_dir_all(&path)?;
         // 0700 on create AND reuse: the dir holds the VM's control sockets (the
         // exec channel is a root shell in the guest), and unlike the temp-dir
         // default this path is caller-chosen — often inside a repo tree — so
         // deny other users traversal regardless of umask or a pre-existing mode.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restricting {} to 0700", path.display()))?;
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(crate::statefile::DIR_MODE),
+        )
+        .with_context(|| format!("restricting {} to its owner", path.display()))?;
         let lock = lock_state_dir(&path)?;
         remove_stale_sockets(&path)?;
         mark_active(&path);
+        // The dir is this run's from here on: leave its recipe — only now, so a run refused
+        // the dir never rewrites the recipe of the one that holds it.
+        crate::names::write_pending_recipe(&path)?;
         Ok(WorkDir {
             path,
             pinned: true,

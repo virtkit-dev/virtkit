@@ -91,8 +91,11 @@ pub struct Running {
 /// One state directory, as `vk dev list` reports it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Row {
-    /// the directory's own name, and what `vk dev gc` takes
+    /// the environment's VM name (see [`crate::names`]), else the directory's own name; what
+    /// `vk dev stop`, `vk dev gc` and every VM command take
     pub name: String,
+    /// the state directory's own name, which still names the environment too
+    pub dir_name: String,
     pub dir: PathBuf,
     /// the workspace the identity records; `None` when nothing was recorded
     pub workspace: Option<PathBuf>,
@@ -130,6 +133,98 @@ impl Row {
     fn stale(&self) -> bool {
         self.status != Status::Running
             && (self.has(Flag::WorkspaceMissing) || self.has(Flag::Ephemeral))
+    }
+}
+
+/// Give every dev environment that has no name one, oldest boot first, so names are handed
+/// out in the same order on every host and an existing host migrates without a boot. A boot
+/// names its own environment (`session::name_environment`), so this finds something to do
+/// only for environments from before names existed; with none, it writes nothing.
+/// Best-effort: a failure leaves the environments unnamed, still reachable by their state
+/// dir's own name.
+pub fn name_unnamed() {
+    let (Ok(base), Ok(idx)) = (
+        crate::dev::plan::dev_state_base(),
+        crate::names::Index::open(),
+    ) else {
+        return;
+    };
+    if let Err(e) = name_unnamed_in(&base, &idx) {
+        eprintln!("vk: warning: naming dev environments: {e:#}");
+    }
+}
+
+/// [`name_unnamed`] for the environments under `base`, in the index `idx`. An ephemeral
+/// directory (no `dev.json`) gets no name.
+pub(crate) fn name_unnamed_in(base: &Path, idx: &crate::names::Index) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Ok(());
+    };
+    let named: std::collections::HashSet<PathBuf> =
+        idx.all().into_iter().map(|(_, dir)| dir).collect();
+    let mut todo: Vec<(u64, PathBuf, String)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| crate::vms::canonical(&e.path()))
+        .filter(|dir| !named.contains(dir))
+        .filter_map(|dir| {
+            let bytes = std::fs::read(dir.join("dev.json")).ok()?;
+            let identity: crate::dev::Identity = serde_json::from_slice(&bytes).ok()?;
+            let text = |key: &str| identity.manifest.get(key)?.as_str().map(str::to_string);
+            let base = default_name(
+                Path::new(&text("workspace").unwrap_or_default()),
+                &text("environment").unwrap_or_else(|| "dev".into()),
+            );
+            Some((identity.booted_secs, dir, base))
+        })
+        .collect();
+    if todo.is_empty() {
+        return Ok(());
+    }
+    todo.sort();
+    let _lock = idx.lock()?;
+    for (_, dir, base) in todo {
+        idx.claim_locked(&dir, &base)?;
+    }
+    Ok(())
+}
+
+/// The dev state dirs under the dev base that are not among `named`, each with its own name
+/// and whether it recorded a boot (`dev.json`). Reads only, for a listing: what
+/// [`name_unnamed`] would name, and the directories no boot ever finished in.
+pub fn unnamed_dirs(named: &[(String, PathBuf)]) -> Vec<(String, PathBuf, bool)> {
+    let Ok(base) = crate::dev::plan::dev_state_base() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return Vec::new();
+    };
+    let named: std::collections::HashSet<&Path> = named.iter().map(|(_, d)| d.as_path()).collect();
+    entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| {
+            let dir = crate::vms::canonical(&e.path());
+            if named.contains(dir.as_path()) || named.contains(e.path().as_path()) {
+                return None;
+            }
+            let booted = dir.join("dev.json").is_file();
+            Some((e.file_name().to_str()?.to_string(), dir, booted))
+        })
+        .collect()
+}
+
+/// The name a dev environment is first given: its workspace's directory name, then
+/// `-<environment>` for any environment but `dev`.
+pub fn default_name(workspace: &Path, environment: &str) -> String {
+    let ws = workspace
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "workspace".into());
+    match environment {
+        "dev" => crate::names::sanitize(&ws),
+        env => crate::names::sanitize(&format!("{ws}-{env}")),
     }
 }
 
@@ -200,6 +295,7 @@ fn row(dir: &Path, running: &[Running], with_sizes: bool, with_flags: bool) -> R
     let booted_secs = identity.as_ref().map(|i| i.booted_secs);
     Row {
         name: dir.file_name().unwrap_or_default().to_string_lossy().into(),
+        dir_name: dir.file_name().unwrap_or_default().to_string_lossy().into(),
         dir: dir.to_path_buf(),
         workspace,
         workspace_folder: manifest("workspace_folder"),
@@ -254,7 +350,7 @@ pub fn contents(dir: &Path) -> Vec<Entry> {
 /// and `vk dev endpoints`. Each column is as wide as its widest cell, header included,
 /// columns are two spaces apart, and a line's trailing padding is trimmed. A row shorter
 /// than the header keeps the columns it has; a longer one widens the table.
-pub(super) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
+pub(crate) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
     let mut width: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
@@ -354,7 +450,7 @@ pub fn select_gc(rows: Vec<Row>, names: &[String], all_stale: bool) -> Result<Ve
     }
     let mut selected: Vec<Row> = Vec::new();
     for name in names {
-        let Some(row) = rows.iter().find(|r| &r.name == name) else {
+        let Some(row) = rows.iter().find(|r| &r.name == name || &r.dir_name == name) else {
             bail!("no dev environment state named {name} (`vk dev list` names them)");
         };
         selected.push(row.clone());
@@ -363,7 +459,7 @@ pub fn select_gc(rows: Vec<Row>, names: &[String], all_stale: bool) -> Result<Ve
         selected.extend(rows.iter().filter(|r| r.stale()).cloned());
     }
     selected.sort_by(|a, b| a.name.cmp(&b.name));
-    selected.dedup_by(|a, b| a.name == b.name);
+    selected.dedup_by(|a, b| a.dir == b.dir);
     if let Some(row) = selected.iter().find(|r| r.status == Status::Running) {
         bail!("{} is running — `vk dev stop {}` first", row.name, row.name);
     }
@@ -436,6 +532,9 @@ pub fn remove(selected: &[Row]) -> Result<String> {
         crate::publish::stop_all_quietly(&row.dir, PUBLISH_STOP);
         std::fs::remove_dir_all(&row.dir)
             .with_context(|| format!("removing {}", row.dir.display()))?;
+        if let Ok(idx) = crate::names::Index::open() {
+            idx.release(&row.dir);
+        }
         drop(lock);
         out.push_str(&format!(
             "removed {} ({})\n",
@@ -475,11 +574,26 @@ fn running_vms() -> Vec<Running> {
 /// the state base scanned against what is running. Measuring what each holds on disk is a stat
 /// walk of every file in it, done by default; `--no-sizes` (`sizes = false`) opts out.
 pub fn state(sizes: bool) -> Result<Vec<Row>> {
-    Ok(scan(
-        &crate::dev::plan::dev_state_base()?,
-        &running_vms(),
-        sizes,
-    ))
+    let mut rows = scan(&crate::dev::plan::dev_state_base()?, &running_vms(), sizes);
+    apply_names(&mut rows);
+    Ok(rows)
+}
+
+/// Name every row as the name index does, naming the environments that have none first,
+/// and order them by name.
+pub fn apply_names(rows: &mut [Row]) {
+    name_unnamed();
+    let Ok(idx) = crate::names::Index::open() else {
+        return;
+    };
+    let all = idx.all();
+    for row in rows.iter_mut() {
+        let canonical = crate::vms::canonical(&row.dir);
+        if let Some((name, _)) = all.iter().find(|(_, d)| *d == row.dir || *d == canonical) {
+            row.name = name.clone();
+        }
+    }
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
 /// [`state`] without sizes or flags: no workspace is looked at, so a hung share or an
@@ -548,6 +662,38 @@ mod tests {
         std::fs::write(dir.join("root.qcow2"), vec![0u8; 4096]).unwrap();
         std::fs::write(dir.join("console.log"), "boot\n").unwrap();
         dir
+    }
+
+    #[test]
+    fn unnamed_environments_get_names_oldest_boot_first_and_ephemeral_ones_none() {
+        let tmp = scratch("names");
+        let base = tmp.0.join("dev");
+        let idx = crate::names::Index::at(tmp.0.join("names"));
+        let with = |name: &str, ws: &str, env: &str, booted: u64| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let identity = serde_json::json!({
+                "digest": "d", "booted_secs": booted,
+                "manifest": {"workspace": ws, "environment": env},
+            });
+            std::fs::write(dir.join("dev.json"), identity.to_string()).unwrap();
+            crate::vms::canonical(&dir)
+        };
+        // Two checkouts named `app`: the one booted first keeps the plain name.
+        let newer = with("app-1111", "/a/app", "dev", 200);
+        let older = with("app-2222", "/b/app", "dev", 100);
+        let ci = with("app-ci-3333", "/a/app", "ci", 300);
+        ephemeral(&base, "app-task-x-44");
+        name_unnamed_in(&base, &idx).unwrap();
+        assert_eq!(idx.name_of(&older).as_deref(), Some("app"));
+        assert_eq!(idx.name_of(&newer).as_deref(), Some("app-2"));
+        assert_eq!(idx.name_of(&ci).as_deref(), Some("app-ci"));
+        assert_eq!(idx.all().len(), 3);
+        // Run again, nothing changes.
+        name_unnamed_in(&base, &idx).unwrap();
+        assert_eq!(idx.all().len(), 3);
+        assert_eq!(default_name(Path::new("/x/My Repo"), "dev"), "my-repo");
+        assert_eq!(default_name(Path::new("/"), "e2e"), "workspace-e2e");
     }
 
     #[test]

@@ -1206,7 +1206,11 @@ enum Ready {
 fn dev_gc(yes: bool, all_stale: bool, names: &[String], own: bool) -> ExitCode {
     // Always measured: the preview's whole job is to show what is about to be destroyed.
     let selected = match crate::dev::list::state(true).and_then(|rows| {
-        if own && !rows.iter().any(|r| names.contains(&r.name)) {
+        if own
+            && !rows
+                .iter()
+                .any(|r| names.contains(&r.name) || names.contains(&r.dir_name))
+        {
             return Ok(Vec::new());
         }
         crate::dev::list::select_gc(rows, names, all_stale)
@@ -1259,21 +1263,18 @@ fn dev_stop_named(name: &str, timeout: u64) -> ExitCode {
     }
 }
 
-/// Match only immediate directories, like `list`, without collecting their metadata.
+/// The state dir of the dev environment `name` names — its VM name, or its state dir's own
+/// name — without collecting any listing's metadata.
 fn named_state_dir(name: &str) -> anyhow::Result<PathBuf> {
-    let base = plan::dev_state_base()?;
-    let entries = match std::fs::read_dir(&base) {
-        Ok(entries) => Some(entries),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(anyhow::Error::new(e).context("reading dev environment state")),
-    };
-    for entry in entries.into_iter().flatten() {
-        let entry = entry?;
-        if entry.file_name() == std::ffi::OsStr::new(name) && entry.file_type()?.is_dir() {
-            return Ok(entry.path());
-        }
+    let base = crate::vms::canonical(&plan::dev_state_base()?);
+    match crate::names::resolve(name)? {
+        Some(dir) if crate::vms::canonical(&dir).parent() == Some(base.as_path()) => Ok(dir),
+        Some(dir) => anyhow::bail!(
+            "{name} is not a dev environment ({}); `vk stop {name}` stops any VM",
+            dir.display()
+        ),
+        None => anyhow::bail!("no dev environment state named {name} (`vk dev list` names them)"),
     }
-    anyhow::bail!("no dev environment state named {name} (`vk dev list` names them)")
 }
 
 /// Bring the environment up, from whichever of the two processes this is (see `dev`'s module
