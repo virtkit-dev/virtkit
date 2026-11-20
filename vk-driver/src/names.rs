@@ -1,5 +1,6 @@
-//! The index maps stable VM names to state directories. `vk dev list` displays environment
-//! names, and `vk dev stop`, `gc` and `prune` accept them.
+//! The index maps stable VM names to state directories. `vk list` prints these names.
+//! VM commands accept these names. `vk dev list`, `vk dev stop`, `vk dev gc` and
+//! `vk dev prune` use the names of dev environments.
 //!
 //! Each `$XDG_STATE_HOME/virtkit/names/<name>` symlink points to a state directory.
 //! Creating the link reserves the name atomically. The index's `.lock` serializes
@@ -232,21 +233,39 @@ impl Index {
         std::fs::read_link(self.dir.join(name)).ok()
     }
 
-    /// Every name and its state dir, by name.
+    /// Whether the run's name claim is still uncommitted.
+    pub fn is_provisional(&self, name: &str) -> bool {
+        std::fs::symlink_metadata(self.dir.join(marker(name))).is_ok()
+    }
+
+    /// Name and state directory pairs sorted by name, or an empty list on a read error.
     pub fn all(&self) -> Vec<(String, PathBuf)> {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return Vec::new();
+        self.try_all().unwrap_or_default()
+    }
+
+    /// Like [`Index::all`], but propagates directory read errors. A missing index is empty.
+    pub fn try_all(&self) -> Result<Vec<(String, PathBuf)>> {
+        let read = |e| anyhow::Error::from(e).context(format!("reading {}", self.dir.display()));
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(read(e)),
         };
-        let mut out: Vec<(String, PathBuf)> = entries
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
-                validate(&name).ok()?;
-                Some((name, std::fs::read_link(e.path()).ok()?))
-            })
-            .collect();
+        let mut out = Vec::new();
+        for e in entries {
+            let e = e.map_err(read)?;
+            let Ok(name) = e.file_name().into_string() else {
+                continue;
+            };
+            if validate(&name).is_err() {
+                continue;
+            }
+            if let Ok(target) = std::fs::read_link(e.path()) {
+                out.push((name, target));
+            }
+        }
         out.sort();
-        out
+        Ok(out)
     }
 
     /// The name of `dir`, if it has one.
@@ -519,8 +538,8 @@ impl Raw {
     }
 }
 
-/// `#[serde(with)]` for one `OsString` or `PathBuf`, as [`Raw`].
-mod os_string {
+/// Serialize an `OsString` or `PathBuf` as [`Raw`]. Existing JSON strings remain valid.
+pub(crate) mod os_string {
     use super::{OsStr, OsString, Raw};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -533,19 +552,60 @@ mod os_string {
     }
 }
 
-/// `#[serde(with)]` for a list of `OsString`s, each as [`Raw`].
-mod os_strings {
-    use super::{OsString, Raw};
-    use serde::{Deserialize, Deserializer, Serializer};
+/// [`os_string`] for an optional value, `null` for none.
+pub(crate) mod opt_os_string {
+    use super::{OsStr, OsString, Raw};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    pub fn serialize<S: Serializer>(v: &[OsString], s: S) -> Result<S::Ok, S::Error> {
-        s.collect_seq(v.iter().map(|a| Raw::of(a)))
+    pub fn serialize<T: AsRef<OsStr>, S: Serializer>(
+        v: &Option<T>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        v.as_ref().map(|v| Raw::of(v.as_ref())).serialize(s)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<OsString>, D::Error> {
+    pub fn deserialize<'de, T: From<OsString>, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<T>, D::Error> {
+        Ok(Option::<Raw>::deserialize(d)?.map(|r| r.into_os().into()))
+    }
+}
+
+/// `#[serde(with)]` for a list of `OsString`s or `PathBuf`s, each as [`Raw`].
+pub(crate) mod os_strings {
+    use super::{OsStr, OsString, Raw};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<T: AsRef<OsStr>, S: Serializer>(v: &[T], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(v.iter().map(|a| Raw::of(a.as_ref())))
+    }
+
+    pub fn deserialize<'de, T: From<OsString>, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Vec<T>, D::Error> {
         Ok(Vec::<Raw>::deserialize(d)?
             .into_iter()
-            .map(Raw::into_os)
+            .map(|r| r.into_os().into())
+            .collect())
+    }
+}
+
+/// `#[serde(with)]` for a list of `(name, path)` pairs, each path as [`Raw`].
+pub(crate) mod named_os_strings {
+    use super::Raw;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::path::PathBuf;
+
+    pub fn serialize<S: Serializer>(v: &[(String, PathBuf)], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(v.iter().map(|(n, p)| (n, Raw::of(p.as_os_str()))))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Vec<(String, PathBuf)>, D::Error> {
+        Ok(Vec::<(String, Raw)>::deserialize(d)?
+            .into_iter()
+            .map(|(n, r)| (n, PathBuf::from(r.into_os())))
             .collect())
     }
 }
@@ -571,6 +631,19 @@ impl Recipe {
         let json = serde_json::to_vec_pretty(self).context("encoding the run recipe")?;
         crate::statefile::write(&dir.join(RECIPE), &json)
             .with_context(|| format!("writing {}", dir.join(RECIPE).display()))
+    }
+
+    /// Read the saved recipe. A missing file returns `None`.
+    pub fn read(dir: &Path) -> Result<Option<Recipe>> {
+        let path = dir.join(RECIPE);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes)
+                    .with_context(|| format!("reading {}", path.display()))?,
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
     }
 }
 
@@ -763,6 +836,19 @@ mod tests {
         let back: Recipe = serde_json::from_str(&json).unwrap();
         assert_eq!(back, recipe);
         assert_eq!(back.args[2], odd);
+    }
+
+    #[test]
+    fn a_recipe_reads_back_what_was_written() {
+        let t = tmp("recipe");
+        assert_eq!(Recipe::read(&t.0).unwrap(), None);
+        let r = Recipe {
+            args: vec!["run".into(), "alpine".into()],
+            cwd: "/w".into(),
+            project_dir: "/p".into(),
+        };
+        r.write(&t.0).unwrap();
+        assert_eq!(Recipe::read(&t.0).unwrap(), Some(r));
     }
 
     #[test]

@@ -551,9 +551,9 @@ are lost. `--images --storage` and `--all` select both categories.
 vk dev prune NAME --all             # prune another environment by its `vk dev list` name
 ```
 
-Use the VM name from `vk dev list` or the state directory's name for `NAME`. Either
-selects an environment host-wide without a workspace config. Prune uses the storage
-recorded at its last boot, so workspace moves or changes do not affect selection.
+For `NAME`, use the environment name from `vk list` or `vk dev list`, or its state
+directory's name. Either works host-wide without a workspace config. Prune uses the storage
+recorded at the last boot, even if the workspace has moved or changed.
 An environment booted by a `vk` from before
 this was recorded prunes its images and its fixed roots, overlays and editor storage,
 but a disk backing left loose in the state directory cannot be identified by name; prune
@@ -594,9 +594,10 @@ workspace's environment, not its task leftovers; if that environment has no
 state, it reports nothing to remove. At first boot, an environment gets a stable name
 from its workspace directory, with `-ENV` appended for environments other than `dev`.
 Collisions add `-2`, `-3`, and so on. A listing or name lookup assigns names to older
-environments. The same name works with `vk stop` and every other VM command. The state
+environments. Use that name with `vk stop` and other VM commands. `vk list` shows the
+environment's active and previously started compose services under `NAME/SERVICE`. The state
 directory's name also works, including any leading `.` or `-`
-(e.g. `app-3f9c0d1e2a4b5c6d`, shown as `dir_name` in `--json`). A task's leftover
+(e.g. `app-3f9c0d1e2a4b5c6d`, shown as `dir_name` in `vk dev list --json`). A task's leftover
 state uses only its directory name. If `NAME` identifies two different directories,
 use the other name of the environment you want. The `MEM` column
 shows what a running environment's VM holds on the host now over the size it

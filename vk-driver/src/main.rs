@@ -110,6 +110,7 @@ mod units;
 mod usage;
 mod vm;
 mod vmdk;
+mod vmlist;
 mod vmm;
 mod vmmctl;
 mod vmmthreads;
@@ -737,8 +738,9 @@ enum PublishAction {
         to: String,
         /// have this compose sibling's agent dial instead of the primary's
         ///
-        /// By name, as `vk list --wide` shows it; the service must be running. Reported as
-        /// `via` by `vk publish list --json` and in `vk list --json`'s `published`.
+        /// By name: the service part of a `vk list` row (`db` in `shop/db`); the service must
+        /// be running. Reported as `via` by `vk publish list --json`, and as `@NAME` in
+        /// `vk list`'s PUBLISHED.
         #[arg(long, visible_alias = "service", value_name = "NAME")]
         via: Option<String>,
     },
@@ -1386,8 +1388,8 @@ enum Cmd {
     Status {
         /// which VM: a name, a pid, a project directory, or a raw agent address
         ///
-        /// A REF (`NAME/SERVICE` for a compose service; default: the current directory's
-        /// VM); a raw agent address (`scheme://…`) is dialed directly.
+        /// A REF as `vk list` prints it (`NAME/SERVICE` for a compose service; default: the
+        /// current directory's VM); a raw agent address (`scheme://…`) is dialed directly.
         #[arg(value_name = "REF")]
         target: Option<String>,
         /// print whether the VM's root image is `fresh`, `stale` or `unknown`
@@ -1465,13 +1467,14 @@ enum Cmd {
     Exec {
         /// which VM: a name, a pid, a project directory, or a raw agent address
         ///
-        /// A REF (`NAME/SERVICE` for a compose service; default: the current directory's
-        /// VM); a raw agent address (`scheme://…`) is dialed directly.
+        /// A REF as `vk list` prints it (`NAME/SERVICE` for a compose service; default: the
+        /// current directory's VM); a raw agent address (`scheme://…`) is dialed directly.
         #[arg(value_name = "REF")]
         target: Option<String>,
         /// run in this compose sibling service instead of the primary
         ///
-        /// By name, as `vk list --wide` shows it; the service must be running.
+        /// By name: the service part of a `vk list` row (`db` in `shop/db`); the service must
+        /// be running.
         #[arg(long, value_name = "NAME")]
         service: Option<String>,
         /// Background mode: no stdio, do not wait for the command to exit
@@ -1549,13 +1552,14 @@ enum Cmd {
     Publish {
         /// which VM's agent to ask: a name, a pid, a project directory, or a raw agent address
         ///
-        /// A REF (`NAME/SERVICE` for a compose service; default: the current directory's
-        /// VM); a raw agent address (`scheme://…`) is dialed directly.
+        /// A REF as `vk list` prints it (`NAME/SERVICE` for a compose service; default: the
+        /// current directory's VM); a raw agent address (`scheme://…`) is dialed directly.
         #[arg(value_name = "REF")]
         target: Option<String>,
         /// have this compose sibling's agent dial instead of the primary's
         ///
-        /// By name, as `vk list --wide` shows it; the service must be running. This form
+        /// By name: the service part of a `vk list` row (`db` in `shop/db`); the service must
+        /// be running. This form
         /// records nothing, so nothing reports it; `vk publish ensure --via` is reported as
         /// `via`.
         #[arg(long, visible_alias = "service", value_name = "NAME")]
@@ -1794,6 +1798,9 @@ enum Cmd {
     /// interactive shell — runs in the guest. Without `--detach`, `vk` exits with the guest
     /// command's status, dying of its signal if it was killed; a run failure exits 1 and a
     /// `--require-cached` miss exits 3. A `--shell` session exits 0 whatever its status.
+    ///
+    /// `--name`, `--state-dir` or `--detach` gives the primary a name that `vk list` keeps
+    /// after it stops. A services-only compose run has no primary to name.
     #[command(display_order = 1)]
     Run {
         /// Image to boot, e.g. `alpine:3.20`
@@ -2386,7 +2393,7 @@ enum Cmd {
             help_heading = "Mounts and disks"
         )]
         state_dir: Option<PathBuf>,
-        /// name the VM, a handle it keeps after it stops
+        /// name the VM, a handle it keeps after it stops and `vk list` shows
         ///
         /// 1 to 40 of a-z, 0-9, `.`, `_` and `-`, starting with a letter or a digit, and not
         /// all digits (that reads as a pid). Without `--state-dir`, the VM gets a state dir of its own under
@@ -2598,51 +2605,69 @@ enum Cmd {
         #[arg(last = true)]
         command: Vec<String>,
     },
-    /// List the running vk VMs
+    /// List known VMs and their compose services by project
     ///
-    /// VMs started with `--state-dir`, with their pid, uptime, memory, name, compose
-    /// services, project directory (`--workspace`, then `--workdir`, then launch directory)
-    /// and published ports (`listen->to`; `@service` when a compose sibling dials). MEM is
-    /// what the VM's whole process tree holds on the host right now over the size it booted
-    /// with (`1.2G/8G`) — the guest, its service VMs and their helpers, counted
-    /// proportionally so pages they share are charged once. The table folds `$HOME` to `~`
-    /// and names at most three services; `--wide` shows every service, the project directory
-    /// in full and the exec-channel address. With a REF, only the VMs it names; one that
-    /// names exactly one VM prints its full record instead of a table row. The record folds
-    /// nothing, so `--wide` has nothing to add there. Use `--json` or `--field` for scripts;
-    /// neither takes `--wide`, since both already report every field.
+    /// Each primary has a row, followed by its services in name order. A service appears when
+    /// its manager reports it active or its console log records a start. `vk list` includes dev
+    /// environments, named runs and running UEFI bundles. A dev environment's project is its
+    /// workspace. A run uses `--workspace`, then `--workdir`, then its launch directory.
+    ///
+    /// Use NAME with commands such as `vk stop`. A dev environment without a stable name uses
+    /// its state directory's name. Other unnamed running VMs use their pid. `vk list`, `exec`,
+    /// `cp`, `logs`, `status` and `publish` also accept `NAME/SERVICE`.
+    ///
+    /// On a running primary, MEM shows host memory used by its process tree over the recorded
+    /// boot size (`1.2G/8G`). The tree includes its service VMs and helpers. Proportional
+    /// usage counts shared pages once. The fallback to resident usage can count them more than once.
+    /// The table abbreviates `$HOME` to `~`. `--wide` shows full project paths and exec addresses.
+    ///
+    /// Without `--json` or `--field`, a reference to exactly one running primary and no stopped
+    /// primary prints its full record. A service reference or `--running`, `--stopped` or
+    /// `--kind` selects table rows instead. Use `--json` or `--field` for scripts. For example,
+    /// `vk list --running --kind service --field name` prints names for `vk exec`.
     #[command(display_order = 6)]
     List {
         /// which VMs: a name, a pid, or those of a project directory (default: all)
         ///
-        /// A VM's name; an all-digit argument is a pid; a path (`/…`,
-        /// `./…`, `../…`, `~…`) a project or state directory, matched exactly unless
-        /// `--recursive`.
+        /// A name as the NAME column prints it (`NAME/SERVICE` for one service row); an
+        /// all-digit argument is a pid; a path (`/…`, `./…`, `../…`, `~…`) a project or
+        /// state directory, matched exactly unless `--recursive`.
         #[arg(value_name = "REF")]
         target: Option<std::ffi::OsString>,
         /// with a directory (default: the current one), also every VM whose project is below it
         #[arg(short = 'r', long)]
         recursive: bool,
-        /// the full table: every service named, the project path in full, and EXEC ADDRESS
+        /// only the VMs reported running
+        ///
+        /// A service counts by its own state; one whose state could not be read is left out.
+        #[arg(long, conflicts_with = "stopped")]
+        running: bool,
+        /// only stopped VMs and dev environments that never booted
+        #[arg(long)]
+        stopped: bool,
+        /// only VMs of this kind
+        #[arg(long, value_name = "KIND")]
+        kind: Option<crate::vmlist::Kind>,
+        /// the full table: the project path in full, and EXEC ADDRESS
         #[arg(short = 'w', long, conflicts_with_all = ["json", "field"])]
         wide: bool,
-        /// emit the entries as a JSON array instead of a table
+        /// emit the rows as a JSON array instead of a table
         #[arg(long)]
         json: bool,
         /// print only this field of each VM (repeatable, one field per flag)
         ///
-        /// A `--json` key, or a dotted path into one: `guest_ip`, `services.0.ip`. Several
+        /// A `--json` key, or a dotted path into one: `ip`, `published.0`. Several
         /// fields take one `--field` each, not a list. One line per VM, the fields
         /// tab-separated, each as `jq -r` would print it: a string bare, anything else as
-        /// JSON; as text, nothing running prints nothing. Values are not escaped, so a value
+        /// JSON; as text, no rows print nothing. Values are not escaped, so a value
         /// holding a tab or newline needs `--json`, which gives an array of objects holding
         /// only those fields.
         #[arg(long, value_name = "FIELD")]
         field: Vec<String>,
-        /// also report, per VM, whether a fresh `vk run` would rebuild its image
+        /// check running primaries and their build services for stale images
         ///
-        /// The report says whether the working tree drifted from what booted. It resolves
-        /// base image digests, so it does network I/O.
+        /// Reports whether a fresh `vk run` would rebuild an image. Checking base image digests
+        /// can use the network. Service and stopped rows show `-` (`null` in JSON).
         #[arg(long)]
         stale: bool,
     },
@@ -2655,8 +2680,9 @@ enum Cmd {
     Stop {
         /// the VM to stop: a name, a pid or a directory (default: the current one's)
         ///
-        /// A VM's name; an all-digit argument is a pid; a path (`/…`, `./…`, `../…`,
-        /// `~…`) a project or state directory, matched exactly unless `--recursive`.
+        /// A VM's name as `vk list` prints it; an all-digit argument is a pid; a path (`/…`,
+        /// `./…`, `../…`, `~…`) a project or state directory, matched exactly unless
+        /// `--recursive`.
         #[arg(value_name = "REF")]
         target: Option<std::ffi::OsString>,
         /// with a directory (default: the current one), also every VM whose project is below it
@@ -3821,17 +3847,30 @@ async fn cli_main(cli: Cli) -> ExitCode {
     if let Cmd::List {
         target,
         recursive,
+        running,
+        stopped,
+        kind,
         wide,
         json,
         field,
         stale,
     } = &cli.cmd
     {
-        let target = match vms::selector_of(target.as_deref(), *recursive) {
-            Ok(sel) => sel,
-            Err(e) => return fail(&e, 2),
+        let opts = vms::ListOpts {
+            target: target.clone(),
+            recursive: *recursive,
+            json: *json,
+            stale: *stale,
+            fields: field.clone(),
+            wide: *wide,
+            filter: crate::vmlist::Filter {
+                running: *running,
+                stopped: *stopped,
+                kind: *kind,
+                service: None,
+            },
         };
-        return match vms::list_report(target, *json, *stale, field, *wide) {
+        return match vms::list_report(opts) {
             Ok(report) => write_report(&report),
             Err(e) => fail(&e, 2),
         };

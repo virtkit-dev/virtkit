@@ -31,11 +31,13 @@ use vk_core::fleetctl::{Frame, Reply, Request, UnitStatus};
 /// One running VM's record. Serialized as `<slug(state_dir)>.json` in the registry dir.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmEntry {
-    /// The run's `--state-dir`, canonicalized — the VM's identity and the file's key.
+    /// The canonical state directory identifies the VM and keys its registry file. Paths
+    /// serialize as UTF-8 strings or as `{"bytes": [...]}` for other byte sequences.
+    #[serde(with = "crate::names::os_string")]
     pub state_dir: PathBuf,
     /// Canonical project directory: `--workspace`, then `--workdir`, then the `vk run`
     /// launch directory. `vk list DIR` and `vk stop DIR` match it; `None` when unavailable.
-    #[serde(default)]
+    #[serde(default, with = "crate::names::opt_os_string")]
     pub project_dir: Option<PathBuf>,
     /// PID of the managing `vk run`, which holds the state-dir lock. `vk list` displays it, and
     /// `vk stop` can select and signal it. On exit, it tears down the VM and compose siblings.
@@ -49,7 +51,7 @@ pub struct VmEntry {
     pub ssh_addr: Option<String>,
     /// The boot-time recording (`vk run --atop`) this VM's guest is writing, else `None`.
     /// `vk atop` follows this log instead of attaching a second sampler.
-    #[serde(default)]
+    #[serde(default, with = "crate::names::opt_os_string")]
     pub atop_log: Option<PathBuf>,
     /// Unix time (seconds) the entry was recorded — the VM's start, for an uptime column.
     pub created_secs: u64,
@@ -96,11 +98,11 @@ pub struct VmEntry {
     pub services: Vec<ServiceEntry>,
     /// The qemu-ga socket of an agent-less guest (a UEFI bundle: Windows), which `vk exec` and
     /// `vk cp` use instead of `exec_addr`; `None` for a guest running vk-agent.
-    #[serde(default)]
+    #[serde(default, with = "crate::names::opt_os_string")]
     pub guest_agent: Option<PathBuf>,
     /// The VM's control socket ([`crate::vmmctl`]), which `vk pause` and `vk resume` use;
     /// `None` for a VM without one.
-    #[serde(default)]
+    #[serde(default, with = "crate::names::opt_os_string")]
     pub control: Option<PathBuf>,
 }
 
@@ -122,16 +124,19 @@ pub struct ServiceEntry {
 /// key matches the one the boot stamped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaleRecipe {
+    #[serde(with = "crate::names::os_strings")]
     pub dockerfiles: Vec<PathBuf>,
+    #[serde(with = "crate::names::os_strings")]
     pub contexts: Vec<PathBuf>,
     /// Named build contexts, so editing a file in one is seen as drift like any other input.
     /// Defaulted: an entry written before this field existed must still load, or the VM it
     /// describes drops out of the registry (`load_all_in` skips what it cannot parse).
-    #[serde(default)]
+    #[serde(default, with = "crate::names::named_os_strings")]
     pub build_contexts: Vec<(String, PathBuf)>,
     pub build_args: Vec<(String, String)>,
     pub target: Option<String>,
     /// The built root image whose ext4 UUID carries its stamped stage key.
+    #[serde(with = "crate::names::os_string")]
     pub root_ext4: PathBuf,
 }
 
@@ -165,7 +170,7 @@ impl Freshness {
             Freshness::Unknown => "unknown",
         }
     }
-    fn json(self) -> Option<bool> {
+    pub(crate) fn json(self) -> Option<bool> {
         match self {
             Freshness::Stale => Some(true),
             Freshness::Fresh => Some(false),
@@ -380,6 +385,28 @@ pub(crate) fn running_in(dir: &Path) -> Vec<VmEntry> {
     out
 }
 
+/// The last registry entry of a VM, kept in its state dir.
+pub const LAST: &str = ".virtkit-last.json";
+
+fn record_last(entry: &VmEntry) -> Result<()> {
+    crate::statefile::write(
+        &entry.state_dir.join(LAST),
+        &serde_json::to_vec_pretty(entry)?,
+    )
+}
+
+/// Read the last registration. Older VMs may have no saved copy.
+pub fn last_entry(state_dir: &Path) -> Result<Option<VmEntry>> {
+    let path = state_dir.join(LAST);
+    match std::fs::read(&path) {
+        Ok(json) => serde_json::from_slice(&json)
+            .map(Some)
+            .with_context(|| format!("reading {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 /// RAII handle: removes the VM's registry entry when the run drops it (clean exit or unwind).
 /// A `SIGKILL` skips this — those stale entries are pruned by `alive` on the next read.
 pub struct Registration {
@@ -394,13 +421,17 @@ impl Drop for Registration {
     }
 }
 
-/// Record a VM and return a handle that unregisters it on drop. Best-effort: a write failure
-/// only warns (the registry is a convenience, never a reason to fail a boot) and yields a
-/// no-op handle.
+/// Register a VM until the returned handle drops. Both writes are best-effort. A failed
+/// state-directory copy only warns. A failed registry write also yields a no-op handle.
 pub fn register(entry: VmEntry) -> Registration {
     // Serialized against a correction to the same entry (see `WRITES`); taken here rather than
     // in `record_in`, which the correction calls while already holding it.
     let _writes = WRITES.lock().unwrap_or_else(PoisonError::into_inner);
+    // Refresh the saved boot details for the next stopped listing. A failed write can leave
+    // an older registration in the state directory.
+    if let Err(e) = record_last(&entry) {
+        eprintln!("virtkit: warning: could not keep the VM's entry in its state dir: {e:#}");
+    }
     match registry_dir().and_then(|dir| record_in(&dir, &entry)) {
         Ok(()) => Registration {
             state_dir: Some(entry.state_dir),
@@ -550,134 +581,8 @@ pub(crate) fn fmt_uptime(s: u64) -> String {
     }
 }
 
-/// The public shape of a VM in `vk list --json`: the user-facing fields plus a computed
-/// `uptime_secs` and (with `--stale`) `stale`. Deliberately omits the internal `stale_recipe`,
-/// so the JSON stays a stable contract for scripts. Fields an older `vk run` did not record
-/// serialize as `null`; inside `published`, `via` and `unconfirmed` are omitted rather than
-/// `null`/`false` when they do not apply.
-#[derive(Serialize)]
-struct VmView<'a> {
-    state_dir: &'a Path,
-    project_dir: Option<&'a Path>,
-    pid: u32,
-    vmm: Option<&'a str>,
-    vmm_pid: Option<u32>,
-    label: &'a str,
-    exec_addr: &'a str,
-    ssh_addr: Option<&'a str>,
-    guest_ip: Option<std::net::Ipv4Addr>,
-    cpus: Option<u32>,
-    mem: Option<&'a str>,
-    /// Live host memory for the guest, service VMs and helpers (`usage::tree_resident`),
-    /// beside the boot-time size in `mem`. `null` when the managing `vk run` is gone or
-    /// the tree's memory could not be read from `/proc`.
-    mem_used_bytes: Option<u64>,
-    nested: Option<bool>,
-    atop_log: Option<&'a Path>,
-    created_secs: u64,
-    uptime_secs: u64,
-    /// A double option so `--stale` is self-describing: the outer `None` (no `--stale`) omits
-    /// the field, while `Some(None)` — freshness requested but unknown — serializes as an
-    /// explicit `null`, distinct from a known `true`/`false`. Reflects the VM *and* its services.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stale: Option<Option<bool>>,
-    /// Every declared compose service (empty for a non-compose VM), each with its state.
-    services: Vec<ServiceView<'a>>,
-    /// The ports `vk publish ensure` holds open on the host for this VM.
-    published: Vec<PublishedView<'a>>,
-}
-
 /// A managed publisher's record and whether it was shown to be running.
-type Published = (crate::publish::Entry, crate::publish::Liveness);
-
-/// One managed publisher (`<state dir>/publish/<name>.json`) as `vk list --json` shows it.
-#[derive(Serialize)]
-struct PublishedView<'a> {
-    name: &'a str,
-    /// The host address it accepts connections on.
-    listen: &'a str,
-    /// The address the guest dials for each connection.
-    to: &'a str,
-    /// The compose sibling whose agent dials `to`; absent when the primary dials.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    via: Option<&'a str>,
-    pid: u32,
-    /// Serialized only when the lock could not be tested (see `vk publish list`); the pid is
-    /// then not to be trusted.
-    #[serde(skip_serializing_if = "is_false")]
-    unconfirmed: bool,
-}
-
-/// `skip_serializing_if` for a flag that means something only when set.
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
-#[derive(Serialize)]
-struct ServiceView<'a> {
-    name: &'a str,
-    exec_addr: &'a str,
-    /// `"running"` or `"stopped"`. `null` when the VM could not be asked (the text view then
-    /// names every declared service) or when its reply omits the declared name (the text view
-    /// then leaves it out).
-    state: Option<&'a str>,
-    /// The service's address on the run's LAN, without the prefix length; `null` whenever
-    /// `state` is.
-    ip: Option<&'a str>,
-}
-
-fn view<'a>(
-    entry: &'a VmEntry,
-    units: Option<&'a [UnitStatus]>,
-    published: &'a [Published],
-    freshness: Freshness,
-    stale: bool,
-    mem_used: Option<u64>,
-) -> VmView<'a> {
-    VmView {
-        state_dir: &entry.state_dir,
-        project_dir: entry.project_dir.as_deref(),
-        pid: entry.pid,
-        vmm: entry.vmm.as_deref(),
-        vmm_pid: entry.vmm_pid,
-        label: &entry.label,
-        exec_addr: &entry.exec_addr,
-        ssh_addr: entry.ssh_addr.as_deref(),
-        guest_ip: entry.guest_ip,
-        cpus: entry.cpus,
-        mem: entry.mem.as_deref(),
-        mem_used_bytes: mem_used,
-        nested: entry.nested,
-        atop_log: entry.atop_log.as_deref(),
-        created_secs: entry.created_secs,
-        uptime_secs: unix_now().saturating_sub(entry.created_secs),
-        stale: if stale { Some(freshness.json()) } else { None },
-        services: entry
-            .services
-            .iter()
-            .map(|service| {
-                let unit = find_unit(units, &service.name);
-                ServiceView {
-                    name: &service.name,
-                    exec_addr: &service.exec_addr,
-                    state: unit.map(|u| u.state.as_str()),
-                    ip: unit.map(|u| bare_ip(&u.ip)),
-                }
-            })
-            .collect(),
-        published: published
-            .iter()
-            .map(|(e, liveness)| PublishedView {
-                name: &e.name,
-                listen: &e.listen,
-                to: &e.to,
-                via: e.service.as_deref(),
-                pid: e.pid,
-                unconfirmed: liveness.unconfirmed(),
-            })
-            .collect(),
-    }
-}
+pub(crate) type Published = (crate::publish::Entry, crate::publish::Liveness);
 
 /// The reported status of the declared service `name`, if the VM answered and listed it.
 fn find_unit<'a>(units: Option<&'a [UnitStatus]>, name: &str) -> Option<&'a UnitStatus> {
@@ -685,19 +590,13 @@ fn find_unit<'a>(units: Option<&'a [UnitStatus]>, name: &str) -> Option<&'a Unit
 }
 
 /// The service manager reports addresses as `ip/prefix`; the view shows only the address.
-fn bare_ip(ip: &str) -> &str {
+pub(crate) fn bare_ip(ip: &str) -> &str {
     ip.split_once('/').map_or(ip, |(addr, _)| addr)
-}
-
-/// Whether the text view names `name`: when the VM reports it running, or when the VM could
-/// not be asked (`units` is `None`) and the declared set is all there is.
-fn named_in_text(units: Option<&[UnitStatus]>, name: &str) -> bool {
-    units.is_none() || find_unit(units, name).is_some_and(|u| u.state == "running")
 }
 
 /// Ask the run's service manager for every unit's status, or `None` if it cannot be reached
 /// or refuses (callers then fall back to the registry's declared set).
-fn service_units(entry: &VmEntry) -> Option<Vec<UnitStatus>> {
+pub(crate) fn service_units(entry: &VmEntry) -> Option<Vec<UnitStatus>> {
     if entry.services.is_empty() {
         return None;
     }
@@ -725,30 +624,9 @@ fn published(entry: &VmEntry) -> Vec<Published> {
     }
 }
 
-/// The PUBLISHED column: each publisher as `listen->to`, `@service` appended when a compose
-/// sibling dials, comma-separated; `-` when nothing is published. `tcp://` is dropped from
-/// both ends since it is the common case; any other scheme stays spelled out. A publisher
-/// whose lock could not be tested is marked `(unconfirmed)`, as `vk publish list` marks it.
-fn published_cell(published: &[Published]) -> String {
-    if published.is_empty() {
-        return "-".to_string();
-    }
-    published
-        .iter()
-        .map(|(e, liveness)| {
-            let mut cell = published_addr(e);
-            if liveness.unconfirmed() {
-                cell.push_str(" (unconfirmed)");
-            }
-            cell
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// One publisher as `listen->to`, with `@service` when a compose sibling rather than the
 /// primary dials the target.
-fn published_addr(e: &crate::publish::Entry) -> String {
+pub(crate) fn published_addr(e: &crate::publish::Entry) -> String {
     let mut addr = format!("{}->{}", bare_tcp(&e.listen), bare_tcp(&e.to));
     if let Some(service) = &e.service {
         addr.push('@');
@@ -885,35 +763,6 @@ where
     }
 }
 
-/// How many compose siblings the default table names before folding the rest into `+N`.
-/// Keep in sync with the `vk list` help in `main.rs` and the table description in
-/// `README.md`, which both spell the number out.
-const SERVICES_SHOWN: usize = 3;
-
-/// The SERVICES column: the compose siblings running beside the primary (see
-/// `named_in_text`), comma-separated; `-` for none. Unless `wide`, only the first
-/// `SERVICES_SHOWN` are named and the rest counted (`db, redis, web, +4`), so a compose
-/// project with a dozen services does not push the table off the screen.
-fn services_cell(entry: &VmEntry, units: Option<&[UnitStatus]>, wide: bool) -> String {
-    let services: Vec<&str> = entry
-        .services
-        .iter()
-        .map(|service| service.name.as_str())
-        .filter(|name| named_in_text(units, name))
-        .collect();
-    if services.is_empty() {
-        return "-".to_string();
-    }
-    if wide || services.len() <= SERVICES_SHOWN {
-        return services.join(", ");
-    }
-    format!(
-        "{}, +{}",
-        services[..SERVICES_SHOWN].join(", "),
-        services.len() - SERVICES_SHOWN
-    )
-}
-
 /// The `MEM` cell pairs live process-tree usage with the boot-time size: `1.2G/8G`.
 /// Usage includes service VMs and helpers, so this is not guest used/total memory.
 /// Each unknown half reads `-` (an unreadable tree or an older `vk run` that did not record
@@ -952,7 +801,7 @@ fn compact_bytes(bytes: u64) -> String {
 
 /// The PROJECT column: the directory as recorded, or with `$HOME` folded to `~` unless
 /// `wide`. `-` when the run recorded none.
-fn project_cell(project_dir: Option<&Path>, home: Option<&Path>, wide: bool) -> String {
+pub(crate) fn project_cell(project_dir: Option<&Path>, home: Option<&Path>, wide: bool) -> String {
     let Some(dir) = project_dir else {
         return "-".to_string();
     };
@@ -980,12 +829,10 @@ fn tilde(dir: &Path, home: Option<&Path>) -> String {
     }
 }
 
-/// Reject `--field` paths that no view could satisfy, before any VM is asked: several names
-/// in one flag (any whitespace or a comma — every segment is a field name or an array index,
-/// so neither can occur in a valid path), an empty segment (`guest_ip.`), a segment with a
-/// JSON-pointer metacharacter (`/`, `~`), or a path given twice (the `--json` object could
-/// hold it only once, and the text would silently disagree). Unknown names are checked per
-/// view by `select`.
+/// Reject malformed or duplicate `--field` paths before querying VMs. Whitespace and
+/// commas can mean several names in one flag. Empty segments and JSON pointer
+/// metacharacters (`/`, `~`) are invalid. Duplicates would collapse into one JSON key.
+/// [`select`] checks the top-level name on each selected row.
 ///
 /// Paths are quoted in every message, so a stray space or tab shows.
 fn check_fields(fields: &[String]) -> Result<()> {
@@ -1012,10 +859,8 @@ fn check_fields(fields: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// One `--field` of a VM view. `path` is dotted (`guest_ip`, `services.0.ip`) and resolved as
-/// a JSON pointer, so a missing branch below the first segment is `null` — a non-compose VM
-/// has no `services.0`, and a record omits a key that does not apply. An unknown first
-/// segment is an error naming the fields there are.
+/// Resolve a dotted field path such as `ip` or `published.0` on one row. An unknown
+/// top-level field is an error listing the valid names. A missing nested value is `null`.
 fn select(view: &serde_json::Value, path: &str) -> Result<serde_json::Value> {
     let head = path.split_once('.').map_or(path, |(head, _)| head);
     let fields = view.as_object().context("VM view is not a JSON object")?;
@@ -1076,194 +921,233 @@ fn fields_report(views: &[serde_json::Value], fields: &[String], json: bool) -> 
     Ok(out)
 }
 
-/// `vk list`: the running VMs (optionally only those `target` selects) as a table, or JSON.
-/// With `stale`, each VM's freshness is computed (network I/O — see `freshness_all`) and
-/// shown. With `fields`, only those fields of each VM (see `fields_report`). The table folds
-/// `$HOME` to `~`, names at most `SERVICES_SHOWN` services and leaves out EXEC ADDRESS
-/// unless `wide`; a `target` that selects exactly one VM gets that VM's full record instead
-/// (see `detail`). `--json` and `--field` are unaffected by either.
-pub fn list_report(
-    target: Option<Selector>,
-    json: bool,
-    stale: bool,
-    fields: &[String],
-    wide: bool,
-) -> Result<String> {
-    check_fields(fields)?;
-    let target = target.map(Selector::resolved);
+#[derive(Debug, Default)]
+pub struct ListOpts {
+    pub target: Option<std::ffi::OsString>,
+    pub recursive: bool,
+    pub json: bool,
+    pub stale: bool,
+    pub fields: Vec<String>,
+    pub wide: bool,
+    pub filter: crate::vmlist::Filter,
+}
+
+/// Render the VM rows selected by [`ListOpts`]. Without fields, JSON or row filters, a
+/// selector matching one running primary and no stopped primary gets a full record.
+pub fn list_report(opts: ListOpts) -> Result<String> {
+    use crate::vmlist::{Filter, Kind, Known, Live};
+    check_fields(&opts.fields)?;
+    let mut filter = opts.filter;
+    let target = match &opts.target {
+        Some(t) => {
+            // Resolve the primary first. The service suffix filters its rows.
+            let (sel, service) = Selector::from_ref(Ref::parse(t)?, opts.recursive)?;
+            filter.service = service;
+            Some(sel.resolved())
+        }
+        None => selector_of(None, opts.recursive)?.map(Selector::resolved),
+    };
+    let stale = opts.stale;
     let mut vms = running();
+    // Exclude every running directory from stopped results, even if the selector misses it.
+    let running_dirs: HashSet<PathBuf> = vms.iter().map(|e| e.state_dir.clone()).collect();
     if let Some(sel) = &target {
         vms.retain(|e| sel.matches(e));
     }
-    let fresh: Vec<Freshness> = vms
-        .iter()
-        .map(|e| {
-            if stale {
-                freshness_all(e)
-            } else {
-                Freshness::Unknown
-            }
-        })
-        .collect();
-    let units_by_vm: Vec<Option<Vec<UnitStatus>>> = vms.iter().map(service_units).collect();
-    let published_by_vm: Vec<Vec<Published>> = vms.iter().map(published).collect();
-    // Measure once per VM for all output forms: table, detail record and JSON.
-    let mem_used: Vec<Option<u64>> = vms
-        .iter()
-        .map(|e| {
-            i32::try_from(e.pid)
-                .ok()
-                .and_then(crate::usage::tree_resident)
-        })
-        .collect();
-
-    if json || !fields.is_empty() {
-        let views: Vec<VmView> = vms
+    let idx = crate::names::Index::open()?;
+    crate::dev::list::name_unnamed();
+    let named = idx.try_all()?;
+    let name_of = |dir: &Path| {
+        let canonical = canonical(dir);
+        named
             .iter()
-            .zip(&units_by_vm)
-            .zip(&published_by_vm)
-            .zip(&fresh)
-            .zip(&mem_used)
-            .map(|((((entry, units), published), freshness), used)| {
-                view(entry, units.as_deref(), published, *freshness, stale, *used)
-            })
-            .collect();
-        if !fields.is_empty() {
-            let views = views
-                .iter()
-                .map(|v| serde_json::to_value(v).context("serializing VM view"))
-                .collect::<Result<Vec<_>>>()?;
-            return fields_report(&views, fields, json);
+            .find(|(_, d)| *d == dir || *d == canonical)
+            .map(|(n, _)| n.clone())
+    };
+    let dev_base = crate::dev::plan::dev_state_base()
+        .map(|b| canonical(&b))
+        .ok();
+    let kind_of = |dir: &Path| match canonical(dir).parent() == dev_base.as_deref() {
+        true => Kind::Dev,
+        false => Kind::Run,
+    };
+    // A dev environment without an indexed name uses its directory name, including during
+    // first boot or a throwaway task. Other unnamed runs (older VMs and foreground UEFI
+    // bundles) use their pid.
+    let listed_name = |e: &VmEntry| {
+        name_of(&e.state_dir).or_else(|| {
+            let dir_name = e.state_dir.file_name()?.to_str()?;
+            (kind_of(&e.state_dir) == Kind::Dev).then(|| dir_name.to_string())
+        })
+    };
+    let live: Vec<Live> = vms
+        .iter()
+        .map(|e| Live {
+            entry: e,
+            name: listed_name(e),
+            kind: kind_of(&e.state_dir),
+            environment: dev_identity(&e.state_dir).1,
+            units: service_units(e),
+            published: published(e),
+            mem_used: i32::try_from(e.pid)
+                .ok()
+                .and_then(crate::usage::tree_resident),
+            fresh: stale.then(|| freshness_all(e)),
+        })
+        .collect();
+    // An unindexed dev directory is still selectable by its directory name.
+    let unnamed = crate::dev::list::unnamed_dirs(&named)?;
+    let warn = |e: anyhow::Error| eprintln!("virtkit: warning: {e:#}");
+    let known: Vec<Known> = named
+        .iter()
+        // An uncommitted claim can belong to a starting or abandoned run.
+        .filter(|(name, _)| !idx.is_provisional(name))
+        .map(|(name, dir)| (name, dir, crate::vmlist::STOPPED))
+        .chain(unnamed.iter().map(|(name, dir, booted)| match booted {
+            true => (name, dir, crate::vmlist::STOPPED),
+            false => (name, dir, crate::vmlist::NEVER_BOOTED),
+        }))
+        // The directory lock also catches runs that registered after the live snapshot.
+        .filter(|(_, dir, _)| {
+            dir.is_dir() && !running_dirs.contains(&canonical(dir)) && !dir_locked(dir)
+        })
+        .filter_map(|(name, dir, status)| {
+            let kind = kind_of(dir);
+            let last = last_entry(dir).unwrap_or_else(|e| {
+                warn(e);
+                None
+            });
+            let (project, environment) = match kind {
+                Kind::Dev => dev_identity(dir),
+                _ => match crate::names::Recipe::read(dir) {
+                    Ok(recipe) => (recipe.map(|r| r.project_dir), None),
+                    Err(e) => {
+                        warn(e);
+                        (None, None)
+                    }
+                },
+            };
+            // Use the same project for display and directory matching, even without a recipe.
+            let project = project.or_else(|| last.as_ref().and_then(|e| e.project_dir.clone()));
+            let k = Known {
+                name: name.clone(),
+                dir: dir.clone(),
+                kind,
+                status,
+                last,
+                project,
+                environment,
+            };
+            let keep = match &target {
+                None => true,
+                Some(Selector::Pid(_)) => false,
+                Some(Selector::Named { dir: d, .. }) => canonical(dir) == *d,
+                Some(Selector::Dir { dir: d, below }) => {
+                    canonical(dir) == *d
+                        || k.project.as_deref().is_some_and(|p| {
+                            let p = canonical(p);
+                            p == *d || (*below && p.starts_with(d))
+                        })
+                }
+                Some(Selector::Here { .. }) => unreachable!("resolved to a directory above"),
+            };
+            keep.then_some(k)
+        })
+        .collect();
+    let mut rows: Vec<crate::vmlist::Row> = crate::vmlist::rows(&live, &known, unix_now())
+        .into_iter()
+        .filter(|r| filter.keeps(r))
+        .collect();
+    if stale {
+        // Keep the requested key on every row, including unknown results.
+        for r in &mut rows {
+            r.stale.get_or_insert(None);
         }
-        return Ok(serde_json::to_string_pretty(&views).context("serializing VM list")? + "\n");
     }
-    if vms.is_empty() {
-        // Name the unmatched target when one was given.
-        return Ok(match &target {
-            Some(sel) => sel.not_found(),
-            None => "no running vk VMs\n".to_string(),
-        });
+    if !opts.fields.is_empty() {
+        let views = rows
+            .iter()
+            .map(|r| serde_json::to_value(r).context("serializing VM row"))
+            .collect::<Result<Vec<_>>>()?;
+        return fields_report(&views, &opts.fields, opts.json);
     }
-    if full_record(target.as_ref(), vms.len())
-        && let ([e], [units], [published], [f], [used]) = (
-            vms.as_slice(),
-            units_by_vm.as_slice(),
-            published_by_vm.as_slice(),
-            fresh.as_slice(),
-            mem_used.as_slice(),
-        )
+    if opts.json {
+        return Ok(serde_json::to_string_pretty(&rows).context("serializing VM list")? + "\n");
+    }
+    // A bare listing keeps its table even on a one-VM host.
+    let unfiltered = filter == Filter::default();
+    if target.is_some()
+        && unfiltered
+        && known.is_empty()
+        && let [vm] = live.as_slice()
     {
-        return Ok(detail(e, units.as_deref(), published, *f, stale, *used));
+        return Ok(detail(
+            vm.entry,
+            &vm.name.clone().unwrap_or_else(|| vm.entry.pid.to_string()),
+            vm.units.as_deref(),
+            &vm.published,
+            vm.fresh.unwrap_or(Freshness::Unknown),
+            stale,
+            vm.mem_used,
+        ));
+    }
+    if rows.is_empty() {
+        return Ok(match (&opts.target, &target) {
+            (Some(r), _) => format!("no matching vk VM for {}\n", r.to_string_lossy()),
+            (None, Some(_)) => "no matching vk VM\n".to_string(),
+            (None, None) if !unfiltered => "no matching vk VM\n".to_string(),
+            (None, None) => "no vk VMs\n".to_string(),
+        });
     }
     // `tilde` matches against a canonical `project_dir`, so canonicalize `$HOME` as well;
     // only the narrow table folds it.
-    let home = (!wide)
+    let home = (!opts.wide)
         .then(|| std::env::var_os("HOME").map(|h| canonical(Path::new(&h))))
         .flatten();
-    Ok(table(
-        &vms,
-        &units_by_vm,
-        &published_by_vm,
-        &fresh,
-        &mem_used,
+    Ok(crate::vmlist::render(
+        &rows,
         home.as_deref(),
+        opts.wide,
         stale,
-        wide,
     ))
 }
 
-/// The `vk list` table: one header row and one row per VM, with columns padded to their
-/// widest cell and separated by two spaces. EXEC ADDRESS requires `wide`; STALE requires
-/// `stale`. All four combinations must keep header and row columns in the same order
-/// because padding uses column positions.
-///
-/// Per-VM slices come from `list_report`, in `vms` order.
-#[allow(clippy::too_many_arguments)]
-fn table(
-    vms: &[VmEntry],
-    units_by_vm: &[Option<Vec<UnitStatus>>],
-    published_by_vm: &[Vec<Published>],
-    fresh: &[Freshness],
-    mem_used: &[Option<u64>],
-    home: Option<&Path>,
-    stale: bool,
-    wide: bool,
-) -> String {
-    let mut headers: Vec<&str> = vec!["PID", "UPTIME", "MEM", "NAME", "SERVICES", "PROJECT"];
-    if wide {
-        headers.push("EXEC ADDRESS");
-    }
-    headers.push("PUBLISHED");
-    if stale {
-        headers.push("STALE");
-    }
-    let rows: Vec<Vec<String>> = vms
-        .iter()
-        .zip(units_by_vm)
-        .zip(published_by_vm)
-        .zip(fresh)
-        .zip(mem_used)
-        .map(|((((e, units), published), f), used)| {
-            let mut row = vec![
-                e.pid.to_string(),
-                uptime(e.created_secs),
-                mem_cell(*used, e.mem.as_deref()),
-                e.label.clone(),
-                services_cell(e, units.as_deref(), wide),
-                project_cell(e.project_dir.as_deref(), home, wide),
-            ];
-            if wide {
-                row.push(e.exec_addr.clone());
-            }
-            row.push(published_cell(published));
-            if stale {
-                row.push(f.cell().to_string());
-            }
-            row
-        })
-        .collect();
-    // Widths are counted in characters, not bytes, to match how the formatter pads: a
-    // non-ASCII project path or service name would otherwise reserve one blank column per
-    // extra UTF-8 byte, making the table wider than it needs to be.
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
-    for row in &rows {
-        for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell.chars().count());
-        }
-    }
-    let mut out = String::new();
-    let fmt_row = |cells: &[String], out: &mut String| {
-        for (i, cell) in cells.iter().enumerate() {
-            if i + 1 == cells.len() {
-                out.push_str(cell); // last column: no trailing pad
-            } else {
-                out.push_str(&format!("{cell:<width$}  ", width = widths[i]));
-            }
-        }
-        out.push('\n');
+/// Read the workspace and environment from `dev.json`. A missing file is normal.
+/// Other read errors and malformed JSON produce a warning.
+fn dev_identity(state_dir: &Path) -> (Option<PathBuf>, Option<String>) {
+    let path = state_dir.join("dev.json");
+    let read = match std::fs::read(&path) {
+        Ok(json) => serde_json::from_slice::<crate::dev::Identity>(&json)
+            .with_context(|| format!("parsing {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (None, None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    fmt_row(
-        &headers.iter().map(|h| h.to_string()).collect::<Vec<_>>(),
-        &mut out,
-    );
-    for row in &rows {
-        fmt_row(row, &mut out);
-    }
-    out
+    let identity = match read {
+        Ok(identity) => identity,
+        Err(e) => {
+            eprintln!("virtkit: warning: {e:#}");
+            return (None, None);
+        }
+    };
+    let text = |key: &str| {
+        identity
+            .manifest
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    (text("workspace").map(PathBuf::from), text("environment"))
 }
 
-/// `vk list PID|DIR` when it names exactly one VM: every recorded fact about it as
-/// `KEY  value` lines — what `--json` carries, laid out to read — then one line per compose
-/// service (name, state, LAN address, exec address) and per published port. Nothing is
-/// folded or left out here, so `--wide` has nothing to add. A field the run did not record
-/// (an older `vk`, no `--ssh`, no `--net`) reads `-`; a service's state reads `-` when the
-/// VM could not be asked, or did not report it.
+/// The full text record for one running primary. Include all declared services (name,
+/// state, LAN and exec addresses) and publishers, with full paths at any table width.
+/// Missing boot fields and unreported service state or IP appear as `-`.
 ///
-/// `MEM USED` comes from `/proc` at report time; `MEM` is the recorded boot-time token.
-/// The table combines them, but the detail record keeps them separate. Unreadable usage
-/// reads `-`.
+/// `MEM` is the boot-time token. `MEM USED` is the current process-tree usage from
+/// `/proc`, or `-` if unreadable. The table combines the two.
 fn detail(
     e: &VmEntry,
+    name: &str,
     units: Option<&[UnitStatus]>,
     published: &[Published],
     freshness: Freshness,
@@ -1281,7 +1165,8 @@ fn detail(
     };
     let yes_no = |b: Option<bool>| opt(b.map(|b| if b { "yes" } else { "no" }.to_string()));
     let mut rows: Vec<(&str, String)> = vec![
-        ("NAME", e.label.clone()),
+        ("NAME", name.to_string()),
+        ("IMAGE", e.label.clone()),
         ("PID", e.pid.to_string()),
         (
             "UPTIME",
@@ -1374,13 +1259,6 @@ fn aligned<const N: usize>(rows: &[[String; N]]) -> Vec<String> {
         .collect()
 }
 
-/// Show a full record only when an explicit target matches exactly one VM.
-/// A bare `vk list` keeps its table even for one VM, so its shape stays stable as VMs
-/// come and go.
-fn full_record(target: Option<&Selector>, matched: usize) -> bool {
-    target.is_some() && matched == 1
-}
-
 /// A multi-line detail value: the lines joined, or `-` for none.
 fn block(lines: &[String]) -> String {
     if lines.is_empty() {
@@ -1451,8 +1329,8 @@ pub enum Ref {
 impl Ref {
     /// ASCII digits within `u32` name a pid. `+5` and numbers above `u32::MAX` are words.
     /// `/…`, `./…`, `../…`, `~…`, `.` and `..` are paths, as is any non-UTF-8 argument.
-    /// Paths retain their original bytes. Other words are names. `NAME/SERVICE` and
-    /// `PID/SERVICE` select compose services, including by pid when the VM is unnamed.
+    /// Paths retain their original bytes. Other words are names. For a compose service,
+    /// use `NAME/SERVICE` or `PID/SERVICE`, including when the primary has no name.
     pub fn parse(arg: &OsStr) -> Result<Self> {
         let bytes = arg.as_bytes();
         if bytes.is_empty() {
@@ -1517,8 +1395,8 @@ fn expand_tilde(arg: &OsStr) -> PathBuf {
     }
 }
 
-/// Which running VMs a command means: a pid, a directory (exactly, or with `below` every VM
-/// whose project is that directory or under it), or the state dir a name stands for.
+/// Select a primary by pid, name, state directory or project directory. With `below`,
+/// include descendant projects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selector {
     Pid(u32),
@@ -1571,7 +1449,7 @@ impl Selector {
                         None => vm.clone(),
                     };
                     if !Path::new(&word).is_dir() {
-                        bail!("no VM is named {vm}");
+                        bail!("no VM is named {vm} (`vk list` names them)");
                     }
                     eprintln!(
                         "vk: note: reading {word} as a directory; write ./{word} — a bare \
@@ -2026,7 +1904,7 @@ pub(crate) fn serve_connections(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::publish::Liveness;
 
@@ -2043,7 +1921,7 @@ mod tests {
         d
     }
 
-    fn entry(state_dir: PathBuf, project: Option<PathBuf>) -> VmEntry {
+    pub(crate) fn entry(state_dir: PathBuf, project: Option<PathBuf>) -> VmEntry {
         VmEntry {
             state_dir,
             project_dir: project,
@@ -2344,7 +2222,7 @@ mod tests {
     fn a_ref_reads_digits_as_a_pid_paths_as_paths_and_words_as_names() {
         assert_eq!(parse("2144802"), Ref::Pid(2144802, None));
         assert_eq!(parse("007"), Ref::Pid(7, None));
-        // A service of a VM that has no name.
+        // A service of a VM that has no name, as `vk list` prints it.
         assert_eq!(parse("4242/db"), Ref::Pid(4242, Some("db".into())));
         assert_eq!(parse("4242/"), Ref::Pid(4242, None));
         assert_eq!(parse("42a/db"), name("42a", Some("db")));
@@ -2556,75 +2434,6 @@ mod tests {
         assert_eq!(combine([Unknown, Unknown].into_iter()), Unknown);
     }
 
-    fn service_json(name: &str, state: Option<&str>, ip: Option<&str>) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "exec_addr": format!("vsock-auto:///state/app/svc-{name}/vsock.sock:4444"),
-            "state": state,
-            "ip": ip,
-        })
-    }
-
-    fn services_json(e: &VmEntry, units: Option<&[UnitStatus]>) -> serde_json::Value {
-        serde_json::to_value(view(e, units, &[], Freshness::Unknown, false, None)).unwrap()["services"]
-            .take()
-    }
-
-    #[test]
-    fn list_view_falls_back_to_every_declared_service_when_unqueried() {
-        let e = compose_entry();
-        // No answer from the VM: the text view names every recorded service and the JSON
-        // carries an explicit null state and ip for each.
-        assert_eq!(services_cell(&e, None, false), "db, redis");
-        assert_eq!(
-            services_json(&e, None),
-            serde_json::json!([
-                service_json("db", None, None),
-                service_json("redis", None, None)
-            ])
-        );
-    }
-
-    #[test]
-    fn text_view_names_only_running_services() {
-        let e = compose_entry();
-        let units = [
-            unit("db", "running", "10.0.0.2/24"),
-            unit("redis", "stopped", "10.0.0.3/24"),
-        ];
-        assert_eq!(services_cell(&e, Some(&units), false), "db");
-        assert_eq!(services_cell(&e, Some(&[]), false), "-");
-    }
-
-    /// `compose_entry` plus `extra` further services, in order.
-    fn compose_entry_with(extra: &[&str]) -> VmEntry {
-        let mut e = compose_entry();
-        for name in extra {
-            e.services.push(ServiceEntry {
-                name: (*name).to_string(),
-                exec_addr: format!("vsock-auto:///state/app/svc-{name}/vsock.sock:4444"),
-                stale_recipe: None,
-            });
-        }
-        e
-    }
-
-    #[test]
-    fn services_cell_folds_the_tail_unless_wide() {
-        let mut e = compose_entry_with(&["web", "cache", "queue", "mail"]);
-        assert_eq!(services_cell(&e, None, false), "db, redis, web, +3");
-        assert_eq!(
-            services_cell(&e, None, true),
-            "db, redis, web, cache, queue, mail"
-        );
-        // One past the shown count still folds, so the column never names a fourth.
-        e.services.truncate(SERVICES_SHOWN + 1);
-        assert_eq!(services_cell(&e, None, false), "db, redis, web, +1");
-        // Exactly the shown count is not folded: `+0` would say nothing.
-        e.services.truncate(SERVICES_SHOWN);
-        assert_eq!(services_cell(&e, None, false), "db, redis, web");
-    }
-
     #[test]
     fn project_cell_folds_home_to_tilde_unless_wide() {
         let home = Path::new("/home/me");
@@ -2675,92 +2484,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&real);
     }
 
-    /// One VM per row, with no publishers, unknown freshness and no memory reading — enough
-    /// to check which columns the table emits. `table_of_mem` supplies the figures.
-    fn table_of(vms: &[VmEntry], home: Option<&Path>, stale: bool, wide: bool) -> String {
-        let none: Vec<Option<u64>> = vms.iter().map(|_| None).collect();
-        table_of_mem(vms, &none, home, stale, wide)
-    }
-
-    fn table_of_mem(
-        vms: &[VmEntry],
-        mem_used: &[Option<u64>],
-        home: Option<&Path>,
-        stale: bool,
-        wide: bool,
-    ) -> String {
-        let units: Vec<Option<Vec<UnitStatus>>> = vms.iter().map(|_| None).collect();
-        let published: Vec<Vec<Published>> = vms.iter().map(|_| Vec::new()).collect();
-        let fresh: Vec<Freshness> = vms.iter().map(|_| Freshness::Unknown).collect();
-        table(vms, &units, &published, &fresh, mem_used, home, stale, wide)
-    }
-
-    /// The cells of one table line. No cell holds two consecutive spaces, so the padding
-    /// between columns is the only place a line can split.
-    fn cells(line: &str) -> Vec<&str> {
-        line.split("  ")
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .collect()
-    }
-
-    #[test]
-    fn the_table_shows_exec_address_only_with_wide() {
-        let vms = [compose_entry()];
-        let narrow = table_of(&vms, None, false, false);
-        assert!(narrow.contains("PID"), "{narrow}");
-        assert!(!narrow.contains("EXEC ADDRESS"), "{narrow}");
-        assert!(!narrow.contains(&vms[0].exec_addr), "{narrow}");
-        let wide = table_of(&vms, None, false, true);
-        assert!(wide.contains("EXEC ADDRESS"), "{wide}");
-        assert!(wide.contains(&vms[0].exec_addr), "{wide}");
-    }
-
-    #[test]
-    fn every_table_row_has_the_header_s_columns_in_its_order() {
-        let vms = [
-            compose_entry_with(&["web", "cache", "queue", "mail"]),
-            entry(PathBuf::from("/state/solo"), None),
-        ];
-        for (stale, wide) in [(false, false), (false, true), (true, false), (true, true)] {
-            let text = table_of(&vms, Some(Path::new("/home/me")), stale, wide);
-            let mut expected = vec!["PID", "UPTIME", "MEM", "NAME", "SERVICES", "PROJECT"];
-            if wide {
-                expected.push("EXEC ADDRESS");
-            }
-            expected.push("PUBLISHED");
-            if stale {
-                expected.push("STALE");
-            }
-            let mut lines = text.lines();
-            assert_eq!(cells(lines.next().unwrap()), expected, "{text}");
-            let rows: Vec<&str> = lines.collect();
-            assert_eq!(rows.len(), vms.len(), "{text}");
-            for row in &rows {
-                assert_eq!(cells(row).len(), expected.len(), "{text}");
-            }
-        }
-    }
-
-    #[test]
-    fn the_table_measures_width_in_characters_not_bytes() {
-        // "caf\u{e9}" has four characters but five UTF-8 bytes. Byte widths would add one
-        // extra space compared with an ASCII label of the same character count.
-        let labelled = |label: &str| {
-            let mut e = entry(PathBuf::from("/state/cafe"), None);
-            e.label = label.to_string();
-            table_of(&[e], None, false, false)
-        };
-        let widths = |text: &str| {
-            text.lines()
-                .map(|line| line.chars().count())
-                .collect::<Vec<_>>()
-        };
-        let accented = labelled("caf\u{e9}");
-        let ascii = labelled("cafe");
-        assert_eq!(widths(&accented), widths(&ascii), "{accented}");
-    }
-
     #[test]
     fn detail_lays_out_every_recorded_fact_with_services_and_ports() {
         let mut e = compose_entry();
@@ -2787,10 +2510,11 @@ mod tests {
             ),
             Liveness::Held,
         )];
-        // Only the uptime moves with the clock; every other line is fixed by the entry.
+        // Only uptime depends on the clock. NAME identifies the VM and IMAGE identifies what it boots.
         let expected = format!(
             "\
-NAME          app
+NAME          shop
+IMAGE         app
 PID           41877
 UPTIME        {up} (since 2025/09/04 08:00:00 UTC)
 PROJECT       /project
@@ -2814,6 +2538,7 @@ PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 4242
         assert_eq!(
             detail(
                 &e,
+                "shop",
                 Some(&units),
                 &published,
                 Freshness::Stale,
@@ -2831,7 +2556,8 @@ PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 4242
         plain.created_secs = 1_756_972_800;
         let expected = format!(
             "\
-NAME          devcontainer
+NAME          7
+IMAGE         devcontainer
 PID           7
 UPTIME        {up} (since 2025/09/04 08:00:00 UTC)
 PROJECT       -
@@ -2852,7 +2578,7 @@ PUBLISHED     -
         );
         // Without --stale the STALE row is absent entirely, not reported as unknown.
         assert_eq!(
-            detail(&plain, None, &[], Freshness::Unknown, false, None),
+            detail(&plain, "7", None, &[], Freshness::Unknown, false, None),
             expected
         );
     }
@@ -2863,7 +2589,7 @@ PUBLISHED     -
         e.nested = Some(false);
         // A VMM the run named but whose pid it did not record prints bare.
         e.vmm = Some("libkrun".into());
-        let text = detail(&e, None, &[], Freshness::Fresh, true, None);
+        let text = detail(&e, "app", None, &[], Freshness::Fresh, true, None);
         assert!(text.contains("\nVMM           libkrun\n"), "{text}");
         assert!(text.contains("\nNESTED        no\n"), "{text}");
         assert!(text.contains("\nSTALE         no\n"), "{text}");
@@ -2874,6 +2600,7 @@ PUBLISHED     -
         // The VM answered and knows of neither service, so only the recorded facts remain.
         let text = detail(
             &compose_entry(),
+            "app",
             Some(&[]),
             &[],
             Freshness::Unknown,
@@ -2910,6 +2637,7 @@ PUBLISHED     -
         ];
         let text = detail(
             &compose_entry(),
+            "app",
             None,
             &published,
             Freshness::Unknown,
@@ -2943,60 +2671,24 @@ PUBLISHED     -
         assert_eq!(accented[0], "caf\u{e9}  x");
     }
 
-    #[test]
-    fn a_full_record_needs_a_target_and_exactly_one_match() {
-        let sel = Selector::Pid(41877);
-        assert!(full_record(Some(&sel), 1));
-        // A bare `vk list` keeps its table, so a one-VM host does not change shape.
-        assert!(!full_record(None, 1));
-        assert!(!full_record(Some(&sel), 0));
-        assert!(!full_record(Some(&sel), 2));
-    }
-
-    #[test]
-    fn json_view_lists_every_declared_service_with_state_and_bare_ip() {
-        let e = compose_entry();
-        let units = [
-            unit("db", "running", "10.0.0.2/24"),
-            unit("redis", "stopped", "10.0.0.3/24"),
-        ];
-        assert_eq!(
-            services_json(&e, Some(&units)),
-            serde_json::json!([
-                service_json("db", Some("running"), Some("10.0.0.2")),
-                service_json("redis", Some("stopped"), Some("10.0.0.3")),
-            ])
-        );
-    }
-
-    #[test]
-    fn service_missing_from_the_reply_is_null_in_json_and_unnamed_in_text() {
-        let e = compose_entry();
-        // The VM answered but knows nothing of `redis` (registry/manager drift).
-        let units = [unit("db", "running", "10.0.0.2/24")];
-        assert_eq!(services_cell(&e, Some(&units), false), "db");
-        assert_eq!(
-            services_json(&e, Some(&units)),
-            serde_json::json!([
-                service_json("db", Some("running"), Some("10.0.0.2")),
-                service_json("redis", None, None),
-            ])
-        );
-    }
-
-    /// A compose VM with one running service and a plain VM, as `--field` sees them.
+    /// Synthetic records for field projection, including nested arrays and missing values.
     fn field_views() -> Vec<serde_json::Value> {
-        let mut e = compose_entry();
-        e.pid = 4242;
-        e.nested = Some(true);
-        let units = [unit("db", "running", "10.0.0.2/24")];
-        let mut plain = entry(PathBuf::from("/state/plain"), None);
-        plain.label = "plain".into();
-        plain.pid = 7;
+        let svc = |name: &str, state: Option<&str>, ip: Option<&str>| {
+            serde_json::json!({
+                "exec_addr": format!("vsock-auto:///state/app/svc-{name}/vsock.sock:4444"),
+                "ip": ip,
+                "name": name,
+                "state": state,
+            })
+        };
         vec![
-            serde_json::to_value(view(&e, Some(&units), &[], Freshness::Unknown, false, None))
-                .unwrap(),
-            serde_json::to_value(view(&plain, None, &[], Freshness::Unknown, false, None)).unwrap(),
+            serde_json::json!({
+                "guest_ip": null, "label": "app", "nested": true, "pid": 4242,
+                "services": [svc("db", Some("running"), Some("10.0.0.2")), svc("redis", None, None)],
+            }),
+            serde_json::json!({
+                "guest_ip": null, "label": "plain", "nested": null, "pid": 7, "services": [],
+            }),
         ]
     }
 
@@ -3032,7 +2724,7 @@ PUBLISHED     -
             fields(&views, &["services.1.ip"], false).unwrap(),
             "null\nnull\n"
         );
-        // Nothing running: nothing printed, whatever was asked.
+        // With no rows, field names are never looked up.
         assert_eq!(fields(&[], &["nope"], false).unwrap(), "");
     }
 
@@ -3060,15 +2752,10 @@ PUBLISHED     -
         assert!(err.contains("guest_ip, label"), "{err}");
         let err = fields(&views, &["stale"], false).unwrap_err().to_string();
         assert!(err.contains("(pass --stale)"), "{err}");
-        let plain = entry(PathBuf::from("/state/plain"), None);
-        let with_stale =
-            [
-                serde_json::to_value(view(&plain, None, &[], Freshness::Unknown, true, None))
-                    .unwrap(),
-            ];
+        let with_stale = [serde_json::json!({"label": "plain", "stale": null})];
         assert_eq!(fields(&with_stale, &["stale"], false).unwrap(), "null\n");
 
-        // Malformed paths and repeats are rejected up front, even with nothing running.
+        // Malformed and duplicate paths fail even with no rows.
         let check = |names: &[&str]| {
             let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
             check_fields(&names).unwrap_err().to_string()
@@ -3177,168 +2864,6 @@ PUBLISHED     -
         }
     }
 
-    #[test]
-    fn published_cell_maps_listen_to_target_and_marks_the_dialing_service_and_unconfirmed() {
-        assert_eq!(published_cell(&[]), "-");
-        let published = [
-            (
-                publisher("web", "tcp://127.0.0.1:8443", "tcp://runner:443", None),
-                Liveness::Held,
-            ),
-            (
-                publisher("db", "/tmp/pg.sock", "tcp://127.0.0.1:5432", Some("db")),
-                Liveness::Unknown,
-            ),
-        ];
-        assert_eq!(
-            published_cell(&published),
-            "127.0.0.1:8443->runner:443, /tmp/pg.sock->127.0.0.1:5432@db (unconfirmed)"
-        );
-    }
-
-    #[test]
-    fn json_view_marks_a_publisher_via_sibling_and_unconfirmed_pid_only_when_they_apply() {
-        let e = entry(PathBuf::from("/state/app"), None);
-        let published = [
-            (
-                publisher("web", "tcp://127.0.0.1:8443", "tcp://runner:443", None),
-                Liveness::Held,
-            ),
-            (
-                publisher(
-                    "db",
-                    "tcp://127.0.0.1:5432",
-                    "tcp://127.0.0.1:5432",
-                    Some("db"),
-                ),
-                Liveness::Unknown,
-            ),
-        ];
-        let json =
-            serde_json::to_value(view(&e, None, &published, Freshness::Unknown, false, None))
-                .unwrap();
-        assert_eq!(
-            json["published"],
-            serde_json::json!([
-                {
-                    "name": "web",
-                    "listen": "tcp://127.0.0.1:8443",
-                    "to": "tcp://runner:443",
-                    "pid": 4242,
-                },
-                {
-                    "name": "db",
-                    "listen": "tcp://127.0.0.1:5432",
-                    "to": "tcp://127.0.0.1:5432",
-                    "via": "db",
-                    "pid": 4242,
-                    "unconfirmed": true,
-                },
-            ])
-        );
-        // Nothing published is an empty array, not an absent key, so `--field` into it reads
-        // null rather than failing.
-        let none =
-            serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false, None)).unwrap();
-        assert_eq!(none["published"], serde_json::json!([]));
-        assert_eq!(
-            fields(&[json.clone(), none], &["published.0.listen"], false).unwrap(),
-            "tcp://127.0.0.1:8443\nnull\n"
-        );
-        // An omitted key on a record that *is* there reads null too. `published.1` is the
-        // telling one: it used to carry `"confirmed": false` and `"service": "db"`, and a
-        // script reading either old name now gets null and must read the new one.
-        assert_eq!(
-            fields(
-                std::slice::from_ref(&json),
-                &["published.1.confirmed", "published.1.service"],
-                false
-            )
-            .unwrap(),
-            "null\tnull\n"
-        );
-        assert_eq!(
-            fields(
-                std::slice::from_ref(&json),
-                &[
-                    "published.1.via",
-                    "published.1.unconfirmed",
-                    "published.0.via"
-                ],
-                false
-            )
-            .unwrap(),
-            "db\ttrue\tnull\n"
-        );
-    }
-
-    #[test]
-    fn list_view_reports_boot_time_fields() {
-        let mut e = entry(PathBuf::from("/state/app"), None);
-        e.vmm = Some("libkrun".into());
-        e.vmm_pid = Some(4242);
-        e.cpus = Some(4);
-        e.mem = Some("8G".into());
-        e.nested = Some(true);
-        e.guest_ip = Some(std::net::Ipv4Addr::new(10, 42, 0, 2));
-        let json =
-            serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false, None)).unwrap();
-        assert_eq!(json["vmm"], "libkrun");
-        assert_eq!(json["vmm_pid"], 4242);
-        assert_eq!(json["cpus"], 4);
-        assert_eq!(json["mem"], "8G");
-        assert_eq!(json["nested"], true);
-        assert_eq!(json["guest_ip"], "10.42.0.2");
-
-        // A run without `--net` has no address: an explicit null, not an absent key, so
-        // scripts can tell it from a field this `vk` never emitted.
-        let e = entry(PathBuf::from("/state/app"), None);
-        let json =
-            serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false, None)).unwrap();
-        assert_eq!(json.get("guest_ip"), Some(&serde_json::Value::Null));
-    }
-
-    #[test]
-    fn json_stale_field_distinguishes_absent_unknown_and_known() {
-        let dir = PathBuf::from("/state/x");
-        let view = |stale: Option<Option<bool>>| VmView {
-            state_dir: &dir,
-            project_dir: None,
-            pid: 1,
-            vmm: None,
-            vmm_pid: None,
-            label: "x",
-            exec_addr: "a",
-            ssh_addr: None,
-            guest_ip: None,
-            cpus: None,
-            mem: None,
-            mem_used_bytes: None,
-            nested: None,
-            atop_log: None,
-            created_secs: 0,
-            uptime_secs: 0,
-            stale,
-            services: vec![],
-            published: vec![],
-        };
-        // No `--stale`: the field is omitted entirely.
-        let j = serde_json::to_string(&view(None)).unwrap();
-        assert!(!j.contains("\"stale\""), "{j}");
-        // `--stale` but freshness unknown: an explicit null, not omitted.
-        assert!(
-            serde_json::to_string(&view(Some(None)))
-                .unwrap()
-                .contains("\"stale\":null")
-        );
-        // `--stale` with a verdict: the bool.
-        assert!(
-            serde_json::to_string(&view(Some(Some(true))))
-                .unwrap()
-                .contains("\"stale\":true")
-        );
-    }
-
     // An entry written before `atop_log` and the boot-time fields existed still loads:
     // `load_all_in` skips what it cannot parse, so a required field would drop a live VM out
     // of the registry. The view then reports each missing fact as an explicit `null`.
@@ -3354,22 +2879,13 @@ PUBLISHED     -
         assert_eq!(e.mem, None);
         assert_eq!(e.nested, None);
         assert_eq!(e.guest_ip, None);
-        let json =
-            serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false, None)).unwrap();
-        for key in [
-            "atop_log", "vmm", "vmm_pid", "cpus", "mem", "nested", "guest_ip",
-        ] {
-            assert_eq!(json.get(key), Some(&serde_json::Value::Null), "{key}");
-        }
-    }
-
-    #[test]
-    fn list_view_reports_the_atop_log_path() {
-        let mut e = entry(PathBuf::from("/state/app"), None);
-        e.atop_log = Some(PathBuf::from("/state/app/atop/atop.log"));
-        let json =
-            serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false, None)).unwrap();
-        assert_eq!(json["atop_log"], "/state/app/atop/atop.log");
+        assert_eq!(e.project_dir, None);
+        // Paths written as plain strings read back as they always did.
+        let json = r#"{"state_dir":"/state/x","project_dir":"/p","pid":1,"label":"x","exec_addr":"a","created_secs":0}"#;
+        let e: VmEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(e.state_dir, PathBuf::from("/state/x"));
+        assert_eq!(e.project_dir, Some(PathBuf::from("/p")));
+        assert_eq!(serde_json::to_value(&e).unwrap()["project_dir"], "/p");
     }
 
     // An entry written before `build_contexts` existed has to keep loading: `load_all_in` skips
@@ -3417,93 +2933,6 @@ PUBLISHED     -
         // on the rounded figure, as `usage::fmt_bytes` does.
         assert_eq!(compact_bytes(1024 * 1024 * 1024 - 1), "1.0G");
         assert_eq!(compact_bytes(1024 * 1024 - 1), "1M");
-    }
-
-    #[test]
-    fn the_table_shows_memory_after_uptime() {
-        let vms = [entry(PathBuf::from("/state/solo"), None)];
-        let mut sized = vms[0].clone();
-        sized.mem = Some("8G".into());
-        let text = table_of_mem(
-            std::slice::from_ref(&sized),
-            &[Some(1_288_490_189)],
-            None,
-            false,
-            false,
-        );
-        let mut lines = text.lines();
-        let header = cells(lines.next().unwrap());
-        let row = cells(lines.next().unwrap());
-        // The column sits third, between UPTIME and NAME, in the header and the row alike.
-        assert_eq!(header[1..3], ["UPTIME", "MEM"], "{text}");
-        assert_eq!(row[2], "1.2G/8G", "{text}");
-        // A VM with neither figure keeps the column and dashes it, so the row stays aligned.
-        let bare = table_of(&vms, None, false, false);
-        assert_eq!(cells(bare.lines().nth(1).unwrap())[2], "-", "{bare}");
-    }
-
-    #[test]
-    fn json_view_reports_memory_used_in_bytes_beside_the_boot_token() {
-        let mut e = entry(PathBuf::from("/state/x"), None);
-        e.mem = Some("8G".into());
-        let json = serde_json::to_value(view(
-            &e,
-            None,
-            &[],
-            Freshness::Unknown,
-            false,
-            Some(1_288_490_189),
-        ))
-        .unwrap();
-        // JSON gives scripts bytes without parsing "1.2G", beside the unchanged boot token.
-        assert_eq!(json["mem_used_bytes"], 1_288_490_189u64);
-        assert_eq!(json["mem"], "8G");
-        // Unreadable tree: an explicit null, distinct from a zero-byte tree.
-        let unknown =
-            serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false, None)).unwrap();
-        assert_eq!(unknown["mem_used_bytes"], serde_json::Value::Null);
-    }
-
-    /// Renders the exact table the README shows, so the sample there cannot drift out of
-    /// alignment with the formatter.
-    #[test]
-    fn readme_table_sample_is_what_the_formatter_emits() {
-        let vm = |label: &str, pid: u32, mem: &str, services: &[&str], project: &str| {
-            let mut e = entry(PathBuf::from("/state/x"), None);
-            e.services = compose_entry_with(services).services[2..].to_vec();
-            e.label = label.to_string();
-            e.pid = pid;
-            e.mem = Some(mem.to_string());
-            e.project_dir = Some(PathBuf::from(project));
-            e.created_secs = unix_now();
-            e
-        };
-        let vms = [
-            vm("app/Dockerfile:dev", 41230, "8G", &[], "/home/me/app"),
-            vm(
-                "shop",
-                41877,
-                "16G",
-                &["db", "redis", "web", "worker", "mailer", "queue", "search"],
-                "/home/me/shop",
-            ),
-        ];
-        let text = table_of_mem(
-            &vms,
-            &[Some(1_288_490_189), Some(6_335_076_761)],
-            Some(Path::new("/home/me")),
-            false,
-            false,
-        );
-        let header = text.lines().next().unwrap();
-        assert_eq!(
-            header,
-            "PID    UPTIME  MEM       NAME                SERVICES            PROJECT  PUBLISHED",
-            "{text}"
-        );
-        // The two figures as the README prints them, in the cells it puts them in.
-        assert_eq!(cells(text.lines().nth(1).unwrap())[2], "1.2G/8G", "{text}");
-        assert_eq!(cells(text.lines().nth(2).unwrap())[2], "5.9G/16G", "{text}");
     }
 
     /// A state-dir lock held by a process other than the entry's `vk run` reads as a run that
@@ -3608,5 +3037,335 @@ PUBLISHED     -
         );
         assert!(!ok);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// End-to-end listing with a temporary name index and registry.
+    mod listing {
+        use super::*;
+        use crate::dev::testutil::Homes;
+        use crate::vmlist::{Filter, Kind};
+        use std::ffi::OsString;
+
+        /// Register a running primary, hold its state directory lock and give each service a console log.
+        fn up(dir: &Path, project: &Path, services: &[&str]) -> (Registration, std::fs::File) {
+            std::fs::create_dir_all(dir).unwrap();
+            let dir = canonical(dir);
+            let mut e = entry(dir.clone(), Some(canonical(project)));
+            e.exec_addr = format!("vsock-auto://{}/vsock.sock:4444", dir.display());
+            for s in services {
+                let svc = dir.join(format!("svc-{s}"));
+                std::fs::create_dir_all(&svc).unwrap();
+                std::fs::write(svc.join(crate::run::CONSOLE_LOG), "").unwrap();
+                e.services.push(ServiceEntry {
+                    name: s.to_string(),
+                    exec_addr: format!("vsock-auto://{}/vsock.sock:4444", svc.display()),
+                    stale_recipe: None,
+                });
+            }
+            let lock = crate::dev::list::try_lock_state_dir(&dir).unwrap();
+            (register(e), lock)
+        }
+
+        /// A stopped run in `run/<name>`, named `name`, launched for `project`.
+        fn stopped(homes: &Homes, name: &str, project: &Path) -> PathBuf {
+            let dir = run_dir(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let recipe = crate::names::Recipe {
+                args: vec!["run".into()],
+                cwd: project.to_path_buf(),
+                project_dir: project.to_path_buf(),
+            };
+            recipe.write(&dir).unwrap();
+            homes.name(&dir, name);
+            dir
+        }
+
+        fn run_dir(name: &str) -> PathBuf {
+            crate::names::run_base().unwrap().join(name)
+        }
+
+        fn project(homes: &Homes) -> PathBuf {
+            let p = homes.dir().join("proj");
+            std::fs::create_dir_all(&p).unwrap();
+            canonical(&p)
+        }
+
+        fn list(target: Option<&OsStr>, filter: Filter, fields: &[&str], json: bool) -> String {
+            list_report(ListOpts {
+                target: target.map(OsStr::to_os_string),
+                fields: fields.iter().map(|f| f.to_string()).collect(),
+                json,
+                filter,
+                ..ListOpts::default()
+            })
+            .unwrap()
+        }
+
+        fn stopped_only() -> Filter {
+            Filter {
+                stopped: true,
+                ..Filter::default()
+            }
+        }
+
+        #[test]
+        fn a_full_record_is_one_running_primary_unfiltered() {
+            let homes = Homes::new("list-detail");
+            let proj = project(&homes);
+            let app = run_dir("app");
+            let _app = up(&app, &proj, &[]);
+            homes.name(&app, "app");
+            let app = OsStr::new("app");
+            let record = list(Some(app), Filter::default(), &[], false);
+            assert!(
+                record.starts_with("NAME          app\nIMAGE         devcontainer\n"),
+                "{record}"
+            );
+            assert_eq!(
+                list(Some(app), stopped_only(), &[], false),
+                "no matching vk VM for app\n"
+            );
+            assert_eq!(list(Some(app), stopped_only(), &[], true), "[]\n");
+            // A project with a running and a stopped primary is a table of both.
+            stopped(&homes, "old", &proj);
+            let dir = proj.as_os_str();
+            let table = list(Some(dir), Filter::default(), &[], false);
+            assert!(table.starts_with("NAME "), "{table}");
+            assert!(table.lines().any(|l| l.starts_with("app ")), "{table}");
+            assert!(table.lines().any(|l| l.starts_with("old ")), "{table}");
+            let json: serde_json::Value =
+                serde_json::from_str(&list(Some(dir), Filter::default(), &[], true)).unwrap();
+            let names: Vec<&str> = json
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, ["app", "old"]);
+        }
+
+        // The claim can outlive a run killed during its first boot.
+        #[test]
+        fn a_provisional_name_is_not_listed_as_stopped() {
+            let _homes = Homes::new("list-claim");
+            let dir = run_dir("boot");
+            std::fs::create_dir_all(&dir).unwrap();
+            let held = crate::dev::list::try_lock_state_dir(&dir).unwrap();
+            let idx = crate::names::Index::open().unwrap();
+            assert!(idx.provisional().claim_exact(&dir, "boot").unwrap());
+            for filter in [Filter::default(), stopped_only()] {
+                assert_eq!(list(None, filter, &["name"], false), "", "held");
+            }
+            drop(held);
+            for filter in [Filter::default(), stopped_only()] {
+                assert_eq!(list(None, filter, &["name"], false), "", "abandoned");
+            }
+            idx.commit("boot").unwrap();
+            assert_eq!(list(None, stopped_only(), &["name"], false), "boot\n");
+        }
+
+        // Null fields remain selectable. A service with unknown status does not match `--running`.
+        #[test]
+        fn every_row_has_every_field() {
+            let homes = Homes::new("list-fields");
+            let proj = project(&homes);
+            let app = run_dir("app");
+            let _app = up(&app, &proj, &["db"]);
+            homes.name(&app, "app");
+            stopped(&homes, "old", &proj);
+            let report = |fields: &[&str], stale: bool| {
+                list_report(ListOpts {
+                    fields: fields.iter().map(|f| f.to_string()).collect(),
+                    stale,
+                    ..ListOpts::default()
+                })
+            };
+            assert_eq!(
+                report(&["name", "parent"], false).unwrap(),
+                "app\tnull\napp/db\tapp\nold\tnull\n"
+            );
+            assert_eq!(
+                report(&["name", "stale"], true).unwrap(),
+                "app\tnull\napp/db\tnull\nold\tnull\n"
+            );
+            let err = report(&["stale"], false).unwrap_err().to_string();
+            assert!(err.contains("pass --stale"), "{err}");
+            let running = Filter {
+                running: true,
+                ..Filter::default()
+            };
+            assert_eq!(list(None, running, &["name"], false), "app\n");
+            let services = Filter {
+                kind: Some(Kind::Service),
+                ..Filter::default()
+            };
+            assert_eq!(list(None, services, &["status"], false), "-\n");
+        }
+
+        // A directory-name alias selects the service under its primary's displayed name.
+        #[test]
+        fn a_service_is_found_by_its_vm_s_directory_name() {
+            let homes = Homes::new("list-alias");
+            let proj = project(&homes);
+            let alias = "shop-3f9c0d1e2a4b5c6d";
+            let dir = crate::dev::plan::dev_state_base().unwrap().join(alias);
+            let running = up(&dir, &proj, &["db"]);
+            homes.name(&dir, "shop");
+            let db = OsString::from(format!("{alias}/db"));
+            let fields = ["name", "status"];
+            assert_eq!(
+                list(Some(&db), Filter::default(), &fields, false),
+                "shop/db\t-\n"
+            );
+            drop(running);
+            assert_eq!(
+                list(Some(&db), Filter::default(), &fields, false),
+                "shop/db\tstopped\n"
+            );
+            let web = OsString::from(format!("{alias}/web"));
+            assert_eq!(
+                list(Some(&web), Filter::default(), &[], false),
+                format!("no matching vk VM for {alias}/web\n")
+            );
+        }
+
+        // A recipe's non-UTF-8 project survives both JSON output and field selection.
+        #[test]
+        fn a_project_that_is_not_utf8_is_listed() {
+            use std::os::unix::ffi::OsStrExt;
+            let homes = Homes::new("list-bytes");
+            stopped(&homes, "odd", Path::new(OsStr::from_bytes(b"/w/\xff")));
+            let json: serde_json::Value =
+                serde_json::from_str(&list(None, Filter::default(), &[], true)).unwrap();
+            assert_eq!(
+                json[0]["project"],
+                serde_json::json!({"bytes": [47, 119, 47, 255]})
+            );
+            assert_eq!(list(None, Filter::default(), &["name"], false), "odd\n");
+        }
+
+        // A retargeted symlink can make the recipe and live registration name different projects.
+        #[test]
+        fn a_running_vm_missed_by_the_ref_is_not_stopped() {
+            let homes = Homes::new("list-moved");
+            let (a, b) = (homes.dir().join("a"), project(&homes));
+            std::fs::create_dir_all(&a).unwrap();
+            let app = stopped(&homes, "app", &b);
+            let _app = up(&app, &a, &[]);
+            assert_eq!(
+                list(Some(b.as_os_str()), stopped_only(), &["name"], false),
+                ""
+            );
+            assert_eq!(
+                list(Some(b.as_os_str()), Filter::default(), &[], false),
+                format!("no matching vk VM for {}\n", b.display())
+            );
+            assert_eq!(
+                list(None, Filter::default(), &["status"], false),
+                "running\n"
+            );
+        }
+
+        // Non-UTF-8 project and build paths survive registration and the stopped-listing copy.
+        #[test]
+        fn a_running_vm_with_paths_that_are_not_utf8_is_running() {
+            use std::os::unix::ffi::OsStrExt;
+            let homes = Homes::new("list-bytes-up");
+            let odd = PathBuf::from(OsStr::from_bytes(b"/w/\xff"));
+            let dir = stopped(&homes, "odd", &odd);
+            let dir = canonical(&dir);
+            let lock = crate::dev::list::try_lock_state_dir(&dir).unwrap();
+            let mut e = entry(dir.clone(), Some(odd.clone()));
+            let dockerfile = odd.join("Dockerfile");
+            e.stale_recipe = Some(StaleRecipe {
+                dockerfiles: vec![dockerfile.clone()],
+                contexts: vec![odd.clone()],
+                build_contexts: vec![("extra".into(), odd.clone())],
+                build_args: Vec::new(),
+                target: None,
+                root_ext4: odd.join("root.ext4"),
+            });
+            let _reg = register(e);
+            let last = last_entry(&dir).unwrap().unwrap();
+            assert_eq!(last.project_dir, Some(odd.clone()));
+            let recipe = last.stale_recipe.unwrap();
+            assert_eq!(recipe.dockerfiles, [dockerfile]);
+            assert_eq!(recipe.contexts, std::slice::from_ref(&odd));
+            assert_eq!(recipe.build_contexts, [("extra".to_string(), odd.clone())]);
+            assert_eq!(recipe.root_ext4, odd.join("root.ext4"));
+            let running = Filter {
+                running: true,
+                ..Filter::default()
+            };
+            assert_eq!(list(None, running, &["name"], false), "odd\n");
+            drop(lock);
+        }
+
+        // A run can acquire its state lock after the registry snapshot.
+        #[test]
+        fn a_locked_state_dir_is_not_stopped() {
+            let homes = Homes::new("list-locked");
+            let proj = project(&homes);
+            let dir = stopped(&homes, "app", &proj);
+            let held = crate::dev::list::try_lock_state_dir(&dir).unwrap();
+            assert_eq!(list(None, stopped_only(), &["name"], false), "");
+            drop(held);
+            assert_eq!(list(None, stopped_only(), &["name"], false), "app\n");
+        }
+
+        #[test]
+        fn an_unreadable_index_is_an_error() {
+            use std::os::unix::fs::PermissionsExt;
+            let homes = Homes::new("list-unreadable");
+            stopped(&homes, "app", &project(&homes));
+            let bases = [
+                crate::names::state_base().unwrap().join("names"),
+                crate::dev::plan::dev_state_base().unwrap(),
+            ];
+            for dir in bases {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+                // Root may still read the directory after chmod.
+                let readable = std::fs::read_dir(&dir).is_ok();
+                let report = list_report(ListOpts::default());
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+                if !readable {
+                    let err = format!("{:#}", report.unwrap_err());
+                    assert!(err.contains(&dir.display().to_string()), "{err}");
+                }
+            }
+        }
+
+        #[test]
+        fn a_bad_state_home_is_an_error() {
+            let _homes = Homes::new("list-badhome");
+            // SAFETY: serialized by `Homes`, which puts it back on drop.
+            unsafe { std::env::set_var("XDG_STATE_HOME", "relative") };
+            let err = list_report(ListOpts::default()).unwrap_err();
+            assert!(format!("{err:#}").contains("XDG_STATE_HOME"), "{err:#}");
+        }
+
+        // Without a recipe, the saved registration supplies the project for display and selection.
+        #[test]
+        fn a_stopped_run_is_selected_by_the_project_it_shows() {
+            let homes = Homes::new("list-last");
+            let proj = project(&homes);
+            let dir = run_dir("last");
+            std::fs::create_dir_all(&dir).unwrap();
+            record_last(&entry(canonical(&dir), Some(proj.clone()))).unwrap();
+            homes.name(&dir, "last");
+            let fields = ["name", "project"];
+            let row = format!("last\t{}\n", proj.display());
+            assert_eq!(list(None, Filter::default(), &fields, false), row);
+            assert_eq!(
+                list(Some(proj.as_os_str()), stopped_only(), &fields, false),
+                row
+            );
+            // Distinguish a malformed registration from a missing file.
+            std::fs::write(dir.join(LAST), "{").unwrap();
+            assert!(last_entry(&dir).is_err());
+            std::fs::remove_file(dir.join(LAST)).unwrap();
+            assert!(last_entry(&dir).unwrap().is_none());
+        }
     }
 }

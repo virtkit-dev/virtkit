@@ -13,6 +13,13 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **`vk list` shows running and stopped VMs, grouped by project.** Dev environments,
+  named runs and compose services each get a row. A service appears when its manager
+  reports it active or its console log records a start. Filter by `--running`, `--stopped`
+  or `--kind`. Use the first column to select a VM, including `NAME/SERVICE` with `list`,
+  `exec`, `cp`, `logs`, `status` and `publish`.
+- **`vk list --json` and `--field` use the new row format.** JSON has one object per
+  row. Replace `guest_ip` with `ip`, `label` with `image` and `project_dir` with `project`.
 - **A directory names exactly one project's VMs.** `vk list`, `stop`, `reboot`, `pause` and
   `resume` take the VMs of the directories below it only with `--recursive` (`-r`). A bare
   word is a VM name: write `./dir` for a directory.

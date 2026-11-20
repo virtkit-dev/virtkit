@@ -185,6 +185,37 @@ pub(crate) fn name_unnamed_in(base: &Path, idx: &crate::names::Index) -> Result<
     Ok(())
 }
 
+/// List unindexed dev state directories by directory name and presence of `dev.json`.
+/// Includes both candidates for [`name_unnamed`] and directories without a recorded boot.
+/// A missing dev base is empty. Other directory read errors propagate.
+pub fn unnamed_dirs(named: &[(String, PathBuf)]) -> Result<Vec<(String, PathBuf, bool)>> {
+    let base = crate::dev::plan::dev_state_base()?;
+    let read = |e| anyhow::Error::from(e).context(format!("reading {}", base.display()));
+    let entries = match std::fs::read_dir(&base) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(read(e)),
+    };
+    let named: std::collections::HashSet<&Path> = named.iter().map(|(_, d)| d.as_path()).collect();
+    let mut out = Vec::new();
+    for e in entries {
+        let e = e.map_err(read)?;
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let dir = crate::vms::canonical(&e.path());
+        if named.contains(dir.as_path()) || named.contains(e.path().as_path()) {
+            continue;
+        }
+        let Some(own) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let booted = dir.join("dev.json").is_file();
+        out.push((own, dir, booted));
+    }
+    Ok(out)
+}
+
 /// The name a dev environment is first given: its workspace's directory name, then
 /// `-<environment>` for any environment but `dev`.
 pub fn default_name(workspace: &Path, environment: &str) -> String {
@@ -317,11 +348,10 @@ pub fn contents(dir: &Path) -> Vec<Entry> {
     out
 }
 
-/// The padded-column renderer the dev listings share: `vk dev list`, `vk dev storage list`
-/// and `vk dev endpoints`. Each column is as wide as its widest cell, header included,
-/// columns are two spaces apart, and a line's trailing padding is trimmed. A row shorter
-/// than the header keeps the columns it has; a longer one widens the table.
-pub(super) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
+/// Column layout for `vk list` and the dev environment, storage and endpoint tables.
+/// Widths include the header. Columns have two spaces between them and no trailing
+/// padding. Short rows keep their columns, and extra cells widen the table.
+pub(crate) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
     let mut width: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
