@@ -1,7 +1,7 @@
 //! Fetches and summarizes guest kernel OOM kills.
 //!
 //! [`fetch`] reads the agent's records over the exec channel. [`summary`] formats them for
-//! build-stage output, CI traces, `vk run`, and `vk status`, including the setting that raises
+//! build-stage output, CI traces, `vk run`, and `vk ping`, including the setting that raises
 //! the memory limit.
 
 use std::time::Duration;

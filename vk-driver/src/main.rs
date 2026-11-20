@@ -741,7 +741,7 @@ enum PublishAction {
         ///
         /// By name, as `vk list --wide` shows it; the service must be running. Reported as
         /// `via` by `vk publish list --json` and in `vk list --json`'s `published`.
-        #[arg(long, visible_alias = "service", value_name = "NAME")]
+        #[arg(long = "service", visible_alias = "via", value_name = "NAME")]
         via: Option<String>,
     },
     /// List the publishers running for a state dir
@@ -1383,8 +1383,8 @@ enum Cmd {
     /// exercises the agent protocol, stronger than a socket stat. Selects the VM whose project
     /// is the current directory by default; pass a name, a pid or a directory to select
     /// another. A raw agent address (`vsock-auto://DIR/vsock.sock:4444`) probes it directly,
-    /// for plumbing that already knows the socket.
-    #[command(display_order = 7)]
+    /// for plumbing that already knows the socket. `vk status` is the same command.
+    #[command(name = "ping", alias = "status", display_order = 7)]
     Status {
         /// which VM: a name, a pid, a project directory, or a raw agent address
         ///
@@ -1533,10 +1533,10 @@ enum Cmd {
     /// Publish a port on the guest's own network to the host
     ///
     /// Accepts connections on `--listen` and, for each one, asks the target VM's agent —
-    /// over the same exec control channel `vk exec`/`vk status` use — to dial `--to` and
+    /// over the same exec control channel `vk exec`/`vk ping` use — to dial `--to` and
     /// splice raw bytes back, reusing that already-open channel for the relay. The VM is
     /// selected as `vk exec` selects it (a name, a pid, a directory or a raw agent address;
-    /// a compose service with `NAME/SERVICE` or `--via`), and `--to` can name any
+    /// a compose service with `NAME/SERVICE` or `--service`), and `--to` can name any
     /// address that VM's own network reaches — a LAN peer's own compose hostname included,
     /// resolved through that VM's own DNS:
     /// `vk publish app/devcontainer --listen tcp://127.0.0.1:8443 --to tcp://runner:443`.
@@ -1555,7 +1555,7 @@ enum Cmd {
         /// By name, as `vk list --wide` shows it; the service must be running. This form
         /// records nothing, so nothing reports it; `vk publish ensure --via` is reported as
         /// `via`.
-        #[arg(long, visible_alias = "service", value_name = "NAME")]
+        #[arg(long = "service", visible_alias = "via", value_name = "NAME")]
         via: Option<String>,
         /// Local address to accept connections on (tcp://host:port, a unix path, ...)
         #[arg(long, required = true)]
@@ -3457,12 +3457,12 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
     let state_dir = effective_state_dir(cfg)?;
     writeln!(
         out,
-        "state dir       {} ({state_note})",
+        "data dir        {} ({state_note})",
         state_dir.display()
     )?;
     writeln!(
         out,
-        "                the root of everything vk stores on this host"
+        "                the root of the caches and records vk keeps on this host"
     )?;
     writeln!(
         out,
@@ -3581,11 +3581,38 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
     )?;
     writeln!(
         out,
-        "                one entry per `vk run --state-dir` VM; `vk list`/`vk stop` read it"
+        "                one entry per running `vk run --state-dir` VM; `vk list`/`vk stop` read it"
     )?;
     writeln!(
         out,
         "                (self-pruned as VMs exit — no `vk gc` needed)"
+    )?;
+    writeln!(
+        out,
+        "runs ledger     {} (default: $XDG_DATA_HOME/virtkit/runs)",
+        crate::run::default_data_base()?.join("runs").display()
+    )?;
+    writeln!(
+        out,
+        "                the root images runs built into their state dirs, for `vk gc`"
+    )?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "VM state        {} (default: $XDG_STATE_HOME/virtkit)",
+        crate::names::state_base()?.display()
+    )?;
+    writeln!(
+        out,
+        "  dev/          one state dir per dev environment (`vk dev list`)"
+    )?;
+    writeln!(
+        out,
+        "  run/          state dirs of runs named with --name or started with --detach"
+    )?;
+    writeln!(
+        out,
+        "  names/        the VM names `vk list` prints: a link per name to its state dir"
     )?;
     if let Some(repo) = cfg.registry.as_ref().and_then(|r| r.local_root()) {
         writeln!(
@@ -5507,7 +5534,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 }
             }
             Ok(atop_attach::Target::Recorded(job)) => match atop::resolve(&ctx.cfg, &job) {
-                // Exit 2 for a job nothing answers to, like `vk status`/`list`/`stop` — a
+                // Exit 2 for a job nothing answers to, like `vk ping`/`list`/`stop` — a
                 // reader of the path must not be handed a success with no path.
                 Err(e) => fail(&e, 2),
                 // A recorded job names itself: its log sits in the directory the run made,
@@ -5621,7 +5648,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             }
         }
         // Run a command in a live guest, reproducing its exit status as our own. The target
-        // selects the VM the same way `vk status` does (a name, pid or directory, default cwd,
+        // selects the VM the same way `vk ping` does (a name, pid or directory, default cwd,
         // or a raw agent address); the command is the trailing `-- …` group.
         Cmd::Exec {
             target,
@@ -5667,7 +5694,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                     Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
                 };
             }
-            // Resolution/usage errors exit 2, matching `vk status`/`vk list`/`vk stop` and
+            // Resolution/usage errors exit 2, matching `vk ping`/`vk list`/`vk stop` and
             // clap's own usage-error exit. Any vk-chosen code can collide with the remote
             // command's status vk reproduces below; 2 matches what the old CLI returned
             // when the positional address failed to parse.
@@ -5809,7 +5836,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             let (Some(listen), Some(to)) = (listen, to) else {
                 return fail(&anyhow::anyhow!("--listen and --to are required"), 2);
             };
-            let addr = match resolve_exec_addr(target.as_deref(), via.as_deref(), "--via") {
+            let addr = match resolve_exec_addr(target.as_deref(), via.as_deref(), "--service") {
                 Ok(a) => a,
                 Err(e) => return fail(&e, 2),
             };
@@ -6637,7 +6664,7 @@ fn broken_pipe(r: std::io::Result<()>) -> anyhow::Result<bool> {
     }
 }
 
-/// Resolve a `vk status`/`vk exec` target to the agent address to dial: a raw `scheme://…`
+/// Resolve a `vk ping`/`vk exec` target to the agent address to dial: a raw `scheme://…`
 /// address is used as-is; anything else (or nothing) is a directory selecting the VM through the
 /// registry, defaulting to the current directory.
 fn resolve_agent_addr(target: Option<&str>) -> anyhow::Result<SocketAddr> {
@@ -6797,8 +6824,8 @@ fn resolve_exec_addr_at(state_dir: &Path, via: Option<&str>) -> anyhow::Result<S
         );
     };
     // `ensure` canonicalizes the state dir, so only a hand-run `serve` reaches this
-    // message — and `--via` is the right name there too.
-    resolve_exec_addr(Some(target), via, "--via")
+    // message — and `--service` is the right name there too.
+    resolve_exec_addr(Some(target), via, "--service")
 }
 
 /// The managed half of `vk publish`. Each action names its VM by state dir — the same
@@ -7329,6 +7356,42 @@ mod tests {
     // `vk paths --gitlab` must report the jobs root the executor actually uses:
     // Config::state_dir() (/var/lib/virtkit when unset), not the XDG dev default
     // `vk run` caches under.
+    #[test]
+    fn paths_report_names_the_data_dir_and_where_vms_keep_state() {
+        let report = paths_report(&config::Config::default(), false).unwrap();
+        assert!(report.contains("\ndata dir        "), "{report}");
+        assert!(!report.contains("\nstate dir "), "{report}");
+        for line in [
+            "runs ledger     ",
+            "VM state        ",
+            "  dev/  ",
+            "  run/  ",
+            "  names/  ",
+        ] {
+            assert!(report.contains(line), "{line}: {report}");
+        }
+    }
+
+    #[test]
+    fn ping_is_the_probe_and_status_still_reaches_it() {
+        for name in ["ping", "status"] {
+            let cli = Cli::try_parse_from(["vk", name, "app"]).unwrap();
+            assert!(matches!(cli.cmd, Cmd::Status { .. }), "{name}");
+        }
+        let cli = Cli::try_parse_from([
+            "vk",
+            "publish",
+            "--service",
+            "db",
+            "--listen",
+            "tcp://127.0.0.1:1",
+            "--to",
+            "tcp://x:2",
+        ])
+        .unwrap();
+        assert!(matches!(cli.cmd, Cmd::Publish { via: Some(ref s), .. } if s == "db"));
+    }
+
     #[test]
     fn paths_report_gitlab_matches_jobctx() {
         let ctx =
@@ -8319,6 +8382,7 @@ mod tests {
                 "list",
                 "logs",
                 "pause",
+                "ping",
                 "publish",
                 "reboot",
                 "rename",
@@ -8330,7 +8394,6 @@ mod tests {
                 "ssh",
                 "ssh-config",
                 "start",
-                "status",
                 "stop",
                 "toolchain",
                 "update"

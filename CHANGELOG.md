@@ -28,6 +28,9 @@ All notable changes to virtkit will be documented in this file.
   word is a VM name: write `./dir` for a directory.
 - **Compose services appear in `vk list` once they have booted**; a declared service
   that never started is not listed.
+- **`vk status` is now `vk ping`**, and `vk publish --via` is now `--service`; the old
+  spellings still work. `vk paths` calls its root the data dir and shows where VMs keep
+  their state.
 
 ## [0.114.0] - 2026-11-20
 

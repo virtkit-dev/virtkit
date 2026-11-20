@@ -871,7 +871,7 @@ hit `ENOSPC` while the host still has free disk space.
 
 The guest agent records processes killed by the guest kernel's OOM killer. The host reports
 them alongside memory figures in build-stage completion output, CI traces, completed
-`vk run` output, and `vk status` for a live VM. Each line identifies the victim, the
+`vk run` output, and `vk ping` for a live VM. Each line identifies the victim, the
 anonymous RSS reclaimed, its guest uptime at death, and the setting that raises the memory
 limit. This can explain a command that exited with signal 9.
 
@@ -959,7 +959,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk list` | List every VM vk knows — running or stopped, dev environments, named runs and their compose services — one row each; `--running`/`--stopped`, `--kind`, `-w` for the full table, `--json`/`--field` for scripts. |
 | `vk start`, `vk stop`, `vk restart`, `vk delete`, `vk rename` | Start, stop, restart, delete or rename a VM by the name `vk list` prints (`NAME/SERVICE` for a service); `start`, `restart` and `delete` take several; `vk stop` also takes a pid or directory, or `--all`. |
 | `vk reboot` | Reboot a running VM in place through its guest, or power-cycle it with `--force`. |
-| `vk status` | Probe a guest agent, or report whether its root image is stale. |
+| `vk ping` | Probe a guest agent, or report whether its root image is stale (`vk status` is the same). |
 | `vk logs` | Show a VM's console log, telling kernel, agent and guest output apart; `--level warn`, `--agent`, `--service NAME`, `-f`. |
 | `vk cp`, `vk console`, `vk pause\|resume`, `vk snapshot` | Copy files into or out of a [Windows guest](#windows-guests), attach to its serial console, freeze it, or save it to restore later. |
 | `vk atop` | Follow or inspect guest resource recordings. |
@@ -993,7 +993,7 @@ optional. With no configuration file, local `run` and `build` workflows use defa
 vk config             # print the effective TOML and its source
 vk config --example   # print the annotated reference configuration
 vk config --path      # print the resolved configuration path
-vk paths              # print resolved state, cache, and registry paths
+vk paths              # print the data dir, caches, VM state dirs and registry paths
 ```
 
 [`vk-driver/config.example.toml`](vk-driver/config.example.toml) documents every key.
