@@ -27,13 +27,17 @@ use crate::gpt;
 pub const AGENT_PATH: &str = "vk-init";
 /// `run-init` path in a merged-/usr initrd, where `/sbin` points to `usr/sbin`.
 const RUN_INIT_PATH: &str = "usr/sbin/run-init";
-/// With `VIRTKIT_BOOT=initrd`, `/init` execs this stand-in to report the root
-/// and exit. The dry run (`-n`) succeeds and the capability drop (`-d`) is
-/// skipped because the agent handles the PID 1 handoff.
+/// Under `VIRTKIT_BOOT=initrd`, `run-init` reports the mounted root in `/virtkit-root`
+/// and exits. The `-n` dry run succeeds because the agent selects and checks init.
+/// Any other leading option, including `-d` (`drop_capabilities=`), fails because
+/// the agent cannot honor it.
 const RUN_INIT_STANDIN: &str = "#!/bin/sh
 # vk: hand the mounted root to vk's agent, PID 1, instead of exec'ing its init.
-[ \"$1\" = -n ] && exit 0
-[ \"$1\" = -d ] && shift 2
+case \"$1\" in
+-n) exit 0 ;;
+-d) echo 'vk: drop_capabilities= is not supported on a vk disk boot' >&2; exit 1 ;;
+-*) echo \"vk: run-init $1 is not supported on a vk disk boot\" >&2; exit 1 ;;
+esac
 echo \"$1\" > /virtkit-root
 ";
 
@@ -322,6 +326,29 @@ mod tests {
     fn the_layout_names_the_partitions_the_agent_uses() {
         assert_eq!(layout_text(3, Some(4)), "boot=/dev/vda3\nroot=/dev/vda4\n");
         assert_eq!(layout_text(3, None), "boot=/dev/vda3\n");
+    }
+
+    /// Exercise the stand-in with Debian initramfs-tools arguments.
+    #[test]
+    fn the_run_init_stand_in_refuses_what_it_cannot_do() {
+        let run = |args: &[&str]| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(RUN_INIT_STANDIN)
+                .arg("run-init")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(run(&["-n", "/root", "/sbin/init"]).status.success());
+        for args in [
+            &["-d", "cap_sys_admin", "/root", "/sbin/init"][..],
+            &["-x", "/root"],
+        ] {
+            let out = run(args);
+            assert!(!out.status.success(), "{args:?}");
+            assert!(String::from_utf8_lossy(&out.stderr).contains("not supported"));
+        }
     }
 
     #[test]

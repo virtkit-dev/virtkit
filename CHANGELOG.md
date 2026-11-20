@@ -15,7 +15,7 @@ All notable changes to virtkit will be documented in this file.
   starts only if `/boot` exposes the root of that partition.
   With `--boot-cmdline root=…`, a Debian initramfs-tools initrd with a merged `/usr`
   can mount the root before handoff, including LVM on LUKS unlocked with a key file
-  on `/boot`.
+  on `/boot`. Boot fails if the initrd requests `drop_capabilities=`.
 
 ## [0.113.1] - 2026-11-20
 
