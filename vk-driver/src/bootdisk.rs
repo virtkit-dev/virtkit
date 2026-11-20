@@ -1,11 +1,14 @@
 //! Boot a persistent disk on the kernel installed in its own `/boot` (`vk run --boot-disk`,
 //! experimental; see `docs/vm-boot-from-disk-design.md`).
 //!
-//! On every launch, including guest reboots, [`resolve`] reads the GPT disk's ext2
-//! XBOOTLDR partition and selects the newest complete `vmlinuz-<release>` and
-//! `initrd.img-<release>` pair. vk appends its archive to the guest initrd with
-//! the agent ([`AGENT_PATH`]), boot config and module names for the initrd's
-//! `modprobe`. `rdinit=` starts the agent and leaves the guest's `/init` intact.
+//! On every launch, including guest reboots, [`resolve`] reads the GPT and selects the
+//! newest complete `vmlinuz-<release>`/`initrd.img-<release>` pair from the ext2
+//! XBOOTLDR partition (`/boot`). vk preserves the guest initrd and appends its own
+//! archive. `rdinit=` starts the archived agent at [`AGENT_PATH`] in place of `/init`.
+//! The archive also supplies the boot config and module names for the running release.
+//! The agent loads those modules with the initrd's `modprobe`. A last archive, written for
+//! each launch, names the partitions this launch found ([`vk_core::runcfg::DISK_LAYOUT`]):
+//! the agent mounts that root.
 //!
 //! The agent mounts a `Linux root (x86-64)` partition directly. With `--boot-cmdline`,
 //! it runs Debian initramfs-tools' `/init` to mount a root such as LVM on LUKS.
@@ -43,6 +46,8 @@ pub struct BootDisk {
     pub disk: PathBuf,
     /// vk's archive, appended to the guest's initrd.
     pub vk_cpio: PathBuf,
+    /// The agent mounts the root partition when `--boot-cmdline` is absent.
+    pub own_root: bool,
 }
 
 /// Kernel release selected for one launch.
@@ -51,25 +56,24 @@ pub struct Resolved {
     pub release: String,
 }
 
-/// The root partition's index on `disk`, for the guest's `/dev/vda<N>`.
-pub fn root_partition(disk: &Path) -> Result<u32> {
-    let img = DiskImage::open(disk)?;
-    let parts = gpt::read(&img).with_context(|| format!("{}", disk.display()))?;
-    Ok(gpt::only_of_type(&parts, gpt::TYPE_ROOT_X86_64)?.index)
-}
-
-/// Write the newest complete pair from `/boot` to `kernel_out` and `initramfs_out`,
-/// extracting an ELF vmlinux and appending vk's archive to the initrd. Read all inputs
-/// before writing either output. A write failure can leave the outputs incomplete.
+/// Write the newest complete pair from `/boot` to `kernel_out` (ELF vmlinux) and
+/// `initramfs_out` (guest initrd, vk archive, then [`vk_core::runcfg::DISK_LAYOUT`]).
+/// [`BootDisk::own_root`] requires a root partition. Read all inputs before writing
+/// either output. A write failure can leave the outputs incomplete.
 pub fn resolve(bd: &BootDisk, kernel_out: &Path, initramfs_out: &Path) -> Result<Resolved> {
     let name = bd.disk.display().to_string();
     // One open for the table and the filesystem both, so they describe the same image.
     let img = DiskImage::open(&bd.disk)?;
     let parts = gpt::read(&img).with_context(|| name.clone())?;
     let boot = gpt::only_of_type(&parts, gpt::TYPE_XBOOTLDR).with_context(|| name.clone())?;
-    let index = boot.index;
+    let root = if bd.own_root {
+        Some(gpt::only_of_type(&parts, gpt::TYPE_ROOT_X86_64).with_context(|| name.clone())?)
+    } else {
+        None
+    };
+    let layout = layout_text(boot.index, root.map(|r| r.index));
     let fs = img.slice(boot.offset, boot.len)?;
-    let reader = Ext4Reader::open_image(fs, &format!("{name} partition {index}"))?;
+    let reader = Ext4Reader::open_image(fs, &format!("{name} partition {}", boot.index))?;
     let entries = reader.list_dir("/").context("listing /boot")?;
     let release = newest_pair(&entries)?;
 
@@ -83,11 +87,22 @@ pub fn resolve(bd: &BootDisk, kernel_out: &Path, initramfs_out: &Path) -> Result
     let vk =
         std::fs::read(&bd.vk_cpio).with_context(|| format!("reading {}", bd.vk_cpio.display()))?;
 
+    let mut tail = crate::cpio::CpioWriter::new(Vec::new());
+    tail.file_bytes(vk_core::runcfg::DISK_LAYOUT, 0o644, layout.as_bytes())?;
+    let initramfs = append_archive(append_archive(initrd, &vk), &tail.finish()?);
     std::fs::write(kernel_out, &elf)
         .with_context(|| format!("writing {}", kernel_out.display()))?;
-    std::fs::write(initramfs_out, append_archive(initrd, &vk))
+    std::fs::write(initramfs_out, initramfs)
         .with_context(|| format!("writing {}", initramfs_out.display()))?;
     Ok(Resolved { release })
+}
+
+fn layout_text(boot: u32, root: Option<u32>) -> String {
+    let mut text = format!("boot=/dev/vda{boot}\n");
+    if let Some(root) = root {
+        text.push_str(&format!("root=/dev/vda{root}\n"));
+    }
+    text
 }
 
 /// Align the appended cpio archive to the 4-byte boundary the kernel expects.
@@ -300,6 +315,12 @@ mod tests {
             e("initrd.img-9.9\x1b[2J", FileType::Regular),
         ];
         assert!(newest_pair(&escape).is_err());
+    }
+
+    #[test]
+    fn the_layout_names_the_partitions_the_agent_uses() {
+        assert_eq!(layout_text(3, Some(4)), "boot=/dev/vda3\nroot=/dev/vda4\n");
+        assert_eq!(layout_text(3, None), "boot=/dev/vda3\n");
     }
 
     #[test]

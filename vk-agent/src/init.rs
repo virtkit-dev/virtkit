@@ -204,7 +204,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     // If booted from the agent-only initramfs (`VIRTKIT_PIVOT=<root dev>`), mount the
     // real image ext4 and switch into it — keeping this process as PID 1 — so the agent
     // never lives inside the image. A no-op on the legacy in-rootfs `init=` boot.
-    if let Err(e) = pivot_to_real_root() {
+    if let Err(e) = pivot_to_real_root(None) {
         warn!("vk-agent init: pivot to real root failed: {e:#} — continuing in place");
     }
 
@@ -304,9 +304,9 @@ fn raise_nofile_hard_limit() {
     }
 }
 
-/// When booted from the agent-only initramfs, mount the real root (an ext4 named by
-/// `VIRTKIT_PIVOT` on the kernel cmdline, e.g. `/dev/vda`) and switch into it while
-/// staying PID 1. Returns `Ok(false)` (a no-op) on the legacy boot where the agent was
+/// Switch from the initramfs to the real root while staying PID 1. `VIRTKIT_PIVOT`
+/// names the root device (e.g. `/dev/vda`), or `disk` to use this launch's root partition.
+/// Returns `Ok(false)` on a legacy boot where the agent was
 /// `init=`'d from inside the rootfs and `VIRTKIT_PIVOT` is absent.
 ///
 /// This is the initramfs→real-root `switch_root` dance: the new root is mounted, moved
@@ -314,7 +314,7 @@ fn raise_nofile_hard_limit() {
 /// underneath; this process keeps running and its binary stays reachable via
 /// `/proc/self/exe` even though the path is gone — which is how the host re-invokes the
 /// agent's `copy`/`mount`/`fsfreeze` subcommands without it being present in the image.
-fn pivot_to_real_root() -> Result<bool> {
+fn pivot_to_real_root(layout: Option<&DiskLayout>) -> Result<bool> {
     // /proc to read the cmdline, /dev for the root block-device node.
     let _ = std::fs::create_dir_all("/proc");
     let _ = mount("proc", "/proc", "proc", 0);
@@ -333,6 +333,13 @@ fn pivot_to_real_root() -> Result<bool> {
     }
     let Some(dev) = cmdline.get("VIRTKIT_PIVOT").cloned() else {
         return Ok(false);
+    };
+    let dev = if dev == "disk" {
+        layout
+            .and_then(|l| l.root.clone())
+            .context("VIRTKIT_PIVOT=disk, and no disk layout names a root partition")?
+    } else {
+        dev
     };
     let _ = std::fs::create_dir_all("/dev");
     let _ = mount("devtmpfs", "/dev", "devtmpfs", 0);
@@ -577,7 +584,12 @@ fn run_full_vm(
     // image — its own /sbin/init, or its entrypoint — and neither exists anywhere but the
     // real root. Unlike the serve-mode path (which can keep serving in place), continuing
     // without the pivot would just exec the initramfs's own tree — so fail loudly instead.
-    pivot_to_real_root().context("vk-agent image-init: pivot to real root")?;
+    // Read the layout before the pivot hides the initramfs.
+    let disk_layout = match cmdline.get("VIRTKIT_BOOT").map(String::as_str) {
+        Some("disk" | "initrd") => Some(DiskLayout::read()?),
+        _ => None,
+    };
+    pivot_to_real_root(disk_layout.as_ref()).context("vk-agent image-init: pivot to real root")?;
     // Re-mount /proc and /dev in the pivoted root before the setup below: the
     // pivot's MS_MOVE hid the initramfs mounts, so the new root has neither. /proc
     // is needed because `spawn_serve` execs `/proc/self/exe` (else exit 127); /dev
@@ -1093,6 +1105,35 @@ fn passwd_home(user: &str) -> Option<std::ffi::OsString> {
         }
         let bytes = std::ffi::CStr::from_ptr((*p).pw_dir).to_bytes();
         (!bytes.is_empty()).then(|| std::ffi::OsStr::from_bytes(bytes).to_os_string())
+    }
+}
+
+/// What the host found on a disk boot's disk for this launch: unless the guest's initrd
+/// mounts it, its root partition.
+#[derive(Debug, Default, PartialEq)]
+struct DiskLayout {
+    root: Option<String>,
+}
+
+impl DiskLayout {
+    /// Read the host's [`vk_core::runcfg::DISK_LAYOUT`] from the initramfs.
+    fn read() -> Result<Self> {
+        let path = format!("/{}", vk_core::runcfg::DISK_LAYOUT);
+        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
+        Ok(Self::parse(&text))
+    }
+
+    fn parse(text: &str) -> Self {
+        let mut layout = DiskLayout::default();
+        for line in text.lines() {
+            match line.split_once('=') {
+                Some(("boot", _)) => {}
+                Some(("root", dev)) => layout.root = Some(dev.to_string()),
+                // Only the host writes this file. Unknown lines can indicate a format mismatch.
+                _ => warn!("vk-agent init: disk layout line {line:?} not understood"),
+            }
+        }
+        layout
     }
 }
 
@@ -4130,6 +4171,17 @@ mod tests {
     }
 
     /// git's helpers and scripts are left to an image with git; git-lfs is a tool of its own.
+
+    #[test]
+    fn disk_layout_reads_its_partitions() {
+        assert_eq!(
+            super::DiskLayout::parse("boot=/dev/vda3\nroot=/dev/vda4\nother=x\n"),
+            super::DiskLayout {
+                root: Some("/dev/vda4".into()),
+            }
+        );
+        assert_eq!(super::DiskLayout::parse("boot=/dev/vda3\n").root, None);
+    }
 
     #[test]
     fn git_family() {

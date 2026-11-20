@@ -16,6 +16,10 @@ pub const INITRAMFS_PATH: &str = "virtkit-service.json";
 /// Archive path listing modules for the guest initrd's `modprobe` to load before mounting root.
 pub const MODPROBE_LIST: &str = "virtkit-modprobe";
 
+/// Per-launch archive member containing `boot=/dev/vdaN` and, when the agent mounts
+/// the root partition, `root=/dev/vdaN`.
+pub const DISK_LAYOUT: &str = "virtkit-disk";
+
 /// Guest file the embedded SSH server reads into every session's environment: how a
 /// development environment's `exec-env` reaches Remote-SSH's server process and terminals.
 /// The host writes it (as root, mode 0600) once the guest is up and again on every attach,

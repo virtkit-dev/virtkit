@@ -2001,6 +2001,7 @@ async fn build_and_boot(
             let bd = crate::bootdisk::BootDisk {
                 disk: disk.clone(),
                 vk_cpio,
+                own_root: args.boot_cmdline.is_none(),
             };
             // Read once here so a disk vk cannot boot fails the run, not the boot child.
             let resolved = crate::bootdisk::resolve(&bd, &kernel_medium, &preinit)
@@ -2010,6 +2011,9 @@ async fn build_and_boot(
                 resolved.release,
                 disk.display()
             );
+            // The partition numbers can change across a reboot. For a direct mount the
+            // agent reads this launch's root device from the initrd. With --boot-cmdline,
+            // the guest initrd mounts the requested root (e.g. LVM on LUKS) for the agent.
             let root = match &args.boot_cmdline {
                 // Override a caller's `ro` for setup and `prepare`. `--root ro`
                 // appends a final `ro` for the handoff.
@@ -2017,10 +2021,7 @@ async fn build_and_boot(
                     "VIRTKIT_BOOT=initrd VIRTKIT_INITRD_TIMEOUT={} {extra} rw",
                     args.boot_timeout_secs - 10
                 ),
-                None => format!(
-                    "VIRTKIT_BOOT=disk VIRTKIT_PIVOT=/dev/vda{}",
-                    crate::bootdisk::root_partition(&disk)?
-                ),
+                None => "VIRTKIT_BOOT=disk VIRTKIT_PIVOT=disk".to_string(),
             };
             boot_kernel = kernel_medium;
             boot_disk = Some(bd);
