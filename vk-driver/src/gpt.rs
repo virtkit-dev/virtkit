@@ -1,6 +1,6 @@
 //! Read partition types, unique GUIDs, names and byte ranges from a disk image's primary GPT.
-//! Check the header and entry array CRCs and each partition's bounds. A damaged primary
-//! is an error. The reader never consults the backup.
+//! Check the protective MBR, header revision, reserved field, table layout, header and array
+//! CRCs, and partition bounds. An invalid primary is an error. The backup table is never read.
 
 use anyhow::{Context, Result, bail};
 
@@ -8,8 +8,12 @@ use crate::diskimg::DiskImage;
 
 /// The sector size vk's disks are attached with.
 pub const SECTOR: u64 = 512;
-/// Maximum entry count accepted by the reader.
+/// Maximum entry count. Partitioners typically write 128 entries.
 const MAX_ENTRIES: u32 = 1024;
+/// Linux ignores a GPT whose entries are not 128 bytes.
+const ENTRY_SIZE: u32 = 128;
+/// UEFI reserves at least 16 KiB for each entry array.
+const MIN_ARRAY_SECTORS: u64 = 16384 / SECTOR;
 
 // GUID comparisons use the uppercase text returned by read.
 
@@ -33,6 +37,19 @@ pub struct Partition {
 
 /// The partitions of the GPT on `disk`, in table order, unused entries left out.
 pub fn read(disk: &DiskImage) -> Result<Vec<Partition>> {
+    let mut mbr = [0u8; SECTOR as usize];
+    disk.read_exact_at(&mut mbr, 0)
+        .context("reading the protective MBR")?;
+    // By default, Linux requires a protective entry of type 0xEE starting at LBA 1.
+    if mbr[510..512] != [0x55, 0xAA]
+        || !mbr[446..510]
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .any(|e| e[4] == 0xEE && rd32(e, 8) == 1)
+    {
+        bail!("no protective MBR at LBA 0");
+    }
     let mut hdr = [0u8; SECTOR as usize];
     disk.read_exact_at(&mut hdr, SECTOR)
         .context("reading the GPT header")?;
@@ -48,19 +65,42 @@ pub fn read(disk: &DiskImage) -> Result<Vec<Partition>> {
     if crc32(&crc_input) != rd32(&hdr, 16) {
         bail!("GPT header CRC mismatch");
     }
+    if rd32(&hdr, 8) != 0x0001_0000 {
+        bail!("GPT header revision {:#x} unsupported", rd32(&hdr, 8));
+    }
+    if rd32(&hdr, 20) != 0 {
+        bail!("GPT header reserved field nonzero");
+    }
     let sectors = disk.len() / SECTOR;
+    let (my_lba, alternate) = (rd64(&hdr, 24), rd64(&hdr, 32));
     let first_usable = rd64(&hdr, 40);
     let last_usable = rd64(&hdr, 48);
-    if first_usable > last_usable || last_usable >= sectors {
-        bail!("GPT usable range {first_usable}..={last_usable} outside {sectors} sectors");
-    }
     let entries_lba = rd64(&hdr, 72);
     let count = rd32(&hdr, 80);
     let entry_size = rd32(&hdr, 84);
-    if count > MAX_ENTRIES || !(128..=4096).contains(&entry_size) || !entry_size.is_multiple_of(8) {
+    if count == 0 || count > MAX_ENTRIES || entry_size != ENTRY_SIZE {
         bail!("GPT entry array of {count} entries of {entry_size} bytes");
     }
     let array_len = u64::from(count) * u64::from(entry_size);
+    // Each array needs whole sectors and at least the UEFI minimum. The primary array
+    // fits before the first usable LBA. Leave room for the backup array immediately
+    // before its header, which may precede the end of a grown disk.
+    let array_sectors = array_len.div_ceil(SECTOR).max(MIN_ARRAY_SECTORS);
+    // Reject overflow in layout sums computed from guest header fields.
+    let fits = |a: u64, b: u64, limit: u64| a.checked_add(b).is_some_and(|end| end <= limit);
+    if my_lba != 1
+        || entries_lba < 2
+        || !fits(entries_lba, array_sectors, first_usable)
+        || first_usable > last_usable
+        || alternate >= sectors
+        || !fits(last_usable, array_sectors, alternate.saturating_sub(1))
+    {
+        bail!(
+            "GPT layout inconsistent: header at LBA {my_lba}, backup at {alternate}, entries at \
+             {entries_lba} ({array_sectors} sectors), usable {first_usable}..={last_usable}, \
+             {sectors} sectors"
+        );
+    }
     let mut array = vec![0u8; array_len as usize];
     let array_at = entries_lba
         .checked_mul(SECTOR)
@@ -89,6 +129,14 @@ pub fn read(disk: &DiskImage) -> Result<Vec<Partition>> {
         }) {
             bail!("GPT partitions {} and {} overlap", p.index, i + 1);
         }
+        let unique_guid = guid(&e[16..32]);
+        if let Some(p) = parts.iter().find(|p| p.unique_guid == unique_guid) {
+            bail!(
+                "GPT partitions {} and {} share GUID {unique_guid}",
+                p.index,
+                i + 1
+            );
+        }
         let name: Vec<u16> = e[56..128]
             .as_chunks::<2>()
             .0
@@ -99,7 +147,7 @@ pub fn read(disk: &DiskImage) -> Result<Vec<Partition>> {
         parts.push(Partition {
             index: i as u32 + 1,
             type_guid: guid(&e[0..16]),
-            unique_guid: guid(&e[16..32]),
+            unique_guid,
             name: String::from_utf16_lossy(&name),
             offset: first * SECTOR,
             len: (last - first + 1) * SECTOR,
@@ -198,6 +246,9 @@ mod tests {
                 e[56 + 2 * j..58 + 2 * j].copy_from_slice(&c.to_le_bytes());
             }
         }
+        d[446 + 4] = 0xEE;
+        d[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+        d[510..512].copy_from_slice(&[0x55, 0xAA]);
         let h = &mut d[512..1024];
         h[0..8].copy_from_slice(b"EFI PART");
         h[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
@@ -220,7 +271,7 @@ mod tests {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!("vk-gpt-{}-{seq}", std::process::id()));
-        std::fs::write(&p, d).unwrap();
+        vk_fs::write_new(&p, d, 0o600).unwrap();
         let img = DiskImage::open(&p).unwrap();
         std::fs::remove_file(&p).unwrap();
         read(&img)
@@ -282,16 +333,57 @@ mod tests {
         bad_hdr[512 + 40] ^= 1;
         let mut bad_array = good.clone();
         bad_array[1024 + 60] ^= 1;
+        let mut no_mbr = good.clone();
+        no_mbr[510] = 0;
+        let mut mbr_at_0 = good.clone();
+        mbr_at_0[446 + 8] = 0;
         for (d, want) in [
+            (no_mbr, "protective MBR"),
+            (mbr_at_0, "protective MBR"),
+            // Both array bounds can overflow u64.
+            (
+                with(&good, 72, &(u64::MAX - 1).to_le_bytes()),
+                "inconsistent",
+            ),
+            (
+                with(&good, 48, &(u64::MAX - 1).to_le_bytes()),
+                "inconsistent",
+            ),
+            (with(&good, 84, &256u32.to_le_bytes()), "entry array"),
+            (with(&good, 8, &0x0002_0000u32.to_le_bytes()), "revision"),
+            (with(&good, 20, &1u32.to_le_bytes()), "reserved"),
+            // Backup header off disk or at LBA 0. Primary array before LBA 2 or one
+            // sector into the usable range. Last usable LBA one sector into the backup array.
+            (with(&good, 32, &2048u64.to_le_bytes()), "inconsistent"),
+            (with(&good, 32, &0u64.to_le_bytes()), "inconsistent"),
+            (with(&good, 72, &1u64.to_le_bytes()), "inconsistent"),
+            (with(&good, 72, &0u64.to_le_bytes()), "inconsistent"),
+            (with(&good, 72, &3u64.to_le_bytes()), "inconsistent"),
+            (with(&good, 48, &2015u64.to_le_bytes()), "inconsistent"),
+            // A short table still reserves UEFI's 32 sectors before the first usable LBA.
+            (
+                with(
+                    &with(&good, 80, &4u32.to_le_bytes()),
+                    40,
+                    &10u64.to_le_bytes(),
+                ),
+                "inconsistent",
+            ),
+            // The primary header reports its own location as LBA 5.
+            (with(&good, 24, &5u64.to_le_bytes()), "inconsistent"),
+            // Entries running into the first usable LBA, and a backup header inside the
+            // usable range.
+            (with(&good, 72, &10u64.to_le_bytes()), "inconsistent"),
+            (with(&good, 32, &1500u64.to_le_bytes()), "inconsistent"),
+            (with(&good, 84, &136u32.to_le_bytes()), "entry array"),
+            (with(&good, 80, &0u32.to_le_bytes()), "entry array"),
             (bad_hdr, "header CRC"),
             (bad_array, "array CRC"),
             (with(&good, 12, &91u32.to_le_bytes()), "header size"),
             (with(&good, 12, &513u32.to_le_bytes()), "header size"),
             (with(&good, 80, &2000u32.to_le_bytes()), "entry array"),
-            (
-                with(&good, 72, &2047u64.to_le_bytes()),
-                "reading the GPT entry array",
-            ),
+            // The array starts past the first usable LBA and extends beyond the disk.
+            (with(&good, 72, &2047u64.to_le_bytes()), "inconsistent"),
             (
                 disk(&[(TYPE_XBOOTLDR, 199, 100, "x")]),
                 "outside the usable",
@@ -307,7 +399,6 @@ mod tests {
                 ]),
                 "overlap",
             ),
-            (vec![0u8; 4096], "no GPT header"),
         ] {
             let err = format!("{:#}", read_bytes(&d).unwrap_err());
             assert!(err.contains(want), "{want}: {err}");
@@ -319,5 +410,39 @@ mod tests {
         .unwrap();
         assert!(only_of_type(&two, TYPE_XBOOTLDR).is_err());
         assert!(only_of_type(&two, TYPE_ROOT_X86_64).is_err());
+        let mut no_header = good.clone();
+        no_header[512] = 0;
+        let err = format!("{:#}", read_bytes(&no_header).unwrap_err());
+        assert!(err.contains("no GPT header"), "{err}");
+        // Two entries with one unique GUID.
+        let mut dup = disk(&[
+            (TYPE_XBOOTLDR, 100, 199, "a"),
+            (TYPE_ROOT_X86_64, 200, 299, "b"),
+        ]);
+        dup.copy_within(1024 + 16..1024 + 32, 1024 + 128 + 16);
+        let array_crc = crc32(&dup[1024..1024 + 128 * 128]);
+        dup[512 + 88..512 + 92].copy_from_slice(&array_crc.to_le_bytes());
+        dup[512 + 16..512 + 20].fill(0);
+        let c = crc32(&dup[512..512 + 92]);
+        dup[512 + 16..512 + 20].copy_from_slice(&c.to_le_bytes());
+        let err = format!("{:#}", read_bytes(&dup).unwrap_err());
+        assert!(err.contains("share GUID"), "{err}");
+    }
+
+    /// Growing a disk can leave its backup header before the last LBA.
+    /// Any MBR slot can hold the protective entry.
+    #[test]
+    fn accepts_a_grown_disk_and_any_mbr_slot() {
+        let good = disk(&[(TYPE_XBOOTLDR, 100, 199, "boot")]);
+        let grown = with(
+            &with(&good, 32, &1500u64.to_le_bytes()),
+            48,
+            &1467u64.to_le_bytes(),
+        );
+        assert_eq!(read_bytes(&grown).unwrap().len(), 1);
+        let mut slot3 = good.clone();
+        slot3.copy_within(446..462, 446 + 32);
+        slot3[446..462].fill(0);
+        assert_eq!(read_bytes(&slot3).unwrap().len(), 1);
     }
 }
