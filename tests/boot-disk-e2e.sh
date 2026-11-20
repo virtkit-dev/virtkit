@@ -5,7 +5,8 @@
 # lvdata: ext4 on /var/data), unlocked at boot with a key file on /boot.
 #
 #   1. the seed boots on its kernel A through its own initrd (unlock, LVM, root mount), with
-#      --root ro and a prepare, and comes up with every filesystem and the swap;
+#      --root ro and a prepare hook. Its init sees a read-only / and writable /var. All
+#      filesystems mount, the ESP contains the source marker, and swap is active;
 #   2. the guest installs a newer kernel B with apt, whose scripts rebuild its initrd;
 #   3. `systemctl reboot` in the guest comes back on B, same machine, same data;
 #   4. a stop and a cold start boot B again.
@@ -38,6 +39,7 @@ gx() { "$VK" exec "$vm" -- sh -c "$1"; }
 start() {
   # 2G: the guest runs apt and rebuilds its initrd for kernel B.
   "$VK" run --net --detach --mem 2G --init image \
+    --init-argv /usr/local/sbin/vk-handoff-probe \
     -f "$tools/boot-disk/Dockerfile" --context "$tools" --target fixture \
     --boot-disk "$WORK/disk.img" --boot-cmdline root=/dev/mapper/vg00-lvroot \
     --root ro --prepare "sh -c 'findmnt -rno OPTIONS /var > /var/lib/vk-prepared'" \
@@ -54,6 +56,8 @@ settle() { # wait for systemd, and print the machine's state
     echo "kernel: $(uname -r)"
     echo "boot-id: $(cat /proc/sys/kernel/random/boot_id)"
     echo "pid1: $(readlink /proc/1/exe)"
+    h=$(dmesg | grep -o "vk-handoff: .*" | tail -1); echo "${h:-vk-handoff: none}"
+    echo "esp: $(cat /boot/efi/EFI/vk/marker 2>/dev/null || echo none)"
     echo "prepared: $(cat /var/lib/vk-prepared 2>/dev/null || echo none)"
     if touch /vk-rw-probe 2>/dev/null; then echo "root-now: rw"; else echo "root-now: ro"; fi
     findmnt -rno TARGET,SOURCE,FSTYPE | grep -E " (btrfs|ext2|ext4|vfat)$" | sed "s/^/mount: /"
@@ -71,6 +75,9 @@ settle() { # wait for systemd, and print the machine's state
 expect_machine() { # <output>
   expect "$1" '^system-state: (running|degraded)$' "systemd did not reach a run state"
   expect "$1" '^pid1: .*/systemd$' "systemd is not PID 1"
+  expect "$1" '^vk-handoff: root=ro var=rw$' \
+    "the init did not start on a read-only / and a writable /var"
+  expect "$1" '^esp: esp-ok$' "the ESP lost the source's /boot/efi"
   expect "$1" '^prepared: rw,' "prepare did not run on a writable /var"
   expect "$1" '^root-now: rw$' "systemd did not remount / rw"
   expect "$1" '^block: cryptroot crypt$' "the LUKS volume is not open"

@@ -38,4 +38,12 @@ RUN mkdir -p /etc/initramfs-tools/conf.d \
         initramfs-tools btrfs-progs dosfstools iproute2 ca-certificates cryptsetup \
         cryptsetup-initramfs lvm2 \
     && rm -rf /var/lib/apt/lists/*
+# The PID 1 probe logs mount modes before systemd can remount /. The test checks the
+# source marker on the ESP after each boot.
+RUN printf '%s\n' '#!/bin/sh' \
+        'o() { findmnt -rno OPTIONS --mountpoint "$1" | cut -d, -f1; }' \
+        'echo "vk-handoff: root=$(o /) var=$(o /var)" > /dev/kmsg' \
+        'exec /sbin/init "$@"' > /usr/local/sbin/vk-handoff-probe \
+    && chmod 0755 /usr/local/sbin/vk-handoff-probe \
+    && mkdir -p /boot/efi/EFI/vk && echo esp-ok > /boot/efi/EFI/vk/marker
 CMD ["/sbin/init"]
