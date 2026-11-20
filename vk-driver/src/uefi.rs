@@ -997,7 +997,7 @@ pub(crate) async fn run(
     };
     // `vk reboot` hard-resets the guest: there is no agent to ask.
     crate::run::forward_hard_resets(&ch);
-    println!(
+    crate::quiet::note!(
         "virtkit: {name}: UEFI guest {} ({cpus} vCPU, {mem}{}{}); console {}",
         if restore {
             "restored from its snapshot"
@@ -1048,7 +1048,9 @@ pub(crate) async fn run(
         tokio::select! {
             off = power_off(&mut ch, work, crate::winsvc::STOP_GRACE) => match off {
                 Some(after) => {
-                    println!("virtkit: guest powered off ({after:.0?} after the power button)")
+                    crate::quiet::note!(
+                        "virtkit: guest powered off ({after:.0?} after the power button)"
+                    )
                 }
                 None => eprintln!(
                     "virtkit: guest still up {}s after the power button; ending the VM",
@@ -1091,7 +1093,7 @@ fn set_clock_when_up(socket: PathBuf) {
     let _ = std::thread::Builder::new()
         .name("vk-set-clock".into())
         .spawn(move || match set() {
-            Ok(()) => println!("virtkit: guest clock set to the host's"),
+            Ok(()) => crate::quiet::note!("virtkit: guest clock set to the host's"),
             Err(e) => eprintln!(
                 "virtkit: warning: the restored guest's clock is not set, so Kerberos may fail \
                  until it is: {e:#}"
@@ -1107,7 +1109,7 @@ fn set_tap_address_when_up(work: PathBuf, tap: TapNet, vmm: u32) {
         .name("vk-tap-address".into())
         .spawn(
             move || match set_tap_address(&work, &tap, &mut || crate::spawn::pid_alive(vmm)) {
-                Ok(()) => println!("virtkit: the guest's tap address is set"),
+                Ok(()) => crate::quiet::note!("virtkit: the guest's tap address is set"),
                 Err(e) => eprintln!("virtkit: warning: the guest's tap address is not set: {e:#}"),
             },
         );
@@ -1163,7 +1165,7 @@ async fn hold(ch: &mut Child, console: &Path, detach_log: Option<&Path>) -> Resu
             if !status.success() {
                 bail!("the VMM exited with {status}");
             }
-            println!("virtkit: guest powered off");
+            crate::quiet::note!("virtkit: guest powered off");
             return Ok(());
         }
         if !ready && spawned.elapsed() >= BOOT_SETTLE {
@@ -1172,7 +1174,7 @@ async fn hold(ch: &mut Child, console: &Path, detach_log: Option<&Path>) -> Resu
         }
         tokio::select! {
             () = &mut stop => {
-                println!("virtkit: stopping ... (ACPI power button)");
+                crate::quiet::note!("virtkit: stopping ... (ACPI power button)");
                 return Ok(());
             }
             () = tokio::time::sleep(Duration::from_millis(200)) => {}

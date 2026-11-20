@@ -758,7 +758,7 @@ pub fn keep(spec: &VmSpec) -> Result<i32> {
             short_boots = 0;
         }
         restore = false;
-        eprintln!("virtkit: guest reset — rebooting");
+        crate::quiet::enote!("virtkit: guest reset — rebooting");
     }
 }
 

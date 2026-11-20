@@ -66,14 +66,16 @@ impl Source {
             Source::Docker { docker, image } => docker_export_stream(docker, image, consume),
             Source::Oci { reference, creds } => {
                 let (merger, layers) =
-                    crate::oci::pull_merged(reference, creds, scratch_dir, &|m| println!("{m}"))
-                        .await?;
+                    crate::oci::pull_merged(reference, creds, scratch_dir, &|m| {
+                        crate::quiet::note!("{m}")
+                    })
+                    .await?;
                 let hints = TarHints {
                     data_bytes: merger.data_bytes(),
                     entries: Some(merger.entry_count() as u64),
                 };
                 let (out, n) = stream_pipe(move |w| merger.finish_to(w), |rd| consume(rd, &hints))?;
-                println!("virtkit: flattened {layers} layers -> {n} entries");
+                crate::quiet::note!("virtkit: flattened {layers} layers -> {n} entries");
                 Ok(out)
             }
         }

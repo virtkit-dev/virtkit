@@ -1479,7 +1479,7 @@ async fn resolve_source(args: &RunArgs) -> Result<Source> {
                 .await
                 .with_context(|| format!("checking the registry for {}", args.image))?;
             if !exists {
-                println!(
+                crate::quiet::note!(
                     "virtkit: {} is not in a registry — falling back to docker",
                     args.image
                 );
@@ -2108,7 +2108,7 @@ async fn build_and_boot(
             let ext4 = if let Some(ext4) = &dockerfile_ext4 {
                 ext4.clone()
             } else {
-                println!("virtkit: building ext4 rootfs");
+                crate::quiet::note!("virtkit: building ext4 rootfs");
                 let rootfs = medium("root.ext4")?;
                 let source = source.as_ref().expect("an image boot resolved a source");
                 source
@@ -2210,7 +2210,7 @@ async fn build_and_boot(
             let ext4 = if let Some(ext4) = &dockerfile_ext4 {
                 ext4.clone()
             } else {
-                println!("virtkit: building ext4 rootfs");
+                crate::quiet::note!("virtkit: building ext4 rootfs");
                 let rootfs = medium("root.ext4")?;
                 let source = source.as_ref().expect("an image boot resolved a source");
                 source
@@ -2265,7 +2265,7 @@ async fn build_and_boot(
             // --ram: the image itself is the initramfs, with the agent and the boot config
             // injected into it. The agent unlinks the config once read; nothing here is on a
             // disk.
-            println!("virtkit: building cpio initramfs");
+            crate::quiet::note!("virtkit: building cpio initramfs");
             let env_config = scratch_boot_config(work, &image_env, &primary_user)?;
             let injects: [(&str, &Path, u16); 2] = [
                 (crate::initramfs::CMDRUNNER_PATH, agent, 0o755),
@@ -2787,7 +2787,7 @@ async fn build_and_boot(
                 cache: crate::vmm::ShareCache::Auto,
             });
             push_knob(&mut cmdline, &vk_core::atop::cmdline_knob(secs));
-            println!(
+            crate::quiet::note!(
                 "virtkit: recording guest stats every {secs}s -> {} (`vk atop` to watch)",
                 log.display()
             );
@@ -2844,7 +2844,7 @@ async fn build_and_boot(
     let console = work.join(CONSOLE_LOG);
     let vmm = crate::vmm::selected();
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
-    println!("virtkit: booting {} (cpus={cpus}, mem={mem})", vmm.name());
+    crate::quiet::note!("virtkit: booting {} (cpus={cpus}, mem={mem})", vmm.name());
     // exec channel always; the switch NICs and the ssh-agent bridge only when set up above.
     let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
     let nics = net_attach.map(|attach| attach.nics).unwrap_or_default();
@@ -2961,7 +2961,7 @@ async fn build_and_boot(
     // announces placements it chooses, as the CI ledger does. Use `describe` because an
     // explicit interleave is not the auto path's "does not fit one node" fallback.
     if let crate::numa::Numa::Placed(placement) = &spec.numa {
-        eprintln!("virtkit: NUMA: {}", placement.describe());
+        crate::quiet::enote!("virtkit: NUMA: {}", placement.describe());
     }
     let mut ch = match spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Normal) {
         Ok(ch) => ch,
@@ -3196,7 +3196,7 @@ async fn build_and_boot(
     let power_off = std::cell::Cell::new(PowerOff::of(persistent, &addr));
     let stop = async {
         signalled.await;
-        println!("virtkit: stopping ...");
+        crate::quiet::note!("virtkit: stopping ...");
         stopping.cancel();
         if !persistent {
             return;
@@ -3287,7 +3287,7 @@ async fn build_and_boot(
     // Read after teardown: every guest and helper has been waited for, so their CPU is in
     // and the switch has published the last of what it carried.
     if let Some(usage) = meter.read() {
-        eprintln!(
+        crate::quiet::enote!(
             "{}",
             usage.with_network(&work.join(NET_BYTES)).summary("run")
         );
@@ -3334,7 +3334,7 @@ async fn start_eager(
         stopped = stop => stopped,
         started = &mut starts => return started.context("starting the services")?,
     };
-    println!("virtkit: stopping ...");
+    crate::quiet::note!("virtkit: stopping ...");
     boot.stop();
     // The start under way ends once its guest is stopped (a Windows provisioning gives up as
     // its guest goes).
@@ -3533,7 +3533,7 @@ fn start_services(
                 let reply = start(name);
                 let mut p = boot.progress.lock().unwrap();
                 if reply.ok {
-                    println!("virtkit: service {name}: {}", reply.message);
+                    crate::quiet::note!("virtkit: service {name}: {}", reply.message);
                     p.up.insert(name.clone());
                     boot.changed.notify_all();
                 } else if p.failure.is_none() {
@@ -4207,7 +4207,7 @@ async fn compose_up(
         stop_switch(switch);
         return Err(e);
     }
-    println!(
+    crate::quiet::note!(
         "virtkit: compose up on {gw}/{prefix}; {} of {} service(s) started — ctrl-c stops everything",
         planned.start.len(),
         mgr.declared(),
@@ -4218,7 +4218,7 @@ async fn compose_up(
         crate::detach::signal_ready(args.detach_log.as_deref());
     }
     stop.await;
-    println!("virtkit: stopping ...");
+    crate::quiet::note!("virtkit: stopping ...");
     mgr.stop_all();
     stop_switch(switch);
     if let Some(summary) = crate::egress_report::contacts_summary(
@@ -4235,7 +4235,7 @@ async fn compose_up(
     }
     // Read after stop_all: every service VM has been waited for, so their CPU is in.
     if let Some(usage) = meter.read() {
-        eprintln!(
+        crate::quiet::enote!(
             "{}",
             usage.with_network(&work.join(NET_BYTES)).summary("run")
         );
@@ -5228,7 +5228,7 @@ async fn drive(
             match run_shell(addr).await {
                 Ok(()) => return Ok(()),
                 Err(_) if !stopping.is_cancelled() && ch.try_wait()?.is_none() => {
-                    eprintln!("virtkit: guest rebooted — reconnecting");
+                    crate::quiet::enote!("virtkit: guest rebooted — reconnecting");
                     first_pass = false;
                     continue;
                 }
@@ -5284,7 +5284,7 @@ async fn drive(
             // vsock error is indistinguishable and re-runs a non-idempotent command; the boot loop
             // bounds it by `boot_timeout_secs`.
             Err(_) if !stopping.is_cancelled() && ch.try_wait()?.is_none() => {
-                eprintln!("virtkit: guest rebooted — re-running the command");
+                crate::quiet::enote!("virtkit: guest rebooted — re-running the command");
                 first_pass = false;
                 continue;
             }
@@ -5473,7 +5473,7 @@ pub(crate) fn spawn_vmm(
         // here: one handed down was announced by whoever chose it.
         if let Some(ticket) = ticket {
             ticket.spawned(child.id());
-            eprintln!("virtkit: NUMA: {}", crate::numa::announce(&placement));
+            crate::quiet::enote!("virtkit: NUMA: {}", crate::numa::announce(&placement));
         }
         // The affinity is set in the child's pre_exec, so it is normally in place the instant
         // the VMM exists; a loaded host can still be a beat behind. Re-read a few times while

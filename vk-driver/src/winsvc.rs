@@ -208,7 +208,7 @@ impl Provisioning {
         let mut log = std::fs::File::create(&log_path)
             .with_context(|| format!("creating {}", log_path.display()))?;
         if self.restored {
-            println!("virtkit: service {}: resuming from its snapshot", self.name);
+            crate::quiet::note!("virtkit: service {}: resuming from its snapshot", self.name);
             // Its setup finished before the snapshot: its agent answering is enough.
             let mut ga =
                 crate::qga::Client::connect_while(&socket, RESUME_TIMEOUT, &label, running)
@@ -223,7 +223,7 @@ impl Provisioning {
             }
             return Ok(());
         }
-        println!(
+        crate::quiet::note!(
             "virtkit: service {}: waiting for Windows, then its provisioning (log {})",
             self.name,
             log_path.display()

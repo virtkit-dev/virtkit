@@ -39,6 +39,10 @@ All notable changes to virtkit will be documented in this file.
   Downloads and staged archives stay in `$XDG_CACHE_HOME/virtkit/add` (by default
   `~/.cache/virtkit/add`) without automatic eviction. Placed CI jobs use their own egress
   record for this cache. Job egress reports omit `ADD` downloads.
+- **`vk run --quiet` (`-q`) hides pull, build, boot and service progress**, including the
+  build dashboard, timing and resource usage. Guest output, warnings and errors still print.
+  A failed build prints the end of its log. `--ssh` still prints the SSH command,
+  `--audit-egress` the egress summary, and `--detach` the PID.
 
 ## [0.113.1] - 2026-11-20
 

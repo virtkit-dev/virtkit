@@ -302,7 +302,7 @@ fn resolve_pinned(
     image::mark_used(&dir);
     // A ref pinned by the job already carries a digest; the one it resolved to replaces it.
     let base = strip_digest(full);
-    println!("virtkit: image {base}@{digest} (OCI direct boot)");
+    crate::quiet::note!("virtkit: image {base}@{digest} (OCI direct boot)");
     // generic-disk boot: the boot applies the image's Env/User/WorkingDir/Entrypoint/Cmd
     // from the runner.ext4.json sidecar (`resolved_from_dir` loads it) — no baking.
     Ok(image::resolved_from_dir(&dir, BootKind::GenericDisk))
@@ -317,7 +317,7 @@ fn build(full: &str, creds: &Creds, dir: &Path) -> Result<()> {
     // later sweep to notice. `image::sweep_orphaned_build_tmp` backstops the case nothing
     // can run at all (SIGKILL/OOM).
     let cleanup = image::TmpGuard::create(&tmp)?;
-    println!("virtkit: pulling {full} ...");
+    crate::quiet::note!("virtkit: pulling {full} ...");
     // Flatten the image byte-clean (the agent rides the boot initramfs) and capture its
     // Config into the runner.ext4.json sidecar — the shared OCI-flatten core. A journalled
     // fs and no freshness UUID: the digest-keyed cache dir is this image's identity.

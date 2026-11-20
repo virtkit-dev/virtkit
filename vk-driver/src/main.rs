@@ -77,6 +77,7 @@ mod prio;
 mod publish;
 mod qcow2;
 mod qga;
+mod quiet;
 mod registry;
 mod regproxy;
 mod relay;
@@ -2550,6 +2551,14 @@ enum Cmd {
             help_heading = "Detach"
         )]
         detach_log: Option<PathBuf>,
+        /// Leave out the run's own progress notes
+        ///
+        /// Leaves out the run's progress: pull, build, boot and service notes, the build
+        /// dashboard, the timing breakdown and the resource usage. A failed build still prints
+        /// the end of its log, and what a flag asks for still prints: `--ssh`'s command,
+        /// `--audit-egress`'s summary, `--detach`'s pid.
+        #[arg(short = 'q', long)]
+        quiet: bool,
         /// Command to run in the guest (default: a boot-info probe)
         ///
         /// Several words are an argv, each passed as typed (like docker run — use `sh -c '…'`
@@ -2945,6 +2954,7 @@ fn main() -> ExitCode {
     // free for the VM's process name). Dispatched before the CLI on that env var; it links
     // libkrun and blocks in the VM's event loop until the guest powers off.
     if let Ok(json) = std::env::var(vmm::BOOT_SPEC_ENV) {
+        quiet::inherit();
         let spec: vmm::VmSpec = match serde_json::from_str(&json) {
             Ok(spec) => spec,
             Err(e) => return fail(&anyhow::anyhow!("libkrun boot: bad spec: {e}"), 2),
@@ -2959,6 +2969,10 @@ fn main() -> ExitCode {
     // property of the command, and clap answers `--help`/`--version` by printing and
     // exiting — so neither is ever forked and printed twice.
     let cli = Cli::parse();
+    // Before the fork, so the detaching parent is quiet too.
+    if let Cmd::Run { quiet: true, .. } = &cli.cmd {
+        quiet::set();
+    }
 
     // `vk run … --detach`, and the `vk dev` actions that boot — daemonize once the guest is
     // ready. The fork must precede the Tokio runtime (forking a live multi-threaded runtime
@@ -3725,6 +3739,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         inactivity_timeout,
         detach_log,
         command,
+        ..
     } = &cli.cmd
     {
         let services_only = file.is_empty() && image.is_none() && primary.is_none();

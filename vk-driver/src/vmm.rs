@@ -787,6 +787,12 @@ impl Vmm for Libkrun {
         // BOOT_SPEC_ENV off argv (so `ps` stays clean), and the boot child sets its 15-char
         // `comm` from the spec's `proc_name`. `main` dispatches on BOOT_SPEC_ENV's presence.
         cmd.arg0(&spec.proc_name).env(BOOT_SPEC_ENV, json);
+        // A quiet run's VMM is quiet too; set here so no other child inherits it.
+        if crate::quiet::on() {
+            cmd.env(crate::quiet::ENV, "1");
+        } else {
+            cmd.env_remove(crate::quiet::ENV);
+        }
         cmd
     }
 

@@ -417,11 +417,16 @@ pub struct Options {
 }
 
 /// The reporter for a build: the routed sink when [`Options::progress_sink`] is set (a
-/// streamed on-demand build), else the default terminal/plain dashboard.
-fn build_progress(opts: &Options) -> Arc<Progress> {
+/// streamed on-demand build), a buffered log for a quiet run, or the default terminal/plain
+/// dashboard. Quiet runs also receive the buffer to print on failure.
+fn build_progress(opts: &Options) -> (Arc<Progress>, Option<crate::quiet::Held>) {
     match &opts.progress_sink {
-        Some(sink) => Progress::routed(Arc::clone(sink)),
-        None => Progress::new(),
+        Some(sink) => (Progress::routed(Arc::clone(sink)), None),
+        None if crate::quiet::on() => {
+            let held = crate::quiet::Held::default();
+            (Progress::held(held.sink()), Some(held))
+        }
+        None => (Progress::new(), None),
     }
 }
 
@@ -1192,7 +1197,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     // Live build overview (Docker/buildkit-style): a dashboard in a terminal, plain `#N`
     // lines otherwise. The drivers populate it (which stages/steps run) once they know the
     // needed set, and route each stage's guest output through it.
-    let progress = build_progress(opts);
+    let (progress, held) = build_progress(opts);
     let result = (|| -> Result<Built> {
         // The microVM backend drives stages in parallel over the dependency DAG (each
         // stage on its own guest); the host backend (FROM scratch + COPY) stays
@@ -1285,6 +1290,11 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     })();
     // Leave the final dashboard frame on screen (FINISHED/FAILED) before any teardown log.
     progress.finish(result.is_ok());
+    if result.is_err()
+        && let Some(held) = &held
+    {
+        held.dump();
+    }
     timings.render();
     // What the build cost the host, next to where its time went. Every stage guest is a
     // child this process has already waited for (each stage ends by tearing its guest down),
@@ -1295,7 +1305,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
         // this reads before removing the scratch — a build's guests are gone by now, and each was
         // stopped rather than killed so nothing it carried went unpublished.
         let usage = usage.with_network(&channels.join(crate::run::NET_BYTES));
-        eprintln!("{}", usage.summary("build"));
+        crate::quiet::enote!("{}", usage.summary("build"));
     }
     // After the dashboard froze, so it is safe to print.
     print_audit_summaries(opts, &channels);
@@ -1307,8 +1317,8 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
         .collect::<Vec<_>>()
         .join(" + ");
     match out {
-        Some(out) => println!("virtkit: built {srcs} -> {}", out.display()),
-        None => println!(
+        Some(out) => crate::quiet::note!("virtkit: built {srcs} -> {}", out.display()),
+        None => crate::quiet::note!(
             "virtkit: built {srcs} -> disk {}",
             opts.out_disk.as_deref().unwrap().display()
         ),
@@ -1426,7 +1436,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
         }
     };
 
-    let progress = build_progress(opts);
+    let (progress, held) = build_progress(opts);
     let result = (|| -> Result<HashMap<String, Built>> {
         /// One resolved target of a unit: its stage index and where it exports.
         struct Tgt {
@@ -1761,6 +1771,11 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     })();
     // Leave the final dashboard frame on screen before any teardown log.
     progress.finish(result.is_ok());
+    if result.is_err()
+        && let Some(held) = &held
+    {
+        held.dump();
+    }
     timings.render();
     // Dropped before the meter is read, so the terminal cache-push drain its worker pool
     // joins is charged to the build like build_backend's is — there the pool goes out of
@@ -1769,7 +1784,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     // What the whole fleet build cost the host (see build_backend's counterpart).
     if let Some(usage) = meter.read() {
         let usage = usage.with_network(&channels.join(crate::run::NET_BYTES));
-        eprintln!("{}", usage.summary("build"));
+        crate::quiet::enote!("{}", usage.summary("build"));
     }
     // After the dashboard froze, so it is safe to print.
     print_audit_summaries(opts, &channels);
@@ -1778,8 +1793,8 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     for u in &units {
         for t in &u.targets {
             match &t.out {
-                Some(out) => println!("virtkit: built {} -> {}", t.label, out.display()),
-                None => println!("virtkit: cached {}", t.label),
+                Some(out) => crate::quiet::note!("virtkit: built {} -> {}", t.label, out.display()),
+                None => crate::quiet::note!("virtkit: cached {}", t.label),
             }
         }
     }

@@ -174,8 +174,11 @@ impl Timings {
         e.1 += 1;
     }
 
-    /// Print the breakdown to stdout. A no-op when nothing was recorded.
+    /// Print the breakdown to stdout. A no-op when nothing was recorded, or on a quiet run.
     pub fn render(&self) {
+        if crate::quiet::on() {
+            return;
+        }
         if let Some(text) = self.inner.lock().unwrap().format(self.start.elapsed()) {
             println!("{text}");
         }

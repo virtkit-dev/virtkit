@@ -170,6 +170,8 @@ enum Backend {
 
 pub struct Progress {
     backend: Backend,
+    /// Send warnings directly to stderr for [`Progress::held`].
+    warn_stderr: bool,
     color: bool,
     start: Instant,
     meta: OnceLock<Meta>,
@@ -234,6 +236,13 @@ impl Progress {
         Arc::new(Progress::new_backend(Backend::Routed(sink), false))
     }
 
+    /// Buffer plain `#N …` progress lines in `sink` and send warnings directly to stderr.
+    pub fn held(sink: super::ProgressSink) -> Arc<Self> {
+        let mut p = Progress::new_backend(Backend::Routed(sink), false);
+        p.warn_stderr = true;
+        Arc::new(p)
+    }
+
     /// Emit one already-formatted plain line to the plain/routed target — stdout for the
     /// plain backend, the sink for a routed (streamed) build. Only the `Plain`/`Routed`
     /// event arms call it; the tty/disabled backends render (or drop) their own lines.
@@ -268,6 +277,8 @@ impl Progress {
             Backend::Tty(tty) => {
                 let _ = tty.println(self.paint(line, "\x1b[1;33m"));
             }
+            // Keep live warnings out of the buffer so a failure prints them only once.
+            Backend::Plain | Backend::Routed(_) if self.warn_stderr => eprintln!("{line}"),
             Backend::Plain | Backend::Routed(_) => self.plain_line(format_args!("{line}")),
             Backend::Disabled => {}
         }
@@ -276,6 +287,7 @@ impl Progress {
     fn new_backend(backend: Backend, color: bool) -> Self {
         Progress {
             backend,
+            warn_stderr: false,
             color,
             start: Instant::now(),
             meta: OnceLock::new(),
@@ -2571,6 +2583,26 @@ mod tests {
             !done.ends_with(" 0.0s"),
             "DONE line lost the run time: {done}"
         );
+    }
+
+    #[test]
+    fn a_held_reporter_keeps_steps_and_failure_but_not_warnings() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |l: &str| lines.lock().unwrap().push(l.to_string()))
+                as Arc<dyn Fn(&str) + Send + Sync>
+        };
+        let p = Progress::held(sink);
+        p.init(two_stages(), 0);
+        p.step_start(1, 0);
+        p.warn("virtkit: warning: careful");
+        p.step_done(1, 0, Outcome::Ran);
+        p.finish(false);
+        let got = lines.lock().unwrap();
+        assert!(got.iter().any(|l| l.contains(" DONE ")), "{got:?}");
+        assert!(got.iter().any(|l| l.contains("FAILED")), "{got:?}");
+        assert!(!got.iter().any(|l| l.contains("careful")), "{got:?}");
     }
 
     /// A routed reporter whose lines go nowhere, for the heartbeat tests.

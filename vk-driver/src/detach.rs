@@ -324,6 +324,18 @@ mod tests {
         super::wants_detach(&crate::Cli::parse_from(parts).cmd)
     }
 
+    /// `-q` before the command quiets the run; after `--` it is the guest command's.
+    #[test]
+    fn quiet_is_taken_only_before_the_command() {
+        let quiet = |parts: &[&str]| match crate::Cli::parse_from(parts).cmd {
+            crate::Cmd::Run { quiet, .. } => quiet,
+            _ => unreachable!(),
+        };
+        assert!(quiet(&["vk", "run", "-q", "--", "true"]));
+        assert!(quiet(&["vk", "run", "--quiet"]));
+        assert!(!quiet(&["vk", "run", "--", "grep", "-q", "x"]));
+    }
+
     #[test]
     fn detach_before_double_dash_is_honored() {
         assert!(wants_detach(&["vk", "run", "--detach"]));

@@ -420,14 +420,14 @@ impl Manager {
         for (dependency, condition) in &unit.wait_for {
             match condition {
                 crate::compose::Condition::Healthy => {
-                    println!(
+                    crate::quiet::note!(
                         "virtkit: service {}: waiting for {dependency} to be healthy",
                         unit.name
                     );
                     self.wait_healthy(dependency, &cancelled)?;
                 }
                 crate::compose::Condition::CompletedSuccessfully => {
-                    println!(
+                    crate::quiet::note!(
                         "virtkit: service {}: waiting for {dependency} to complete",
                         unit.name
                     );

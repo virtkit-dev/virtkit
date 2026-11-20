@@ -850,7 +850,7 @@ async fn try_pull_ext4_lazy_async(
         fetched.load(Ordering::Relaxed),
         reused.load(Ordering::Relaxed),
     );
-    println!(
+    crate::quiet::note!(
         "virtkit: registry: {label}: {} ext4 chunks ({fetched} fetched, {reused} cached, lazy restore)",
         fetched + reused
     );
@@ -1454,7 +1454,7 @@ async fn push_disk_diff_async(
             added += 1;
         }
     }
-    println!(
+    crate::quiet::note!(
         "virtkit: registry: {} ext4 chunks ({reused} reused, {regened} re-chunked, {added} added, {uploaded} uploaded)",
         layers.len()
     );
@@ -1496,7 +1496,7 @@ async fn push_disk_diff_async(
         annotations: None,
     });
     let digest = push_manifest(&client, &image, &manifest).await?;
-    println!(
+    crate::quiet::note!(
         "virtkit: registry: pushed {}/{name}:{tag} -> {digest}",
         rg.repo
     );
@@ -1943,7 +1943,7 @@ async fn push_async(
         }
     }
     let chunk_count = layers.len();
-    println!(
+    crate::quiet::note!(
         "virtkit: registry: {chunk_count} ext4 chunks ({uploaded} uploaded, {skipped} deduped)"
     );
 
@@ -1998,7 +1998,7 @@ async fn push_async(
         annotations: None,
     });
     let digest = push_manifest(&client, &image, &manifest).await?;
-    println!(
+    crate::quiet::note!(
         "virtkit: registry: pushed {}/{name}:{tag} -> {digest}",
         rg.repo
     );
@@ -2093,7 +2093,7 @@ async fn resolve_async(
     let boot_kind = image::read_boot_kind(&dir).with_context(|| {
         format!("registry bundle {name}@{digest}: unsupported boot.kind (legacy systemd and unmarked bundles are retired) — rebuild with vk build and re-push")
     })?;
-    println!("virtkit: image {name}@{digest} (registry bundle, {boot_kind:?})");
+    crate::quiet::note!("virtkit: image {name}@{digest} (registry bundle, {boot_kind:?})");
     Ok((image::resolved_from_dir(&dir, boot_kind), dir))
 }
 
@@ -2117,7 +2117,7 @@ async fn pull_into(
     lock.report(vk_hub_proto::dispatch::Activity::Pulling {
         image: label.to_string(),
     });
-    println!("virtkit: registry: pulling {label} ...");
+    crate::quiet::note!("virtkit: registry: pulling {label} ...");
     let (manifest, _) =
         with_transfer_retry(&format!("pulling the manifest of {name}@{digest}"), || {
             client.pull_manifest(image, auth)
@@ -2223,7 +2223,7 @@ async fn pull_into(
         fetched.load(Ordering::Relaxed),
         reused.load(Ordering::Relaxed),
     );
-    println!(
+    crate::quiet::note!(
         "virtkit: registry: {label}: {} ext4 chunks ({fetched} fetched, {reused} cached)",
         fetched + reused
     );

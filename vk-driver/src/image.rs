@@ -473,18 +473,18 @@ fn acquire_pull_lock_with(
                     // every `beat`, so a job log does not go quiet for the whole of it.
                     let waited = since.elapsed();
                     if beat.due(waited) {
-                        println!(
+                        crate::quiet::note!(
                             "virtkit: still waiting for the concurrent {verb} of {name}, {}",
                             crate::build::fmt_wait(waited)
                         );
                     }
                 } else {
                     match &who {
-                        Some(who) => println!(
+                        Some(who) => crate::quiet::note!(
                             "virtkit: waiting for a concurrent {verb} of {name}@{digest} \
                              (held by {who}) ..."
                         ),
-                        None => println!(
+                        None => crate::quiet::note!(
                             "virtkit: waiting for a concurrent {verb} of {name}@{digest} ..."
                         ),
                     }
@@ -615,7 +615,7 @@ pub(crate) struct Evicted {
 pub(crate) fn gc_idle(root: &Path, idle: std::time::Duration) -> Evicted {
     let evicted = collect_idle(root, idle, false);
     if evicted.bases > 0 {
-        println!(
+        crate::quiet::note!(
             "virtkit: evicted {} idle image(s) under {}, {}",
             evicted.bases,
             root.display(),
@@ -941,7 +941,7 @@ pub(crate) fn evict_for_room(
     .map(|(n, what)| format!("{n} {what}"))
     .collect();
     if !what.is_empty() {
-        println!(
+        crate::quiet::note!(
             "virtkit: evicted {} under {} for room in {}: {} freed of the {} needed",
             what.join(" and "),
             state_dir.display(),
@@ -1212,7 +1212,7 @@ impl Swept {
     /// and, with [`Leftovers::Name`], what it left.
     fn report(&self, root: &Path, leftovers: Leftovers) {
         if self.dirs > 0 {
-            println!(
+            crate::quiet::note!(
                 "virtkit: reclaimed {} dead build dir(s) under {}, {}",
                 self.dirs,
                 root.display(),
