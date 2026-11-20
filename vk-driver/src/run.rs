@@ -326,6 +326,40 @@ fn session_exit_code(r: &vk_core::messages::CmdResult) -> Result<i32> {
     }
 }
 
+/// Refuse a boot disk the run itself writes over: a file of the run's state (`root.qcow2`
+/// and its `.tmp` and `.json` a `-f` or `--primary` build exports, a sibling's `svc-*`, ...),
+/// named directly or through a symlink, or a hard link to `root.qcow2`, its `.tmp` or `.json`.
+/// The disk must exist, checked before any build.
+fn check_boot_disk_target(disk: &Path, work: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let refuse = || {
+        anyhow::anyhow!(
+            "--boot-disk {}: the run writes its state there; keep the disk elsewhere",
+            disk.display()
+        )
+    };
+    let cdisk = std::fs::canonicalize(disk)
+        .with_context(|| format!("--boot-disk {}: cannot access", disk.display()))?;
+    let cwork =
+        std::fs::canonicalize(work).with_context(|| format!("state dir {}", work.display()))?;
+    if let Ok(rel) = cdisk.strip_prefix(&cwork)
+        && rel
+            .components()
+            .next()
+            .is_some_and(|c| is_host_state_entry(c.as_os_str()))
+    {
+        return Err(refuse());
+    }
+    let id = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    let disk_id = id(&cdisk);
+    for name in ["root.qcow2", "root.qcow2.tmp", "root.qcow2.json"] {
+        if disk_id.is_some() && id(&cwork.join(name)) == disk_id {
+            return Err(refuse());
+        }
+    }
+    Ok(())
+}
+
 /// Minimum host boot timeout. The initrd timeout is 10 seconds shorter.
 const MIN_INITRD_BOOT_TIMEOUT_SECS: u64 = 30;
 
@@ -777,6 +811,9 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
         if args.root_image.is_some() {
             bail!("--root-image boots a Linux root, not a UEFI bundle");
         }
+        if args.boot_disk.is_some() {
+            bail!("--boot-disk boots a Linux disk, not a UEFI bundle");
+        }
         work.lock()?;
         return crate::uefi::run(args, cfg, &work.path, bundle).await;
     }
@@ -799,7 +836,12 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
         KernelSource::Default | KernelSource::Image => None,
     };
     let kernel = crate::embed::resolve(crate::embed::Asset::Kernel, kernel_path)?;
-    if args.kernel != KernelSource::Image && !kernel.is_embedded() && !kernel.path.is_file() {
+    // A boot disk brings its own kernel too, unless compose siblings boot beside it.
+    if args.kernel != KernelSource::Image
+        && (args.boot_disk.is_none() || args.compose.is_some())
+        && !kernel.is_embedded()
+        && !kernel.path.is_file()
+    {
         bail!(
             "kernel not found at {} (pass --kernel, or use a `vk` with it embedded)",
             kernel.path.display()
@@ -825,6 +867,9 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
             bail!(
                 "--root-image is the primary VM's root, and a services-only compose run boots none"
             );
+        }
+        if args.boot_disk.is_some() {
+            bail!("--boot-disk boots the primary VM, and a services-only compose run boots none");
         }
         if args.atop.is_some() {
             bail!("--atop records the primary VM, and a services-only compose run boots none");
@@ -1593,6 +1638,16 @@ async fn build_and_boot(
         Some(root) => Some(crate::fullvm::root_image_fstype(root)?),
         None => None,
     };
+    if let Some(disk) = &args.boot_disk {
+        // The disk's /boot names the kernel: an explicit one would be set aside.
+        if args.kernel != KernelSource::Default {
+            bail!(
+                "--boot-disk {} boots the kernel in its /boot: drop --kernel",
+                disk.display()
+            );
+        }
+        check_boot_disk_target(disk, work)?;
+    }
     // Both non-default axes boot the image from an ext4 (the modular image kernel
     // mounts /dev/vda; the image's init pivots into it), so they need an ext4 — a `-f`
     // build or a non-`--ram` image — never the pure-RAM cpio path.
@@ -1746,6 +1801,14 @@ async fn build_and_boot(
         // The disk is the machine's root: a persistent root beside it would go unused.
         if primary_persist_root.is_some() {
             bail!("--boot-disk is the machine's root; a persist_root primary keeps another");
+        }
+        // The disk's /boot names the kernel: a primary's own would be silently set aside.
+        if let Some(unit) = primary_unit.filter(|u| u.kernel != KernelSource::Default) {
+            bail!(
+                "--boot-disk boots the kernel in the disk's /boot: drop x-virtkit.kernel from \
+                 service {}",
+                unit.name
+            );
         }
     }
     if let (Some(root), Some(fstype)) = (&args.root_image, root_fstype) {
@@ -6816,6 +6879,44 @@ mod tests {
         // A bogus signal number from the agent still fails.
         assert_ne!(r(None, Some(0)).unwrap(), 0);
         assert!(r(None, None).is_err());
+    }
+
+    #[test]
+    fn a_boot_disk_is_never_a_file_the_run_writes() {
+        let t = crate::qga::tests::TempDir::new("boot-disk-target");
+        let work = t.0.join("state");
+        std::fs::create_dir_all(&work).unwrap();
+        let elsewhere = t.0.join("disk.qcow2");
+        std::fs::write(&elsewhere, b"disk").unwrap();
+        assert!(check_boot_disk_target(&elsewhere, &work).is_ok());
+        // Kept in the state dir under a name of its own: fine.
+        let own = work.join("machine.qcow2");
+        std::fs::write(&own, b"disk").unwrap();
+        assert!(check_boot_disk_target(&own, &work).is_ok());
+        // Not there yet: refused before any build, rather than found once one wrote it.
+        assert!(check_boot_disk_target(&work.join("missing.qcow2"), &work).is_err());
+        for name in [
+            "root.qcow2",
+            "root.qcow2.tmp",
+            "root.qcow2.json",
+            "ROOT.QCOW2",
+            "svc-x",
+        ] {
+            let p = work.join(name);
+            std::fs::write(&p, b"disk").unwrap();
+            assert!(check_boot_disk_target(&p, &work).is_err(), "{name}");
+            let dotted = work.join(".").join(name);
+            assert!(check_boot_disk_target(&dotted, &work).is_err(), "./{name}");
+            std::fs::remove_file(&p).unwrap();
+        }
+        let root = work.join("root.qcow2");
+        std::fs::write(&root, b"disk").unwrap();
+        let link = t.0.join("link.qcow2");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        assert!(check_boot_disk_target(&link, &work).is_err(), "symlink");
+        let hard = t.0.join("hard.qcow2");
+        std::fs::hard_link(&root, &hard).unwrap();
+        assert!(check_boot_disk_target(&hard, &work).is_err(), "hard link");
     }
 
     #[test]
