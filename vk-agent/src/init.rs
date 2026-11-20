@@ -656,6 +656,12 @@ fn run_full_vm(
     let _ = DISK_MOUNTS.set(disk_freeze);
     apply_symlinks(cmdline);
     configure_network_fullvm(cmdline);
+    // Check after volume setup because a volume can cover the fstab mount.
+    let boot_check = match disk_layout.as_ref().map(|l| l.boot.as_deref()) {
+        None => Ok(()),
+        Some(Some(dev)) => verify_boot_mount(dev),
+        Some(None) => Err(anyhow::anyhow!("the disk layout names no /boot partition")),
+    };
 
     // Fork vsock services before exec so they reparent to systemd and keep serving:
     // ssh-serve, host-agent and socket forwarders, the compose control fs, and exec.
@@ -681,12 +687,19 @@ fn run_full_vm(
         Some(Ok(link)) => (Some(link), None),
         Some(Err(e)) => (None, Some(e)),
     };
+    // Start the exec server before handling a failed check so the guest can be inspected.
+    let boot_check = match (axis, boot_check) {
+        (ImageInit::Init, check) => check,
+        (_, Err(e)) => return hold_failed_handoff(serve, None, &e),
+        (_, Ok(())) => Ok(()),
+    };
     if axis == ImageInit::Init
         && let Err(e) = ready_for_init(
             link.as_mut(),
             link_error,
             cfg,
             cfg_error.as_ref(),
+            boot_check,
             root_ro,
             serve,
         )
@@ -723,7 +736,8 @@ fn run_full_vm(
 /// from the start. A healthy server listens in milliseconds.
 const SERVE_LISTEN_WAIT: Duration = Duration::from_secs(30);
 
-/// What has to hold before the image's init takes PID 1: a readable boot config, its `prepare`
+/// The image's init requires a valid boot config if present and, on disk boots, `/boot`
+/// at the boot partition's root. Any configured `prepare` must
 /// run to success once the exec server listens, then `/` remounted read-only if the cmdline
 /// asks — last, so the setup and `prepare` could still write it, and an init handed a
 /// read-only `/`, as a real boot hands it one, remounts it rw itself. A stop that came in
@@ -733,12 +747,14 @@ fn ready_for_init(
     link_error: Option<anyhow::Error>,
     cfg: Option<&RunConfig>,
     cfg_error: Option<&anyhow::Error>,
+    boot_check: Result<()>,
     root_ro: bool,
     serve: libc::pid_t,
 ) -> Result<()> {
     if let Some(e) = cfg_error {
         bail!("the boot config: {e:#}");
     }
+    boot_check?;
     let prepare = cfg
         .map(|c| c.handoff.prepare.as_slice())
         .filter(|argv| !argv.is_empty());
@@ -1108,10 +1124,11 @@ fn passwd_home(user: &str) -> Option<std::ffi::OsString> {
     }
 }
 
-/// What the host found on a disk boot's disk for this launch: unless the guest's initrd
-/// mounts it, its root partition.
+/// Partitions the host selected for this launch. The root partition is omitted
+/// when the guest's initrd mounts the root.
 #[derive(Debug, Default, PartialEq)]
 struct DiskLayout {
+    boot: Option<String>,
     root: Option<String>,
 }
 
@@ -1127,7 +1144,7 @@ impl DiskLayout {
         let mut layout = DiskLayout::default();
         for line in text.lines() {
             match line.split_once('=') {
-                Some(("boot", _)) => {}
+                Some(("boot", dev)) => layout.boot = Some(dev.to_string()),
                 Some(("root", dev)) => layout.root = Some(dev.to_string()),
                 // Only the host writes this file. Unknown lines can indicate a format mismatch.
                 _ => warn!("vk-agent init: disk layout line {line:?} not understood"),
@@ -1137,8 +1154,32 @@ impl DiskLayout {
     }
 }
 
+/// Require `/boot` to expose the root of `dev`, where the host looks for kernels.
+/// After a failed mount or a volume mounted over `/boot`, a kernel update can land elsewhere.
+fn verify_boot_mount(dev: &str) -> Result<()> {
+    /// An ext2 filesystem's root directory.
+    const EXT2_ROOT_INO: u64 = 2;
+    use std::os::unix::fs::MetadataExt;
+    let want = std::fs::metadata(dev)
+        .with_context(|| dev.to_string())?
+        .rdev();
+    let boot = std::fs::metadata("/boot").context("/boot")?;
+    if boot.dev() != want {
+        bail!(
+            "/boot is not mounted from {dev}, the partition vk boots kernels from (no fstab \
+             entry for it, a failed mount, or a volume over /boot?)"
+        );
+    }
+    // A bind mount of a subdirectory has the same device number.
+    if boot.ino() != EXT2_ROOT_INO {
+        bail!("/boot is a directory of {dev}, not its root, where vk looks for kernels");
+    }
+    Ok(())
+}
+
 /// Use the guest's `mount` for fstab entries on btrfs, ext2, ext4 and vfat, including
-/// subvolumes, /boot, data volumes and the ESP. Mount failures warn and allow handoff.
+/// subvolumes, /boot, data volumes and the ESP. Failures warn. On disk boots,
+/// [`verify_boot_mount`] checks `/boot` after volume setup.
 fn mount_fstab() {
     match std::process::Command::new("mount")
         .args(["-a", "-t", "btrfs,ext2,ext4,vfat"])
@@ -4177,6 +4218,7 @@ mod tests {
         assert_eq!(
             super::DiskLayout::parse("boot=/dev/vda3\nroot=/dev/vda4\nother=x\n"),
             super::DiskLayout {
+                boot: Some("/dev/vda3".into()),
                 root: Some("/dev/vda4".into()),
             }
         );

@@ -8,7 +8,8 @@
 //! The archive also supplies the boot config and module names for the running release.
 //! The agent loads those modules with the initrd's `modprobe`. A last archive, written for
 //! each launch, names the partitions this launch found ([`vk_core::runcfg::DISK_LAYOUT`]):
-//! the agent mounts that root.
+//! the agent mounts the root partition when supplied and checks that `/boot` exposes
+//! the boot partition's root.
 //!
 //! The agent mounts a `Linux root (x86-64)` partition directly. With `--boot-cmdline`,
 //! it runs Debian initramfs-tools' `/init` to mount a root such as LVM on LUKS.

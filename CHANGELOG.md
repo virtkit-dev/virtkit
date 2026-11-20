@@ -11,7 +11,8 @@ All notable changes to virtkit will be documented in this file.
   use `--kernel image` with btrfs built in or available as a module.
 - **Boot a persistent disk with its own kernel (experimental).** `vk run --boot-disk DISK
   --init image|entrypoint` selects the newest matching kernel and initrd in the GPT disk's
-  ext2 `/boot` on every boot, including guest reboots.
+  ext2 `/boot` on every boot, including guest reboots. The image's init or entrypoint
+  starts only if `/boot` exposes the root of that partition.
   With `--boot-cmdline root=…`, a Debian initramfs-tools initrd with a merged `/usr`
   can mount the root before handoff, including LVM on LUKS unlocked with a key file
   on `/boot`.
