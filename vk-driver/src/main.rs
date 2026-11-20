@@ -2593,9 +2593,9 @@ enum Cmd {
     /// process tree holds on the host right now over the size it booted with (`1.2G/8G`) —
     /// the guest, its service VMs and their helpers, counted proportionally so pages they
     /// share are charged once. The table folds `$HOME` to `~`; `--wide` shows the project
-    /// directory in full and the exec-channel address. With a REF, only the VMs it names; one
-    /// that names exactly one running VM prints its full record instead of a table row. Use
-    /// `--json` or `--field` for scripts.
+    /// directory in full and the exec-channel address. With a REF, only the VMs it names.
+    /// The output's shape follows the flags alone: a table, or with `--detail` a full record
+    /// per VM. Use `--json` or `--field` for scripts.
     #[command(display_order = 6, visible_alias = "ls")]
     List {
         /// which VMs: a name, a pid, or those of a project directory (default: all)
@@ -2627,6 +2627,11 @@ enum Cmd {
         /// the full table: the project path in full, and EXEC ADDRESS
         #[arg(short = 'w', long, conflicts_with_all = ["json", "field"])]
         wide: bool,
+        /// a full record per VM instead of the table
+        ///
+        /// Every recorded fact, its compose services and its published ports.
+        #[arg(short = 'd', long, conflicts_with_all = ["json", "field", "wide"])]
+        detail: bool,
         /// emit the rows as a JSON array instead of a table
         #[arg(long)]
         json: bool,
@@ -3931,6 +3936,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         kind,
         problems,
         wide,
+        detail,
         json,
         field,
         stale,
@@ -3943,6 +3949,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             stale: *stale,
             fields: field.clone(),
             wide: *wide,
+            detail: *detail,
             filter: crate::vmlist::Filter {
                 running: *running,
                 stopped: *stopped,

@@ -102,7 +102,7 @@ pub struct Row {
 /// A row's STATUS as printed: its status — `-` for state that never booted, which has no
 /// status to speak of; `--json` keeps the word — with `!` when the VM needs attention and
 /// `*` when the row came from stale records.
-fn status_cell(r: &Row) -> String {
+pub fn status_cell(r: &Row) -> String {
     let mut cell = match r.status.as_str() {
         NEVER_BOOTED => "-".to_string(),
         status => status.to_string(),

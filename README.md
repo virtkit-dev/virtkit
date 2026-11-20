@@ -643,11 +643,12 @@ when `vk` made it, and only the recipe and name of a `--state-dir` of yours;
 it deletes nothing unless `-y`/`--yes` or `-f`. `-n`/`--dry-run` only lists. If one REF
 cannot be deleted, none is. `vk ls` is `vk list`.
 
-A REF that names exactly one running VM makes `vk list` print its full record instead of a
-table row: every recorded fact, then each compose service as name, state, LAN address and
-exec address, and each published port as name, `listen->to` (with `@NAME` when a compose
-sibling dials) and the publisher's pid. Nothing is folded in a full record, so `--wide` has
-no effect.
+`vk list --detail` prints a full record per VM instead of the table, whatever the number
+of VMs listed: every recorded fact, then each compose service as name, state, LAN address
+and exec address, and each published port as name, `listen->to` (with `@NAME` when a
+compose sibling dials) and the publisher's pid; a VM that is not running gets a short
+record of what it left. Nothing is folded in a full record, so it does not combine with
+`--wide`.
 
 ```sh
 vk list shop                 # one VM, in full

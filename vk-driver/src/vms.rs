@@ -971,11 +971,15 @@ pub struct ListOpts {
     pub stale: bool,
     pub fields: Vec<String>,
     pub wide: bool,
+    /// `--detail`: a full record per VM instead of the table
+    pub detail: bool,
     pub filter: crate::vmlist::Filter,
 }
 
 /// `vk list`: every VM this host knows, running or stopped, one row each (see
-/// [`crate::vmlist`]). A REF that names exactly one running VM prints its full record.
+/// [`crate::vmlist`]). What is printed depends on the flags alone, never on how many VMs
+/// matched or whether they run: a table, `--json`, `--field`s, or with `--detail` a full
+/// record per VM.
 pub fn list_report(opts: ListOpts) -> Result<String> {
     use crate::vmlist::{Kind, Known, Live};
     check_fields(&opts.fields)?;
@@ -1178,16 +1182,27 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
              again); the next `vk start`, `vk stop`, `vk run` or `vk dev up` puts them right"
         );
     }
-    // One running VM asked for by name, pid or directory: its full record.
-    if filter.name.is_none() && full_record(target.as_ref(), vms.len()) {
-        return Ok(detail(
-            &vms[0],
-            units[0].as_deref(),
-            &published_by_vm[0],
-            fresh[0],
-            stale,
-            mem_used[0],
-        ));
+    if opts.detail && !rows.is_empty() {
+        // One record per VM kept, in the table's order, a blank line between: a running
+        // VM's in full, with its services; one that is not running by what it left.
+        let records: Vec<String> = rows
+            .iter()
+            .filter(|r| r.parent.is_none())
+            .map(
+                |r| match vms.iter().position(|e| e.state_dir == r.state_dir) {
+                    Some(i) => detail(
+                        &vms[i],
+                        units[i].as_deref(),
+                        &published_by_vm[i],
+                        fresh[i],
+                        stale,
+                        mem_used[i],
+                    ),
+                    None => detail_at_rest(r),
+                },
+            )
+            .collect();
+        return Ok(records.join("\n"));
     }
     if rows.is_empty() {
         return Ok(match &target {
@@ -1230,7 +1245,7 @@ fn attention(
     Some(match t.state {
         crate::vmstate::State::Stopping => format!(
             "a stop {how} {ago} ago and its run (pid {pid}) is still there — `vk logs \
-             {name}` and `vk list {name}` show it, `vk stop {name}` tries again, \
+             {name}` and `vk list --detail {name}` show it, `vk stop {name}` tries again, \
              `vk stop --force {name}` insists then kills it"
         ),
         crate::vmstate::State::Starting => format!(
@@ -1263,7 +1278,30 @@ pub(crate) fn dev_identity(state_dir: &Path) -> (Option<PathBuf>, Option<String>
     (text("workspace").map(PathBuf::from), text("environment"))
 }
 
-/// `vk list PID|DIR` when it names exactly one VM: every recorded fact about it as
+/// The record `vk list --detail` prints of a VM that is not running: what it is, and what
+/// it left to run again from. `NAME` is its label, as in a running VM's record.
+fn detail_at_rest(r: &crate::vmlist::Row) -> String {
+    let dash = || "-".to_string();
+    let rows = [
+        ("NAME", r.image.clone().unwrap_or_else(dash)),
+        ("VM", r.name.clone()),
+        ("STATUS", crate::vmlist::status_cell(r)),
+        (
+            "PROJECT",
+            r.project
+                .as_ref()
+                .map_or_else(dash, |p| p.display().to_string()),
+        ),
+        ("STATE DIR", r.state_dir.display().to_string()),
+        ("MEM", r.mem.clone().unwrap_or_else(dash)),
+    ];
+    let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    rows.iter()
+        .map(|(key, value)| format!("{key:<width$}  {value}\n"))
+        .collect()
+}
+
+/// `vk list --detail`, for a running VM: every recorded fact about it as
 /// `KEY  value` lines — what `--json` carries, laid out to read — then one line per compose
 /// service (name, state, LAN address, exec address) and per published port. Nothing is
 /// folded or left out here, so `--wide` has nothing to add. A field the run did not record
@@ -1383,13 +1421,6 @@ fn aligned<const N: usize>(rows: &[[String; N]]) -> Vec<String> {
             line
         })
         .collect()
-}
-
-/// Show a full record only when an explicit target matches exactly one VM.
-/// A bare `vk list` keeps its table even for one VM, so its shape stays stable as VMs
-/// come and go.
-fn full_record(target: Option<&Selector>, matched: usize) -> bool {
-    target.is_some() && matched == 1
 }
 
 /// A multi-line detail value: the lines joined, or `-` for none.
@@ -2877,16 +2908,6 @@ PUBLISHED     -
         let ascii = aligned(&[["cafe".to_string(), "x".to_string()]]);
         assert_eq!(accented[0].chars().count(), ascii[0].chars().count());
         assert_eq!(accented[0], "caf\u{e9}  x");
-    }
-
-    #[test]
-    fn a_full_record_needs_a_target_and_exactly_one_match() {
-        let sel = Selector::Pid(41877);
-        assert!(full_record(Some(&sel), 1));
-        // A bare `vk list` keeps its table, so a one-VM host does not change shape.
-        assert!(!full_record(None, 1));
-        assert!(!full_record(Some(&sel), 0));
-        assert!(!full_record(Some(&sel), 2));
     }
 
     /// A compose VM with one running service and a plain VM, as `--field` sees them.
