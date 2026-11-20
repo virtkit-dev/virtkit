@@ -783,7 +783,14 @@ async fn dev_action(
         } => match dev_up(&plan, host_cfg, over, false, true, false).await {
             Ready::Done(code) => code,
             Ready::Act => service_reply(
-                dev::service(&plan, &vk_core::fleetctl::Request::Start { unit: name }).await,
+                dev::service(
+                    &plan,
+                    &vk_core::fleetctl::Request::Start {
+                        unit: name,
+                        cached: false,
+                    },
+                )
+                .await,
             ),
         },
         DevAction::Service {

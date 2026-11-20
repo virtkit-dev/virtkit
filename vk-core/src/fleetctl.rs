@@ -18,8 +18,14 @@ pub enum Request {
     Status {
         unit: String,
     },
+    /// Start a unit, building its image first when that is needed — unless `cached`, which
+    /// boots only what is already built and fails otherwise.
     Start {
         unit: String,
+        /// boot only an image already built (or restored from the cache): never build. Left
+        /// out by an older peer, which so asks for a start that may build.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cached: bool,
     },
     Stop {
         unit: String,
@@ -92,7 +98,10 @@ impl ServiceOp {
         let mut on_progress = |line: &str| eprintln!("{line}");
         match self {
             ServiceOp::Up(unit) => {
-                let req = Request::Start { unit: unit.clone() };
+                let req = Request::Start {
+                    unit: unit.clone(),
+                    cached: false,
+                };
                 client.request_streamed(&req, &mut on_progress).await
             }
             ServiceOp::Down(unit) => client.request(&Request::Stop { unit: unit.clone() }).await,
@@ -317,6 +326,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cached` is left out unless set, and a peer that never sends it asks for a start
+    /// that may build: older and newer sides read each other's starts alike.
+    #[test]
+    fn a_start_is_cached_only_when_it_says_so() {
+        let plain = serde_json::to_string(&Request::Start {
+            unit: "db".into(),
+            cached: false,
+        })
+        .unwrap();
+        assert_eq!(plain, r#"{"Start":{"unit":"db"}}"#);
+        let Request::Start { cached, .. } = serde_json::from_str(&plain).unwrap() else {
+            panic!("not a start");
+        };
+        assert!(!cached);
+        let cached = serde_json::to_string(&Request::Start {
+            unit: "db".into(),
+            cached: true,
+        })
+        .unwrap();
+        assert_eq!(cached, r#"{"Start":{"unit":"db","cached":true}}"#);
+    }
 
     #[test]
     fn service_op_parses_vk_service_args() {

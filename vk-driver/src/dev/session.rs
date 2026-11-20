@@ -785,7 +785,7 @@ pub async fn service(
         let _ = publish_for(plan, &entry, Some(unit)).await;
     }
     let reply = result?;
-    if let vk_core::fleetctl::Request::Start { unit } = req
+    if let vk_core::fleetctl::Request::Start { unit, .. } = req
         && reply.ok
     {
         let failed = publish_for(plan, &entry, Some(unit)).await?;

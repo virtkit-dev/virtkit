@@ -332,7 +332,10 @@ impl Filesystem for CtlFs {
         // matched against the fixed ASCII verb set, non-UTF-8 falls through to EINVAL.
         let verb = String::from_utf8_lossy(data).trim().to_string();
         let req = match verb.as_str() {
-            "start" => Request::Start { unit: name.clone() },
+            "start" => Request::Start {
+                unit: name.clone(),
+                cached: false,
+            },
             "stop" => Request::Stop { unit: name.clone() },
             "restart" => Request::Restart { unit: name.clone() },
             _ => {

@@ -166,11 +166,11 @@ impl Manager {
         match req {
             Request::List => self.list(),
             Request::Status { unit } => self.status(&unit),
-            Request::Start { unit } => self.start(&unit),
+            Request::Start { unit, cached } => self.start_streamed(&unit, None, cached),
             Request::Stop { unit } => self.stop(&unit),
             Request::Restart { unit } => {
                 let _ = self.stop(&unit);
-                self.start(&unit)
+                self.start_streamed(&unit, None, false)
             }
             Request::Reboot { unit } => self.reboot(&unit),
             Request::Logs { unit, lines } => self.logs(&unit, lines),
@@ -207,8 +207,20 @@ impl Manager {
         }
     }
 
+    /// Whether the `build:` unit's image is in this host's build tier, so a start would boot it
+    /// without building. Its path is a function of the stage fingerprint alone.
+    fn built(&self, unit: &crate::compose::Unit) -> bool {
+        crate::units::build_unit_ext4(
+            &self.dirs.cache,
+            &self.build.build_args,
+            unit,
+            self.build.base_registry.as_ref(),
+        )
+        .is_ok_and(|image| image.exists())
+    }
+
     pub fn start(&self, name: &str) -> Reply {
-        self.start_streamed(name, None)
+        self.start_streamed(name, None, false)
     }
 
     /// Start a service, building its image first if it is not already materialized (a
@@ -220,8 +232,14 @@ impl Manager {
     /// `build:` stage are serialized inside `ensure_unit_build_sync` (the shared build tier's
     /// per-stage pull lock), not by the units lock — so they cannot race the tier write, and
     /// share the one tier entry. An `image:` unit was resolved/pulled at provisioning, so it
-    /// skips the build and just boots.
-    pub fn start_streamed(&self, name: &str, sink: Option<crate::build::ProgressSink>) -> Reply {
+    /// skips the build and just boots. `cached` boots a `build:` unit only when its image is
+    /// already in this host's build tier, and never builds: otherwise the start fails.
+    pub fn start_streamed(
+        &self,
+        name: &str,
+        sink: Option<crate::build::ProgressSink>,
+        cached: bool,
+    ) -> Reply {
         // Snapshot the unit under the lock, then release it for the (possibly long) build.
         let (unit, stops) = {
             let mut u = self.units_guard();
@@ -242,6 +260,9 @@ impl Manager {
         // A `build:` unit materializes into the shared build tier (lock released for the
         // build) — a fresh stage returns instantly; an `image:` unit was already pulled.
         let built_image = if matches!(unit.source, crate::compose::Source::Build { .. }) {
+            if cached && !self.built(&unit) {
+                return Reply::err(format!("{name} is not built: `up` builds it"));
+            }
             match crate::units::ensure_unit_build_sync(
                 &unit,
                 &self.dirs.cache,
@@ -851,8 +872,10 @@ async fn handle_control(conn: tokio::net::UnixStream, mgr: Arc<Manager>) -> Resu
         match req {
             // Start/Restart may build the image on demand — a long, blocking op whose
             // progress streams back as Progress frames, then a terminal Done.
-            Request::Start { unit } => stream_start(&mut wr, &mgr, unit, false).await?,
-            Request::Restart { unit } => stream_start(&mut wr, &mgr, unit, true).await?,
+            Request::Start { unit, cached } => {
+                stream_start(&mut wr, &mgr, unit, false, cached).await?
+            }
+            Request::Restart { unit } => stream_start(&mut wr, &mgr, unit, true, false).await?,
             // Stop holds the units lock while the guest powers off. Run every other request
             // outside the runtime too, so a status waiting on that lock does not occupy a
             // runtime worker for the grace period.
@@ -878,6 +901,7 @@ async fn stream_start(
     mgr: &Arc<Manager>,
     unit: String,
     restart: bool,
+    cached: bool,
 ) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let sink: crate::build::ProgressSink = Arc::new(move |line: &str| {
@@ -889,7 +913,7 @@ async fn stream_start(
             if restart {
                 let _ = mgr.stop(&unit);
             }
-            let reply = mgr.start_streamed(&unit, Some(sink));
+            let reply = mgr.start_streamed(&unit, Some(sink), cached);
             let dir = mgr.units_guard().get(&unit).map(|st| st.dir.clone());
             (reply, dir)
         }
