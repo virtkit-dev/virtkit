@@ -74,7 +74,7 @@ pub enum Standing {
     /// to stop again or end the process — so the record stays until the process is gone
     Overdue,
     /// its process is gone, or cannot be told to be there any more: the record describes
-    /// nothing
+    /// nothing, and the tidy pass removes it
     Gone,
 }
 
@@ -184,6 +184,19 @@ pub fn peek(dir: &Path) -> Option<(Transient, Standing)> {
     Some((record, standing))
 }
 
+/// Remove the record of the VM on `dir` if it describes nothing any more. An overdue one
+/// is kept: its process is still there, and what to do about it is the user's call.
+/// Whether one was removed.
+pub fn clear_if_stale(dir: &Path) -> bool {
+    match peek(dir) {
+        Some((_, Standing::Gone)) => {
+            clear(dir);
+            true
+        }
+        _ => false,
+    }
+}
+
 fn read_raw(dir: &Path) -> Option<Transient> {
     serde_json::from_slice(&std::fs::read(dir.join(FILE)).ok()?).ok()
 }
@@ -283,6 +296,7 @@ mod tests {
             None,
         );
         assert_eq!(read(&dir).expect("stopping").deadline_secs, None);
+        assert!(!clear_if_stale(&dir), "it still holds");
         // A stop of this process whose deadline has passed: overdue, shown and kept.
         let overdue = Transient {
             state: State::Stopping,
@@ -296,6 +310,7 @@ mod tests {
         write(&dir, &overdue).unwrap();
         assert_eq!(read(&dir), None, "no longer under way");
         assert!(matches!(peek(&dir), Some((_, Standing::Overdue))));
+        assert!(!clear_if_stale(&dir), "its process is still there");
         // A record naming a process that started at another time: not this one, so stale.
         stopping(&dir, std::process::id(), Some(1), Some(30));
         assert_eq!(read(&dir), None);
@@ -303,6 +318,8 @@ mod tests {
             matches!(peek(&dir), Some((_, Standing::Gone))),
             "there, and stale"
         );
+        assert!(clear_if_stale(&dir));
+        assert_eq!(peek(&dir), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

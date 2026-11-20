@@ -612,6 +612,8 @@ pub fn run_how(
 ) -> ExitCode {
     let build = matches!(verb, Verb::Start { build: true });
     let mut ok = true;
+    // Put the records right first, so a REF resolves against what is there.
+    crate::tidy::run();
     for r in refs {
         // A project directory means its own VM: one REF starts or stops one VM at most.
         let result = resolve(r, Among::ProjectVm).and_then(|t| {
@@ -701,6 +703,7 @@ pub fn stop_all(
     timeout: Option<u64>,
     how: vms::StopHow,
 ) -> ExitCode {
+    crate::tidy::run();
     let started = std::time::Instant::now();
     let left = || timeout.map(|t| t.saturating_sub(started.elapsed().as_secs()));
     let (mut found, mut all_down) = (true, true);
@@ -843,6 +846,7 @@ pub fn delete(
 ) -> ExitCode {
     let mut planned = Vec::new();
     let mut ok = true;
+    crate::tidy::run();
     for r in refs {
         let result = resolve(r, Among::One).and_then(|t| {
             let steps = steps_for(Verb::Delete { force }, &t)?;

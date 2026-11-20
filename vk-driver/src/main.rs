@@ -104,6 +104,7 @@ mod term;
 mod termclean;
 #[cfg(test)]
 mod testutil;
+mod tidy;
 mod timing;
 mod toolchain;
 mod uefi;
@@ -2616,6 +2617,13 @@ enum Cmd {
         /// only VMs of this kind
         #[arg(long, value_name = "KIND")]
         kind: Option<crate::vmlist::Kind>,
+        /// only the VMs that are not in order
+        ///
+        /// Those whose STATUS ends in `!` — a stop timed out and its run is still there:
+        /// what can be done is said on stderr — and those ending in `*`, worked out from
+        /// records that were out of date. Listing shows them and changes nothing.
+        #[arg(long)]
+        problems: bool,
         /// the full table: the project path in full, and EXEC ADDRESS
         #[arg(short = 'w', long, conflicts_with_all = ["json", "field"])]
         wide: bool,
@@ -2659,6 +2667,15 @@ enum Cmd {
         /// stop every running vk VM
         #[arg(long, conflicts_with = "targets")]
         all: bool,
+        /// put vk's records right, and settle stops that timed out
+        ///
+        /// Stops no VM. Forgets the names of state directories that were removed, clears the state
+        /// records and registry entries of runs that are gone, and names the dev
+        /// environments that have none — all of it, however long it takes. A run that
+        /// outlived a stop's timeout (`!` in `vk list`) is then asked about, on a terminal:
+        /// killed as `--kill` kills, or left. Exits 1 while one is left.
+        #[arg(long, conflicts_with_all = ["targets", "all", "recursive", "force", "kill"])]
+        tidy: bool,
         /// insist: SIGTERM once a second for 5 seconds, then kill
         ///
         /// For a run that does not answer a plain stop. The kill is SIGKILL to the VMM
@@ -3119,6 +3136,9 @@ fn main() -> ExitCode {
     // ready. The fork must precede the Tokio runtime (forking a live multi-threaded runtime
     // is undefined behavior): the child continues as the background daemon, the parent
     // supervises the foreground build/boot.
+    // The commands that start a VM put `vk`'s records right once they are done (see
+    // [`tidy`]): `vk run`, and the `vk dev` actions that boot.
+    let starts_a_vm = matches!(cli.cmd, Cmd::Run { .. }) || detach::wants_detach(&cli.cmd);
     if detach::wants_detach(&cli.cmd)
         && let detach::Forked::Parent { code, ok } = detach::fork()
     {
@@ -3127,8 +3147,12 @@ fn main() -> ExitCode {
         // is busy holding the VM for its lifetime.
         if ok && matches!(cli.cmd, Cmd::Dev(_)) {
             detach::note_after_boot();
-            return on_runtime(cli);
+            let code = on_runtime(cli);
+            tidy::run();
+            return code;
         }
+        // The VM is up, or failed to come up: either way this command is done.
+        tidy::run();
         return code;
     }
 
@@ -3136,6 +3160,9 @@ fn main() -> ExitCode {
     // In the process that ran the run — the daemon, for `--detach` — which is the one that
     // knows whether a VM ever came up.
     prepared.settle();
+    if starts_a_vm {
+        tidy::run();
+    }
     code
 }
 
@@ -3902,6 +3929,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         running,
         stopped,
         kind,
+        problems,
         wide,
         json,
         field,
@@ -3919,6 +3947,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 running: *running,
                 stopped: *stopped,
                 kind: *kind,
+                problems: *problems,
                 name: None,
             },
         };
@@ -3961,6 +3990,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         targets,
         recursive,
         all,
+        tidy,
         force,
         kill,
         timeout,
@@ -3971,6 +4001,28 @@ async fn cli_main(cli: Cli) -> ExitCode {
             (true, false) => vms::StopHow::Force,
             (false, false) => vms::StopHow::Graceful,
         };
+        if *tidy {
+            let (report, settled) = tidy::thorough(|o| {
+                if !dev::on_terminal() {
+                    return tidy::Decision::NoTerminal;
+                }
+                let question = format!(
+                    "{} is still {} (pid {}), past its deadline: kill its VM?",
+                    o.name,
+                    o.record.state.label(),
+                    o.record.pid
+                );
+                match dev::ask_on_terminal(&question) {
+                    Ok(true) => tidy::Decision::End,
+                    _ => tidy::Decision::Leave,
+                }
+            });
+            return match write_report(&report) {
+                ExitCode::SUCCESS if !settled => exit_code(1),
+                code => code,
+            };
+        }
+        tidy::run();
         if targets.is_empty() {
             return act_on_vms(None, *recursive, |sel| {
                 vms::stop_cmd_how(sel, *all, *timeout, how)

@@ -360,6 +360,19 @@ pub fn running() -> Vec<VmEntry> {
     running_in(&dir)
 }
 
+/// The recorded VMs that are still alive, oldest first, and the state dirs of the entries
+/// whose run is gone — left where they are. For a command that only reads, such as
+/// `vk list`: [`running`] is what drops them.
+pub fn registered() -> (Vec<VmEntry>, Vec<PathBuf>) {
+    let Ok(dir) = registry_dir() else {
+        return (Vec::new(), Vec::new());
+    };
+    let (mut alive_ones, dead): (Vec<VmEntry>, Vec<VmEntry>) =
+        load_all_in(&dir).into_iter().partition(alive);
+    alive_ones.sort_by_key(|e| e.created_secs);
+    (alive_ones, dead.into_iter().map(|e| e.state_dir).collect())
+}
+
 /// [`running`], for the registry at `dir`.
 pub(crate) fn running_in(dir: &Path) -> Vec<VmEntry> {
     let mut out = Vec::new();
@@ -982,12 +995,14 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
         None => None,
     };
     let stale = opts.stale;
-    let mut vms = running();
+    // A listing writes nothing: an entry whose run is gone, a name whose directory is, an
+    // environment not named yet or a transient state that lapsed are worked around here and
+    // said to be stale; the commands that start or stop a VM put them right ([`crate::tidy`]).
+    let (mut vms, dead) = registered();
     if let Some(sel) = &target {
         vms.retain(|e| sel.matches(e));
     }
     let idx = crate::names::Index::open().ok();
-    crate::dev::list::name_unnamed();
     let named = idx.as_ref().map(|i| i.all()).unwrap_or_default();
     let name_of = |dir: &Path| {
         let canonical = canonical(dir);
@@ -1067,29 +1082,32 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
         .collect();
     let running_dirs: Vec<&Path> = vms.iter().map(|e| e.state_dir.as_path()).collect();
     // What is known and not running: every named VM, and every dev state dir that has no
-    // name — one that recorded no boot, or one that could not be named — which its own
-    // directory name still names.
+    // name — one that recorded no boot, or one from before names that no command has named
+    // yet — which its own directory name still names. The latter's record is out of date:
+    // it is owed a name.
     let unnamed = crate::dev::list::unnamed_dirs(&named);
+    let dangling = named.iter().filter(|(_, dir)| !dir.is_dir()).count();
     let known: Vec<Known> = named
         .iter()
-        .map(|(name, dir)| (name, dir, crate::vmlist::STOPPED))
+        .map(|(name, dir)| (name, dir, crate::vmlist::STOPPED, false))
         .chain(unnamed.iter().map(|(name, dir, booted)| match booted {
-            true => (name, dir, crate::vmlist::STOPPED),
-            false => (name, dir, crate::vmlist::NEVER_BOOTED),
+            true => (name, dir, crate::vmlist::STOPPED, true),
+            false => (name, dir, crate::vmlist::NEVER_BOOTED, false),
         }))
-        .filter(|(_, dir, _)| dir.is_dir() && !running_dirs.contains(&canonical(dir).as_path()))
-        .filter_map(|(name, dir, at_rest)| {
+        .filter(|(_, dir, _, _)| dir.is_dir() && !running_dirs.contains(&canonical(dir).as_path()))
+        .filter_map(|(name, dir, at_rest, unnamed)| {
             let kind = kind_of(dir);
             let last = last_entry(dir);
             // Its run holds the dir and has no VM up yet: neither stopped nor running. A
-            // record that no longer holds is read past.
+            // record that no longer holds is read past, and makes the row a stale one.
             let transient = crate::vmstate::peek(dir);
-            let status = match &transient {
-                Some((_, Standing::Gone)) => at_rest,
+            let (status, lapsed) = match &transient {
+                Some((_, Standing::Gone)) => (at_rest, true),
                 // Under way or overdue: as its record words it.
-                Some((t, _)) => t.state.label(),
-                None => at_rest,
+                Some((t, _)) => (t.state.label(), false),
+                None => (at_rest, false),
             };
+            let stale_record = unnamed || lapsed || dead.contains(&canonical(dir));
             let attention = transient
                 .as_ref()
                 .and_then(|(t, standing)| attention(t, *standing, name, now));
@@ -1108,6 +1126,7 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
                 dir: dir.clone(),
                 kind,
                 status,
+                stale_record,
                 attention,
                 last,
                 project,
@@ -1142,6 +1161,8 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
     if opts.json {
         return Ok(serde_json::to_string_pretty(&rows).context("serializing VM list")? + "\n");
     }
+    // On stderr, so what is printed stays the table it always is.
+    let out_of_date = dangling + dead.len() + rows.iter().filter(|r| r.stale_record).count();
     // What needs someone's attention is said in full, with what can be done about it: a
     // listing shows it, and neither asks nor acts.
     for r in rows.iter().filter(|r| r.attention.is_some()) {
@@ -1149,6 +1170,12 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
             "vk: {}: {}",
             r.name,
             r.attention.as_deref().unwrap_or_default()
+        );
+    }
+    if out_of_date > 0 {
+        eprintln!(
+            "vk: note: {out_of_date} record(s) out of date (rows marked `*` were worked out \
+             again); the next `vk start`, `vk stop`, `vk run` or `vk dev up` puts them right"
         );
     }
     // One running VM asked for by name, pid or directory: its full record.
@@ -1472,7 +1499,7 @@ fn kill_vmms(entry: &VmEntry) {
 /// its registry entry and state record are removed here. A run still
 /// standing at the end keeps its `stopping` record, which `vk list` shows as overdue until
 /// the run is gone or a stop succeeds — what to do about it is the user's call.
-fn stop_many(entries: &[VmEntry], timeout: Option<u64>, how: StopHow) -> Vec<bool> {
+pub(crate) fn stop_many(entries: &[VmEntry], timeout: Option<u64>, how: StopHow) -> Vec<bool> {
     use std::time::{Duration, Instant};
     let down = |e: &VmEntry| {
         if let Ok(dir) = registry_dir() {

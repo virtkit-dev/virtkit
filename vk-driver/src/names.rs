@@ -93,7 +93,6 @@ pub fn sanitize(raw: &str) -> String {
 /// environment's state dir has under the dev base (its name before names existed). `None`
 /// when the word names nothing.
 pub fn resolve(name: &str) -> Result<Option<PathBuf>> {
-    crate::dev::list::name_unnamed();
     if let Some(dir) = Index::open()?.lookup(name) {
         return Ok(Some(dir));
     }
@@ -225,6 +224,41 @@ impl Index {
                 let _ = std::fs::remove_file(self.dir.join(name));
             }
         }
+    }
+
+    /// [`Index::forget_removed`] over `names`, as read before, for a pass that must end by
+    /// `deadline`, if it has one: how many were forgotten, and whether it stopped early. The lock — and
+    /// with it the index directory — is taken only once there is a name to forget, and
+    /// each is looked at again under it.
+    pub fn forget_removed_until(
+        &self,
+        names: &[(String, PathBuf)],
+        deadline: Option<std::time::Instant>,
+    ) -> (usize, bool) {
+        let mut lock = None;
+        let mut forgotten = 0;
+        for (name, target) in names {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return (forgotten, true);
+            }
+            if !removed(target) {
+                continue;
+            }
+            if lock.is_none() {
+                match self.lock() {
+                    Ok(held) => lock = Some(held),
+                    Err(_) => return (forgotten, false),
+                }
+            }
+            // Under the lock: still the same link, to a directory still gone.
+            if self.lookup(name).as_ref() == Some(target)
+                && removed(target)
+                && std::fs::remove_file(self.dir.join(name)).is_ok()
+            {
+                forgotten += 1;
+            }
+        }
+        (forgotten, false)
     }
 
     /// Give `dir` exactly `name`. Fine when `name` already names `dir`; an error when it names
@@ -526,6 +560,33 @@ mod tests {
         assert_eq!(idx.claim(&b, "app").unwrap(), "app");
         assert_eq!(idx.lookup("app").unwrap(), b);
         assert_eq!(idx.lookup("elsewhere").unwrap(), away);
+    }
+
+    /// A bounded pass forgets what was removed, creates nothing when there is nothing to
+    /// forget, and stops at its deadline.
+    #[test]
+    fn a_bounded_pass_forgets_removed_names_and_stops_at_its_deadline() {
+        let t = tmp("bounded");
+        let idx = Index::at(t.0.join("names"));
+        let later = || Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        assert_eq!(idx.forget_removed_until(&idx.all(), later()), (0, false));
+        assert!(!t.0.join("names").exists(), "nothing to do writes nothing");
+        let (a, b) = (t.0.join("a"), t.0.join("b"));
+        for d in [&a, &b] {
+            std::fs::create_dir(d).unwrap();
+        }
+        idx.claim(&a, "gone").unwrap();
+        idx.claim(&b, "kept").unwrap();
+        std::fs::remove_dir(&a).unwrap();
+        let names = idx.all();
+        assert_eq!(
+            idx.forget_removed_until(&names, Some(std::time::Instant::now())),
+            (0, true),
+            "out of time before the first"
+        );
+        assert_eq!(idx.forget_removed_until(&names, None), (1, false));
+        assert_eq!(idx.lookup("gone"), None);
+        assert_eq!(idx.lookup("kept").unwrap(), b);
     }
 
     #[test]

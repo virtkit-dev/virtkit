@@ -774,10 +774,9 @@ pub fn state(sizes: bool) -> Result<Vec<Row>> {
     Ok(rows)
 }
 
-/// Name every row as the name index does, naming the environments that have none first,
-/// and order them by name.
+/// Name every row as the name index does, and order them by name. Reads only: an
+/// environment that has no name yet keeps its state dir's own, which names it too.
 pub fn apply_names(rows: &mut [Row]) {
-    name_unnamed();
     let Ok(idx) = crate::names::Index::open() else {
         return;
     };

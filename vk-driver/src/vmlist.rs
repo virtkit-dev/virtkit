@@ -87,6 +87,11 @@ pub struct Row {
     /// with `--stale`: whether a fresh `vk run` would rebuild its image (`null`: unknown)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale: Option<Option<bool>>,
+    /// what `vk` had recorded of this VM was out of date, and the listing worked the row
+    /// out again without writing anything: an entry or a transient state its run left
+    /// behind, or an environment not named yet. Left out when the records were right
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stale_record: bool,
     /// what needs someone to look at this VM, and what can be done: a stop that timed out
     /// while its run is still there. Nothing clears it but the run going, or a stop that
     /// succeeds. Left out when there is nothing
@@ -95,7 +100,8 @@ pub struct Row {
 }
 
 /// A row's STATUS as printed: its status — `-` for state that never booted, which has no
-/// status to speak of; `--json` keeps the word — with `!` when the VM needs attention.
+/// status to speak of; `--json` keeps the word — with `!` when the VM needs attention and
+/// `*` when the row came from stale records.
 fn status_cell(r: &Row) -> String {
     let mut cell = match r.status.as_str() {
         NEVER_BOOTED => "-".to_string(),
@@ -103,6 +109,9 @@ fn status_cell(r: &Row) -> String {
     };
     if r.attention.is_some() {
         cell.push('!');
+    }
+    if r.stale_record {
+        cell.push('*');
     }
     cell
 }
@@ -134,6 +143,8 @@ pub struct Known {
     /// [`STOPPED`], [`NEVER_BOOTED`], or the transient state on record for it, under way
     /// or overdue, as its record words it (`starting` while its run has registered no VM)
     pub status: &'static str,
+    /// what was recorded of it was out of date (see [`Row::stale_record`])
+    pub stale_record: bool,
     /// what needs attention about it (see [`Row::attention`])
     pub attention: Option<String>,
     /// the registry entry it last ran with, if it left one
@@ -190,6 +201,7 @@ pub fn rows_with(
             ip: e.guest_ip.map(|ip| ip.to_string()),
             published: own.into_iter().map(published_text).collect(),
             stale: l.fresh.map(Freshness::json),
+            stale_record: false,
             attention: l.attention.clone(),
         });
         for s in &e.services {
@@ -224,6 +236,7 @@ pub fn rows_with(
                     .map(|p| published_text(p))
                     .collect(),
                 stale: None,
+                stale_record: false,
                 attention: None,
             });
         }
@@ -251,6 +264,7 @@ pub fn rows_with(
             ip: None,
             published: Vec::new(),
             stale: None,
+            stale_record: k.stale_record,
             attention: k.attention.clone(),
         });
         let project = out.last().and_then(|r| r.project.clone());
@@ -277,6 +291,7 @@ pub fn rows_with(
                 ip: None,
                 published: Vec::new(),
                 stale: None,
+                stale_record: false,
                 attention: None,
             });
         }
@@ -329,6 +344,9 @@ pub struct Filter {
     pub running: bool,
     pub stopped: bool,
     pub kind: Option<Kind>,
+    /// only the rows that are not in order: those that need attention, and those worked
+    /// out from stale records
+    pub problems: bool,
     /// only this row (a `NAME/SERVICE`)
     pub name: Option<String>,
 }
@@ -338,6 +356,7 @@ impl Filter {
         (!self.running || !at_rest(&r.status))
             && (!self.stopped || at_rest(&r.status))
             && self.kind.is_none_or(|k| k == r.kind)
+            && (!self.problems || r.attention.is_some() || r.stale_record)
             && self.name.as_ref().is_none_or(|n| *n == r.name)
     }
 }
@@ -454,6 +473,7 @@ mod tests {
             dir: "/s/zeta".into(),
             kind: Kind::Run,
             status: STOPPED,
+            stale_record: false,
             attention: None,
             last: Some(entry("/s/zeta", "/w/app", 13, &["cache"])),
             project: None,
@@ -503,6 +523,7 @@ mod tests {
             dir: "/s/zeta".into(),
             kind: Kind::Run,
             status: STOPPED,
+            stale_record: false,
             attention: None,
             last: Some(entry("/s/zeta", "/w/app", 13, &["cache", "never"])),
             project: None,
@@ -548,6 +569,7 @@ mod tests {
             dir: format!("/s/{name}").into(),
             kind: Kind::Dev,
             status,
+            stale_record: status == NEVER_BOOTED,
             attention: None,
             last: None,
             project: None,
@@ -586,13 +608,28 @@ mod tests {
         );
         assert_eq!(keep(running), ["app", "coming", "hung"]);
         assert_eq!(keep(stopped), ["task-1a2b"]);
+        // `--problems` keeps what needs attention and what came from stale records.
         assert_eq!(status("hung"), "stopping");
+        let problems = Filter {
+            problems: true,
+            ..Filter::default()
+        };
+        assert_eq!(keep(problems), ["hung", "task-1a2b"]);
+        // A row worked out from stale records says so beside its status, and in `--json`;
+        // one whose records were right carries neither.
         let table = render(&rows, None, false, false);
         // State that never booted has no status to print; `--json` still says which it is.
         assert!(!table.contains("never booted"), "{table}");
+        assert!(table.contains("  -*  "), "{table}");
         assert!(table.contains("stopping!"), "{table}");
+        assert!(
+            !table.contains("starting*") && !table.contains("stopping*"),
+            "{table}"
+        );
         let json = serde_json::to_string(&rows).unwrap();
         assert!(json.contains("\"status\":\"never booted\""), "{json}");
+        assert_eq!(json.matches("\"stale_record\":true").count(), 1, "{json}");
+        assert!(!json.contains("\"stale_record\":false"), "{json}");
     }
 
     #[test]
@@ -716,6 +753,7 @@ mod tests {
             dir: scratch.state_dir.clone(),
             kind: Kind::Run,
             status: STOPPED,
+            stale_record: false,
             attention: None,
             last: Some(scratch.clone()),
             project: None,

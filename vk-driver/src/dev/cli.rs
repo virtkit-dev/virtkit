@@ -1436,9 +1436,8 @@ fn declared_environments(files: config::Files) -> Vec<crate::dev::list::Declared
 /// `(name, state)`; `None` when nothing runs there or it cannot be asked.
 fn reported_units(state_dir: &Path) -> Option<Vec<(String, String)>> {
     let dir = crate::vms::canonical(state_dir);
-    let entry = crate::vms::running()
-        .into_iter()
-        .find(|e| e.state_dir == dir)?;
+    let (running, _) = crate::vms::registered();
+    let entry = running.into_iter().find(|e| e.state_dir == dir)?;
     Some(
         crate::vms::service_units(&entry)?
             .into_iter()
