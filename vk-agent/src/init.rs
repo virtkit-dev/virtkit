@@ -700,7 +700,11 @@ fn run_full_vm(
             cfg,
             cfg_error.as_ref(),
             boot_check,
-            root_ro,
+            root_ro.then_some(if disk_layout.is_some() {
+                RoRemount::Mount
+            } else {
+                RoRemount::Superblock
+            }),
             serve,
         )
     {
@@ -748,7 +752,7 @@ fn ready_for_init(
     cfg: Option<&RunConfig>,
     cfg_error: Option<&anyhow::Error>,
     boot_check: Result<()>,
-    root_ro: bool,
+    root_ro: Option<RoRemount>,
     serve: libc::pid_t,
 ) -> Result<()> {
     if let Some(e) = cfg_error {
@@ -771,8 +775,8 @@ fn ready_for_init(
     if let Some(prepare) = prepare {
         run_prepare(prepare, serve)?;
     }
-    if root_ro {
-        remount_root_read_only()?;
+    if let Some(how) = root_ro {
+        remount_root_read_only(how)?;
     }
     // Checked last, just before the exec: a stop accepted during the remount above must end
     // the machine, not be dropped by an init that never heard of it. Only a stop between
@@ -878,17 +882,23 @@ fn root_read_only(cmdline: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// What `root: ro` makes read-only at the handoff.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RoRemount {
+    /// The root's filesystem, as the kernel's `ro` mounts it.
+    Superblock,
+    /// Only the `/` mount, preserving its existing mount flags where available.
+    /// Sibling btrfs subvolumes such as `/var` and `/home` can stay writable.
+    Mount,
+}
+
 /// How long [`remount_root_read_only`] waits out a writer still holding a file on `/` open.
 const RO_REMOUNT_WAIT: Duration = Duration::from_secs(5);
 
-/// Remount `/` read-only (the superblock, as the kernel's `ro` mounts it), for the image's init.
-/// A file still open for writing makes the kernel refuse with EBUSY: the setup's own forks
-/// may be closing theirs, so retry for [`RO_REMOUNT_WAIT`] before giving up.
-///
-/// Disk boots remount only `/` so btrfs subvolumes such as `/var` and `/home` can stay
-/// writable on the same superblock.
-fn remount_root_read_only() -> Result<()> {
-    let flags = if read_cmdline().contains_key("VIRTKIT_BOOT") {
+/// Remount `/` read-only for the image's init. Setup children may still have files
+/// open for writing, so retry EBUSY for up to [`RO_REMOUNT_WAIT`].
+fn remount_root_read_only(how: RoRemount) -> Result<()> {
+    let flags = if how == RoRemount::Mount {
         libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | mount_flags_of("/")
     } else {
         libc::MS_REMOUNT | libc::MS_RDONLY
