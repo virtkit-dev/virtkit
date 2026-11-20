@@ -744,7 +744,7 @@ enum PublishAction {
         /// By name: the service part of a `vk list` row (`db` in `shop/db`); the service must
         /// be running. Reported as `via` by `vk publish list --json`, and as `@NAME` in
         /// `vk list`'s PUBLISHED.
-        #[arg(long, visible_alias = "service", value_name = "NAME")]
+        #[arg(long = "service", visible_alias = "via", value_name = "NAME")]
         via: Option<String>,
     },
     /// List the publishers running for a state dir
@@ -792,7 +792,7 @@ enum PublishAction {
         /// have this compose sibling's agent dial instead of the primary's
         // Keep the alias hidden for this internal command; another build of `ensure` may
         // still spawn it with the old spelling.
-        #[arg(long, alias = "service", value_name = "NAME")]
+        #[arg(long = "service", alias = "via", value_name = "NAME")]
         via: Option<String>,
         /// the inherited listening socket
         #[arg(long = "listen-fd")]
@@ -1544,10 +1544,13 @@ enum Cmd {
     /// over the same exec control channel `vk exec`/`vk ping` use — to dial `--to` and
     /// splice raw bytes back, reusing that already-open channel for the relay. The VM is
     /// selected as `vk exec` selects it (a name, a pid, a directory or a raw agent address;
-    /// a compose service with `NAME/SERVICE` or `--via`), and `--to` can name any
+    /// a compose service with `NAME/SERVICE` or `--service`), and `--to` can name any
     /// address that VM's own network reaches — a LAN peer's own compose hostname included,
     /// resolved through that VM's own DNS:
     /// `vk publish app/devcontainer --listen tcp://127.0.0.1:8443 --to tcp://runner:443`.
+    /// With `--service`, that compose service's own guest dials, so a loopback `--to` is the
+    /// service itself: `vk publish app --service db --listen tcp://127.0.0.1:15432 --to
+    /// tcp://127.0.0.1:5432`.
     ///
     /// That form runs in the foreground and goes with the terminal; `vk publish ensure` and
     /// its siblings keep one running in the background instead.
@@ -1563,9 +1566,9 @@ enum Cmd {
         ///
         /// By name: the service part of a `vk list` row (`db` in `shop/db`); the service must
         /// be running. This form
-        /// records nothing, so nothing reports it; `vk publish ensure --via` is reported as
+        /// records nothing, so nothing reports it; `vk publish ensure --service` is reported as
         /// `via`.
-        #[arg(long, visible_alias = "service", value_name = "NAME")]
+        #[arg(long = "service", visible_alias = "via", value_name = "NAME")]
         via: Option<String>,
         /// Local address to accept connections on (tcp://host:port, a unix path, ...)
         #[arg(long, required = true)]
@@ -5793,12 +5796,11 @@ async fn cli_main(cli: Cli) -> ExitCode {
         } => {
             // Resolution/usage errors exit 2, matching `vk list`/`vk stop`; the code-1
             // result below is reserved for a resolved VM whose agent does not answer.
-            let addr = match exec_target(target.as_deref(), None, "--service")
-                .and_then(|t| resolve_exec_addr(&t))
-            {
-                Ok(a) => a,
-                Err(e) => return fail(&e, 2),
-            };
+            let addr =
+                match exec_target(target.as_deref(), None).and_then(|t| resolve_exec_addr(&t)) {
+                    Ok(a) => a,
+                    Err(e) => return fail(&e, 2),
+                };
             match vk_core::status::get_status(&addr).await {
                 Ok(status) => {
                     println!("{status}");
@@ -5867,7 +5869,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             command,
         } => {
             // Resolved once, for both the Windows check and the agent address below.
-            let target = match exec_target(target.as_deref(), service.as_deref(), "--service") {
+            let target = match exec_target(target.as_deref(), service.as_deref()) {
                 Ok(t) => t,
                 Err(e) => return fail(&e, 2),
             };
@@ -5958,7 +5960,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             target,
             service,
         } => {
-            let target = exec_target(target.as_deref(), service.as_deref(), "--service");
+            let target = exec_target(target.as_deref(), service.as_deref());
             let socket = match target.and_then(|t| Ok((windows_exec_socket(&t)?, t))) {
                 Ok((Some(s), _)) => s,
                 Ok((None, t)) => {
@@ -6050,7 +6052,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             let (Some(listen), Some(to)) = (listen, to) else {
                 return fail(&anyhow::anyhow!("--listen and --to are required"), 2);
             };
-            let addr = match exec_target(target.as_deref(), via.as_deref(), "--via")
+            let addr = match exec_target(target.as_deref(), via.as_deref())
                 .and_then(|t| resolve_exec_addr(&t))
             {
                 Ok(a) => a,
@@ -6980,16 +6982,11 @@ enum ExecTarget {
     },
 }
 
-/// Resolve `target` and `sibling`, given by `flag` (`--service` for `vk exec`, `--via` for
-/// `vk publish`, so the error names what the caller actually typed).
-fn exec_target(
-    target: Option<&str>,
-    sibling: Option<&str>,
-    flag: &str,
-) -> anyhow::Result<ExecTarget> {
+/// Resolve a target and its optional compose service.
+fn exec_target(target: Option<&str>, sibling: Option<&str>) -> anyhow::Result<ExecTarget> {
     if let Some(addr) = target.filter(|t| is_agent_addr(t)) {
         if sibling.is_some() {
-            anyhow::bail!("{flag} selects a VM by REF, not a raw agent address");
+            anyhow::bail!("--service selects a VM by REF, not a raw agent address");
         }
         return Ok(ExecTarget::Addr(addr.parse::<SocketAddr>()?));
     }
@@ -7102,9 +7099,8 @@ fn resolve_exec_addr_at(state_dir: &Path, via: Option<&str>) -> anyhow::Result<S
             state_dir.display()
         );
     };
-    // `ensure` canonicalizes the state dir, so only a hand-run `serve` reaches this
-    // message — and `--via` is the right name there too.
-    resolve_exec_addr(&exec_target(Some(target), via, "--via")?)
+    // Only a hand-run `serve` can pass a raw agent address here. `ensure` passes an absolute path.
+    resolve_exec_addr(&exec_target(Some(target), via)?)
 }
 
 /// The managed half of `vk publish`. Each action names its VM by state dir — the same
@@ -7970,7 +7966,7 @@ mod tests {
         assert!(Cli::try_parse_from(["vk", "console", "a", "b"]).is_err());
     }
 
-    /// `vk publish` names the dialing sibling `--via`, and still answers to `--service`.
+    /// `vk publish` names the dialing sibling `--service`, and still answers to `--via`.
     #[test]
     fn publish_takes_via_under_either_spelling() {
         let via = |args: &[&str]| {
@@ -8042,6 +8038,34 @@ mod tests {
             assert_eq!(name, "pg");
             assert_eq!(via.as_deref(), sibling);
         }
+        // An older `ensure` spawns `serve` with `--via`.
+        let cli = Cli::try_parse_from([
+            "vk",
+            "publish",
+            "serve",
+            "/state/app",
+            "--name",
+            "pg",
+            "--listen",
+            "tcp://127.0.0.1:8443",
+            "--to",
+            "tcp://runner:443",
+            "--listen-fd",
+            "3",
+            "--lock-fd",
+            "4",
+            "--via",
+            "db",
+        ])
+        .unwrap();
+        let Cmd::Publish {
+            action: Some(PublishAction::Serve { via, .. }),
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected `publish serve`")
+        };
+        assert_eq!(via.as_deref(), Some("db"));
     }
 
     // `vk update` CLI shape: the version is an optional positional (absent = latest),
@@ -8479,15 +8503,10 @@ mod tests {
                 .unwrap()
         );
 
-        // The error names the flag the caller typed, not whichever one the helper prefers.
-        let err = exec_target(Some("vsock://3:4444"), Some("db"), "--service")
+        let err = exec_target(Some("vsock://3:4444"), Some("db"))
             .err()
             .unwrap();
         assert!(err.to_string().starts_with("--service selects"), "{err}");
-        let err = exec_target(Some("vsock://3:4444"), Some("db"), "--via")
-            .err()
-            .unwrap();
-        assert!(err.to_string().starts_with("--via selects"), "{err}");
     }
 
     // A closed reader (`vk logs | head`) is the reader having seen enough, not this
@@ -8691,7 +8710,7 @@ mod tests {
         // `src` is also a directory where the tests run: the name wins.
         assert!(Path::new("src").is_dir());
         homes.name(&run, "src");
-        let target = exec_target(Some("src/win"), None, "--service").unwrap();
+        let target = exec_target(Some("src/win"), None).unwrap();
         assert!(matches!(
             &target,
             ExecTarget::Ref {
@@ -8706,25 +8725,23 @@ mod tests {
             Some(run.join("svc-win").join(uefi::GUEST_AGENT_SOCKET))
         );
         // No socket under the name's own run: a Linux service, left to vk-agent.
-        let target = exec_target(Some("src"), Some("db"), "--service").unwrap();
+        let target = exec_target(Some("src"), Some("db")).unwrap();
         assert_eq!(windows_exec_socket(&target).unwrap(), None);
         // A service with a path in it never reaches the filesystem.
         for bad in ["src/../win", "src/win/x"] {
-            let err = exec_target(Some(bad), None, "--service").err().unwrap();
+            let err = exec_target(Some(bad), None).err().unwrap();
             assert!(
                 err.to_string().contains("not a compose service name"),
                 "{err}"
             );
         }
-        assert!(exec_target(Some("src"), Some("../win"), "--service").is_err());
+        assert!(exec_target(Some("src"), Some("../win")).is_err());
         // A word naming two directories is refused, not read as either.
         std::fs::create_dir_all(homes.dir().join("XDG_STATE_HOME/virtkit/dev/amb")).unwrap();
         let other = homes.dir().join("other");
         std::fs::create_dir_all(&other).unwrap();
         homes.name(&other, "amb");
-        let err = exec_target(Some("amb/win"), None, "--service")
-            .err()
-            .unwrap();
+        let err = exec_target(Some("amb/win"), None).err().unwrap();
         assert!(err.to_string().contains("ambiguous"), "{err}");
         std::fs::remove_dir_all(&run).unwrap();
     }
@@ -8799,12 +8816,12 @@ mod tests {
         let _homes = crate::dev::testutil::Homes::new("direct");
         let (run, _live) = run_with_sockets("direct", &[("win", true)]);
         let socket = run.join("svc-win").join(uefi::GUEST_AGENT_SOCKET);
-        let target = exec_target(run.to_str(), Some("win"), "--service").unwrap();
+        let target = exec_target(run.to_str(), Some("win")).unwrap();
         assert!(matches!(&target, ExecTarget::Qga(s) if *s == socket));
         assert_eq!(windows_exec_socket(&target).unwrap(), Some(socket));
         assert!(resolve_exec_addr(&target).is_err());
         // No socket for that service: the registry decides, and nothing runs there.
-        let target = exec_target(run.to_str(), Some("db"), "--service").unwrap();
+        let target = exec_target(run.to_str(), Some("db")).unwrap();
         assert!(matches!(&target, ExecTarget::Ref { vm: None, .. }));
         assert!(windows_exec_socket(&target).is_err());
         std::fs::remove_dir_all(&run).unwrap();

@@ -81,6 +81,7 @@ All notable changes to virtkit will be documented in this file.
 - `vk list`, `vk dev list` and VM lookups by name or pid leave saved state untouched.
   `vk start`, `stop`, `restart` and `delete` clean up stale run records for their targets.
 - **`vk status` is now `vk ping`.** The old name still works.
+- **`vk publish --via` is now `--service`.** `--via` still works.
 
 ### Fixed
 

@@ -105,7 +105,7 @@ pub struct Entry {
     /// Normalized so equivalent address spellings compare equal.
     pub listen: String,
     pub to: String,
-    /// The compose sibling whose agent dials `to` (`--via`); absent when the primary
+    /// The compose sibling whose agent dials `to` (`--service`); absent when the primary
     /// dials. Old `service` records still load; older `vk` versions ignore `via` and treat
     /// the publisher as dialing through the primary.
     #[serde(
@@ -583,7 +583,7 @@ pub(crate) fn serve_argv(
         argv.push(arg.into());
     }
     if let Some(s) = service {
-        argv.push("--via".into());
+        argv.push("--service".into());
         argv.push(s.into());
     }
     argv
@@ -1063,9 +1063,8 @@ pub(crate) fn hold_op_lock(state_dir: &Path) -> std::fs::File {
     op_lock(state_dir).unwrap()
 }
 
-/// Model a live publisher by holding its lifetime lock beside its record, for tests here and
-/// in modules that stop publishers. `service` names the compose sibling that dials, as `--via`
-/// does; `None` is the primary.
+/// Model a live publisher for tests here and in modules that stop publishers. Hold its lifetime
+/// lock beside its record. `service` names the dialing compose sibling, or `None` for the primary.
 #[cfg(test)]
 pub(crate) fn fake_publisher(
     state_dir: &Path,
