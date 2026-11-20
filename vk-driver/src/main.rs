@@ -51,6 +51,7 @@ mod fdpressure;
 mod files;
 mod fullvm;
 mod gc;
+mod gpt;
 mod guestbuild;
 mod health;
 mod hostpolicy;

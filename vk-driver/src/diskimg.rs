@@ -1,7 +1,6 @@
 //! A disk image read by logical offset — a raw file or a qcow2's guest view — or a window
-//! of one, such as a partition. The reader of what a guest wrote ([`crate::ext4_read`]) takes
-//! its bytes through it, so a read past the window is refused here rather than becoming a
-//! read of a neighbouring partition.
+//! of one, such as a partition. Reads by [`crate::ext4_read`] and [`crate::gpt`] are bounded
+//! by the window so they cannot cross into a neighbouring partition.
 
 use std::cell::RefCell;
 use std::os::unix::fs::FileExt;
