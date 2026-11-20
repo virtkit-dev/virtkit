@@ -41,7 +41,7 @@ pub enum Among {
     /// refuse, and name them: for a verb that removes something
     One,
     /// the project's own VM, its `dev` environment, when there is exactly one: what
-    /// `vk dev up` in that directory would start
+    /// `vk dev start` in that directory would start
     ProjectVm,
 }
 
@@ -207,9 +207,14 @@ pub enum Step {
 /// The verbs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verb {
-    Start,
+    /// `build`: build what is not built yet, as `up` does; otherwise boot only what is
+    Start {
+        build: bool,
+    },
     Stop,
-    Delete { force: bool },
+    Delete {
+        force: bool,
+    },
 }
 
 /// What `verb` does to `t`, given whether its primary and (for a service) the service run,
@@ -224,9 +229,11 @@ pub fn plan(
     use Step::*;
     let dev = t.kind == Kind::Dev;
     Ok(match (verb, &t.service) {
-        (Verb::Start, None) if primary_up => vec![Nothing(format!("{} is running", t.shown()))],
-        (Verb::Start, None) => vec![if dev { DevUp } else { Replay }],
-        (Verb::Start, Some(_)) => {
+        (Verb::Start { .. }, None) if primary_up => {
+            vec![Nothing(format!("{} is running", t.shown()))]
+        }
+        (Verb::Start { .. }, None) => vec![if dev { DevUp } else { Replay }],
+        (Verb::Start { .. }, Some(_)) => {
             let mut steps = Vec::new();
             if !primary_up {
                 steps.push(if dev { DevUp } else { Replay });
@@ -399,8 +406,9 @@ fn vk(args: &[String], cwd: Option<&Path>, from_recipe: bool) -> Result<()> {
     Ok(())
 }
 
-/// Carry out `steps` on `t`.
-fn execute(t: &Target, steps: &[Step], timeout: u64) -> Result<String> {
+/// Carry out `steps` on `t`. A start boots only what is already built, unless `build`.
+fn execute(t: &Target, steps: &[Step], timeout: u64, build: bool) -> Result<String> {
+    let start = if build { "up" } else { "start" };
     let mut out = String::new();
     for step in steps {
         match step {
@@ -408,14 +416,14 @@ fn execute(t: &Target, steps: &[Step], timeout: u64) -> Result<String> {
             Step::DevUp => {
                 let mut args =
                     dev_selection(&t.dir).with_context(|| format!("cannot start {}", t.name))?;
-                args.push("up".into());
+                args.push(start.into());
                 vk(&args, None, false)?;
             }
             Step::DevService { up } => {
                 let mut args = dev_selection(&t.dir)?;
                 let service = t.service.clone().unwrap_or_default();
-                let op = if *up { "up" } else { "down" };
-                args.extend(["service".into(), op.into(), service]);
+                let op = if *up { start } else { "stop" };
+                args.extend([op.to_string(), "--service".into(), service]);
                 vk(&args, None, false)?;
             }
             Step::Replay => {
@@ -426,11 +434,15 @@ fn execute(t: &Target, steps: &[Step], timeout: u64) -> Result<String> {
                         crate::names::RECIPE
                     );
                 };
-                vk(
-                    &recipe.replay_args(&t.dir, &t.name),
-                    Some(&recipe.cwd),
-                    true,
-                )?;
+                let mut args = recipe.replay_args(&t.dir, &t.name);
+                if !build {
+                    let at = args
+                        .iter()
+                        .position(|a| a == "--detach")
+                        .unwrap_or(args.len());
+                    args.insert(at, "--require-cached".into());
+                }
+                vk(&args, Some(&recipe.cwd), true)?;
             }
             Step::Control { up } => {
                 let entry =
@@ -441,7 +453,7 @@ fn execute(t: &Target, steps: &[Step], timeout: u64) -> Result<String> {
                 let req = match up {
                     true => vk_core::fleetctl::Request::Start {
                         unit,
-                        cached: false,
+                        cached: !build,
                     },
                     false => vk_core::fleetctl::Request::Stop { unit },
                 };
@@ -564,12 +576,13 @@ fn service_up(entry: Option<&VmEntry>, name: Option<&str>) -> bool {
 
 /// `vk start|stop` on each REF in turn; the exit status says whether every one did.
 pub fn run(verb: Verb, refs: &[std::ffi::OsString], timeout: u64) -> ExitCode {
+    let build = matches!(verb, Verb::Start { build: true });
     let mut ok = true;
     for r in refs {
         // A project directory means its own VM: one REF starts or stops one VM at most.
         let result = resolve(r, Among::ProjectVm).and_then(|t| {
             let steps = steps_for(verb, &t)?;
-            execute(&t, &steps, timeout)
+            execute(&t, &steps, timeout, build)
         });
         match result {
             Ok(report) => print!("{report}"),
@@ -732,7 +745,7 @@ pub fn delete(
         Gate::Go | Gate::DryRun => {}
     }
     for (t, steps) in &planned {
-        match execute(t, steps, timeout) {
+        match execute(t, steps, timeout, false) {
             Ok(report) => print!("{report}"),
             Err(e) => {
                 eprintln!("vk: {e:#}");
@@ -749,12 +762,12 @@ pub fn delete(
 
 /// `vk restart REF…`: stop, then start, each in turn. One that does not stop is not
 /// started; the others still are, and the exit status says whether every one restarted.
-pub fn restart(refs: &[std::ffi::OsString], timeout: u64) -> ExitCode {
+pub fn restart(refs: &[std::ffi::OsString], build: bool, timeout: u64) -> ExitCode {
     let mut ok = true;
     for r in refs {
         let one = std::slice::from_ref(r);
         ok &= run(Verb::Stop, one, timeout) == ExitCode::SUCCESS
-            && run(Verb::Start, one, timeout) == ExitCode::SUCCESS;
+            && run(Verb::Start { build }, one, timeout) == ExitCode::SUCCESS;
     }
     if ok {
         ExitCode::SUCCESS
@@ -830,23 +843,58 @@ mod tests {
     fn start_boots_by_kind_and_a_service_after_its_primary() {
         use Step::*;
         assert_eq!(
-            steps(Verb::Start, Kind::Dev, None, false, false, true),
+            steps(
+                Verb::Start { build: false },
+                Kind::Dev,
+                None,
+                false,
+                false,
+                true
+            ),
             [DevUp]
         );
         assert_eq!(
-            steps(Verb::Start, Kind::Run, None, false, false, true),
+            steps(
+                Verb::Start { build: false },
+                Kind::Run,
+                None,
+                false,
+                false,
+                true
+            ),
             [Replay]
         );
         assert!(matches!(
-            steps(Verb::Start, Kind::Run, None, true, false, true)[..],
+            steps(
+                Verb::Start { build: false },
+                Kind::Run,
+                None,
+                true,
+                false,
+                true
+            )[..],
             [Nothing(_)]
         ));
         assert_eq!(
-            steps(Verb::Start, Kind::Dev, Some("db"), false, false, true),
+            steps(
+                Verb::Start { build: false },
+                Kind::Dev,
+                Some("db"),
+                false,
+                false,
+                true
+            ),
             [DevUp, DevService { up: true }]
         );
         assert_eq!(
-            steps(Verb::Start, Kind::Run, Some("db"), true, false, true),
+            steps(
+                Verb::Start { build: false },
+                Kind::Run,
+                Some("db"),
+                true,
+                false,
+                true
+            ),
             [Control { up: true }]
         );
     }

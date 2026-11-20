@@ -1,6 +1,6 @@
 //! Operator actions on this machine's VMs use the same `vk` commands as a shell: stop or
-//! reboot a pinned run (`vk stop`, `vk reboot`), stop a dev environment (`vk dev stop`),
-//! restart it in its workspace (`vk dev up`), or remove it once stale (`vk dev gc`).
+//! reboot a pinned run (`vk stop`, `vk reboot`), stop a dev environment (`vk stop`),
+//! restart it in its workspace (`vk dev up`), or remove it once stale (`vk delete`).
 //! CI jobs remain under their runner's control.
 //!
 //! Every action is a `POST` the UI's checks pass ([`super::check_post`]), done as the
@@ -78,12 +78,7 @@ fn vm_command(w: &Workload, op: &str) -> Option<Vec<OsString>> {
     match (w.kind, op) {
         (WorkloadKind::Run, "stop") => Some(vec!["stop".into(), "--".into(), target()?]),
         (WorkloadKind::Run, "reboot") => Some(vec!["reboot".into(), "--".into(), target()?]),
-        (WorkloadKind::Dev, "stop") => Some(vec![
-            "dev".into(),
-            "stop".into(),
-            "--".into(),
-            dev_name(w)?.into(),
-        ]),
+        (WorkloadKind::Dev, "stop") => Some(vec!["stop".into(), "--".into(), dev_name(w)?.into()]),
         _ => None,
     }
 }
@@ -167,13 +162,9 @@ fn dev_command(row: &DevRow, op: &str) -> Option<(Vec<OsString>, Duration)> {
         return None;
     }
     Some(match op {
+        // `vk dev` acts on its own workspace's VMs only; `vk` reaches any by name.
         "stop" => (
-            vec![
-                "dev".into(),
-                "stop".into(),
-                "--".into(),
-                row.name.clone().into(),
-            ],
+            vec!["stop".into(), "--".into(), row.name.clone().into()],
             STOP_TIMEOUT,
         ),
         "start" => (
@@ -188,8 +179,7 @@ fn dev_command(row: &DevRow, op: &str) -> Option<(Vec<OsString>, Duration)> {
         ),
         "gc" => (
             vec![
-                "dev".into(),
-                "gc".into(),
+                "delete".into(),
                 "--yes".into(),
                 "--".into(),
                 row.name.clone().into(),
@@ -750,7 +740,7 @@ mod tests {
         assert_eq!(vm_ops(&w), [("stop", "Stop")]);
         assert_eq!(
             vm_command(&w, "stop").unwrap(),
-            ["dev", "stop", "--", "app-1234"].map(OsString::from)
+            ["stop", "--", "app-1234"].map(OsString::from)
         );
         assert!(vm_command(&w, "reboot").is_none());
         // A dev environment whose state dir the list shows altered: no name to stop it by,

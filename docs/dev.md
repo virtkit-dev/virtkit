@@ -263,7 +263,11 @@ vk dev exec --user root -- id
 
 `up` builds and boots in the foreground, then returns once the environment is
 ready. Concurrent callers join an in-flight boot; `up --no-wait` fails promptly
-instead. Primary `exec`, `shell` and `code` bring the environment up when needed.
+instead. `start` boots it again from what is already built: an image the boot would
+have to build fails it (exit 3), a running environment is left as it is, and an
+environment that never finished a boot is `up`'s to create. `stop` (or `down`, the same
+command) powers it off with its services and keeps its state; `restart` is `stop`, then
+`start`. Primary `exec`, `shell` and `code` bring the environment up when needed.
 Commands use the configured user and `exec-env`; a host working directory inside
 the checkout maps to its corresponding guest directory. `--dir` overrides that
 mapping. `exec` passes arguments directly and reproduces the command's exit
@@ -384,18 +388,29 @@ service exec, and every other command to the host policy, which never sees it.
 
 ```sh
 vk dev service status
-vk dev service up runner
+vk dev up runner
 vk dev endpoints --service runner
 vk dev open runner.https
 vk dev exec --service runner --user root -- id
 vk dev shell --service runner
 vk dev logs --service runner -f
 vk dev service reboot runner
-vk dev service down runner
+vk dev stop runner cache
+vk dev start runner
 ```
 
-`service up` brings up the environment if needed, builds the requested service on
-first use, and returns once the service's agent answers. `reboot` restarts the
+`up`, `start`, `stop` (`down`) and `restart` take names: the compose services of the
+environment, an environment of this workspace as `vk list` names it (`app-test`), or
+`ENV/SERVICE`. The primary's own service name is the environment. A name that is both
+a service and an environment is refused until `--service NAME` or `--name NAME` says
+which. `vk dev` acts on its own workspace only: a VM of another workspace is refused,
+and `vk stop NAME` (`vk start`, `vk restart`) reaches any VM. `vk dev service
+up|down NAME` still work.
+
+`up NAME` brings up the environment if needed, builds the requested service on
+first use, and returns once the service's agent answers; `start NAME` does the same
+but only boots a service whose image is already built. `stop NAME` stops the
+service and leaves the environment up. `reboot` restarts the
 guest in place without rebuilding its image. Other service commands do not boot
 the environment. Service `exec` and `shell` require a running service and wait if
 it is still booting. They do not inherit the primary's user, workspace directory
@@ -548,7 +563,7 @@ inside state, configured managed directories and managed editor data. Their cont
 are lost. `--images --storage` and `--all` select both categories.
 
 ```sh
-vk dev prune NAME --all             # prune another environment by its `vk dev list` name
+vk dev prune NAME --all             # prune another environment of this workspace, by its `vk dev list` name
 ```
 
 `NAME` is the environment's VM name, as `vk list` and `vk dev list` print it (its state
@@ -589,17 +604,18 @@ vk dev gc ENVIRONMENT_NAME --yes
 vk dev gc
 ```
 
-`list`, `gc NAME` and `gc --all-stale` work from anywhere without a project
-config. A bare `gc`, like `stop`, reads the config and takes only this
-workspace's environment, not its task leftovers; if that environment has no
-state, it reports nothing to remove. NAME is the environment's VM name: its
+`list` and `gc --all-stale` work from anywhere without a project config. `gc`
+reads the config: bare, like `stop`, it takes this workspace's environment, not its
+task leftovers (if that environment has no state, it reports nothing to remove), and
+`gc NAME` takes environments of this workspace only. `vk delete NAME` removes a VM of
+any workspace, including one whose workspace is gone. NAME is the environment's VM name: its
 workspace's directory name, with `-ENV` for an environment other than `dev`, and
 `-2`, `-3`… when another workspace already has it — given once, on the first
 command that lists it, and kept (`vk rename` changes it). The same name works with
 `vk start`, `vk stop`, `vk delete` and every other VM command, and `vk list` shows the
 environment's compose services beside it. A state directory's own name
 (`app-3f9c0d1e2a4b5c6d`, the `dir_name` of `--json`) still names it, and a task's
-leftover, which has no name, goes by that alone. `vk delete NAME` is `vk dev gc NAME`. The `MEM` column
+leftover, which has no name, goes by that alone. `vk delete NAME` is `vk dev gc NAME` from anywhere. The `MEM` column
 shows what a running environment's VM holds on the host now over the size it
 booted with (`1.2G/8G`), the same figure `vk list` reports; a stopped
 environment reads `-`, and `mem_used_bytes` in `--json` is null for it. `gc`
@@ -918,7 +934,7 @@ shape for inspection, not a complete script to execute.
 
 | Symptom | Next step |
 | --- | --- |
-| No config found | Run `init` at the checkout root or pass `--workspace DIR`. |
+| No config found (exit 5) | `vk dev` works on one workspace. Run `init` at the checkout root, `cd` into the project, or name it: `--workspace DIR` or `VIRTKIT_WORKSPACE=DIR`. |
 | Unknown key or invalid source combination | Check the error's file location, local overrides and schema; select one source. |
 | Missing `${localEnv:NAME}` | Export it, add it to `local.env`, or declare an intentional default. |
 | Wrong files or permissions in the guest | Inspect `workspace`, mount paths, the image's user and UID/GID build arguments. |
@@ -945,13 +961,15 @@ individual options.
 | Command | Purpose |
 | --- | --- |
 | `init` | Import or validate a config; `--from`, `--image`, `--force`. |
-| `up` | Ensure the environment is ready; `--no-wait`. |
+| `up [NAME…]` | Ensure the environment, or named services or environments, are up, building what is needed; `--no-wait`. |
+| `start [NAME…]` | Boot from what is already built (exit 3 when a build is needed). |
+| `restart [NAME…]` | `stop`, then `start`. |
 | `exec -- ARG…` | Run a command; `--dir`, `--user`, `--service`, `-t`. |
 | `shell` | Boot if needed and open an interactive shell; `--service` opens one in a running service. |
 | `code` | Boot if needed and open VS Code; `--editor`. |
 | `editor status`, `editor log`, `editor retry`, `editor reset` | Follow or retry editor reconciliation, or start the server over, without booting. |
 | `build` | Build the primary or `--service NAME` into cache. |
-| `service up/down/reboot NAME`, `service status [NAME]` | Control compose services. |
+| `service up/down/reboot NAME`, `service status [NAME]` | Control compose services (`up`/`stop NAME` do the same). |
 | `endpoints` | Show publication state; `--primary`, `--service`, `--json`. |
 | `open NAME` | Open an endpoint URL, or `--print` it. |
 | `task NAME -- ARG…` | Run a declared project task. |
@@ -961,9 +979,9 @@ individual options.
 | `logs` | Read or follow primary/service console output. |
 | `doctor` | Check the host and resolved requirements. |
 | `plan` | Inspect the resolved config; `--explain`, `--diff`, `--format`, `--show-secrets`. |
-| `stop` | Stop the environment and publishers; `--timeout SECONDS`. |
+| `stop [NAME…]`, `down` | Stop the environment and publishers, or named services or environments; `--timeout SECONDS`. |
 | `storage list`, `storage reset NAME` | Inspect storage or destroy a durable item's data. |
-| `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. `NAME` prunes host-wide by its name (`vk reset NAME`). Requires a stopped environment. |
+| `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. `NAME`: an environment of this workspace (`vk reset NAME` for any). Requires a stopped environment. |
 | `list` | Host-wide environment inventory (on-disk sizes by default); `--no-sizes`, `--json`. |
-| `gc [NAME…]` | Remove stopped state (bare: this workspace's environment; `vk delete NAME` for one); `--all-stale`, `--yes`. |
+| `gc [NAME…]` | Remove stopped state of this workspace's environments (bare: the current one; `vk delete NAME` for any); `--all-stale` (host-wide), `--yes`. |
 | `schema` | Print the configuration JSON Schema. |

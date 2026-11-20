@@ -16,6 +16,11 @@ All notable changes to virtkit will be documented in this file.
   `vk delete` (aliases `rm`, `remove`) asks before it removes anything on a terminal and
   removes nothing without `-y` or `-f` otherwise; `--dry-run` shows what it would remove.
   `vk ls` lists VMs.
+- **`vk dev start`, `vk dev restart` and `vk dev down`.** `start` boots an environment
+  again from what is already built and never builds (exit 3 when it would have to);
+  `down` is `stop`. `vk dev up | start | stop | restart` take the names of compose
+  services (`vk dev stop db redis`) or of this workspace's environments, with `--service`
+  and `--name` to say which when a name is both.
 
 ### Changed
 
@@ -26,6 +31,12 @@ All notable changes to virtkit will be documented in this file.
 - **A directory names exactly one project's VMs.** `vk stop DIR`, `vk list DIR` and the
   other commands no longer take the VMs of directories below unless `--recursive`. A bare
   word is a VM name: write `./dir` for a directory.
+- **`vk start` never builds.** It boots what is built, from the cache if need be, and
+  fails with exit 3 when an image would have to be built: `vk start --build` builds it.
+- **`vk dev` acts on its own workspace.** `vk dev stop NAME`, `vk dev gc NAME` and
+  `vk dev prune NAME` take this workspace's environments only and refuse a VM of
+  another; `vk stop`, `vk delete` and `vk reset` reach any VM. `vk dev gc --all-stale` is
+  still host-wide.
 - **Compose services appear in `vk list` once they have booted**; a declared service
   that never started is not listed.
 - **`vk status` is now `vk ping`**, and `vk publish --via` is now `--service`; the old

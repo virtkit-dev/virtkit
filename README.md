@@ -544,14 +544,15 @@ vk dev init                         # write a first config from devcontainer.jso
 vk dev shell                        # boot if needed, then a login shell as the config's user
 vk dev exec -- cargo test           # a command in the environment, exit status reproduced
 vk dev code                         # VS Code over Remote-SSH, extensions and settings reconciled
-vk dev service up runner            # a profiled compose service, built on first use
+vk dev up runner                    # a profiled compose service, built on first use
 vk dev endpoints                    # the stable host addresses its ports are published on
 vk dev task pre-commit -- "$@"      # a project command under its declared execution policy
 vk dev status                       # what is running and whether its configuration matches
 vk dev plan                         # inspect the resolved configuration without running it
 vk dev doctor                       # check the host and configuration requirements
 vk dev refresh                      # rebuild and restart into the current config
-vk dev stop
+vk dev stop                         # or `down`; `vk dev stop db redis` stops two services
+vk dev start                        # boot again from what is built; never builds
 vk dev prune --dry-run              # preview local boot-image cleanup; --storage selects data
 vk dev list                         # every environment this host keeps state for, from anywhere
 vk dev gc --all-stale               # review/remove stale state; asks on a terminal
@@ -630,9 +631,10 @@ vk rename app web
 vk reset shop --storage       # a dev environment's persistent data, as `vk dev prune`
 ```
 
-`vk start` boots a dev environment from its workspace's config (as `vk dev up` there), a run
-from `run.json` in its state dir — the same `vk run` arguments in the same directory, now
-in the background — and a compose service in its VM.
+`vk start` boots a dev environment from its workspace's config (as `vk dev start` there), a
+run from `run.json` in its state dir — the same `vk run` arguments in the same directory, now
+in the background — and a compose service in its VM. It boots only what is built: an image
+that would have to be built fails the start (exit 3), and `--build` builds it instead.
 
 `vk delete` (also `rm`, `remove`) removes a dev environment's state dir, a run's state dir
 when `vk` made it, and only the recipe and name of a `--state-dir` of yours;
@@ -966,7 +968,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk check` | Validate KVM, VMM, embedded assets, configured host features, and an optional minimum `vk` version. |
 | `vk gc` | Reclaim unused image bases, CI checkouts, image-cache chunks, the local build cache past its retention and size cap, the images of long-unused dev environments and run state dirs, and scratch left by killed builds and runs, then summarize what went and what stayed; `--dry-run` only reports. `vk run` (not of a UEFI bundle), `vk build`, `vk export`, `vk registry pull` and a booting `vk dev` start a pass in the background once a day, and sooner when the disk runs low. |
 | `vk update` | Check for or install a digest-verified GitHub release. |
-| `vk dev ...` | Boot, enter, refresh and stop a project's development environment from `.virtkit/config.toml`; its services, endpoints, storage, tasks and editor. `vk dev list\|gc` covers every environment on the host. |
+| `vk dev ...` | Boot, enter, refresh and stop a project's development environment from `.virtkit/config.toml`; its services, endpoints, storage, tasks and editor. `vk dev list` and `vk dev gc --all-stale` cover every environment on the host. |
 | `vk toolchain lock\|install\|export\|status` | Pin a project's virtkit release and install its artifacts from the lock. |
 | `vk-agent service up\|down\|reboot\|status` | Control compose services from the primary guest; a full `vk` there has `vk service`. |
 | `vk registry ...` | Publish, fetch, inspect, report on, or sweep OCI stores. |

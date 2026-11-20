@@ -222,7 +222,7 @@ fn from_compose(path: &Path, workspace: &Path) -> Result<Draft> {
 }
 
 /// The service names a compose file declares, without resolving anything else in it.
-fn service_names(path: &Path) -> Result<Vec<String>> {
+pub(crate) fn service_names(path: &Path) -> Result<Vec<String>> {
     let text = crate::dev::config::read_regular(path)?
         .with_context(|| format!("{} is gone", path.display()))?;
     let doc =

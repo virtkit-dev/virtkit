@@ -293,6 +293,8 @@ fn run_args(
             args.require_cached = plan.cached_only;
         }
     }
+    // `vk dev start`: what is not built already is not built now.
+    args.require_cached |= over.no_build;
     // A compose primary lives as long as its service's command; an image or build alone has
     // no command to live by, so the run keeps the VM until `vk dev stop`.
     if !matches!(plan.source, Source::Compose { .. }) {
@@ -1886,6 +1888,7 @@ mod tests {
             cache_registry: Some("/var/cache/vk".into()),
             cache_insecure: false,
             freshness: None,
+            no_build: false,
         };
         let args = run_args(&plan, None, &over, &cfg, CheckoutMode::Shared).unwrap();
         let opts = crate::run::service_build_options(&args, Path::new("/k"), Path::new("/a"));

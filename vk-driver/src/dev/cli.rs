@@ -17,6 +17,11 @@ pub struct Dev {
     #[command(subcommand)]
     action: DevAction,
     /// the workspace, instead of finding it from the current directory
+    ///
+    /// `vk dev` works on one workspace: the project whose `.virtkit/config.toml` it reads.
+    /// It is this option, else `$VIRTKIT_WORKSPACE`, else found from the current directory
+    /// (itself or a parent, up to the checkout's root). With none of them, a command that
+    /// needs a workspace exits 5.
     #[arg(long, value_name = "DIR", global = true)]
     workspace: Option<PathBuf>,
     /// the config file to read, instead of `.virtkit/config.toml`
@@ -56,10 +61,13 @@ pub async fn run(dev: Dev, host_cfg: &crate::config::Config) -> ExitCode {
         cache_registry: dev.cache_registry,
         cache_insecure: dev.cache_insecure,
         freshness: dev.freshness,
+        no_build: false,
     };
+    let workspace =
+        config::chosen_workspace(dev.workspace, std::env::var_os(config::WORKSPACE_ENV));
     dev_action(
         dev.action,
-        dev.workspace.as_deref(),
+        workspace.as_deref(),
         dev.dev_config.as_deref(),
         &dev.environment,
         &over,
@@ -98,10 +106,35 @@ enum DevAction {
     /// the same configuration is a no-op; one running a different configuration, or created
     /// by an older vk, is handled as the config's `freshness` (or `--freshness`) says. To
     /// rebuild and restart one that matches, use `vk dev refresh`.
+    ///
+    /// With NAMEs, brings up those compose services (the environment first, if it is down),
+    /// building an image on first use, or those environments of this workspace.
     Up {
         /// fail promptly when a boot someone else started is in flight, instead of joining it
         #[arg(long)]
         no_wait: bool,
+        #[command(flatten)]
+        targets: Targets,
+    },
+    /// Start the environment from what is already built
+    ///
+    /// `up` without the build: an image the boot would have to build fails the start (exit
+    /// 3), restored from the cache if it is there; an environment that never booted fails
+    /// too. A running environment is left as it is, matching the config or not. With NAMEs,
+    /// starts those compose services or environments of this workspace.
+    Start {
+        #[command(flatten)]
+        targets: Targets,
+    },
+    /// Stop the environment, then start it from what is already built
+    ///
+    /// `stop`, then `start`. With NAMEs, restarts those compose services or environments.
+    Restart {
+        #[command(flatten)]
+        targets: Targets,
+        /// seconds to wait for each to go
+        #[arg(long, default_value_t = super::boot::STOP_TIMEOUT_SECS)]
+        timeout: u64,
     },
     /// Run a command in the environment, bringing it up first
     ///
@@ -355,20 +388,19 @@ enum DevAction {
     /// source and mount paths, free host ports for the endpoints, the state directory, and
     /// the host variables the config refers to. Exits 1 when a check fails.
     Doctor,
-    /// Stop the environment and everything published from it
+    /// Stop the environment and everything published from it (`down` is the same)
     ///
-    /// Powers the guest off and takes down the publishers that were reaching into it. The
-    /// state directory stays — its storage, keys and identity are what the next `vk dev up`
-    /// starts from; `vk dev gc` is what removes it. Stopping what is already stopped is the
-    /// state asked for, not a failure.
+    /// Powers the guest off, its compose services with it, and takes down the publishers
+    /// that were reaching into it. The state directory stays — its storage, keys and identity
+    /// are what the next `vk dev start` or `up` starts from; `vk dev gc` is what removes it.
+    /// Stopping what is already stopped is the state asked for, not a failure.
     ///
-    /// With no NAME, works on this workspace's environment, from its config. NAME instead
-    /// stops one by the identity `vk dev list` gives it, host-wide and without a config — for
-    /// an environment in another workspace, or one whose workspace is gone.
+    /// With NAMEs, stops those compose services, leaving the environment up, or those
+    /// environments of this workspace. A VM of another workspace is `vk stop NAME`'s.
+    #[command(visible_alias = "down")]
     Stop {
-        /// the environment to stop, as `vk dev list` names it [default: this workspace's]
-        #[arg(value_name = "NAME")]
-        name: Option<String>,
+        #[command(flatten)]
+        targets: Targets,
         /// seconds to wait for it to go
         #[arg(long, default_value_t = super::boot::STOP_TIMEOUT_SECS)]
         timeout: u64,
@@ -472,7 +504,10 @@ impl DevAction {
             // A task boots only under `policy = "require"`, which is in the config rather
             // than on the command line; the fork is where a boot *may* happen, and the
             // policies that boot nothing leave the work to the parent (see `dev_up`).
-            Self::Up { .. } | Self::Code { .. } | Self::Task { .. } => true,
+            // Named services and environments are reached from this process: it boots none
+            // itself (see `act_on`).
+            Self::Up { targets, .. } | Self::Start { targets } => targets.is_empty(),
+            Self::Code { .. } | Self::Task { .. } => true,
             // A service exec or shell reaches a running service and boots nothing.
             Self::Exec { service, .. } | Self::Shell { service } => service.is_none(),
             // Of the service operations only `up` boots the environment.
@@ -492,12 +527,39 @@ impl DevAction {
             | Self::Logs { .. }
             | Self::Doctor
             | Self::Stop { .. }
+            | Self::Restart { .. }
             | Self::List { .. }
             | Self::Gc { .. }
             | Self::Prune { .. }
             | Self::Plan { .. }
             | Self::Schema => false,
         }
+    }
+}
+
+/// What `up`, `start`, `stop` and `restart` act on, by name: compose services of the
+/// environment, or environments of this workspace. None means the environment itself.
+#[derive(Args, Debug, Default)]
+struct Targets {
+    /// compose services, or environments of this workspace [default: the environment]
+    ///
+    /// A service by its compose name (the primary's is the environment itself), an
+    /// environment as `vk list` names it, or `ENV/SERVICE`. A name that is both is refused:
+    /// `--service` or `--name` says which. A VM of another workspace is refused too: `vk`
+    /// itself (`vk start NAME`, `vk stop NAME`) reaches any VM.
+    #[arg(value_name = "NAME")]
+    names: Vec<String>,
+    /// a compose service of the environment (repeatable)
+    #[arg(long = "service", value_name = "SERVICE")]
+    services: Vec<String>,
+    /// an environment of this workspace, as `vk list` names it (repeatable)
+    #[arg(long = "name", value_name = "NAME")]
+    vms: Vec<String>,
+}
+
+impl Targets {
+    fn is_empty(&self) -> bool {
+        self.names.is_empty() && self.services.is_empty() && self.vms.is_empty()
     }
 }
 
@@ -645,14 +707,6 @@ async fn dev_action(
     if matches!(action, DevAction::Schema) {
         return write_report(schema::SCHEMA_JSON);
     }
-    // Named stops use host state, so they also work from another or deleted workspace.
-    if let DevAction::Stop {
-        name: Some(name),
-        timeout,
-    } = &action
-    {
-        return dev_stop_named(name, *timeout);
-    }
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => return fail(&anyhow::anyhow!(e).context("resolving the current dir"), 1),
@@ -679,50 +733,91 @@ async fn dev_action(
         };
         return write_report(&report);
     }
-    // A bare `gc` means this workspace's environment, so only that one reads the config.
+    // `--all-stale` looks host-wide for environments whose workspace is gone: it has none.
     if let DevAction::Gc {
         yes,
-        all_stale,
+        all_stale: true,
         names,
     } = &action
-        && (*all_stale || !names.is_empty())
     {
-        if !names.is_empty() {
-            eprintln!(
-                "vk: note: `vk delete {}` removes a VM, whatever made it",
-                names.join(" ")
-            );
-        }
-        return dev_gc(*yes, *all_stale, names, false);
-    }
-    // Like named stops, named prunes use host state and work from another or deleted
-    // workspace. Select from the recorded boot state without resolving a config.
-    if let DevAction::Prune {
-        name: Some(name),
-        options,
-    } = &action
-    {
-        eprintln!("vk: note: `vk reset {name}` does the same");
-        return match super::prune::run_by_name(name, options) {
-            Ok(report) => write_report(&report),
-            Err(e) => fail(&e, 1),
-        };
+        return dev_gc(*yes, true, names, false);
     }
     // A config that cannot be read or does not describe something virtkit can build is the
     // caller's to fix, like a usage error.
     let loaded = match config::discover(&cwd, workspace, config).and_then(config::load) {
         Ok(l) => l,
         Err(e) if matches!(action, DevAction::Gc { .. }) => {
-            let e = e.context("a bare `vk dev gc` takes this workspace's environment; name one (`vk dev list`) or pass --all-stale");
-            return fail(&e, 2);
+            let e = e.context(
+                "`vk dev gc` takes this workspace's environments; `vk delete NAME` removes any VM, \
+                 and --all-stale those whose workspace is gone",
+            );
+            return no_workspace_or(e, 2, Some("vk delete NAME"));
         }
-        Err(e) => return fail(&e, 2),
+        Err(e) => return no_workspace_or(e, 2, None),
     };
     let plan = match plan::resolve(&loaded, environment) {
         Ok(p) => p,
         Err(e) => return fail(&e, 2),
     };
+    let globals = Globals {
+        loaded: &loaded,
+        over,
+    };
     match action {
+        DevAction::Up { no_wait, targets } if !targets.is_empty() => {
+            act_on(Verb::Up { no_wait }, &targets, 0, &plan, &globals).await
+        }
+        DevAction::Start { targets } if !targets.is_empty() => {
+            act_on(Verb::Start, &targets, 0, &plan, &globals).await
+        }
+        DevAction::Stop { targets, timeout } if !targets.is_empty() => {
+            act_on(Verb::Stop, &targets, timeout, &plan, &globals).await
+        }
+        DevAction::Restart { targets, timeout } if !targets.is_empty() => {
+            act_on(Verb::Restart, &targets, timeout, &plan, &globals).await
+        }
+        DevAction::Start { .. } => {
+            if !plan.state_dir.join("dev.json").exists() {
+                let e = anyhow::anyhow!(
+                    "the {} environment has no finished boot to start again: `vk dev up` \
+                     builds and starts it",
+                    plan.environment
+                );
+                return fail(&e, 1);
+            }
+            let over = dev::Overrides {
+                freshness: Some(config::Freshness::Reuse),
+                no_build: true,
+                ..over.clone()
+            };
+            match dev_up(&plan, host_cfg, &over, false, true, true).await {
+                Ready::Act => ExitCode::SUCCESS,
+                Ready::Done(code) => code,
+            }
+        }
+        DevAction::Restart { timeout, .. } => {
+            let env = plan.environment.clone();
+            match restart_env(&env, &plan.state_dir, timeout, &globals) {
+                Ok(report) => write_report(&report),
+                Err(e) => fail(&e, 1),
+            }
+        }
+        DevAction::Gc { yes, names, .. } if !names.is_empty() => {
+            match in_scope(&plan, &names, "vk delete") {
+                Ok(()) => dev_gc(yes, false, &names, false),
+                Err(code) => code,
+            }
+        }
+        DevAction::Prune {
+            name: Some(name),
+            options,
+        } => match in_scope(&plan, std::slice::from_ref(&name), "vk reset") {
+            Ok(()) => match super::prune::run_by_name(&name, &options) {
+                Ok(report) => write_report(&report),
+                Err(e) => fail(&e, 1),
+            },
+            Err(code) => code,
+        },
         DevAction::Prune {
             name: None,
             options,
@@ -730,7 +825,7 @@ async fn dev_action(
             Ok(report) => write_report(&report),
             Err(e) => fail(&e, 1),
         },
-        DevAction::Up { no_wait } => {
+        DevAction::Up { no_wait, .. } => {
             match dev_up(&plan, host_cfg, over, false, !no_wait, true).await {
                 Ready::Act => ExitCode::SUCCESS,
                 Ready::Done(code) => code,
@@ -1113,10 +1208,7 @@ async fn dev_action(
             let code = write_report(&report);
             if ok { code } else { exit_code(1) }
         }
-        DevAction::Stop {
-            name: None,
-            timeout,
-        } => match dev::stop(&plan.state_dir, timeout) {
+        DevAction::Stop { timeout, .. } => match dev::stop(&plan.state_dir, timeout) {
             Ok(stopped) => match write_report(&stopped.report) {
                 ExitCode::SUCCESS if !stopped.all_down => exit_code(1),
                 code => code,
@@ -1132,11 +1224,7 @@ async fn dev_action(
             let name = plan.state_dir.file_name().unwrap_or_default();
             dev_gc(yes, false, &[name.to_string_lossy().into_owned()], true)
         }
-        DevAction::Init { .. }
-        | DevAction::List { .. }
-        | DevAction::Stop { name: Some(_), .. }
-        | DevAction::Prune { name: Some(_), .. }
-        | DevAction::Schema => {
+        DevAction::Init { .. } | DevAction::List { .. } | DevAction::Schema => {
             unreachable!("handled before the plan is resolved")
         }
         // Nothing running is not an error for a read-only preview — `refresh --dry-run`
@@ -1254,34 +1342,263 @@ pub(crate) fn dev_gc(yes: bool, all_stale: bool, names: &[String], own: bool) ->
     }
 }
 
-/// Stop a host-wide environment by the state-directory name used by `list` and `gc`,
-/// without loading a workspace config.
-fn dev_stop_named(name: &str, timeout: u64) -> ExitCode {
-    let dir = match named_state_dir(name) {
-        Ok(dir) => dir,
-        Err(e) => return fail(&e, 1),
-    };
-    match dev::stop(&dir, timeout) {
-        Ok(stopped) => match write_report(&stopped.report) {
-            ExitCode::SUCCESS if !stopped.all_down => exit_code(1),
-            code => code,
-        },
-        Err(e) => fail(&e, 1),
+/// The exit status of a `vk dev` command that needs a workspace and was given none: it is
+/// run outside any, with neither `--workspace` nor `$VIRTKIT_WORKSPACE`. Its own status, so
+/// a script can tell "not in a workspace" from a workspace whose config is wrong (2).
+pub(crate) const NO_WORKSPACE_EXIT: i32 = 5;
+
+/// Fail with `e`: as [`NO_WORKSPACE_EXIT`] when it says there is no workspace — with, on a
+/// terminal, how one is chosen and what works without one — and as `code` otherwise.
+/// `host_wide` is the command that does this command's job on any workspace's VMs.
+fn no_workspace_or(e: anyhow::Error, code: i32, host_wide: Option<&str>) -> ExitCode {
+    if e.downcast_ref::<config::NoWorkspace>().is_none() {
+        return fail(&e, code);
+    }
+    let status = fail(&e.context("not in a workspace"), NO_WORKSPACE_EXIT);
+    if dev::on_terminal() {
+        eprint!("{}", no_workspace_hint(host_wide));
+    }
+    status
+}
+
+/// How a workspace is chosen, for someone who ran `vk dev` outside one.
+fn no_workspace_hint(host_wide: Option<&str>) -> String {
+    let mut hint = format!(
+        "vk: hint: `vk dev` works on one workspace, the project holding {file}:\n\
+         \x20         cd into it, or name it with `vk dev --workspace DIR …` or {env}=DIR\n\
+         \x20         `vk dev list` lists every workspace's environments, `vk list` every VM\n",
+        file = config::CONFIG_FILE,
+        env = config::WORKSPACE_ENV,
+    );
+    if let Some(cmd) = host_wide {
+        hint.push_str(&format!("\x20         `{cmd}` works from anywhere\n"));
+    }
+    hint
+}
+
+/// What the commands acting on named VMs carry from `vk dev`'s own options.
+struct Globals<'a> {
+    loaded: &'a config::Loaded,
+    over: &'a dev::Overrides,
+}
+
+/// A lifecycle verb on named services and environments.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verb {
+    Up { no_wait: bool },
+    Start,
+    Stop,
+    Restart,
+}
+
+impl Verb {
+    /// The `vk` command that does the same to a VM of any workspace.
+    fn global(self) -> &'static str {
+        match self {
+            Verb::Up { .. } => "vk start --build",
+            Verb::Start => "vk start",
+            Verb::Stop => "vk stop",
+            Verb::Restart => "vk restart",
+        }
     }
 }
 
-/// The state dir of the dev environment `name` names — its VM name, or its state dir's own
-/// name — without collecting any listing's metadata.
-fn named_state_dir(name: &str) -> anyhow::Result<PathBuf> {
-    let base = crate::vms::canonical(&plan::dev_state_base()?);
-    match crate::names::resolve(name)? {
-        Some(dir) if crate::vms::canonical(&dir).parent() == Some(base.as_path()) => Ok(dir),
-        Some(dir) => anyhow::bail!(
-            "{name} is not a dev environment ({}); `vk stop {name}` stops any VM",
-            dir.display()
-        ),
-        None => anyhow::bail!("no dev environment state named {name} (`vk dev list` names them)"),
+/// Refuse a VM of another workspace, naming on a terminal the `vk` command that reaches it.
+fn refuse_outside(name: &str, global: &str) -> ExitCode {
+    let mut e = anyhow::anyhow!("{name} is not a VM of this workspace");
+    if dev::on_terminal() {
+        e = e.context(format!("`{global} {name}` acts on a VM of any workspace"));
     }
+    fail(&e, 2)
+}
+
+/// Check that every one of `names` is an environment of this workspace, as `gc` and `prune`
+/// take them.
+fn in_scope(plan: &plan::Plan, names: &[String], global: &str) -> Result<(), ExitCode> {
+    let scope = super::targets::scope(plan).map_err(|e| fail(&e, 1))?;
+    match super::targets::pick(&scope, &[], &[], names, &super::targets::known_anywhere) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(match e.downcast_ref::<super::targets::Outside>() {
+            Some(o) => refuse_outside(&o.0, global),
+            None => fail(&e, 2),
+        }),
+    }
+}
+
+/// `vk dev up | start | stop | restart NAME…`: act on each named service or environment in
+/// turn. An environment that has to boot does so in a `vk dev` of its own, so this process
+/// boots nothing and can go on to the next name.
+async fn act_on(
+    verb: Verb,
+    targets: &Targets,
+    timeout: u64,
+    plan: &plan::Plan,
+    g: &Globals<'_>,
+) -> ExitCode {
+    use super::targets::Pick;
+    let picks = match super::targets::scope(plan).and_then(|scope| {
+        super::targets::pick(
+            &scope,
+            &targets.names,
+            &targets.services,
+            &targets.vms,
+            &super::targets::known_anywhere,
+        )
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            return match e.downcast_ref::<super::targets::Outside>() {
+                Some(o) => refuse_outside(&o.0, verb.global()),
+                None => fail(&e, 2),
+            };
+        }
+    };
+    let mut ok = true;
+    for pick in picks {
+        let done = match &pick {
+            Pick::Env(env) => env_verb(verb, env, timeout, g),
+            Pick::Service(env, service) => service_verb(verb, env, service, g).await,
+        };
+        match done {
+            Ok(report) => print!("{report}"),
+            Err(e) => {
+                eprintln!("vk: {e:#}");
+                ok = false;
+            }
+        }
+    }
+    if ok { ExitCode::SUCCESS } else { exit_code(1) }
+}
+
+/// Run `vk dev <verb>` on `environment` of this workspace in a process of its own, its
+/// output ours, with the options this one was given.
+fn dev_child(environment: &str, verb: &[&str], g: &Globals<'_>) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let files = &g.loaded.files;
+    let mut args: Vec<std::ffi::OsString> = vec!["dev".into()];
+    args.push(format!("--workspace={}", files.workspace.display()).into());
+    args.push(format!("--dev-config={}", files.config.display()).into());
+    args.push(format!("--environment={environment}").into());
+    if let Some(f) = g.over.freshness {
+        args.push(format!("--freshness={}", f.as_str()).into());
+    }
+    if let Some(r) = &g.over.cache_registry {
+        args.push(format!("--cache-registry={r}").into());
+    }
+    if g.over.cache_insecure {
+        args.push("--cache-insecure".into());
+    }
+    args.extend(verb.iter().map(Into::into));
+    let exe = std::env::current_exe().context("resolving the running vk")?;
+    let status = std::process::Command::new(exe)
+        .args(&args)
+        .status()
+        .context("running vk")?;
+    if !status.success() {
+        anyhow::bail!(
+            "`vk dev --environment {environment} {}` {status}",
+            verb.join(" ")
+        );
+    }
+    Ok(())
+}
+
+/// Stop the environment on `dir`, then start it again from what is built.
+fn restart_env(
+    environment: &str,
+    dir: &Path,
+    timeout: u64,
+    g: &Globals<'_>,
+) -> anyhow::Result<String> {
+    let stopped = dev::stop(dir, timeout)?;
+    if !stopped.all_down {
+        anyhow::bail!("{}it did not stop", stopped.report);
+    }
+    print!("{}", stopped.report);
+    dev_child(environment, &["start"], g)?;
+    Ok(String::new())
+}
+
+/// `verb` on an environment of this workspace.
+fn env_verb(
+    verb: Verb,
+    env: &super::targets::Env,
+    timeout: u64,
+    g: &Globals<'_>,
+) -> anyhow::Result<String> {
+    match verb {
+        Verb::Up { no_wait } => {
+            let up: &[&str] = if no_wait {
+                &["up", "--no-wait"]
+            } else {
+                &["up"]
+            };
+            dev_child(&env.environment, up, g)?;
+            Ok(String::new())
+        }
+        Verb::Start => {
+            dev_child(&env.environment, &["start"], g)?;
+            Ok(String::new())
+        }
+        Verb::Stop => {
+            let stopped = dev::stop(&env.dir, timeout)?;
+            if !stopped.all_down {
+                anyhow::bail!("{}{} did not stop", stopped.report, env.name);
+            }
+            Ok(stopped.report)
+        }
+        Verb::Restart => restart_env(&env.environment, &env.dir, timeout, g),
+    }
+}
+
+/// `verb` on the compose service `service` of `env`: a start brings the environment up
+/// first, a stop leaves it up.
+async fn service_verb(
+    verb: Verb,
+    env: &super::targets::Env,
+    service: &str,
+    g: &Globals<'_>,
+) -> anyhow::Result<String> {
+    use vk_core::fleetctl::Request;
+    let plan = plan::resolve(g.loaded, &env.environment)?;
+    let shown = format!("{}/{service}", env.name);
+    let up = super::targets::running(&env.dir);
+    let stop = Request::Stop {
+        unit: service.to_string(),
+    };
+    let start = |cached| Request::Start {
+        unit: service.to_string(),
+        cached,
+    };
+    let reqs: Vec<Request> = match verb {
+        Verb::Stop if !up => return Ok(format!("{shown} is not running\n")),
+        Verb::Stop => vec![stop],
+        Verb::Up { .. } => vec![start(false)],
+        Verb::Start => vec![start(true)],
+        Verb::Restart if up => vec![stop, start(true)],
+        Verb::Restart => vec![start(true)],
+    };
+    if !matches!(verb, Verb::Stop) && !up {
+        let boot = match verb {
+            Verb::Up { no_wait: true } => &["up", "--no-wait"][..],
+            Verb::Up { .. } => &["up"],
+            _ => &["start"],
+        };
+        dev_child(&env.environment, boot, g)?;
+    }
+    let mut out = String::new();
+    for req in &reqs {
+        let reply = dev::service(&plan, req).await?;
+        let (lines, note) = render_service_reply(&reply);
+        out.push_str(&lines);
+        if !reply.ok {
+            anyhow::bail!(
+                "{out}{shown}: {}",
+                note.unwrap_or_else(|| reply.message.clone())
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// Bring the environment up, from whichever of the two processes this is (see `dev`'s module
@@ -1375,17 +1692,50 @@ mod tests {
     }
 
     #[test]
-    fn stop_takes_an_optional_name_selector() {
+    fn lifecycle_verbs_take_names_services_and_vms() {
         // No name is this workspace's environment, resolved from a config.
         assert!(matches!(
             parse(&["vk", "dev", "stop"]).action,
-            DevAction::Stop { name: None, .. }
+            DevAction::Stop { targets, .. } if targets.is_empty()
         ));
-        // A name selects host-wide, as `vk dev list`/`gc` name environments.
+        // `down` is `stop`.
         assert!(matches!(
-            parse(&["vk", "dev", "stop", "myenv-1a2b"]).action,
-            DevAction::Stop { name: Some(n), .. } if n == "myenv-1a2b"
+            parse(&["vk", "dev", "down", "db", "redis"]).action,
+            DevAction::Stop { targets, .. } if targets.names == ["db", "redis"]
         ));
+        let Dev {
+            action: DevAction::Start { targets },
+            ..
+        } = parse(&[
+            "vk",
+            "dev",
+            "start",
+            "db",
+            "--service",
+            "web",
+            "--name",
+            "app-test",
+            "--service",
+            "cache",
+        ])
+        else {
+            panic!("not a start");
+        };
+        assert_eq!(targets.names, ["db"]);
+        assert_eq!(targets.services, ["web", "cache"]);
+        assert_eq!(targets.vms, ["app-test"]);
+        assert!(matches!(
+            parse(&["vk", "dev", "restart", "db"]).action,
+            DevAction::Restart { targets, .. } if targets.names == ["db"]
+        ));
+        assert!(matches!(
+            parse(&["vk", "dev", "up", "--no-wait", "db"]).action,
+            DevAction::Up { no_wait: true, targets } if targets.names == ["db"]
+        ));
+        // Only a bare `up` or `start` boots in this process.
+        assert!(parse(&["vk", "dev", "start"]).boots());
+        assert!(!parse(&["vk", "dev", "start", "db"]).boots());
+        assert!(!parse(&["vk", "dev", "up", "--service", "db"]).boots());
     }
 
     #[test]
@@ -1402,7 +1752,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_gc_removes_this_workspaces_environment_and_selecting_gc_needs_no_config() {
+    fn bare_gc_removes_this_workspaces_environment_and_a_named_gc_stays_in_it() {
         const CHILD: &str = "VK_TEST_BARE_GC";
         if std::env::var_os(CHILD).is_some() {
             let cwd = std::env::current_dir().unwrap();
@@ -1440,11 +1790,15 @@ mod tests {
             // A bare gc reads the config, so a missing one is a usage error.
             let missing = cwd.join("missing.toml");
             assert_eq!(gc(&[], false, Some(&missing)), exit_code(2));
-            // Named and `--all-stale` runs never read it.
-            assert_eq!(gc(&["other"], false, Some(&missing)), ExitCode::SUCCESS);
-            assert!(!base.join("other").exists());
+            // A named gc takes this workspace's environments only: `other` is no VM of it,
+            // and a gc that cannot tell which workspace it is in takes nothing.
+            assert_eq!(gc(&["other"], false, None), exit_code(2));
+            assert_eq!(gc(&["other"], false, Some(&missing)), exit_code(2));
+            assert!(base.join("other").is_dir());
+            // `--all-stale` is host-wide and never reads the config.
             assert_eq!(gc(&[], true, Some(&missing)), ExitCode::SUCCESS);
             assert!(!base.join("stale").exists());
+            assert!(!base.join("other").exists());
             return;
         }
         let _guard = crate::dev::testutil::env_guard();
@@ -1459,7 +1813,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "dev::cli::tests::bare_gc_removes_this_workspaces_environment_and_selecting_gc_needs_no_config",
+                "dev::cli::tests::bare_gc_removes_this_workspaces_environment_and_a_named_gc_stays_in_it",
                 "--nocapture",
             ])
             .env(CHILD, "1")
@@ -1471,35 +1825,32 @@ mod tests {
         assert!(output.status.success(), "{output:?}");
     }
 
+    /// A named stop takes only this workspace's services and environments: a VM of another
+    /// workspace, a name nothing has, and a name that cannot be one are refused alike.
     #[test]
-    fn named_stop_needs_neither_a_config_nor_a_surviving_cwd() {
+    fn a_named_stop_stays_in_its_workspace() {
         const CHILD: &str = "VK_TEST_NAMED_STOP";
         if std::env::var_os(CHILD).is_some() {
             let cwd = std::env::current_dir().unwrap();
-            std::fs::remove_dir(&cwd).unwrap();
-            assert!(std::env::current_dir().is_err());
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .unwrap();
-            for (name, expected) in [
-                ("known", ExitCode::SUCCESS),
-                ("known", ExitCode::SUCCESS),
-                ("unknown", exit_code(1)),
-                ("linked", exit_code(1)),
-                ("../outside", exit_code(1)),
-            ] {
+            for name in ["known", "unknown", "linked", "../outside"] {
                 let result = runtime.block_on(dev_action(
                     DevAction::Stop {
-                        name: Some(name.into()),
+                        targets: Targets {
+                            names: vec![name.into()],
+                            ..Targets::default()
+                        },
                         timeout: 0,
                     },
                     Some(&cwd),
-                    Some(&cwd.join("missing.toml")),
+                    None,
                     "dev",
                     &dev::Overrides::default(),
                     &crate::config::Config::default(),
                 ));
-                assert_eq!(result, expected, "{name}");
+                assert_eq!(result, exit_code(2), "{name}");
             }
             return;
         }
@@ -1510,12 +1861,17 @@ mod tests {
         std::fs::create_dir_all(base.join("known")).unwrap();
         std::os::unix::fs::symlink(base.join("known"), base.join("linked")).unwrap();
         std::fs::create_dir_all(state.join("virtkit/outside")).unwrap();
-        let cwd = tmp.0.join("removed-workspace");
-        std::fs::create_dir(&cwd).unwrap();
+        let cwd = tmp.0.join("ws");
+        std::fs::create_dir_all(cwd.join(".virtkit")).unwrap();
+        std::fs::write(
+            cwd.join(config::CONFIG_FILE),
+            "schema = 1\n[dev]\nimage = \"x\"\nworkspace = \"/w\"\n",
+        )
+        .unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "dev::cli::tests::named_stop_needs_neither_a_config_nor_a_surviving_cwd",
+                "dev::cli::tests::a_named_stop_stays_in_its_workspace",
                 "--nocapture",
             ])
             .env(CHILD, "1")
@@ -1583,6 +1939,10 @@ mod tests {
     const ACTIONS: &[(&[&str], bool)] = &[
         (&["init"], false),
         (&["up"], true),
+        (&["up", "db"], false),
+        (&["start"], true),
+        (&["start", "--service", "db"], false),
+        (&["restart"], false),
         (&["exec", "--", "true"], true),
         (&["exec", "--service", "db", "--", "true"], false),
         (&["shell"], true),
@@ -1609,6 +1969,7 @@ mod tests {
         (&["logs", "-f"], false),
         (&["doctor"], false),
         (&["stop"], false),
+        (&["down", "db"], false),
         (&["list"], false),
         (&["gc", "--all-stale", "--yes"], false),
         (&["prune"], false),
