@@ -762,6 +762,7 @@ fn refused(left: &NotReady, digest: &str) -> String {
 /// would record it as booted from a config it was not. With `restart`, a refresh's, either is
 /// [`Joined::Restart`] instead: the caller restarts it.
 fn take_over(plan: &Plan, parent_pid: u32, wanted: Wanted<'_>, restart: bool) -> Option<Joined> {
+    mark_unbegun_readying(plan);
     match not_ready_here(plan, wanted)? {
         (left, _) if restart => Some(Joined::Restart(left.vm)),
         (_, LeftBehind::Claim) => claim(plan, parent_pid, wanted).then_some(Joined::Claimed),
@@ -1437,6 +1438,76 @@ async fn wait_for_boot(
         }
         tokio::time::sleep(INFLIGHT_POLL).await;
     }
+}
+
+/// Mark the running VM abandoned when the `vk dev` that booted it went before it began
+/// readying it — before its `begin_readying` named it in a marker, so nothing
+/// says it is gone and a joiner would wait out `READY_WAIT`. What does say so is its child's
+/// note, still unread: only that parent takes it (see [`take_transition`]). The marker names
+/// nobody, so [`take_over`] claims or weighs it as for any readying that failed.
+fn mark_unbegun_readying(plan: &Plan) {
+    let Some(vm) = running_vm(plan) else {
+        return;
+    };
+    let Some(parent) = unbegun_parent(&plan.state_dir, &vm) else {
+        return;
+    };
+    // What that parent's readying would have recorded, as `begin_readying` computes it: the
+    // compose file this boot's `vk run` loaded and the wrapper it was given, the rest from
+    // the config as it is now. So a compose edit since the boot reads as drift in the claim;
+    // an edit to `.virtkit/config.toml` in that window does not: no record of it survives.
+    let Ok(Config {
+        digest, manifest, ..
+    }) = super::identity::booted_identity_of(plan)
+    else {
+        return;
+    };
+    let left = NotReady {
+        vm: VmTie::of(&vm),
+        digest,
+        manifest,
+        booted_secs: vm.created_secs,
+        // That parent is gone without saying which vk it was: the creator stays unknown.
+        created_by: String::new(),
+        readier: None,
+        why: format!("the `vk dev` that booted it (pid {parent}) exited before readying it"),
+    };
+    if super::identity::mark_unbegun(plan, &left) {
+        // Nobody will read it now; leave no note for a later process given the same pid.
+        let _ = std::fs::remove_file(transition_path(&plan.state_dir, parent));
+    }
+}
+
+/// The pid of the parent whose child booted `vm` and that is gone without reading the note
+/// the child left it: a `booted` note, written by `vm`'s own process since it started, whose
+/// parent procfs no longer shows. `None` where this process cannot see `vm`'s process as it
+/// registered — another pid namespace, or no procfs — since a pid not seen there says
+/// nothing about whether it is gone.
+fn unbegun_parent(state_dir: &Path, vm: &crate::vms::VmEntry) -> Option<u32> {
+    let pid = i32::try_from(vm.pid).ok()?;
+    if vm.pid_start_ticks.is_none() || crate::usage::proc_starttime(pid) != vm.pid_start_ticks {
+        return None;
+    }
+    // A note older than `vm`'s process is an earlier boot's, its child given the same pid. A
+    // second of slack for the coarser of the two clocks.
+    let started = std::time::SystemTime::now()
+        .checked_sub(crate::usage::proc_age(pid)? + Duration::from_secs(1))?;
+    std::fs::read_dir(state_dir)
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let name = entry.file_name();
+            let parent: u32 = name.to_str()?.strip_prefix(".transition.")?.parse().ok()?;
+            if entry.metadata().ok()?.modified().ok()? < started {
+                return None;
+            }
+            let body = std::fs::read_to_string(entry.path()).ok()?;
+            let mut fields = body.split_whitespace();
+            let booted =
+                fields.next() == Some("booted") && fields.next()?.parse::<u32>().ok()? == vm.pid;
+            // The parent shares `vm`'s namespace, being the process its child forked from.
+            (booted && super::identity::Readier::of(parent).is_none()).then_some(parent)
+        })
 }
 
 /// Leave the parent the note it reads back: what happened, which process says so, and this
@@ -2694,6 +2765,95 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
+    }
+
+    /// A boot whose parent went before it began readying the VM leaves no marker, only its
+    /// child's unread note: a joiner takes the environment over on the strength of that note,
+    /// rather than waiting out `READY_WAIT` — and only for a note this VM's boot wrote, to a
+    /// parent that is gone.
+    #[test]
+    fn a_boot_whose_parent_went_before_readying_is_taken_over() {
+        const CHILD: &str = "VK_TEST_BOOT_UNBEGUN";
+        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let tmp = scratch("unbegun");
+            crate::dev::testutil::in_child(
+                "dev::boot::tests::a_boot_whose_parent_went_before_readying_is_taken_over",
+                CHILD,
+                &tmp.0,
+            );
+            return;
+        };
+        let plan = plan_in(&tmp);
+        std::fs::create_dir_all(&plan.state_dir).unwrap();
+        let _lock =
+            crate::testutil::acquired(|| crate::dev::list::try_lock_state_dir(&plan.state_dir))
+                .expect("lock it");
+        // This process stands for the VM's `vk run`, registered with its start time as one is.
+        let me = std::process::id();
+        let _vm = crate::vms::register(
+            serde_json::from_value(serde_json::json!({
+                "state_dir": crate::vms::canonical(&plan.state_dir),
+                "pid": me,
+                "pid_start_ticks": crate::vms::own_start_ticks().unwrap(),
+                "label": "devcontainer",
+                "exec_addr": "unused",
+                "created_secs": 7
+            }))
+            .unwrap(),
+        );
+        // The compose file the boot loaded, unchanged since: no drift for the claim to weigh.
+        let Source::Compose { file, .. } = &plan.source else {
+            unreachable!()
+        };
+        let text = "services:\n  devcontainer:\n    image: debian\n";
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+        crate::dev::write_compose_snapshot(&plan.state_dir.join(COMPOSE_SNAPSHOT), text).unwrap();
+        let wanted = identity_of(&plan, None).unwrap();
+        // The joiner's parent, alive so the claim can name it.
+        let joiner = StandIn::spawn();
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let parent = gone.id();
+        gone.wait().unwrap();
+        let note = transition_path(&plan.state_dir, parent);
+        let untouched = |why: &str| {
+            assert!(
+                take_over(&plan, joiner.id(), &wanted, false).is_none(),
+                "{why}"
+            );
+            assert!(read_not_ready(&plan).is_none(), "{why}");
+        };
+
+        untouched("no note");
+        std::fs::write(&note, format!("booted {me} nonce\n")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&note)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1000))
+            .unwrap();
+        untouched("a note older than the VM's process");
+        std::fs::write(&note, format!("booted {} nonce\n", me + 1)).unwrap();
+        untouched("a note naming another boot");
+        std::fs::write(&note, format!("reused {me} nonce\n")).unwrap();
+        untouched("a note for a reuse");
+        std::fs::remove_file(&note).unwrap();
+        let live = transition_path(&plan.state_dir, me);
+        std::fs::write(&live, format!("booted {me} nonce\n")).unwrap();
+        untouched("a parent still alive");
+        std::fs::remove_file(&live).unwrap();
+
+        std::fs::write(&note, format!("booted {me} nonce\n")).unwrap();
+        match take_over(&plan, joiner.id(), &wanted, false) {
+            Some(Joined::Claimed) => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(!note.exists(), "the note is consumed");
+        let left = read_not_ready(&plan).unwrap();
+        assert_eq!(left.vm.pid, me);
+        assert_eq!(left.booted_secs, 7);
+        assert_eq!(left.readier.map(|r| r.pid), Some(joiner.id()));
+        assert_eq!(left.digest, wanted.digest);
     }
 
     #[test]

@@ -58,9 +58,11 @@ pub(super) fn identity_path(plan: &Plan) -> PathBuf {
 /// the environment over once it names nobody or a process that is gone — killed mid-readying,
 /// say.
 ///
-/// Where there is no marker at all, a joiner waits out `READY_WAIT` and fails, as it did
-/// before this existed: a parent killed between the VM coming up and its writing one, or one
-/// that cannot name itself (no start time to read from procfs).
+/// A parent killed between the VM coming up and its writing one leaves none, but its child's
+/// unread note does say so: a joiner that finds it writes the marker on that parent's behalf,
+/// naming nobody (see [`mark_unbegun`]), and takes the environment over. Where neither is
+/// there — a parent that cannot name itself (no start time to read from procfs), or one this
+/// process cannot see — a joiner waits out `READY_WAIT` and fails.
 fn not_ready_path(plan: &Plan) -> PathBuf {
     plan.state_dir.join("not-ready")
 }
@@ -195,6 +197,21 @@ pub(super) fn mark_own_not_ready(
         );
         false
     })
+}
+
+/// Record `left`, for a readying its parent never began, unless a marker already describes
+/// its VM: one there is that parent's own, or another joiner's that got here first. Whether
+/// it was written; a marker that cannot be is reported as not written, which leaves joiners
+/// waiting out `READY_WAIT` as they would have anyway.
+pub(super) fn mark_unbegun(plan: &Plan, left: &NotReady) -> bool {
+    lock_not_ready(plan)
+        .and_then(|_lock| {
+            if read_not_ready(plan).is_some_and(|current| current.vm == left.vm) {
+                return Ok(false);
+            }
+            write_not_ready(plan, left).map(|()| true)
+        })
+        .unwrap_or(false)
 }
 
 /// Write `left` whatever the marker holds, as a readying elsewhere would.
