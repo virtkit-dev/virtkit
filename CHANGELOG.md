@@ -52,6 +52,13 @@ All notable changes to virtkit will be documented in this file.
   recognizes its state directory. Stop and Remove still target the confirmed environment
   if its name changes. Stop leaves runs started inside that directory alone. Use
   `vk dev gc --all-stale` for environments that never booted.
+- **`vk dev list` now requires a workspace.** It lists declared environments, including
+  those without state, and their secondary compose services (`services` in JSON). An
+  environment without state has `status: "not-built"` and `name: null` in JSON. Unreadable
+  config or compose files and invalid service names fail the listing (exit 2).
+  WORKSPACE shows the shortest unique path suffix. Use `--wide` for full paths or `--all`
+  from anywhere for the previous host-wide state inventory (`--all --json` for scripts).
+  The hub uses `--all`.
 
 ### Fixed
 

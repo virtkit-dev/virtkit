@@ -1,4 +1,4 @@
-//! `/dev` lists the host's dev environments on page load using `vk dev list`, including
+//! `/dev` lists the host's dev environments on page load using `vk dev list --all`, including
 //! stopped environments omitted by `vk workloads`.
 
 use std::sync::Arc;
@@ -44,7 +44,7 @@ pub(super) fn dev_name(w: &Workload) -> Option<String> {
     valid_dev_name(name).then(|| name.to_string())
 }
 
-/// One row of `vk dev list --json`: the fields this page reads, whose names are that
+/// One row of `vk dev list --all --json`: the fields this page reads, whose names are that
 /// command's interface and are only ever added to.
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct DevRow {
@@ -140,21 +140,25 @@ impl DevList {
     }
 }
 
-/// Every dev environment this host keeps state for, by `vk dev list`, or why there is none.
+/// List host-wide dev state. Older versions of `vk` list it by default and reject `--all`.
 async fn dev_rows(local: &Local) -> Result<Vec<DevRow>, String> {
-    let out = local
-        .run(
-            &[
-                "dev".as_ref(),
-                "list".as_ref(),
-                "--json".as_ref(),
-                "--no-sizes".as_ref(),
-            ],
-            LIST_TIMEOUT,
-            Keep::Head,
-        )
-        .await
-        .map_err(|e| format!("{e:#}"))?;
+    let mut all = true;
+    let out = loop {
+        let args: Vec<&std::ffi::OsStr> = ["dev", "list", "--all", "--json", "--no-sizes"]
+            .into_iter()
+            .filter(|a| all || *a != "--all")
+            .map(std::ffi::OsStr::new)
+            .collect();
+        let out = local
+            .run(&args, LIST_TIMEOUT, Keep::Head)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        // Propagate other listing failures.
+        if out.ok || !all || !out.stderr.contains("unexpected argument '--all'") {
+            break out;
+        }
+        all = false;
+    };
     if out.cut {
         return Err(format!("`vk dev list` printed too much: {}", out.status));
     }

@@ -437,8 +437,8 @@ pub fn task_args(
     let mut args = run_args(plan, None, over, cfg, task.checkout)?;
     // A VM of its own needs a state directory of its own: the environment's may hold a live
     // run (an ephemeral task while the dev environment is up), and a throwaway must leave
-    // nothing behind. A sibling of the environment's directory, so `vk dev list` shows one
-    // that leaked as `ephemeral` and `vk dev gc` removes it.
+    // nothing behind. A sibling of the environment's directory, so `vk dev list --all` shows one
+    // that leaked as `ephemeral` and `vk dev gc --all-stale` removes it.
     args.state_dir = Some(match state_dir {
         Some(dir) => dir.to_path_buf(),
         None => task_state_dir(plan, task)?,
@@ -2536,7 +2536,7 @@ mod tests {
             crate::build::build(&opts).map(drop)
         };
         let stale = || {
-            let rows = crate::dev::list::scan(&tmp, &[], false);
+            let rows = crate::dev::list::scan(&tmp, &[], false).unwrap();
             crate::dev::list::select_gc(rows, &[], true, |_| Ok(None)).unwrap()
         };
         let is_stale = || stale().iter().any(|r| r.dir == plan.state_dir);
@@ -3902,8 +3902,8 @@ mod tests {
                 std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
                 0o700
             );
-            // A sibling of the environment's, so `vk dev list` shows one that leaked and
-            // `vk dev gc` removes it.
+            // A sibling of the environment's, so `vk dev list --all` shows one that leaked and
+            // `vk dev gc --all-stale` removes it.
             assert_eq!(dir.parent(), plan.state_dir.parent());
             let name = dir.file_name().unwrap().to_string_lossy().to_string();
             assert!(

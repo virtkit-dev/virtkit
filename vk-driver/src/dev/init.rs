@@ -225,8 +225,19 @@ fn from_compose(path: &Path, workspace: &Path) -> Result<Draft> {
 pub(crate) fn service_names(path: &Path) -> Result<Vec<String>> {
     let text = crate::dev::config::read_regular(path)?
         .with_context(|| format!("{} is gone", path.display()))?;
+    names_in(&text, path)
+}
+
+/// Read service names through compose symlinks, as boot does.
+pub(crate) fn booted_service_names(path: &Path) -> Result<Vec<String>> {
+    let text = crate::dev::config::read_regular_followed(path)?
+        .with_context(|| format!("{} is gone", path.display()))?;
+    names_in(&text, path)
+}
+
+fn names_in(text: &str, path: &Path) -> Result<Vec<String>> {
     let doc =
-        crate::compose::yaml_node(&text).with_context(|| format!("parsing {}", path.display()))?;
+        crate::compose::yaml_node(text).with_context(|| format!("parsing {}", path.display()))?;
     let services = match doc {
         YamlNode::Map(entries) => entries.into_iter().find(|(key, _)| key.0 == "services"),
         _ => None,

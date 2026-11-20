@@ -2556,7 +2556,7 @@ listing has no pid, its state directory. `vk dev stop --state-dir` needs no work
 stops only the VM using that state directory and succeeds if the VM is already down. The
 executor controls CI jobs.
 
-`/dev` reads `vk dev list` on page load and caches the result for five seconds, including
+`/dev` reads `vk dev list --all --json --no-sizes` on page load and caches the result for five seconds, including
 stopped environments. Start runs `vk dev up --workspace … --environment …` in the recorded
 workspace. Stop and Remove use the confirmed state directory so reassigning a name cannot
 redirect either action. For a stopped environment whose workspace is gone, Remove runs

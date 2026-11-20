@@ -418,17 +418,22 @@ enum DevAction {
         #[arg(long, default_value_t = super::boot::STOP_TIMEOUT_SECS)]
         timeout: u64,
     },
-    /// List every dev environment this host keeps state for
+    /// List this workspace's dev environments, or use `--all` for host-wide state
     ///
-    /// Host-wide, and needs no config in the current directory: one row per state directory
-    /// under `$XDG_STATE_HOME/virtkit/dev` — which workspace and environment it belongs to,
-    /// whether it is running, which vk created it, how long ago it last booted, what its VM
-    /// holds in memory and what it holds on disk (`--no-sizes` skips the disk measure). MEM
-    /// is the running VM's whole process tree over the size it booted with (`1.2G/8G`), as
-    /// `vk list` reports it, and `-` for an environment that is not running. Flagged when its
-    /// workspace is gone, or when it recorded no boot at all — the shape a task run in a
-    /// throwaway environment leaves. Reads only.
+    /// List declared environments and their secondary compose services (`NAME/SERVICE`),
+    /// followed by recorded environments this workspace no longer declares. An environment
+    /// without state reads `not built`. `--all` lists state directories under
+    /// `$XDG_STATE_HOME/virtkit/dev` without reading a workspace config, including state
+    /// left by throwaway tasks.
+    ///
+    /// Environment rows show the workspace, environment, status, creator, last boot, memory
+    /// and disk usage. MEM shows the running VM's whole process tree over its configured
+    /// memory (`1.2G/8G`), as in `vk list`. A stopped VM shows `-`. `--no-sizes` skips disk
+    /// usage. Flags identify missing workspaces and state directories without a recorded boot.
     List {
+        /// list dev state directories across all workspaces
+        #[arg(long, short = 'a')]
+        all: bool,
         /// print JSON, including whether vk delete recognizes each state directory as its own
         #[arg(long)]
         json: bool,
@@ -437,6 +442,12 @@ enum DevAction {
         /// The `ON DISK` column then shows `-`.
         #[arg(long)]
         no_sizes: bool,
+        /// show each workspace's full path
+        ///
+        /// WORKSPACE uses the shortest path suffix that distinguishes each listed workspace.
+        /// JSON includes the full path when known.
+        #[arg(short = 'w', long, conflicts_with = "json")]
+        wide: bool,
     },
     /// Remove the state of environments that are finished with
     ///
@@ -748,16 +759,21 @@ async fn dev_action(
             Err(e) => fail(&e, 2),
         };
     }
-    // Like `init`, these host-wide commands read the state base and need no config.
-    if let DevAction::List { json, no_sizes } = action {
-        let report = match crate::dev::list::state(!no_sizes).and_then(|rows| match json {
-            true => crate::dev::list::json(&rows),
-            false => Ok(crate::dev::list::render(&rows)),
-        }) {
-            Ok(report) => report,
-            Err(e) => return fail(&e, 1),
+    if let DevAction::List {
+        all,
+        json,
+        no_sizes,
+        wide,
+    } = action
+    {
+        let scope = match all {
+            true => None,
+            false => Some((workspace, config)),
         };
-        return write_report(&report);
+        return match dev_list(&cwd, scope, json, !no_sizes, wide) {
+            Ok(report) => write_report(&report),
+            Err(code) => code,
+        };
     }
     if let DevAction::Stop {
         state_dir: Some(dir),
@@ -1399,6 +1415,121 @@ fn stop_dir(dir: &Path, timeout: u64) -> ExitCode {
     }
 }
 
+/// With a workspace, combine its recorded state and declared environments and services.
+/// Invalid config or compose input is a usage error (2). With `--all`, read only host state.
+fn dev_list(
+    cwd: &Path,
+    scope: Option<(Option<&Path>, Option<&Path>)>,
+    json: bool,
+    sizes: bool,
+    wide: bool,
+) -> Result<String, ExitCode> {
+    let here = match scope {
+        None => None,
+        Some((workspace, config)) => {
+            let loaded = config::discover(cwd, workspace, config)
+                // The common hint already names `vk dev list --all`.
+                .map_err(|e| no_workspace_or(e, 2, None))?;
+            let loaded = config::load(loaded).map_err(|e| fail(&e, 2))?;
+            Some(declared_environments(&loaded).map_err(|e| fail(&e, 2))?)
+        }
+    };
+    let live = crate::vms::running();
+    let rows = match &here {
+        None => crate::dev::list::state_in(&live, sizes),
+        Some((here, declared)) => crate::dev::list::state_in(&live, false).map(|mut rows| {
+            // A state dir that recorded no boot is this workspace's only if its config
+            // declares that dir.
+            let dirs: Vec<PathBuf> = declared
+                .iter()
+                .map(|d| crate::vms::canonical(&d.state_dir))
+                .collect();
+            rows.retain(|r| match &r.workspace {
+                Some(w) => crate::vms::canonical(w) == *here,
+                None => dirs.contains(&crate::vms::canonical(&r.dir)),
+            });
+            if sizes {
+                crate::dev::list::measure(&mut rows);
+            }
+            crate::dev::list::with_services(rows, declared, sizes, &|dir| {
+                reported_units(&live, dir)
+            })
+        }),
+    }
+    .map_err(|e| fail(&e, 1))?;
+    match (json, &here) {
+        (true, _) => crate::dev::list::json(&rows).map_err(|e| fail(&e, 1)),
+        (false, Some((here, _))) if rows.is_empty() => Ok(format!(
+            "no dev environment for {} (`vk dev list --all` lists host-wide state)\n",
+            here.display()
+        )),
+        (false, _) => Ok(crate::dev::list::render(&rows, wide)),
+    }
+}
+
+/// Resolve the canonical workspace, state directories and secondary compose services.
+/// List `dev` first when declared, then `[environments]`. Boot-only inputs such as
+/// build contexts may be missing.
+fn declared_environments(
+    loaded: &config::Loaded,
+) -> anyhow::Result<(PathBuf, Vec<crate::dev::list::Declared>)> {
+    use anyhow::Context as _;
+    let workspace = std::fs::canonicalize(&loaded.files.workspace)
+        .with_context(|| format!("resolving {}", loaded.files.workspace.display()))?;
+    let names = loaded
+        .schema
+        .dev
+        .iter()
+        .map(|_| "dev".to_string())
+        .chain(loaded.schema.environments.keys().cloned());
+    let mut declared = Vec::new();
+    for environment in names {
+        let env = loaded.environment(&environment)?;
+        let services = match (&env.compose, &env.service) {
+            (Some(compose), primary) => {
+                let file = plan::in_workspace(&workspace, compose);
+                let names = init::booted_service_names(&file)
+                    .with_context(|| format!("the {environment} environment's compose file"))?;
+                // Boot requires DNS labels. Service names also become state path components.
+                for name in &names {
+                    crate::compose::check_service_name(name)
+                        .with_context(|| format!("in {}", file.display()))?;
+                }
+                if let Some(p) = primary
+                    && !names.contains(p)
+                {
+                    anyhow::bail!("no compose service {p:?} in {}", file.display());
+                }
+                names
+                    .into_iter()
+                    .filter(|s| Some(s) != primary.as_ref())
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        declared.push(crate::dev::list::Declared {
+            state_dir: plan::derived_state_dir(&workspace, &environment)?,
+            environment,
+            workspace: workspace.clone(),
+            services,
+        });
+    }
+    Ok((workspace, declared))
+}
+
+/// The units the service manager of the environment running on `state_dir` reports, as
+/// `(name, state)`; `None` when nothing in `live` runs there or it cannot be asked.
+fn reported_units(live: &[crate::vms::VmEntry], state_dir: &Path) -> Option<Vec<(String, String)>> {
+    let dir = crate::vms::canonical(state_dir);
+    let entry = live.iter().find(|e| e.state_dir == dir)?;
+    Some(
+        crate::vms::service_units(entry)?
+            .into_iter()
+            .map(|u| (u.name, u.state))
+            .collect(),
+    )
+}
+
 /// The exit status of a `vk dev` command that needs a workspace and was given none: it is
 /// run outside any, with neither `--workspace` nor `$VIRTKIT_WORKSPACE`. Its own status, so
 /// a script can tell "not in a workspace" from a workspace whose config is wrong (2).
@@ -1423,7 +1554,7 @@ fn no_workspace_hint(host_wide: Option<&str>) -> String {
     let mut hint = format!(
         "vk: hint: `vk dev` works on one workspace, the project holding {file}:\n\
          \x20         cd into it, or name it with `vk dev --workspace DIR …` or {env}=DIR\n\
-         \x20         `vk dev list` lists every workspace's environments, `vk list` every VM\n",
+         \x20         `vk dev list --all` lists host-wide state, `vk list` every VM\n",
         file = config::CONFIG_FILE,
         env = config::WORKSPACE_ENV,
     );
@@ -1850,7 +1981,6 @@ mod tests {
 
     #[test]
     fn list_measures_sizes_by_default_and_no_sizes_opts_out() {
-        // Guard the flag sense used by `state(!no_sizes)`: measure by default, skip with `--no-sizes`.
         assert!(matches!(
             parse(&["vk", "dev", "list"]).action,
             DevAction::List {
@@ -1954,6 +2084,156 @@ mod tests {
             readied_by_its_boot: true,
         };
         std::fs::write(dir.join("dev.json"), serde_json::to_vec(&identity).unwrap()).unwrap();
+    }
+
+    /// Scoped listing matches partial boots by directory and includes unbuilt declarations.
+    /// Invalid config or compose input exits 2. Outside a workspace, listing exits 5
+    /// unless `--all` selects host-wide state.
+    #[test]
+    fn a_bare_list_follows_the_config_and_all_lists_the_host() {
+        const CHILD: &str = "VK_TEST_DEV_LIST";
+        if std::env::var_os(CHILD).is_some() {
+            let cwd = std::env::current_dir().unwrap();
+            let ws = std::fs::canonicalize(&cwd).unwrap();
+            let state = |env: &str| plan::derived_state_dir(&ws, env).unwrap();
+            let base = state("dev").parent().unwrap().to_path_buf();
+            booted(&state("dev"), &ws, "dev");
+            // A first boot that failed before recording its identity.
+            std::fs::create_dir_all(state("ci")).unwrap();
+            let elsewhere = cwd.parent().unwrap().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            booted(&base.join("other"), &elsewhere, "dev");
+            std::fs::create_dir_all(base.join("stray")).unwrap();
+            let rows = |report: Result<String, ExitCode>| -> Vec<serde_json::Value> {
+                serde_json::from_str(&report.unwrap()).unwrap()
+            };
+            let by_dir = |rows: &[serde_json::Value], dir: &Path| {
+                let name = dir.file_name().unwrap().to_str().unwrap();
+                rows.iter().find(|r| r["dir_name"] == name).cloned()
+            };
+
+            let here = rows(dev_list(&cwd, Some((Some(&cwd), None)), true, true, false));
+            assert_eq!(here.len(), 3, "{here:#?}");
+            let dev = by_dir(&here, &state("dev")).unwrap();
+            assert_eq!(dev["status"], "stopped");
+            assert!(dev["size_bytes"].is_u64(), "{dev}");
+            let ci = by_dir(&here, &state("ci")).unwrap();
+            assert_eq!(ci["status"], "never-booted");
+            assert_eq!(ci["environment"], "ci");
+            assert_eq!(ci["flags"], serde_json::json!(["ephemeral"]));
+            let e2e = by_dir(&here, &state("e2e")).unwrap();
+            assert_eq!(e2e["status"], "not-built");
+            // Its prospective name may be another VM's: only `dir_name` identifies it.
+            assert_eq!(e2e.get("name"), Some(&serde_json::Value::Null), "{e2e}");
+            let e2e_dir = state("e2e");
+            assert_eq!(
+                e2e["dir_name"],
+                e2e_dir.file_name().unwrap().to_str().unwrap()
+            );
+            assert!(dev["name"].is_string(), "{dev}");
+            assert!(e2e.get("size_bytes").is_none(), "{e2e}");
+            let table = dev_list(&cwd, Some((Some(&cwd), None)), false, false, false).unwrap();
+            assert!(
+                table
+                    .lines()
+                    .any(|l| l.starts_with("-  ") && l.contains("not built"))
+            );
+
+            // What the config declares is read, or the list fails as a usage error.
+            let at = |name: &str, text: &str| {
+                let path = cwd.join(".virtkit").join(name);
+                std::fs::write(&path, text).unwrap();
+                path
+            };
+            let compose = |file: &str| {
+                format!("schema = 1\n[dev]\ncompose = \"{file}\"\nservice = \"app\"\n")
+            };
+            std::fs::write(cwd.join("bad.yaml"), "services: [\n").unwrap();
+            // Nothing writes to it: reading it must not wait for a writer.
+            use std::os::unix::ffi::OsStrExt as _;
+            let fifo = std::ffi::CString::new(cwd.join("fifo.yaml").as_os_str().as_bytes());
+            assert_eq!(unsafe { libc::mkfifo(fifo.unwrap().as_ptr(), 0o600) }, 0);
+            let bad_name = "services:\n  app: {}\n  \"bad/name\": {}\n";
+            std::fs::write(cwd.join("bad-name.yaml"), bad_name).unwrap();
+            let bad_name = at("bad-name.toml", &compose("bad-name.yaml"));
+            std::fs::write(cwd.join("no-app.yaml"), "services:\n  db: {}\n").unwrap();
+            for config in [
+                at("broken.toml", "schema = 1\n[dev\n"),
+                at("gone.toml", &compose("gone.yaml")),
+                at("bad.toml", &compose("bad.yaml")),
+                at("fifo.toml", &compose("fifo.yaml")),
+                bad_name.clone(),
+                at("no-app.toml", &compose("no-app.yaml")),
+            ] {
+                let scope = Some((Some(cwd.as_path()), Some(config.as_path())));
+                assert_eq!(
+                    dev_list(&cwd, scope, true, false, false).unwrap_err(),
+                    exit_code(2),
+                    "{}",
+                    config.display()
+                );
+            }
+
+            // The service the boot would reject is named, with its file.
+            let loaded = config::discover(&cwd, Some(&cwd), Some(&bad_name)).unwrap();
+            let err = declared_environments(&config::load(loaded).unwrap()).unwrap_err();
+            let err = format!("{err:#}");
+            assert!(
+                err.contains("\"bad/name\"") && err.contains("bad-name.yaml"),
+                "{err}"
+            );
+
+            // A symlinked compose file is read through the link, as the boot reads it.
+            std::fs::write(cwd.join("real.yaml"), "services:\n  app: {}\n  db: {}\n").unwrap();
+            std::os::unix::fs::symlink("real.yaml", cwd.join("linked.yaml")).unwrap();
+            let linked = at("linked.toml", &compose("linked.yaml"));
+            let scope = Some((Some(cwd.as_path()), Some(linked.as_path())));
+            let listed = rows(dev_list(&cwd, scope, true, false, false));
+            let dev = by_dir(&listed, &state("dev")).unwrap();
+            assert_eq!(dev["services"][0]["name"], "db", "{dev}");
+
+            let nowhere = cwd.parent().unwrap().join("nowhere");
+            std::fs::create_dir_all(&nowhere).unwrap();
+            std::env::set_current_dir(&nowhere).unwrap();
+            assert_eq!(
+                dev_list(&nowhere, Some((None, None)), true, false, false).unwrap_err(),
+                exit_code(NO_WORKSPACE_EXIT)
+            );
+            let all = rows(dev_list(&nowhere, None, true, false, false));
+            assert_eq!(all.len(), 4, "{all:#?}");
+            assert!(by_dir(&all, &base.join("other")).is_some());
+            assert!(by_dir(&all, &base.join("stray")).is_some());
+            assert!(
+                by_dir(&all, &state("e2e")).is_none(),
+                "--all reads no config"
+            );
+            return;
+        }
+        let _guard = crate::dev::testutil::env_guard();
+        let tmp = crate::dev::testutil::scratch("dev-list");
+        let cwd = tmp.0.join("ws");
+        std::fs::create_dir_all(cwd.join(".virtkit")).unwrap();
+        std::fs::write(
+            cwd.join(config::CONFIG_FILE),
+            "schema = 1\n[dev]\nimage = \"x\"\nworkspace = \"/w\"\n\
+             [environments.ci]\nimage = \"x\"\nworkspace = \"/w\"\n\
+             [environments.e2e]\nbuild = { context = \"gone\" }\nworkspace = \"/w\"\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dev::cli::tests::a_bare_list_follows_the_config_and_all_lists_the_host",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("XDG_STATE_HOME", tmp.0.join("state"))
+            .env("XDG_DATA_HOME", tmp.0.join("data"))
+            .env_remove(config::WORKSPACE_ENV)
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
     }
 
     #[test]

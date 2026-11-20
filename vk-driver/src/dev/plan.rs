@@ -858,7 +858,7 @@ impl Plan {
 }
 
 /// A path a config wrote, relative to the project like every other path in the file.
-fn in_workspace(workspace: &Path, rel: &str) -> PathBuf {
+pub(crate) fn in_workspace(workspace: &Path, rel: &str) -> PathBuf {
     lexical_join(workspace, Path::new(rel))
 }
 
@@ -1062,7 +1062,7 @@ pub(crate) fn no_room(base: &Path) -> anyhow::Error {
 /// the canonical workspace path and the environment name — so two worktrees of one repo,
 /// and two environments of one workspace, never share a VM, and the same one always resolves
 /// to the same directory.
-fn derived_state_dir(workspace: &Path, environment: &str) -> Result<PathBuf> {
+pub(crate) fn derived_state_dir(workspace: &Path, environment: &str) -> Result<PathBuf> {
     let base = dev_state_base()?;
     let name = NameParts::of(workspace, environment)?.environment_dir(&base)?;
     Ok(base.join(name))

@@ -1903,14 +1903,13 @@ while :; do sleep 0.1; done"#,
     let _ = std::fs::remove_dir_all(vk.parent().unwrap());
 }
 
-/// `/dev` lists what `vk dev list` lists, stopped environments too, and no row whose name is
-/// not one.
+/// `/dev` includes stopped environments from `vk dev list --all` and skips invalid VM names.
 #[tokio::test(flavor = "multi_thread")]
 async fn dev_environments_are_listed() {
     let vk = stub_vk(
         "dev",
-        r#"case "$1 $2" in
-"dev list") cat <<'JSON'
+        r#"case "$*" in
+"dev list --all --json --no-sizes") cat <<'JSON'
 [{"name":"app-1111","dir":"/s/app-1111","workspace":"/src/app","environment":"dev","status":"stopped","created_by":null,"booted_secs":1790755279,"age_secs":5,"mem_used_bytes":null,"mem":null,"flags":[]},
  {"name":"old-2222","dir":"/s/old-2222","workspace":"/gone/old","environment":"dev","status":"stopped","created_by":null,"booted_secs":null,"age_secs":null,"mem_used_bytes":null,"mem":null,"flags":["workspace-missing"]},
  {"name":"../evil","dir":"/x","workspace":null,"environment":null,"status":"stopped","flags":[]}]
@@ -1937,7 +1936,40 @@ esac"#,
     let _ = std::fs::remove_dir_all(vk.parent().unwrap());
 }
 
-/// `/dev` lists what `vk dev list` lists, stopped environments too: a stopped one starts in
+/// An older `vk` rejects `--all`, so the hub retries its host-wide default.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_vk_lists_dev_environments_without_all() {
+    let vk = stub_vk(
+        "devold",
+        r#"echo "$*" >> "$(dirname "$0")/ran"
+case "$*" in
+"dev list --all --json --no-sizes")
+  echo "error: unexpected argument '--all' found" >&2; exit 2 ;;
+"dev list --json --no-sizes") cat <<'JSON'
+[{"name":"app-1111","dir":"/s/app-1111","workspace":"/src/app","environment":"dev","status":"stopped","booted_secs":1790755279,"flags":[]}]
+JSON
+;;
+*) exit 3 ;;
+esac"#,
+    );
+    let ran = vk.parent().unwrap().join("ran");
+    let (addr, hub, _, _) = start_with_vk(None, vk.clone(), local::VIEWS_FRESH).await;
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/dev", Some(&cookie)).await;
+    assert!(
+        page.body
+            .contains("<td>app-1111</td><td>stopped</td><td>/src/app</td>"),
+        "{}",
+        page.body
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ran).unwrap(),
+        "dev list --all --json --no-sizes\ndev list --json --no-sizes\n"
+    );
+    let _ = std::fs::remove_dir_all(vk.parent().unwrap());
+}
+
+/// `/dev` lists what `vk dev list --all` lists, stopped environments too: a stopped one starts in
 /// its workspace with no question, a running one stops once a question about its boot is
 /// answered, and only a stale one `vk` says `vk delete` removes whole is offered for removal.
 /// Stop and Remove use the confirmed state directory.

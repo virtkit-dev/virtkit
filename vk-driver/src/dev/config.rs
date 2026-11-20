@@ -1414,15 +1414,22 @@ fn files_of(workspace: PathBuf, config: PathBuf) -> Files {
 /// Open `path` for reading as a regular file, following no symlink. `Ok(None)` when it is not
 /// there.
 ///
-/// The type comes from the descriptor, so nothing can be swapped in between the check and the
-/// read, and `O_NOFOLLOW` keeps a tracked `config.toml` from naming which host file vk reads
-/// and quotes back in an error. Only `NotFound` is absent: a symlink (`ELOOP`), a denied
-/// traversal, a directory and a device are all reported.
+/// Checking the open descriptor avoids a race between the type check and the read.
+/// `O_NONBLOCK` prevents a FIFO with no writer from hanging the open. `O_NOFOLLOW` keeps
+/// a tracked `config.toml` symlink from exposing a host file in a parse error. Only
+/// `NotFound` is treated as absent. Symlinks (`ELOOP`), denied traversal, directories
+/// and devices are errors.
 fn open_regular(path: &Path) -> Result<Option<std::fs::File>> {
+    open_file(path, false)
+}
+
+/// [`open_regular`], following a symlink when `follow`.
+fn open_file(path: &Path, follow: bool) -> Result<Option<std::fs::File>> {
     use std::os::unix::fs::OpenOptionsExt;
+    let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(nofollow | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(f) => f,
@@ -1440,8 +1447,17 @@ fn open_regular(path: &Path) -> Result<Option<std::fs::File>> {
 
 /// The contents of a regular `path`, or `None` when it is not there. See [`open_regular`].
 pub(crate) fn read_regular(path: &Path) -> Result<Option<String>> {
+    read_opened(path, false)
+}
+
+/// Read a regular file through a symlink, as compose boot does.
+pub(crate) fn read_regular_followed(path: &Path) -> Result<Option<String>> {
+    read_opened(path, true)
+}
+
+fn read_opened(path: &Path, follow: bool) -> Result<Option<String>> {
     use std::io::Read;
-    let Some(mut file) = open_regular(path)? else {
+    let Some(mut file) = open_file(path, follow)? else {
         return Ok(None);
     };
     let mut text = String::new();

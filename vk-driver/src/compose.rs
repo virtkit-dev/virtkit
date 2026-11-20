@@ -1177,6 +1177,17 @@ fn bundle_image(image: &str, base: &Path) -> Result<Option<PathBuf>> {
         .with_context(|| format!("image {image:?}"))
 }
 
+/// Reject a service name compose would not boot: it must be a DNS label.
+pub(crate) fn check_service_name(name: &str) -> Result<()> {
+    if !is_dns_label(name) {
+        bail!(
+            "service name {name:?} must be a DNS label \
+             ([a-z0-9-], no leading/trailing hyphen, ≤63 chars) — it becomes a LAN hostname"
+        );
+    }
+    Ok(())
+}
+
 fn map_service(
     name: &str,
     svc: ComposeService,
@@ -1184,12 +1195,7 @@ fn map_service(
     persist_anchor: Option<&Path>,
     declared_secrets: &BTreeMap<String, PathBuf>,
 ) -> Result<Unit> {
-    if !is_dns_label(name) {
-        bail!(
-            "service name {name:?} must be a DNS label \
-             ([a-z0-9-], no leading/trailing hyphen, ≤63 chars) — it becomes a LAN hostname"
-        );
-    }
+    check_service_name(name)?;
     // Resolve one anchor for roots and overlays: the durable state dir, or `.virtkit/`
     // beside the compose file.
     let anchor = persist_anchor

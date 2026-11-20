@@ -120,7 +120,7 @@ pub fn rows(live: &[Live], known: &[Known], now: u64) -> Vec<Row> {
 
 /// [`crate::units::boot_unit`] gives the VMM its console log path. The log records a
 /// start. The directory alone is insufficient because provisioning creates it first.
-fn booted(svc_dir: &Path) -> bool {
+pub(crate) fn booted(svc_dir: &Path) -> bool {
     svc_dir.join(crate::run::CONSOLE_LOG).exists()
 }
 

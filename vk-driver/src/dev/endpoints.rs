@@ -280,7 +280,7 @@ pub(crate) fn allocate(plan: &Plan, service: Option<&str>, live: bool) -> Result
                          environment's or already has a listener on one of the ports {ports:?}; \
                          a wildcard listener (0.0.0.0:<port>, or [::]:<port> with \
                          IPV6_V6ONLY=0) takes every block at once, so look for one of those \
-                         first — and `vk dev list` names the environments"
+                         first — and `vk dev list --all` names the environments"
                     )
                 })?;
             Allocation {

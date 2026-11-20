@@ -241,9 +241,8 @@ pub fn pick(
     Ok(out)
 }
 
-/// This workspace's environments, as `vk dev list` finds them: those whose recorded workspace
-/// is `workspace`. Read from their state alone, so neither the config nor its compose file
-/// has to describe them still.
+/// Environments whose recorded workspace is `workspace`, including environments removed
+/// from its config or compose file.
 pub fn recorded(workspace: &Path) -> Result<Vec<Env>> {
     let workspace = crate::vms::canonical(workspace);
     Ok(crate::dev::list::state(false)?

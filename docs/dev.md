@@ -602,14 +602,21 @@ from removed mount declarations is not inferred; `vk dev gc` removes the whole
 environment state when it is no longer needed.
 
 ```sh
-vk dev list
+vk dev list                         # this workspace's environments
+vk dev list --all                   # host-wide state, from anywhere
 vk dev list --json
 vk dev gc --all-stale
 vk dev gc ENVIRONMENT_NAME --yes
 vk dev gc
 ```
 
-`list` and `gc --all-stale` work from anywhere without a project config;
+`list` shows declared environments and secondary compose services, followed by recorded
+environments this workspace no longer declares. A running manager supplies service
+status. A previously booted service reads `unknown` if the manager is unreachable and
+`stopped` if its environment is down. An environment without state reads `not built`.
+Its name is `-` in the table and `null` in JSON. An unreadable config or compose file,
+an invalid service name, or a missing primary service fails the listing
+(exit 2). `list --all` and `gc --all-stale` work from anywhere without a project config.
 `--all-stale` takes no name. `gc NAME`, like `stop NAME` and `prune NAME`, reads the config
 and rejects a VM outside this workspace (exit 2). `vk delete NAME` can remove a stopped
 recorded dev environment from any workspace, even if the workspace directory is gone. A
@@ -957,7 +964,7 @@ shape for inspection, not a complete script to execute.
 | "The remote host does not meet the prerequisites for running VS Code Server", or extension installs fail with "Signature verification failed with 'ENOENT'" | The image has no FHS loader or libraries for the prebuilt glibc binaries Remote-SSH installs (Nix images in particular). Provide `/lib64/ld-linux-x86-64.so.2`, `/usr/lib64/libstdc++.so.6`, and libssl/libcrypto on the loader's search path, then run `refresh`; this repo's `.devcontainer/Dockerfile` does it with nix-ld. |
 | Startup hook fails | Read its output and guest logs; fix the command, user or working directory before retrying. |
 | Pre-commit overlay is refused | Pair `checkout = "overlay"` with `policy = "ephemeral"`. |
-| Disk use keeps growing | Inspect `storage list --sizes` and host-wide `list`; reset or GC only data you intend to discard. |
+| Disk use keeps growing | Inspect `storage list --sizes` and `list --all`; reset or GC only data you intend to discard. |
 
 Logs remain readable after exit. Filter with `--kernel`, `--agent`, `--guest` or
 `--level warn`, and follow with `-f`. Use `--service NAME` for a service console.
@@ -995,6 +1002,6 @@ Use `vk dev COMMAND --help` for individual options.
 | `stop [NAME…]`, `down` | Stop the environment and publishers, or named services or environments of this workspace; `--timeout SECONDS`. |
 | `storage list`, `storage reset NAME` | Inspect storage or destroy a durable item's data. |
 | `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. `NAME` selects a stopped environment in this workspace. Use `vk reset NAME` for a stopped dev environment with a valid identity and no run recipe in any workspace. |
-| `list` | Host-wide environment inventory (on-disk sizes by default); `--no-sizes`, `--json`. |
+| `list` | List this workspace's environments and secondary compose services. Use `--all` for host-wide state, `--wide` for full paths, `--no-sizes` to skip disk usage, or `--json`. |
 | `gc [NAME…]` | Remove stopped state of this workspace's environments. With no names, remove this workspace's environment. `--all-stale` (host-wide, no names) and `--yes`. For a stopped environment with a valid recorded identity and no run recipe, [`vk delete NAME`](../README.md#manage-vms) also removes its state, from any workspace. |
 | `schema` | Print the configuration JSON Schema. |
