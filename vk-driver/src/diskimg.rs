@@ -29,7 +29,8 @@ impl DiskImage {
             std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let (inner, len) = match crate::qcow2::sniff_kind(&file) {
             crate::qcow2::ImageKind::Qcow2 => {
-                let q = crate::qcow2::Qcow2::open(path)?;
+                // Reopening the path after a rename could select a different image.
+                let q = crate::qcow2::Qcow2::open_file(file, path)?;
                 let len = q.virtual_size();
                 (Inner::Qcow2(RefCell::new(q)), len)
             }
@@ -97,7 +98,7 @@ mod tests {
     #[test]
     fn a_window_reads_only_its_own_bytes() {
         let path = std::env::temp_dir().join(format!("vk-diskimg-{}", std::process::id()));
-        std::fs::write(&path, (0..100u8).collect::<Vec<_>>()).unwrap();
+        vk_fs::write_new(&path, &(0..100u8).collect::<Vec<_>>(), 0o600).unwrap();
         let open = || DiskImage::open(&path).unwrap();
         let img = open().slice(10, 20).unwrap();
         assert_eq!(img.len(), 20);

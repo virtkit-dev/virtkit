@@ -70,6 +70,12 @@ impl Qcow2 {
     /// Open `path` (and recursively its backing image, resolved relative to `path`'s dir).
     pub fn open(path: &Path) -> Result<Qcow2> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        Self::open_file(file, path)
+    }
+
+    /// Like [`Qcow2::open`], using an already-open file. `path` identifies the image in
+    /// errors, and its parent directory anchors relative backing names.
+    pub fn open_file(file: File, path: &Path) -> Result<Qcow2> {
         let mut h = [0u8; 104];
         file.read_exact_at(&mut h, 0)
             .with_context(|| format!("reading qcow2 header of {}", path.display()))?;
