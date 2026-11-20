@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `vk dev up` can finish setting up a running environment after the process that started it
+  exits.
+
 ## [0.114.0] - 2026-11-20
 
 ### Added

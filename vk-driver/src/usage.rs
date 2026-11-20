@@ -552,6 +552,22 @@ pub(crate) fn proc_starttime(pid: i32) -> Option<u64> {
     parse_starttime(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
+/// In the same pid namespace, a missing procfs entry, zombie or dead state, or changed
+/// start ticks confirm exit. Other read errors and inconclusive stat data do not.
+pub(crate) fn proc_exited(pid: i32, started: u64) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        Ok(line) => {
+            let state = line
+                .rfind(')')
+                .and_then(|end| line.get(end + 1..))
+                .and_then(|rest| rest.split_whitespace().next());
+            matches!(state, Some("Z" | "X"))
+                || parse_starttime(&line).is_some_and(|ticks| ticks != started)
+        }
+    }
+}
+
 /// `starttime` — the clock ticks since boot at which the process started. Indexed from the
 /// last `)` for the same reason [`parse_stat`] is: the comm in between is free to contain
 /// spaces and parentheses. `None` for a zombie or dead process (state `Z` or `X`): it has

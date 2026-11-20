@@ -1170,7 +1170,7 @@ async fn hold(ch: &mut Child, console: &Path, detach_log: Option<&Path>) -> Resu
         }
         if !ready && spawned.elapsed() >= BOOT_SETTLE {
             ready = true;
-            crate::detach::signal_ready(detach_log);
+            crate::detach::signal_ready(detach_log)?;
         }
         tokio::select! {
             () = &mut stop => {

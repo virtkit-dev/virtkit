@@ -4214,8 +4214,12 @@ async fn compose_up(
     );
     // Every service booted; for a `--detach` run, daemonize now so the terminal is freed
     // while the services keep running (a no-op unless this is the forked child).
-    if args.detach {
-        crate::detach::signal_ready(args.detach_log.as_deref());
+    if args.detach
+        && let Err(e) = crate::detach::signal_ready(args.detach_log.as_deref())
+    {
+        mgr.stop_all();
+        stop_switch(switch);
+        return Err(e);
     }
     stop.await;
     crate::quiet::note!("virtkit: stopping ...");
@@ -5222,7 +5226,7 @@ async fn drive(
             return Ok(());
         }
         if first_pass && args.detach {
-            crate::detach::signal_ready(args.detach_log.as_deref());
+            crate::detach::signal_ready(args.detach_log.as_deref())?;
         }
         if args.shell {
             match run_shell(addr).await {

@@ -58,9 +58,10 @@ pub(super) fn identity_path(plan: &Plan) -> PathBuf {
 /// the environment over once it names nobody or a process that is gone — killed mid-readying,
 /// say.
 ///
-/// Where there is no marker at all, a joiner waits out `READY_WAIT` and fails, as it did
-/// before this existed: a parent killed between the VM coming up and its writing one, or one
-/// that cannot name itself (no start time to read from procfs).
+/// If the parent exits before writing its marker, the child's `booted` note lets a joiner
+/// write one naming that parent (see [`mark_unbegun`]). Without a marker or verifiable
+/// handoff, for example when procfs cannot supply start ticks or show the VM process,
+/// the joiner waits out `READY_WAIT` and fails.
 fn not_ready_path(plan: &Plan) -> PathBuf {
     plan.state_dir.join("not-ready")
 }
@@ -115,6 +116,15 @@ impl Readier {
             pid,
             started: crate::usage::proc_starttime(i32::try_from(pid).ok()?)?,
         })
+    }
+
+    /// Use the parent's fork-time start ticks when available so pid reuse cannot redirect the
+    /// claim. Otherwise look up `pid` as it is now.
+    pub(super) fn parent(pid: u32) -> Option<Self> {
+        match crate::detach::parent() {
+            Some((at_fork, Some(started))) if at_fork == pid => Some(Self { pid, started }),
+            _ => Self::of(pid),
+        }
     }
 
     /// Whether this process is still the one running under its pid.
@@ -197,6 +207,25 @@ pub(super) fn mark_own_not_ready(
     })
 }
 
+/// Under the marker lock, recheck the note's contents and the running VM. If both still
+/// match, write `left` unless an identity or a marker for this VM already exists. Consume
+/// the matching note once either record is in place.
+pub(super) fn mark_unbegun(plan: &Plan, left: &NotReady, note: &Path, body: &str) -> Result<()> {
+    let _lock = lock_not_ready(plan)?;
+    if std::fs::read_to_string(note).ok().as_deref() != Some(body)
+        || running_vm(plan).map(|vm| VmTie::of(&vm)) != Some(left.vm)
+    {
+        return Ok(());
+    }
+    let settled = identity_path(plan).exists()
+        || read_not_ready(plan).is_some_and(|current| current.vm == left.vm);
+    if !settled {
+        write_not_ready(plan, left)?;
+    }
+    let _ = std::fs::remove_file(note);
+    Ok(())
+}
+
 /// Write `left` whatever the marker holds, as a readying elsewhere would.
 #[cfg(test)]
 pub(super) fn mark_not_ready(plan: &Plan, left: &NotReady) {
@@ -242,7 +271,8 @@ pub(super) fn left_behind(
     }
 }
 
-/// Claim an abandoned marker for `parent_pid`, the next readier. Under [`lock_not_ready`],
+/// Claim an abandoned marker for `parent_pid`, the next readier, named as it was at the fork
+/// (see [`Readier::parent`]). Under [`lock_not_ready`],
 /// `still` rechecks the current marker, which may differ from what the caller inspected.
 /// Naming the parent makes other joiners wait, so only one retries setup. Returns `None`
 /// if the marker can no longer be claimed or the parent cannot be named.
@@ -256,7 +286,7 @@ pub(super) fn claim_not_ready(
 ) -> Option<NotReady> {
     let _lock = lock_not_ready(plan).ok()?;
     let mut left = read_not_ready(plan).filter(|left| left.abandoned() && still(left))?;
-    left.readier = Some(Readier::of(parent_pid)?);
+    left.readier = Some(Readier::parent(parent_pid)?);
     let why = std::mem::take(&mut left.why);
     write_not_ready(plan, &left).ok()?;
     left.why = why;
@@ -332,6 +362,19 @@ pub fn identity_of(plan: &Plan, wrapper: Option<&str>) -> Result<Config> {
 pub(super) fn booted_identity_of(plan: &Plan) -> Result<Config> {
     let compose = compose_source(plan).and_then(|_| read_compose_snapshot(plan));
     identity_with(plan, booted_wrapper_digest(plan).as_deref(), compose)
+}
+
+/// Complete the manifest resolved before `vk run` loaded compose. As in [`booted_identity_of`],
+/// use the compose fingerprints it snapshotted, or remove them if no snapshot exists.
+pub(super) fn as_booted(
+    manifest: serde_json::Value,
+    plan: &Plan,
+) -> Result<(String, serde_json::Value)> {
+    let from = read_compose_snapshot(plan).map_or_else(
+        || serde_json::json!({}),
+        |compose| serde_json::json!({ "compose": compose }),
+    );
+    with_compose_of(manifest, &from)
 }
 
 /// Replace `manifest`'s compose fingerprints with `from`'s (or remove them if absent) and

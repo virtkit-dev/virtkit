@@ -8,7 +8,7 @@ use vk_core::exec::client::Stdin;
 
 use crate::dev::plan::{Plan, Source};
 
-use super::boot::{alias, take_transition};
+use super::boot::{alias, drop_booted_note, take_transition};
 use super::hooks::run_start_hooks;
 use super::identity::{
     NotReady, Readier, VmTie, booted_identity_of, claimed_for_me, drop_own_not_ready,
@@ -62,8 +62,14 @@ pub async fn after_boot(plan: &Plan) -> Result<()> {
         || claimed_for_me(plan, running_vm(plan).map(|vm| VmTie::of(&vm))).is_some();
     // Say who readies the VM before anything else takes time, so a joiner that finds this
     // parent gone takes the environment over rather than waiting out `READY_WAIT`.
+    // Keep the handoff until the marker or identity is written so a joiner can recover if
+    // this parent exits first.
     let readying = if booted {
-        Some(begin_readying(plan)?)
+        let (readying, marked) = begin_readying(plan)?;
+        if marked {
+            drop_booted_note(plan, std::process::id());
+        }
+        Some(readying)
     } else {
         None
     };
@@ -88,10 +94,14 @@ pub async fn after_boot(plan: &Plan) -> Result<()> {
         // claim permits endpoint edits (see `left_behind`).
         reconcile_publishers(plan);
     }
-    ready_or_mark(plan, &readying, || {
+    let readied = ready_or_mark(plan, &readying, || {
         running_vm(plan).map(|vm| VmTie::of(&vm))
     })
-    .await
+    .await;
+    if readied.is_ok() {
+        drop_booted_note(plan, std::process::id());
+    }
+    readied
 }
 
 /// What this parent readies: the VM, the identity it would record, and whether a joiner's
@@ -112,8 +122,8 @@ struct Readying {
 /// Start readying the VM now up: take over what a claim by this invocation's child left for
 /// it, and write the marker naming this parent as the readier, in one step under the marker's
 /// lock. A parent procfs cannot name writes none, so joiners wait out `READY_WAIT` rather
-/// than take over a readying still under way.
-fn begin_readying(plan: &Plan) -> Result<Readying> {
+/// than take over a readying still under way. The flag reports whether the marker was written.
+fn begin_readying(plan: &Plan) -> Result<(Readying, bool)> {
     let booted = running_vm(plan).map(|vm| VmTie::of(&vm));
     let super::identity::Config {
         digest, manifest, ..
@@ -126,7 +136,7 @@ fn begin_readying(plan: &Plan) -> Result<Readying> {
         digest,
         manifest,
     };
-    mark_own_not_ready(plan, |own| {
+    let marked = mark_own_not_ready(plan, |own| {
         let vm = booted?;
         if let Some(claimed) = own.filter(|l| l.vm == vm) {
             readying.booted_secs = claimed.booted_secs;
@@ -153,7 +163,7 @@ fn begin_readying(plan: &Plan) -> Result<Readying> {
             why: String::new(),
         })
     });
-    Ok(readying)
+    Ok((readying, marked))
 }
 
 /// Run [`ready_booted`], then drop this parent's marker; on failure, rewrite it naming
@@ -1229,12 +1239,13 @@ mod tests {
         ensure_state_dir(&plan).unwrap();
         let identity = plan.state_dir.join("dev.json");
         // The note `boot` leaves for its own parent, in the shape `boot::note_transition`
-        // writes it — verb, child pid, this invocation's nonce; this is the process that
-        // would read it.
-        let note = plan
-            .state_dir
-            .join(format!(".transition.{}", std::process::id()));
-        let booted = format!("booted 31337 {}\n", crate::detach::boot_nonce());
+        // writes it. This invocation's pid and nonce identify its note.
+        let note = plan.state_dir.join(format!(
+            ".transition.{}.{}",
+            std::process::id(),
+            crate::detach::boot_nonce()
+        ));
+        let booted = "booted 31337 - -\n";
         // The compose file the boot's `vk run` loaded, and the fingerprints it left.
         let Source::Compose { file, .. } = &plan.source else {
             unreachable!()
@@ -1252,7 +1263,7 @@ mod tests {
             "a reuse must not relabel the environment"
         );
 
-        std::fs::write(&note, &booted).unwrap();
+        std::fs::write(&note, booted).unwrap();
         after_boot(&plan).await.unwrap();
         assert!(!note.exists(), "the note is consumed");
         let recorded: crate::dev::Identity =
@@ -1347,7 +1358,7 @@ mod tests {
         };
         let plan = plan_in(&tmp);
         let _vm = crate::dev::testutil::register_vm(&plan);
-        let readying = begin_readying(&plan).unwrap();
+        let (readying, _) = begin_readying(&plan).unwrap();
         let left = read_not_ready(&plan).expect("a marker");
         assert_eq!(left.readier, Readier::of(std::process::id()));
         assert!(left.why.is_empty() && !left.abandoned());
@@ -1362,7 +1373,7 @@ mod tests {
         claimed.booted_secs = 1000;
         claimed.created_by = "vk 0.1.0 (abc)".into();
         mark_not_ready(&plan, &claimed);
-        let readying = begin_readying(&plan).unwrap();
+        let (readying, _) = begin_readying(&plan).unwrap();
         assert!(readying.claimed);
         assert_eq!(readying.created_by, "vk 0.1.0 (abc)");
         let left = read_not_ready(&plan).unwrap();
@@ -1379,7 +1390,7 @@ mod tests {
             serde_json::to_vec(&old).unwrap(),
         )
         .unwrap();
-        assert_eq!(begin_readying(&plan).unwrap().created_by, "");
+        assert_eq!(begin_readying(&plan).unwrap().0.created_by, "");
     }
 
     /// The child's note is best effort: a claim's marker naming this parent is enough for it

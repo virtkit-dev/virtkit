@@ -31,8 +31,8 @@
 use std::os::fd::RawFd;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// Write end of the readiness pipe, held by the detached child (`-1` = not detaching). Set
 /// by [`fork`] in the child; consumed once by [`signal_ready`].
@@ -48,6 +48,12 @@ static IS_CHILD: AtomicBool = AtomicBool::new(false);
 /// `main` after [`fork`] returns and read by [`crate::dev::cli`]. An environment variable
 /// would be inherited by editors, hooks and task commands and mistaken for their own state.
 static AFTER_BOOT: AtomicBool = AtomicBool::new(false);
+/// Capture the parent's pid and start ticks before the fork. The pid may be reused
+/// before the child can look them up.
+static PARENT: OnceLock<(u32, Option<u64>)> = OnceLock::new();
+/// What [`signal_ready`] runs before it wakes the parent (see [`before_ready`]).
+type ReadyHook = Box<dyn FnOnce() -> anyhow::Result<()> + Send>;
+static BEFORE_READY: Mutex<Option<ReadyHook>> = Mutex::new(None);
 
 /// Say that this process is the one released by the fork (see [`AFTER_BOOT`]).
 pub fn note_after_boot() {
@@ -57,6 +63,39 @@ pub fn note_after_boot() {
 /// Is this the process the fork released once the guest was ready?
 pub fn after_boot() -> bool {
     AFTER_BOOT.load(Ordering::Relaxed)
+}
+
+/// The detached child's parent at the fork, with start ticks when procfs supplied them.
+/// Returns `None` outside the detached child.
+pub fn parent() -> Option<(u32, Option<u64>)> {
+    PARENT.get().copied()
+}
+
+/// Stand in for the fork having recorded `parent`.
+#[cfg(test)]
+pub(crate) fn set_parent(parent: (u32, Option<u64>)) {
+    PARENT.set(parent).unwrap();
+}
+
+/// The forking parent's pid, even after reparenting. Falls back to `getppid` outside the child.
+pub fn parent_pid() -> u32 {
+    // SAFETY: getppid always succeeds and touches no memory.
+    parent().map_or_else(|| unsafe { libc::getppid() } as u32, |(pid, _)| pid)
+}
+
+/// Register `f` to publish state after the guest is ready and before the parent wakes.
+/// If `f` fails, [`signal_ready`] returns the error without signaling readiness.
+pub fn before_ready(f: impl FnOnce() -> anyhow::Result<()> + Send + 'static) {
+    *BEFORE_READY.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(f));
+}
+
+/// Run the registered readiness hook once.
+pub(crate) fn run_before_ready() -> anyhow::Result<()> {
+    let hook = BEFORE_READY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    hook.map_or(Ok(()), |hook| hook())
 }
 
 /// Is this the `--detach` child (see [`IS_CHILD`])?
@@ -159,6 +198,7 @@ extern "C" fn forward_term(_sig: libc::c_int) {
 pub fn fork() -> Forked {
     // Before the fork, so both sides end up with the same value in their own memory.
     let _ = boot_nonce();
+    let parent = (std::process::id(), crate::vms::own_start_ticks());
     let mut fds = [0 as RawFd; 2];
     // SAFETY: called from `main` before any thread or Tokio runtime exists.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -177,6 +217,7 @@ pub fn fork() -> Forked {
         // Keep the foreground group until `signal_ready` so Ctrl-C aborts and Ctrl-Z suspends
         // the build/boot. Keep the readiness writer and terminal stdout/stderr for progress.
         unsafe { libc::close(read_fd) };
+        let _ = PARENT.set(parent);
         READY_FD.store(write_fd, Ordering::Relaxed);
         IS_CHILD.store(true, Ordering::Relaxed);
         return Forked::Child;
@@ -255,12 +296,14 @@ fn stop_forwarding_term() {
 /// Called by the run path once the guest is up and about to enter its lifetime wait: in a
 /// detached child, detach into a new session and redirect stdout/stderr to `log` (so
 /// post-detach output does not spill into the terminal the parent hands back), then wake the
-/// parent. A no-op otherwise.
-pub fn signal_ready(log: Option<&Path>) {
+/// parent. A no-op otherwise. The [`before_ready`] hook runs while the terminal is attached.
+/// If it fails, the parent receives the child's failure instead of a readiness signal.
+pub fn signal_ready(log: Option<&Path>) -> anyhow::Result<()> {
     let fd = READY_FD.swap(-1, Ordering::Relaxed);
     if fd < 0 {
-        return; // not a detached run
+        return Ok(()); // not a detached run
     }
+    run_before_ready()?;
     // The guest is up: leave the terminal's foreground group for our own session now, so the
     // freed terminal's hang-up never reaches the VM we hold — but only now, having stayed in
     // the foreground through the build/boot so Ctrl-C/Ctrl-Z reached it. Safe: a forked child
@@ -294,6 +337,7 @@ pub fn signal_ready(log: Option<&Path>) {
         break;
     }
     unsafe { libc::close(fd) };
+    Ok(())
 }
 
 /// Open the detach log for append (creating it), falling back to `/dev/null` when no path
@@ -318,6 +362,22 @@ fn open_log(log: Option<&Path>) -> RawFd {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+
+    /// A failing readiness hook still runs only once.
+    #[test]
+    fn what_waits_for_readiness_runs_then_and_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static RAN: AtomicUsize = AtomicUsize::new(0);
+        super::before_ready(|| {
+            RAN.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("could not publish it")
+        });
+        assert_eq!(RAN.load(Ordering::Relaxed), 0);
+        let e = super::run_before_ready().unwrap_err();
+        assert!(e.to_string().contains("could not publish it"), "{e}");
+        super::run_before_ready().unwrap();
+        assert_eq!(RAN.load(Ordering::Relaxed), 1);
+    }
 
     /// What `main` decides on, for the argv given: the parse the fork reads.
     fn wants_detach(parts: &[&str]) -> bool {

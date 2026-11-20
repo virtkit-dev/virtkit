@@ -1289,10 +1289,9 @@ async fn dev_up(
             Err(e) => Ready::Done(fail(&e, 1)),
         };
     }
-    // getppid: the parent reads back what this boot decided, and two concurrent `up`s must
-    // not read each other's.
-    // SAFETY: getppid always succeeds and touches no memory.
-    let parent = unsafe { libc::getppid() } as u32;
+    // Route each concurrent `up`'s result to its own parent. After reparenting, `getppid`
+    // would send it to the adopter.
+    let parent = crate::detach::parent_pid();
     match dev::boot(plan, host_cfg, over, refresh, wait, announce_reuse, parent).await {
         // Returned rather than blocked: there was nothing to boot. This process is done
         // either way — the parent it wakes is what acts on the environment.
