@@ -779,6 +779,20 @@ pub fn create_file_in(
     Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
+/// Unlink `name`, which is not a directory, from the already-open `dir`, never following it.
+/// A name already gone is no error. `name` must be nonempty and contain no `/`.
+pub fn remove_file_in(dir: BorrowedFd<'_>, name: &OsStr) -> Result<(), anyhow::Error> {
+    let c_name = one_name(name)?;
+    // SAFETY: the descriptor is live and the name is NUL-terminated and outlives the call.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), c_name.as_ptr(), 0) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(anyhow!(e).context(format!("removing {name:?}")));
+        }
+    }
+    Ok(())
+}
+
 /// Reopen `dir` for listing or `flock`, which an `O_PATH` descriptor from [`open_dir_in`]
 /// cannot support. Opening `.` relative to `dir` preserves its inode even if its name changes.
 pub fn reopen_dir(dir: BorrowedFd<'_>) -> Result<OwnedFd, anyhow::Error> {

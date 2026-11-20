@@ -13,6 +13,9 @@ All notable changes to virtkit will be documented in this file.
 - `vk start NAME` and `vk restart NAME` boot a dev environment from its workspace or
   replay a saved run in the background. Use `NAME/SERVICE` to start, stop or restart one
   compose service. `vk dev service down` accepts `--timeout`.
+- `vk delete` (aliases `rm`, `remove`) removes a stopped VM's name and deletes state that
+  `vk` recognizes as its own. It preserves other files in user-supplied run directories.
+  Use `--dry-run` to preview or `-y` or `-f` to confirm without a terminal.
 
 ### Changed
 

@@ -594,11 +594,14 @@ workspace's environment, not its task leftovers; if that environment has no
 state, it reports nothing to remove. At first boot, an environment gets a stable name
 from its workspace directory, with `-ENV` appended for environments other than `dev`.
 Collisions add `-2`, `-3`, and so on. A listing or name lookup assigns names to older
-environments. Use that name with `vk start`, `vk stop` and other VM commands. `vk list` shows the
+environments. Use that name with `vk start`, `vk stop`, `vk delete`
+and other VM commands. `vk list` shows the
 environment's active and previously started compose services under `NAME/SERVICE`. The state
 directory's name also works, including any leading `.` or `-`
 (e.g. `app-3f9c0d1e2a4b5c6d`, shown as `dir_name` in `vk dev list --json`). A task's leftover
-state uses only its directory name. If `NAME` identifies two different directories,
+state uses only its directory name. Use `vk dev gc NAME` to remove its stopped state.
+For a stopped environment, `vk delete NAME` removes the directory only if it holds a
+valid recorded identity and no run recipe. If `NAME` identifies two different directories,
 use the other name of the environment you want. The `MEM` column
 shows what a running environment's VM holds on the host now over the size it
 booted with (`1.2G/8G`), the same figure `vk list` reports; a stopped
@@ -965,5 +968,5 @@ individual options.
 | `storage list`, `storage reset NAME` | Inspect storage or destroy a durable item's data. |
 | `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. Select a stopped environment by name from any directory. |
 | `list` | Host-wide environment inventory (on-disk sizes by default); `--no-sizes`, `--json`. |
-| `gc [NAME…]` | Remove stopped state (bare: this workspace's environment); `--all-stale`, `--yes`. |
+| `gc [NAME…]` | Remove stopped state. With no names, remove this workspace's environment. Supports `--all-stale` and `--yes`. For a stopped environment with a valid recorded identity and no run recipe, [`vk delete NAME`](../README.md#manage-vms) also removes its state. |
 | `schema` | Print the configuration JSON Schema. |

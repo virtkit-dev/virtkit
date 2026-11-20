@@ -580,9 +580,9 @@ in the background unless it used `-t` or `--shell`. `vk gc` removes a `-f` run's
 image after `[gc] run_image_idle_days` days of inactivity (14 by default). The next `-f`
 run in that directory rebuilds it.
 
-`vk` manages the whole `$XDG_STATE_HOME/virtkit/run` directory. If a run dies before its
-name is committed, a later name claim may remove its empty state directory directly under
-that path, whoever created it. Files in a nonempty directory survive.
+If a run dies before its name is committed, a later name claim may remove its directory
+directly under `$XDG_STATE_HOME/virtkit/run`, whoever created it. The directory must be
+empty or contain only the `.virtkit-made` allocation marker.
 
 ```sh
 vk run --name app --detach --ssh -f Dockerfile --target dev
@@ -607,7 +607,7 @@ registration. Its image and service list come from that registration when availa
 
 Use the primary's NAME to select the VM. A dev environment without a stable name uses its
 state directory's name. An unnamed running `vk run` uses its pid. `vk list`, `start`, `stop`,
-`restart`, `exec`, `cp`, `logs`, `status` and `publish` also accept `NAME/SERVICE`.
+`restart`, `delete`, `exec`, `cp`, `logs`, `status` and `publish` also accept `NAME/SERVICE`.
 
 `--running` selects rows with status `running`. `--stopped` selects `stopped` and
 `never booted` (a dev state directory with no recorded boot). A service with no reported
@@ -629,7 +629,7 @@ the full project path and adds EXEC ADDRESS. It cannot be combined with `--json`
 
 | REF | Means |
 |---|---|
-| `app`, `shop/db`, `41877/db` | a VM name as `vk list` prints it, or a compose service selected by `NAME/SERVICE` or `PID/SERVICE` with `list`, `start`, `stop`, `restart`, `exec`, `cp`, `logs`, `status` or `publish` |
+| `app`, `shop/db`, `41877/db` | a VM name from `vk list`, or a compose service selected by `NAME/SERVICE` or `PID/SERVICE` with `list`, `start`, `stop`, `restart`, `exec`, `cp`, `logs`, `status` or `publish`. To delete a service, stop its VM and use `NAME/SERVICE`. |
 | `41877` | the pid of a running VM's `vk run`. `vk atop` looks up the recorded job only if no running VM matches a directory named `41877`. |
 | `.`, `./x`, `../x`, `/abs`, `~/x` | a project or state directory, matched exactly. `list`, `stop`, `reboot`, `pause` and `resume` also match projects below it with `--recursive` (`-r`). |
 | (none) | the current directory where the command accepts a default target. `-r` includes projects below it. `vk list` alone lists every VM `vk` knows. |
@@ -643,6 +643,8 @@ vk start shop/redis           # a compose service, starting its VM first if need
 vk stop shop                  # that VM alone, and what it publishes
 vk stop shop/redis            # one compose service
 vk restart app
+vk delete scratch             # prompts on a terminal before deleting
+vk delete -n scratch shop/db  # only list what would go
 ```
 
 `vk start` uses `vk dev up` with the recorded workspace, environment and config. For a run,
@@ -655,6 +657,18 @@ published endpoints. An explicit reference to a stopped VM exits 1 with `vk stop
 `vk restart` resolves each reference once. Before stopping a primary, it checks the dev
 workspace and recorded config, or the run recipe, working directory and any recorded
 `--config`. If the primary is already down, `vk restart` starts it.
+
+`vk delete` (aliases `rm`, `remove`) removes a directory directly under the dev state base
+if it holds a recorded dev identity and no run recipe. It removes a directory directly
+under the run state base if `vk` marked it when allocating it. In other directories it
+removes only the name, `run.json` and `.virtkit-last.json`.
+
+For a running VM, `--force` stops it first. To delete a declared service's `svc-<name>/`,
+stop its VM first, even with `--force`, then use `vk delete NAME/SERVICE`.
+By default, `vk delete` lists the planned removals and asks for confirmation on a terminal.
+Without a terminal, pass `-y`/`--yes` or `-f`/`--force`. Use `-n`/`--dry-run` to preview.
+An unresolved REF or a busy VM prevents all removals. A failure during removal can leave
+some targets deleted.
 
 Without `--json` or `--field`, a reference to exactly one running primary and no stopped
 primary prints its full record. A service reference or `--running`, `--stopped` or
@@ -981,7 +995,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk, or a Windows Dockerfile into a bundle. |
 | `vk exec` | Run a command in an existing guest and return the command's exit status. |
 | `vk list` | List known VMs by project, including stopped VMs and compose services that have started. Select by name, pid or directory (`-r` includes subdirectories). Filter by status (`--running`, `--stopped`) or `--kind`. Use `-w` for the wide table or `--json` and `--field` for scripts. |
-| `vk start`, `vk stop`, `vk restart` | Select a VM by name, pid or directory, or a service by `NAME/SERVICE` or `PID/SERVICE`. Starting or restarting a primary requires a name. `start` and `restart` accept multiple references. `stop --all` stops every running VM. |
+| `vk start`, `vk stop`, `vk restart`, `vk delete` | Select a VM by name, pid or directory. Only `stop` accepts an unnamed primary or `--all`. Select a service by `NAME/SERVICE`, or by `PID/SERVICE` for start, stop and restart. Deleting a service requires a stopped parent VM. `start`, `restart` and `delete` accept multiple references. |
 | `vk reboot` | Reboot a running VM in place through its guest, or power-cycle it with `--force`. |
 | `vk status` | Probe a guest agent, or report whether its root image is stale. |
 | `vk logs` | Show a VM's console log, telling kernel, agent and guest output apart; `--level warn`, `--agent`, `--service NAME`, `-f`. |

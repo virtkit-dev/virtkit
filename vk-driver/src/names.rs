@@ -36,6 +36,27 @@ pub fn run_base() -> Result<PathBuf> {
     Ok(state_base()?.join("run"))
 }
 
+/// Marks a state directory that `vk` allocated for a run. `vk delete` can remove a marked
+/// directory directly under the run base. Other run directories may contain user files.
+pub const MADE: &str = ".virtkit-made";
+
+/// Best-effort cleanup of an empty directory or one containing only [`MADE`]. A concurrent
+/// addition keeps the directory. If its mark was already removed, `vk delete` preserves it.
+pub fn remove_bare(dir: &Path) {
+    let Ok(mut entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let only_mark = match (entries.next(), entries.next()) {
+        (None, _) => false,
+        (Some(Ok(e)), None) if e.file_name() == MADE => true,
+        _ => return,
+    };
+    if only_mark {
+        let _ = std::fs::remove_file(dir.join(MADE));
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
 /// A name refused for what the caller asked — invalid, taken, or naming nothing to boot —
 /// rather than a failure to read or write the index.
 #[derive(Debug)]
@@ -329,9 +350,9 @@ impl Index {
                 let ended =
                     crate::dev::list::try_lock_state_dir(&target).is_some() || !target.exists();
                 if ended && target.parent() == Some(roots[0].as_path()) {
-                    // All direct children of run/ are managed, whoever created them.
-                    // remove_dir preserves nonempty directories.
-                    let _ = std::fs::remove_dir(&target);
+                    // Direct children of run/ qualify regardless of who created them. Keep directories
+                    // containing anything besides the allocation mark.
+                    remove_bare(&target);
                 }
                 ended
             } else {
@@ -361,16 +382,13 @@ impl Index {
             if target == canonical || target == dir {
                 return Ok(false);
             }
-            let gone = if target.exists() {
-                String::new()
+            let hint = if target.exists() {
+                format!(" — `vk start {name}`, or `vk delete {name}` first")
             } else {
-                format!(
-                    ", which is not there: if it was removed, deleting {} frees the name",
-                    self.dir.join(name).display()
-                )
+                format!(", which is not there: `vk delete {name}` frees the name")
             };
             return Err(refuse(format!(
-                "the name {name} is taken by {}{gone}",
+                "the name {name} is taken by {}{hint}",
                 target.display()
             )));
         }
@@ -908,11 +926,31 @@ mod tests {
     }
 
     #[test]
-    fn a_dangling_link_still_reads_back() {
+    fn a_dangling_link_still_reads_back_and_can_be_released() {
         let t = tmp("dangling");
         let idx = Index::at(t.0.join("names"));
         let gone = t.0.join("gone");
         idx.claim(&gone, "ghost").unwrap();
         assert_eq!(idx.lookup("ghost").unwrap(), gone);
+        idx.release(&gone).unwrap();
+        assert!(idx.all().is_empty());
+    }
+
+    /// Only a dir holding nothing, or nothing but its mark, is removed.
+    #[test]
+    fn a_bare_dir_goes_and_one_with_anything_in_it_stays() {
+        let t = tmp("bare");
+        let (empty, marked, used) = (t.0.join("e"), t.0.join("m"), t.0.join("u"));
+        for d in [&empty, &marked, &used] {
+            std::fs::create_dir(d).unwrap();
+        }
+        std::fs::write(marked.join(MADE), b"").unwrap();
+        std::fs::write(used.join(MADE), b"").unwrap();
+        std::fs::write(used.join("root.ext4"), b"disk").unwrap();
+        for d in [&empty, &marked, &used] {
+            remove_bare(d);
+        }
+        assert!(!empty.exists() && !marked.exists());
+        assert!(used.join(MADE).exists() && used.join("root.ext4").exists());
     }
 }

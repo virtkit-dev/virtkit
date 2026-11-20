@@ -357,10 +357,9 @@ enum DevAction {
     Doctor,
     /// Stop the environment and everything published from it
     ///
-    /// Powers the guest off and takes down the publishers that were reaching into it. The
-    /// state directory stays — its storage, keys and identity are what the next `vk dev up`
-    /// starts from; `vk dev gc` is what removes it. Stopping what is already stopped is the
-    /// state asked for, not a failure.
+    /// Powers off the guest and stops its publishers. The next `vk dev up` reuses its storage,
+    /// keys and identity. Use `vk dev gc` to remove the state directory. Stopping an environment
+    /// that is already down succeeds.
     ///
     /// With no NAME, works on this workspace's environment, from its config. NAME instead
     /// stops one by the identity `vk dev list` gives it, host-wide and without a config — for
@@ -690,6 +689,12 @@ async fn dev_action(
     } = &action
         && (*all_stale || !names.is_empty())
     {
+        if !names.is_empty() {
+            eprintln!(
+                "vk: note: use `vk delete {}` for stopped VMs; it preserves directories vk does not recognize as its own",
+                names.join(" ")
+            );
+        }
         return dev_gc(*yes, *all_stale, names, None);
     }
     // Like named stops, named prunes use host state and work from another or deleted

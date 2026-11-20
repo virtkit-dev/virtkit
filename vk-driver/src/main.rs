@@ -2614,10 +2614,10 @@ enum Cmd {
     /// environments, named runs and running UEFI bundles. A dev environment's project is its
     /// workspace. A run uses `--workspace`, then `--workdir`, then its launch directory.
     ///
-    /// Use NAME with commands such as `vk start` and `vk stop`. A dev environment without a
-    /// stable name uses its state directory's name. Other unnamed running VMs use their pid.
-    /// `vk list`, `start`, `stop`, `restart`, `exec`, `cp`, `logs`, `status` and `publish`
-    /// also accept `NAME/SERVICE`.
+    /// Use NAME with commands such as `vk start`, `vk stop` and `vk delete`. A dev environment
+    /// without a stable name uses its state directory's name. Other unnamed running VMs use
+    /// their pid. `vk list`, `start`, `stop`, `restart`, `delete`, `exec`, `cp`, `logs`,
+    /// `status` and `publish` also accept `NAME/SERVICE`.
     ///
     /// On a running primary, MEM shows host memory used by its process tree over the recorded
     /// boot size (`1.2G/8G`). The tree includes its service VMs and helpers. Proportional
@@ -2730,6 +2730,41 @@ enum Cmd {
         #[arg(value_name = "REF", required = true)]
         targets: Vec<std::ffi::OsString>,
         /// seconds to wait for VM shutdown or for each socket operation during a service stop
+        #[arg(long, default_value_t = 210, value_name = "SECS")]
+        timeout: u64,
+    },
+    /// Delete a stopped VM's state and name
+    ///
+    /// Deletes a directory directly under the dev state base, including storage and keys, if it
+    /// holds a recorded dev identity and no run recipe. Deletes a directory directly under the
+    /// run state base if vk marked it when allocating it. In other directories, removes only
+    /// the name, `run.json` and `.virtkit-last.json`.
+    ///
+    /// Use `--force` to stop a running VM first. To delete a declared service's `svc-<name>/`
+    /// and start it afresh, stop its VM first, even with `--force`.
+    ///
+    /// By default, lists the planned removals and prompts on a terminal. Without a terminal,
+    /// pass `--yes` or `--force`. An unresolved REF or a busy VM prevents all removals.
+    /// A failure during removal can leave some targets deleted.
+    #[command(display_order = 8, visible_aliases = ["rm", "remove"])]
+    Delete {
+        /// VM or compose service to delete
+        ///
+        /// Use a VM name, state directory or unambiguous project directory. A named running VM
+        /// also accepts its pid and requires `--force`. Add `--dry-run` to preview the stop and
+        /// deletion. For a service, stop its VM first and use `NAME/SERVICE`.
+        #[arg(value_name = "REF", required = true)]
+        targets: Vec<std::ffi::OsString>,
+        /// stop a running VM first; implies --yes
+        #[arg(short = 'f', long)]
+        force: bool,
+        /// delete without asking
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// list what would be deleted, and delete nothing
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+        /// seconds to wait for a VM `--force` stops
         #[arg(long, default_value_t = 210, value_name = "SECS")]
         timeout: u64,
     },
@@ -3247,8 +3282,8 @@ fn prepare_run_name_in(
         Ok(claimed) => claimed,
         Err(e) => {
             if dir_made {
-                // Empty, and made by this call.
-                let _ = std::fs::remove_dir(&dir);
+                // Made by this call, and holding nothing but its mark.
+                names::remove_bare(&dir);
             }
             return Err(e);
         }
@@ -3296,7 +3331,15 @@ fn new_run_dir(
         let readable = name.get(..keep.min(name.len())).unwrap_or(name);
         let dir = run_base.join(format!("{readable}-{token}"));
         match crate::statefile::create_dir(&dir) {
-            Ok(()) => return Ok(dir),
+            Ok(()) => {
+                // Mark the allocation so `vk delete` can remove the whole directory.
+                let mark = dir.join(names::MADE);
+                if let Err(e) = vk_fs::write_new(&mark, b"", crate::statefile::FILE_MODE) {
+                    let _ = std::fs::remove_dir(&dir);
+                    return Err(e.context(format!("writing {}", mark.display())));
+                }
+                return Ok(dir);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
                 return Err(anyhow::Error::new(e).context(format!("creating {}", dir.display())));
@@ -3930,6 +3973,13 @@ async fn cli_main(cli: Cli) -> ExitCode {
     match &cli.cmd {
         Cmd::Start { targets } => return lifecycle::start(targets, opts(210)),
         Cmd::Restart { targets, timeout } => return lifecycle::restart(targets, opts(*timeout)),
+        Cmd::Delete {
+            targets,
+            force,
+            yes,
+            dry_run,
+            timeout,
+        } => return lifecycle::delete(targets, *force, *yes, *dry_run, opts(*timeout)),
         Cmd::Stop {
             target,
             recursive,
@@ -5889,6 +5939,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         | Cmd::List { .. }
         | Cmd::Start { .. }
         | Cmd::Restart { .. }
+        | Cmd::Delete { .. }
         | Cmd::Stop { .. }
         | Cmd::Reboot { .. }
         | Cmd::Pause { .. }
@@ -8610,6 +8661,7 @@ mod tests {
                 "check",
                 "console",
                 "cp",
+                "delete",
                 "dev",
                 "exec",
                 "export",
