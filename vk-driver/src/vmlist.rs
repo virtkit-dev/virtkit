@@ -139,7 +139,7 @@ fn booted(svc_dir: &Path) -> bool {
 /// [`rows`], told by `booted` which service directories hold a VM that booted. A compose
 /// service gets a row only when it has a VM: one its primary reports in any state but
 /// stopped, or one that booted before. A declared service that never booted (profiled out,
-/// or a `build:` service never started) gets none.
+/// or a `build:` service never started) gets none; `vk start VM/SERVICE` still takes it.
 pub fn rows_with(
     live: &[Live],
     known: &[Known],

@@ -552,7 +552,7 @@ vk dev prune NAME --all             # prune another environment by its `vk dev l
 ```
 
 `NAME` is the environment's VM name, as `vk list` and `vk dev list` print it (its state
-directory's own name works too). It selects an
+directory's own name works too); `vk reset NAME` is the same command. It selects an
 environment host-wide from any directory, without a workspace config. Prune uses the storage
 recorded at its last boot, so workspace moves or changes do not affect selection.
 An environment booted by a `vk` from before
@@ -595,11 +595,11 @@ workspace's environment, not its task leftovers; if that environment has no
 state, it reports nothing to remove. NAME is the environment's VM name: its
 workspace's directory name, with `-ENV` for an environment other than `dev`, and
 `-2`, `-3`… when another workspace already has it — given once, on the first
-command that lists it, and kept. The same name works with
-`vk stop` and every other VM command, and `vk list` shows the
+command that lists it, and kept (`vk rename` changes it). The same name works with
+`vk start`, `vk stop`, `vk delete` and every other VM command, and `vk list` shows the
 environment's compose services beside it. A state directory's own name
 (`app-3f9c0d1e2a4b5c6d`, the `dir_name` of `--json`) still names it, and a task's
-leftover, which has no name, goes by that alone. The `MEM` column
+leftover, which has no name, goes by that alone. `vk delete NAME` is `vk dev gc NAME`. The `MEM` column
 shows what a running environment's VM holds on the host now over the size it
 booted with (`1.2G/8G`), the same figure `vk list` reports; a stopped
 environment reads `-`, and `mem_used_bytes` in `--json` is null for it. `gc`
@@ -963,7 +963,7 @@ individual options.
 | `plan` | Inspect the resolved config; `--explain`, `--diff`, `--format`, `--show-secrets`. |
 | `stop` | Stop the environment and publishers; `--timeout SECONDS`. |
 | `storage list`, `storage reset NAME` | Inspect storage or destroy a durable item's data. |
-| `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. `NAME` prunes host-wide by its name. Requires a stopped environment. |
+| `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. `NAME` prunes host-wide by its name (`vk reset NAME`). Requires a stopped environment. |
 | `list` | Host-wide environment inventory (on-disk sizes by default); `--no-sizes`, `--json`. |
-| `gc [NAME…]` | Remove stopped state (bare: this workspace's environment); `--all-stale`, `--yes`. |
+| `gc [NAME…]` | Remove stopped state (bare: this workspace's environment; `vk delete NAME` for one); `--all-stale`, `--yes`. |
 | `schema` | Print the configuration JSON Schema. |

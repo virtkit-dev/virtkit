@@ -1201,8 +1201,8 @@ impl WorkDir {
         let lock = lock_state_dir(&path)?;
         remove_stale_sockets(&path)?;
         mark_active(&path);
-        // The dir is this run's from here on: leave its recipe — only now, so a run refused
-        // the dir never rewrites the recipe of the one that holds it.
+        // The dir is this run's from here on: leave the recipe `vk start` replays — only
+        // now, so a run refused the dir never rewrites the recipe of the one that holds it.
         crate::names::write_pending_recipe(&path)?;
         Ok(WorkDir {
             path,

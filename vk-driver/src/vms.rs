@@ -1147,7 +1147,7 @@ fn dev_environment(state_dir: &Path) -> Option<String> {
 }
 
 /// A dev environment's workspace and environment name, from its `dev.json`.
-fn dev_identity(state_dir: &Path) -> (Option<PathBuf>, Option<String>) {
+pub(crate) fn dev_identity(state_dir: &Path) -> (Option<PathBuf>, Option<String>) {
     let Some(identity) = std::fs::read(state_dir.join("dev.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<crate::dev::Identity>(&b).ok())
@@ -1534,7 +1534,9 @@ impl Selector {
             Selector::Dir { dir, below: false } => {
                 format!("no running vk VM for {}\n", dir.display())
             }
-            Selector::Named { name, .. } => format!("{name} is not running\n"),
+            Selector::Named { name, .. } => {
+                format!("{name} is not running (`vk start {name}`)\n")
+            }
         }
     }
 }
@@ -1577,7 +1579,7 @@ pub fn resolve_ref(
 
 /// The one running VM `sel` selects (default: the current directory's). Errors when nothing
 /// runs there, or when several VMs match a directory.
-fn one_running(sel: Option<Selector>) -> Result<VmEntry> {
+pub fn one_running(sel: Option<Selector>) -> Result<VmEntry> {
     let (sel, mut matched) = select_running(sel)?;
     match matched.len() {
         0 => bail!("{}", sel.not_found().trim_end()),
@@ -2273,7 +2275,7 @@ pub(crate) mod tests {
             dir("/home/other", false).not_found(),
             "no running vk VM for /home/other\n"
         );
-        assert_eq!(named("/s").not_found(), "x is not running\n");
+        assert_eq!(named("/s").not_found(), "x is not running (`vk start x`)\n");
     }
 
     #[test]

@@ -568,7 +568,7 @@ service layout with on-demand test appliances.
 Every VM `vk` remembers has a **name**: a dev environment (named after its workspace, `-ENV`
 added for an environment other than `dev`), and a `vk run` started with `--name`,
 `--state-dir` or `--detach` (named with `--name`, else after what it boots). A name is
-given once and kept; a second `app` becomes `app-2`. A
+given once and kept; a second `app` becomes `app-2`, and `vk rename` changes it. A
 foreground `vk run` without `--state-dir` stays nameless and is forgotten when it ends, as
 does compose up (`--compose` with no image, `-f` or `--primary`), which boots no VM to name.
 
@@ -588,7 +588,7 @@ scratch     run      stopped  -      -       -         alpine              ~/tmp
 
 `vk list` has one row per VM: running or stopped, primary or compose service (`NAME/SERVICE`).
 A service shows once it has a VM: while it runs, or after it has booted once; a declared
-service that never started is not listed.
+service that never started is not listed (`vk start VM/SERVICE` still starts it).
 Rows are grouped by PROJECT — a dev environment's workspace, a run's `--workspace`, then
 `--workdir`, then launch directory, with `$HOME` shown as `~` — a primary first, then its
 services by name. `--running` and `--stopped` keep one state, `--kind dev|run|service` one
@@ -619,6 +619,28 @@ be checked. `--wide` (`-w`) prints the project directory in full and adds EXEC A
 A bare word is a name: write `./app` for a directory called `app`. A dev environment's state
 dir name (`app-3f9c0d1e2a4b5c6d`) still works.
 
+```sh
+vk start app                  # a stopped run again, from the recipe it recorded
+vk start shop/redis           # a compose service, starting its VM first if needed
+vk stop shop                  # a dev environment: as `vk dev stop`
+vk restart app
+vk delete scratch             # a stopped VM's state, and its name (asks first)
+vk delete -n scratch shop/db  # only list what would go
+vk rename app web
+vk reset shop --storage       # a dev environment's persistent data, as `vk dev prune`
+```
+
+`vk start` boots a dev environment from its workspace's config (as `vk dev up` there), a run
+from `run.json` in its state dir — the same `vk run` arguments in the same directory, now
+in the background — and a compose service in its VM.
+
+`vk delete` (also `rm`, `remove`) removes a dev environment's state dir, a run's state dir
+when `vk` made it, and only the recipe and name of a `--state-dir` of yours;
+`vk delete NAME/SERVICE` empties the service's `svc-<name>/`. It refuses a running VM unless
+`--force`, which stops it first. It lists what will go and asks on a terminal; without one
+it deletes nothing unless `-y`/`--yes` or `-f`. `-n`/`--dry-run` only lists. If one REF
+cannot be deleted, none is. `vk ls` is `vk list`.
+
 A REF that names exactly one running VM makes `vk list` print its full record instead of a
 table row: every recorded fact, then each compose service as name, state, LAN address and
 exec address, and each published port as name, `listen->to` (with `@NAME` when a compose
@@ -629,7 +651,7 @@ no effect.
 vk list shop                 # one VM, in full
 vk list 41877                # one VM, by pid
 vk list -r ~/work            # every VM under a tree
-vk list --stopped            # what is not running
+vk list --stopped            # what could be started, or removed
 ```
 
 ```
@@ -935,7 +957,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk, or a Windows Dockerfile into a bundle. |
 | `vk exec` | Run a command in an existing guest and return the command's exit status. |
 | `vk list` | List every VM vk knows — running or stopped, dev environments, named runs and their compose services — one row each; `--running`/`--stopped`, `--kind`, `-w` for the full table, `--json`/`--field` for scripts. |
-| `vk stop` | Stop a running VM by the name `vk list` prints, its pid or project directory, or every one with `--all`. |
+| `vk start`, `vk stop`, `vk restart`, `vk delete`, `vk rename` | Start, stop, restart, delete or rename a VM by the name `vk list` prints (`NAME/SERVICE` for a service); `start`, `restart` and `delete` take several; `vk stop` also takes a pid or directory, or `--all`. |
 | `vk reboot` | Reboot a running VM in place through its guest, or power-cycle it with `--force`. |
 | `vk status` | Probe a guest agent, or report whether its root image is stale. |
 | `vk logs` | Show a VM's console log, telling kernel, agent and guest output apart; `--level warn`, `--agent`, `--service NAME`, `-f`. |

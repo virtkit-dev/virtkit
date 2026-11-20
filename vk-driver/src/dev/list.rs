@@ -493,7 +493,7 @@ pub fn preview(selected: &[Row]) -> String {
 
 /// Take a state directory's lock — the one a boot and a live run hold — for as long as the
 /// returned file lives. `None` when somebody else holds it, or when the directory is gone.
-pub(super) fn try_lock_state_dir(dir: &Path) -> Option<std::fs::File> {
+pub(crate) fn try_lock_state_dir(dir: &Path) -> Option<std::fs::File> {
     use std::os::fd::AsRawFd;
     let f = std::fs::File::open(dir).ok()?;
     // SAFETY: the fd is owned by `f`, which the caller keeps alive; LOCK_NB does not block.

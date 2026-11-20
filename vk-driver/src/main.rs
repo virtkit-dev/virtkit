@@ -62,6 +62,7 @@ mod iso9660;
 mod jobctx;
 mod jobevents;
 mod libkrun_sys;
+mod lifecycle;
 mod local;
 mod manager;
 mod mkoci;
@@ -1791,7 +1792,7 @@ enum Cmd {
     /// `--require-cached` miss exits 3. A `--shell` session exits 0 whatever its status.
     ///
     /// A run with `--name`, `--state-dir` or `--detach` is named and remembered: `vk list`
-    /// shows it after it stops.
+    /// shows it after it stops, and `vk start NAME` runs it again with the same arguments.
     #[command(display_order = 1, args_override_self = true)]
     Run {
         /// Image to boot, e.g. `alpine:3.20`
@@ -2382,10 +2383,10 @@ enum Cmd {
             help_heading = "Mounts and disks"
         )]
         state_dir: Option<PathBuf>,
-        /// name the VM, for `vk list`, `vk stop` and every other VM command
+        /// name the VM, for `vk list`, `vk start`, `vk stop` and `vk delete`
         ///
         /// Without `--state-dir`, the VM gets a state dir of its own under
-        /// `$XDG_STATE_HOME/virtkit/run`, kept after it stops.
+        /// `$XDG_STATE_HOME/virtkit/run`, kept after it stops so `vk start NAME` boots it again.
         /// A `--state-dir` or `--detach` run without a name gets one from what it boots;
         /// compose up, which boots no primary VM, takes none.
         #[arg(long, value_name = "NAME", help_heading = "Detach")]
@@ -2585,7 +2586,7 @@ enum Cmd {
     /// `--detach`, and each of their compose services, grouped by project — a dev
     /// environment's workspace, a run's project directory (`--workspace`, then `--workdir`,
     /// then launch directory) — the primary first, then its services by name. NAME is what
-    /// `vk stop` and every other VM command take (`NAME/SERVICE` for a
+    /// `vk start`, `vk stop`, `vk delete` and every other VM command take (`NAME/SERVICE` for a
     /// service; a running VM without a name shows its pid). MEM is what the VM's whole
     /// process tree holds on the host right now over the size it booted with (`1.2G/8G`) —
     /// the guest, its service VMs and their helpers, counted proportionally so pages they
@@ -2593,7 +2594,7 @@ enum Cmd {
     /// directory in full and the exec-channel address. With a REF, only the VMs it names; one
     /// that names exactly one running VM prints its full record instead of a table row. Use
     /// `--json` or `--field` for scripts.
-    #[command(display_order = 6)]
+    #[command(display_order = 6, visible_alias = "ls")]
     List {
         /// which VMs: a name, a pid, or those of a project directory (default: all)
         ///
@@ -2664,6 +2665,76 @@ enum Cmd {
         /// reporting an orderly shutdown as stuck.
         #[arg(long, default_value_t = 210, value_name = "SECS")]
         timeout: u64,
+    },
+    /// Start a VM vk knows, or one of its compose services
+    ///
+    /// A dev environment boots from its workspace's config (`vk dev up` there); a run from the
+    /// recipe it recorded (`run.json`: the same `vk run` arguments, in the same directory,
+    /// now in the background); a compose service starts in its VM, which starts first when
+    /// it is down. Starting what runs is a no-op.
+    #[command(display_order = 8)]
+    Start {
+        /// the VMs to start, as `vk list` names them (`NAME/SERVICE` for a service)
+        #[arg(value_name = "REF", required = true)]
+        targets: Vec<std::ffi::OsString>,
+    },
+    /// Stop a VM, then start it again
+    ///
+    /// `vk stop`, then `vk start`, on each REF in turn.
+    #[command(display_order = 8)]
+    Restart {
+        /// the VMs, as `vk list` names them (`NAME/SERVICE` for a service)
+        #[arg(value_name = "REF", required = true)]
+        targets: Vec<std::ffi::OsString>,
+        /// seconds to wait for each to go down
+        #[arg(long, default_value_t = 210, value_name = "SECS")]
+        timeout: u64,
+    },
+    /// Delete a stopped VM: its state, and its name
+    ///
+    /// A dev environment's state directory goes — storage, keys and all; a run's state
+    /// directory goes when vk made it, and only its recipe and name when it is a
+    /// `--state-dir` of yours; a compose service's `svc-<name>/` goes, so it starts afresh.
+    /// A running VM is refused unless `--force`. It lists what will go and asks first; with
+    /// no terminal to ask on it deletes nothing unless `--yes` or `--force`. If one REF
+    /// cannot be deleted, none is.
+    #[command(display_order = 8, visible_aliases = ["rm", "remove"])]
+    Delete {
+        /// the VMs to delete, as `vk list` names them (`NAME/SERVICE` for a service)
+        #[arg(value_name = "REF", required = true)]
+        targets: Vec<std::ffi::OsString>,
+        /// stop a running VM first; implies --yes
+        #[arg(short = 'f', long)]
+        force: bool,
+        /// delete without asking
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// list what would be deleted, and delete nothing
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+        /// seconds to wait for a VM `--force` stops
+        #[arg(long, default_value_t = 210, value_name = "SECS")]
+        timeout: u64,
+    },
+    /// Remove a dev environment's boot images or persistent data, keeping the environment
+    ///
+    /// What `vk dev prune NAME` does: boot images by default, `--storage` its persistent
+    /// roots, overlays, disks and managed directories, `--all` both. Stop it first.
+    #[command(display_order = 8)]
+    Reset {
+        /// the dev environment, as `vk list` names it
+        #[arg(value_name = "REF")]
+        target: std::ffi::OsString,
+        #[command(flatten)]
+        options: crate::dev::prune::Options,
+    },
+    /// Give a VM another name
+    #[command(display_order = 8)]
+    Rename {
+        /// its name now
+        old: String,
+        /// the name it takes: a-z, 0-9, `.`, `_`, `-`, at most 40, not all digits
+        new: String,
     },
     /// Reboot running vk VM(s) in place
     ///
@@ -3076,6 +3147,9 @@ impl Prepared {
     }
 }
 
+/// Set when `vk start` replays a run: the run keeps the recipe it was started from.
+pub const FROM_RECIPE_ENV: &str = "VIRTKIT_FROM_RECIPE";
+
 /// Name a `vk run` that is remembered — one with `--name`, `--state-dir` or `--detach` — and
 /// give it a state dir when it has none. Its recipe (`run.json`) is set aside for the run to
 /// write once it holds that dir. A foreground run with neither stays nameless, in a
@@ -3102,7 +3176,8 @@ fn prepare_run_name(cmd: &mut Cmd) -> anyhow::Result<Prepared> {
         if compose.is_none() {
             return Ok(Prepared::default());
         }
-        // Compose up registers nothing: a name would list it stopped while it runs.
+        // Compose up registers nothing: a name would list it stopped while it runs, and
+        // `vk start` would boot a second fleet beside it.
         if let Some(n) = name {
             anyhow::bail!(
                 "--name {n}: compose up (no image, -f or --primary) boots no VM to name; \
@@ -3138,7 +3213,10 @@ fn prepare_run_name(cmd: &mut Cmd) -> anyhow::Result<Prepared> {
         (Some(n), None) => {
             crate::names::validate(n)?;
             if let Some(taken) = idx.lookup(n) {
-                anyhow::bail!("the name {n} is taken by {}", taken.display());
+                anyhow::bail!(
+                    "the name {n} is taken by {} — `vk start {n}`, or `vk delete {n}` first",
+                    taken.display()
+                );
             }
             let d = new_run_dir(n)?;
             if let Err(e) = idx.claim_exact(&d, n) {
@@ -3164,7 +3242,9 @@ fn prepare_run_name(cmd: &mut Cmd) -> anyhow::Result<Prepared> {
     *state_dir = Some(dir.clone());
     // The run writes it once the dir is its own (`run::WorkDir::pinned`): one that is
     // refused the dir must not rewrite the recipe of the run that holds it.
-    crate::names::set_pending_recipe(&dir, recipe);
+    if std::env::var_os(FROM_RECIPE_ENV).is_none() {
+        crate::names::set_pending_recipe(&dir, recipe);
+    }
     made.dir = Some(dir);
     Ok(made)
 }
@@ -3793,6 +3873,48 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Ok(report) => write_report(&report),
             Err(e) => fail(&e, 2),
         };
+    }
+    match &cli.cmd {
+        Cmd::Start { targets } => {
+            return lifecycle::run(lifecycle::Verb::Start, targets, 210);
+        }
+        Cmd::Restart { targets, timeout } => return lifecycle::restart(targets, *timeout),
+        Cmd::Delete {
+            targets,
+            force,
+            yes,
+            dry_run,
+            timeout,
+        } => return lifecycle::delete(targets, *force, *yes, *dry_run, *timeout),
+        Cmd::Reset { target, options } => {
+            return match lifecycle::reset(target, options) {
+                Ok(report) => write_report(&report),
+                Err(e) => fail(&e, 1),
+            };
+        }
+        Cmd::Rename { old, new } => {
+            return match lifecycle::rename(old, new) {
+                Ok(report) => write_report(&report),
+                Err(e) => fail(&e, 1),
+            };
+        }
+        // A name — a VM's or a service's — stops through its kind: `vk dev stop` for a dev
+        // environment, its service manager for a service.
+        Cmd::Stop {
+            target: Some(target),
+            timeout,
+            ..
+        } if vms::names_a_vm(target)
+            || (matches!(vms::Ref::parse(target), Ok(vms::Ref::Name { .. }))
+                && !Path::new(target).is_dir()) =>
+        {
+            return lifecycle::run(
+                lifecycle::Verb::Stop,
+                std::slice::from_ref(target),
+                *timeout,
+            );
+        }
+        _ => {}
     }
     if let Cmd::Stop {
         target,
@@ -5726,6 +5848,11 @@ async fn cli_main(cli: Cli) -> ExitCode {
         | Cmd::DockerHash { .. }
         | Cmd::Fingerprint { .. }
         | Cmd::List { .. }
+        | Cmd::Start { .. }
+        | Cmd::Restart { .. }
+        | Cmd::Delete { .. }
+        | Cmd::Reset { .. }
+        | Cmd::Rename { .. }
         | Cmd::Stop { .. }
         | Cmd::Reboot { .. }
         | Cmd::Pause { .. }
@@ -8184,6 +8311,7 @@ mod tests {
                 "check",
                 "console",
                 "cp",
+                "delete",
                 "dev",
                 "exec",
                 "export",
@@ -8193,11 +8321,15 @@ mod tests {
                 "pause",
                 "publish",
                 "reboot",
+                "rename",
+                "reset",
+                "restart",
                 "resume",
                 "run",
                 "snapshot",
                 "ssh",
                 "ssh-config",
+                "start",
                 "status",
                 "stop",
                 "toolchain",

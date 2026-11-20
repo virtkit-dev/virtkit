@@ -237,10 +237,16 @@ impl Index {
             if target == canonical || target == dir {
                 return Ok(());
             }
-            bail!("the name {name} is taken by {}", target.display());
+            bail!(
+                "the name {name} is taken by {} — `vk start {name}`, or `vk delete {name}` first",
+                target.display()
+            );
         }
         if let Some(other) = self.name_of(dir) {
-            bail!("{} is already named {other}", dir.display());
+            bail!(
+                "{} is already named {other} — `vk rename {other} {name}`",
+                dir.display()
+            );
         }
         if !self.link(name, dir)? {
             bail!("the name {name} was just taken");
@@ -258,6 +264,24 @@ impl Index {
         }
     }
 
+    /// Rename `old` to `new`.
+    pub fn rename(&self, old: &str, new: &str) -> Result<()> {
+        validate(new)?;
+        let _lock = self.lock()?;
+        let Some(dir) = self.lookup(old) else {
+            bail!("no VM is named {old}");
+        };
+        if old == new {
+            return Ok(());
+        }
+        if !self.link(new, &dir)? {
+            bail!("the name {new} is taken");
+        }
+        std::fs::remove_file(self.dir.join(old))
+            .with_context(|| format!("removing the name {old}"))?;
+        Ok(())
+    }
+
     /// Forget every name of `dir`.
     pub fn release(&self, dir: &Path) {
         let canonical = crate::vms::canonical(dir);
@@ -265,6 +289,13 @@ impl Index {
             if target == dir || target == canonical {
                 let _ = std::fs::remove_file(self.dir.join(name));
             }
+        }
+    }
+
+    /// Forget `name`, whatever it points to.
+    pub fn remove(&self, name: &str) {
+        if validate(name).is_ok() {
+            let _ = std::fs::remove_file(self.dir.join(name));
         }
     }
 }
@@ -294,8 +325,8 @@ pub fn write_pending_recipe(dir: &Path) -> Result<()> {
     }
 }
 
-/// How a remembered `vk run` was launched: its command line, where, and the project it is
-/// about. Kept as `run.json` in the state dir.
+/// What `vk start` replays to run a stopped `vk run` again: the command line it was
+/// launched with, where, and the project it is about. Kept as `run.json` in the state dir.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Recipe {
     /// `vk`'s arguments, the program name left out
@@ -343,6 +374,28 @@ impl Recipe {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
+    }
+
+    /// The arguments that run it again in the background as `name`, in `dir`: the recorded
+    /// ones with `--detach --state-dir DIR --name NAME` put before the guest command's `--`,
+    /// where they override any the recording holds (`vk run` takes the last of each).
+    pub fn replay_args(&self, dir: &Path, name: &str) -> Vec<String> {
+        let ours = [
+            "--detach".to_string(),
+            "--state-dir".to_string(),
+            dir.to_string_lossy().into_owned(),
+            "--name".to_string(),
+            name.to_string(),
+        ];
+        let mut args = self.args.clone();
+        let run = args.iter().position(|a| a == "run").unwrap_or(0);
+        let at = args
+            .iter()
+            .skip(run)
+            .position(|a| a == "--")
+            .map_or(args.len(), |i| run + i);
+        args.splice(at..at, ours);
+        args
     }
 }
 
@@ -438,8 +491,8 @@ mod tests {
     }
 
     #[test]
-    fn release_forgets_the_names_of_a_dir() {
-        let t = tmp("release");
+    fn rename_moves_the_link_and_release_forgets_it() {
+        let t = tmp("rename");
         let idx = Index::at(t.0.join("names"));
         let (a, b) = (t.0.join("a"), t.0.join("b"));
         for d in [&a, &b] {
@@ -447,6 +500,11 @@ mod tests {
         }
         idx.claim(&a, "one").unwrap();
         idx.claim(&b, "two").unwrap();
+        assert!(idx.rename("one", "two").is_err());
+        assert!(idx.rename("nope", "three").is_err());
+        idx.rename("one", "uno").unwrap();
+        assert_eq!(idx.lookup("one"), None);
+        assert_eq!(idx.lookup("uno").unwrap(), a);
         idx.release(&a);
         assert_eq!(idx.name_of(&a), None);
         assert_eq!(idx.lookup("two").unwrap(), b);
@@ -471,6 +529,27 @@ mod tests {
     }
 
     #[test]
+    fn a_replay_puts_its_flags_before_the_guest_command() {
+        let recipe = |args: &[&str]| Recipe {
+            args: args.iter().map(|a| a.to_string()).collect(),
+            cwd: "/w".into(),
+            project_dir: "/w".into(),
+        };
+        let dir = Path::new("/s/x");
+        let ours = ["--detach", "--state-dir", "/s/x", "--name", "x"];
+        let got = recipe(&["--config", "c", "run", "alpine", "--", "sh", "-c", "--"])
+            .replay_args(dir, "x");
+        let mut want = vec!["--config", "c", "run", "alpine"];
+        want.extend(ours);
+        want.extend(["--", "sh", "-c", "--"]);
+        assert_eq!(got, want);
+        let got = recipe(&["run", "alpine"]).replay_args(dir, "x");
+        let mut want = vec!["run", "alpine"];
+        want.extend(ours);
+        assert_eq!(got, want);
+    }
+
+    #[test]
     fn a_recipe_reads_back_what_was_written() {
         let t = tmp("recipe");
         assert_eq!(Recipe::read(&t.0).unwrap(), None);
@@ -484,11 +563,13 @@ mod tests {
     }
 
     #[test]
-    fn a_dangling_link_still_reads_back() {
+    fn a_dangling_link_still_reads_back_and_can_be_removed() {
         let t = tmp("dangling");
         let idx = Index::at(t.0.join("names"));
         let gone = t.0.join("gone");
         idx.claim(&gone, "ghost").unwrap();
         assert_eq!(idx.lookup("ghost").unwrap(), gone);
+        idx.remove("ghost");
+        assert!(idx.all().is_empty());
     }
 }

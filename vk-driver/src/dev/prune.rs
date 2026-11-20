@@ -14,7 +14,7 @@ use clap::Args;
 use super::plan::Plan;
 
 #[derive(Args, Default)]
-pub(super) struct Options {
+pub(crate) struct Options {
     /// remove local boot images and disposable boot media (the default selection)
     #[arg(long)]
     images: bool,
@@ -415,7 +415,7 @@ pub(super) fn run(plan: &Plan, opts: &Options) -> Result<String> {
 
 /// `vk dev prune NAME`: prune host-wide without a config, using the state-directory
 /// name shared by `vk dev list` and `vk dev gc`.
-pub(super) fn run_by_name(name: &str, opts: &Options) -> Result<String> {
+pub(crate) fn run_by_name(name: &str, opts: &Options) -> Result<String> {
     // Resolve against the same host-wide listing `vk dev list` shows, so an unknown name
     // fails here the way it does there.
     let Some(row) = super::list::state(false)?
