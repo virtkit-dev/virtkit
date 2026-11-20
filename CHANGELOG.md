@@ -10,6 +10,9 @@ All notable changes to virtkit will be documented in this file.
   name. Runs with `--state-dir` or `--detach` get a name from what they boot.
   Services-only compose runs stay unnamed. `vk stop`, `vk dev stop`, `gc`, `prune` and the
   other VM commands take a name.
+- `vk start NAME` and `vk restart NAME` boot a dev environment from its workspace or
+  replay a saved run in the background. Use `NAME/SERVICE` to start, stop or restart one
+  compose service. `vk dev service down` accepts `--timeout`.
 
 ### Changed
 

@@ -62,6 +62,7 @@ mod iso9660;
 mod jobctx;
 mod jobevents;
 mod libkrun_sys;
+mod lifecycle;
 mod local;
 mod manager;
 mod mkoci;
@@ -1800,7 +1801,8 @@ enum Cmd {
     /// `--require-cached` miss exits 3. A `--shell` session exits 0 whatever its status.
     ///
     /// `--name`, `--state-dir` or `--detach` gives the primary a name that `vk list` keeps
-    /// after it stops. A services-only compose run has no primary to name.
+    /// after shutdown. `vk start NAME` replays its saved command in the background unless the
+    /// run used `-t` or `--shell`. Services-only compose runs have no primary to name.
     #[command(display_order = 1)]
     Run {
         /// Image to boot, e.g. `alpine:3.20`
@@ -2395,10 +2397,10 @@ enum Cmd {
         state_dir: Option<PathBuf>,
         /// name the VM, a handle it keeps after it stops and `vk list` shows
         ///
-        /// 1 to 40 of a-z, 0-9, `.`, `_` and `-`, starting with a letter or a digit, and not
-        /// all digits (that reads as a pid). Without `--state-dir`, the VM gets a state dir of its own under
-        /// `$XDG_STATE_HOME/virtkit/run`, kept after it stops.
-        /// A `--state-dir` or `--detach` run without a name gets one from what it boots;
+        /// Use 1 to 40 characters from a-z, 0-9, `.`, `_` and `-`, starting with a letter or
+        /// digit. An all-digit name is reserved for pids. Without `--state-dir`, the VM keeps its
+        /// state under `$XDG_STATE_HOME/virtkit/run` after shutdown. A `--state-dir` or `--detach`
+        /// run without an explicit name gets one from what it boots;
         /// compose up, which boots no primary VM, takes none. A named run keeps its whole
         /// command line, `--password` included, in `run.json` in its state dir, readable by
         /// its owner alone. The last `--name`, `--state-dir` and `--detach` given win, so a
@@ -2612,9 +2614,10 @@ enum Cmd {
     /// environments, named runs and running UEFI bundles. A dev environment's project is its
     /// workspace. A run uses `--workspace`, then `--workdir`, then its launch directory.
     ///
-    /// Use NAME with commands such as `vk stop`. A dev environment without a stable name uses
-    /// its state directory's name. Other unnamed running VMs use their pid. `vk list`, `exec`,
-    /// `cp`, `logs`, `status` and `publish` also accept `NAME/SERVICE`.
+    /// Use NAME with commands such as `vk start` and `vk stop`. A dev environment without a
+    /// stable name uses its state directory's name. Other unnamed running VMs use their pid.
+    /// `vk list`, `start`, `stop`, `restart`, `exec`, `cp`, `logs`, `status` and `publish`
+    /// also accept `NAME/SERVICE`.
     ///
     /// On a running primary, MEM shows host memory used by its process tree over the recorded
     /// boot size (`1.2G/8G`). The tree includes its service VMs and helpers. Proportional
@@ -2671,18 +2674,19 @@ enum Cmd {
         #[arg(long)]
         stale: bool,
     },
-    /// Stop running vk VM(s)
+    /// Stop running VMs or a compose service
     ///
-    /// SIGTERMs the managing `vk run` (which tears down the VM and any compose siblings),
-    /// then waits for it to exit. Selects the VM whose project is the current directory by
-    /// default; pass a name, a pid or a project directory to select one, or `--all`.
+    /// For a running VM, send SIGTERM to its `vk run` process and wait for it to exit. This
+    /// also stops its compose siblings. Use `NAME/SERVICE` to stop one service through its
+    /// manager. The current project is the default. Use `--all` to stop every running VM.
     #[command(display_order = 8)]
     Stop {
-        /// the VM to stop: a name, a pid or a directory (default: the current one's)
+        /// VM or service to stop (default: the current project)
         ///
-        /// A VM's name as `vk list` prints it; an all-digit argument is a pid; a path (`/…`,
-        /// `./…`, `../…`, `~…`) a project or state directory, matched exactly unless
-        /// `--recursive`.
+        /// Select a VM by name or pid, or a service by `NAME/SERVICE` or `PID/SERVICE`. A path
+        /// (absolute or starting with `./`, `../` or `~`) selects a project or state directory.
+        /// Directories match exactly unless `--recursive`. Stopping a named VM also stops its
+        /// published endpoints. An explicit reference to a stopped VM exits 1.
         #[arg(value_name = "REF")]
         target: Option<std::ffi::OsString>,
         /// with a directory (default: the current one), also every VM whose project is below it
@@ -2691,11 +2695,41 @@ enum Cmd {
         /// stop every running vk VM
         #[arg(long, conflicts_with = "target")]
         all: bool,
-        /// seconds to wait for each VM to go down before reporting it stuck
+        /// seconds to wait for VM shutdown or for each socket operation during a service stop
         ///
         /// A run allows a Linux guest one minute to power off and a Windows guest three, then 10
         /// seconds to save its disks; the default leaves time for either run to exit without
         /// reporting an orderly shutdown as stuck.
+        #[arg(long, default_value_t = 210, value_name = "SECS")]
+        timeout: u64,
+    },
+    /// Start a VM vk knows, or one of its compose services
+    ///
+    /// Start a dev environment with its recorded workspace, environment and config. Replay a
+    /// run's `run.json` in its original directory with `--detach`. Runs recorded with `-t` or
+    /// `--shell` need a terminal. Start those with `vk run`. Starting a running primary is a
+    /// no-op. Starting a service boots its primary if needed.
+    #[command(display_order = 8)]
+    Start {
+        /// one or more VMs or compose services
+        ///
+        /// Select a VM by name, pid or directory, or a service by `NAME/SERVICE` or `PID/SERVICE`.
+        #[arg(value_name = "REF", required = true)]
+        targets: Vec<std::ffi::OsString>,
+    },
+    /// Restart a VM or a compose service
+    ///
+    /// Resolve each REF once, in order. Before stopping a primary, check its dev workspace
+    /// and recorded config, or its run recipe, working directory and recorded `--config`.
+    /// Start a stopped primary directly. Restarting a service leaves a running primary up.
+    #[command(display_order = 8)]
+    Restart {
+        /// one or more VMs or compose services
+        ///
+        /// Select a VM by name, pid or directory, or a service by `NAME/SERVICE` or `PID/SERVICE`.
+        #[arg(value_name = "REF", required = true)]
+        targets: Vec<std::ffi::OsString>,
+        /// seconds to wait for VM shutdown or for each socket operation during a service stop
         #[arg(long, default_value_t = 210, value_name = "SECS")]
         timeout: u64,
     },
@@ -3040,6 +3074,11 @@ fn main() -> ExitCode {
     // property of the command, and clap answers `--help`/`--version` by printing and
     // exiting — so neither is ever forked and printed twice.
     let mut cli = Cli::parse();
+    // Read once, and cleared while this is the only thread: a run's host commands inherit
+    // its environment, and a `vk run` among them is no replay.
+    let from_recipe = std::env::var_os(FROM_RECIPE_ENV).is_some();
+    // SAFETY: no other thread exists yet to read the environment meanwhile.
+    unsafe { std::env::remove_var(FROM_RECIPE_ENV) };
     // Before the fork, so the detaching parent is quiet too.
     if let Cmd::Run { quiet: true, .. } = &cli.cmd {
         quiet::set();
@@ -3048,7 +3087,7 @@ fn main() -> ExitCode {
     // A named or detached run gets its name and state dir now, before the fork, so the
     // parent and the daemon agree on them and a failure is reported in the foreground: an
     // invalid or taken name as a usage error, a failure to record it as a run failure.
-    let prepared = match prepare_run_name(&mut cli.cmd) {
+    let prepared = match prepare_run_name(&mut cli.cmd, from_recipe) {
         Ok(p) => p,
         Err(e) if e.downcast_ref::<names::Refused>().is_some() => return fail(&e, 2),
         Err(e) => return fail(&e, 1),
@@ -3116,17 +3155,24 @@ impl Prepared {
     }
 }
 
+/// Set when `vk start` replays a run: the run keeps the recipe it was started from.
+pub const FROM_RECIPE_ENV: &str = "VIRTKIT_FROM_RECIPE";
+
 /// Prepare a primary VM's state directory and provisional name for `--name`,
 /// `--state-dir` or `--detach`. Allocate a directory if needed and lock it before the
-/// claim until the run ends. [`names::Remembered::publish`] commits the name and writes
-/// `run.json` at readiness. [`Prepared::settle`] handles an unsuccessful boot.
-fn prepare_run_name(cmd: &mut Cmd) -> anyhow::Result<Prepared> {
-    prepare_run_name_in(cmd, || Ok((names::Index::open()?, names::run_base()?)))
+/// claim until the run ends. [`names::Remembered::publish`] commits the name at readiness.
+/// Runs replayed through [`FROM_RECIPE_ENV`] keep their original `run.json`. Other runs
+/// write their recipe. [`Prepared::settle`] handles an unsuccessful boot.
+fn prepare_run_name(cmd: &mut Cmd, from_recipe: bool) -> anyhow::Result<Prepared> {
+    prepare_run_name_in(cmd, from_recipe, || {
+        Ok((names::Index::open()?, names::run_base()?))
+    })
 }
 
 /// [`prepare_run_name`] with the name index and the run base `places()` returns.
 fn prepare_run_name_in(
     cmd: &mut Cmd,
+    from_recipe: bool,
     places: impl FnOnce() -> anyhow::Result<(names::Index, PathBuf)>,
 ) -> anyhow::Result<Prepared> {
     let Cmd::Run {
@@ -3209,6 +3255,8 @@ fn prepare_run_name_in(
     };
     *name = Some(given.clone());
     *state_dir = Some(dir.clone());
+    // Preserve the original recipe. The replay command line includes flags added by `vk start`.
+    let recipe = (!from_recipe).then_some(recipe);
     let r = std::sync::Arc::new(names::Remembered::new(dir, lock, idx, given, recipe));
     *remembered = Some(r.clone());
     Ok(Prepared {
@@ -3875,16 +3923,20 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Err(e) => fail(&e, 2),
         };
     }
-    if let Cmd::Stop {
-        target,
-        recursive,
-        all,
+    let opts = |timeout| lifecycle::Opts {
+        config: cli.config.as_deref(),
         timeout,
-    } = &cli.cmd
-    {
-        return act_on_vms(target.as_deref(), *recursive, |sel| {
-            vms::stop_cmd(sel, *all, *timeout)
-        });
+    };
+    match &cli.cmd {
+        Cmd::Start { targets } => return lifecycle::start(targets, opts(210)),
+        Cmd::Restart { targets, timeout } => return lifecycle::restart(targets, opts(*timeout)),
+        Cmd::Stop {
+            target,
+            recursive,
+            all,
+            timeout,
+        } => return stop_ref(target.as_deref(), *recursive, *all, opts(*timeout)),
+        _ => {}
     }
     if let Cmd::Reboot {
         target,
@@ -5835,6 +5887,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
         | Cmd::DockerHash { .. }
         | Cmd::Fingerprint { .. }
         | Cmd::List { .. }
+        | Cmd::Start { .. }
+        | Cmd::Restart { .. }
         | Cmd::Stop { .. }
         | Cmd::Reboot { .. }
         | Cmd::Pause { .. }
@@ -6108,7 +6162,37 @@ fn act_on_vms(
             return exit_code(2);
         }
     };
-    match run(selector) {
+    report_vms(run(selector))
+}
+
+/// `vk stop [REF]`. The REF is read once: a name — a VM's or a service's — stops through
+/// its kind, and anything else as [`vms::stop_cmd`] selects it. An explicit REF that names
+/// nothing running exits 1, however it is spelled.
+fn stop_ref(
+    target: Option<&std::ffi::OsStr>,
+    recursive: bool,
+    all: bool,
+    opts: lifecycle::Opts,
+) -> ExitCode {
+    let read =
+        target.map(|t| vms::Ref::parse(t).and_then(|r| vms::Selector::from_ref(r, recursive)));
+    let selector = match read.transpose() {
+        Ok(Some((sel @ vms::Selector::Named { .. }, service)))
+        | Ok(Some((sel, service @ Some(_)))) => return lifecycle::stop(sel, service, opts),
+        Ok(Some((sel, None))) => Some(sel),
+        Ok(None) if recursive => Some(vms::Selector::Here { below: true }),
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("vk: {e:#}");
+            return exit_code(2);
+        }
+    };
+    report_vms(vms::stop_cmd(selector, all, opts.timeout))
+}
+
+/// Print what [`act_on_vms`]'s action reports; exit 1 unless it did it to every VM.
+fn report_vms(result: anyhow::Result<(String, bool)>) -> ExitCode {
+    match result {
         Ok((report, all_ok)) => match write_report(&report) {
             ExitCode::SUCCESS if !all_ok => exit_code(1),
             code => code,
@@ -8407,6 +8491,23 @@ mod tests {
         std::fs::remove_dir_all(&run).unwrap();
     }
 
+    /// An explicit `vk stop` of a VM that is not running exits 1, by its name as by its
+    /// state dir.
+    #[test]
+    fn stopping_a_stopped_vm_exits_1_however_it_is_named() {
+        let homes = crate::dev::testutil::Homes::new("stop-stopped");
+        let dir = homes.dir().join("state");
+        std::fs::create_dir_all(&dir).unwrap();
+        homes.name(&dir, "app");
+        let opts = lifecycle::Opts {
+            config: None,
+            timeout: 1,
+        };
+        for r in [std::ffi::OsStr::new("app"), dir.as_os_str()] {
+            assert_eq!(stop_ref(Some(r), false, false, opts), exit_code(1), "{r:?}");
+        }
+    }
+
     // `-r` with no REF means the current directory and every one below it, through the
     // same dispatch `vk stop`, `reboot`, `pause` and `resume` take.
     #[test]
@@ -8518,11 +8619,13 @@ mod tests {
                 "pause",
                 "publish",
                 "reboot",
+                "restart",
                 "resume",
                 "run",
                 "snapshot",
                 "ssh",
                 "ssh-config",
+                "start",
                 "status",
                 "stop",
                 "toolchain",
@@ -8555,7 +8658,7 @@ mod tests {
     #[test]
     fn a_run_with_nothing_to_boot_claims_no_name() {
         let mut cli = Cli::try_parse_from(["vk", "run", "--name", "nothing-to-boot"]).unwrap();
-        let made = prepare_run_name(&mut cli.cmd).unwrap();
+        let made = prepare_run_name(&mut cli.cmd, false).unwrap();
         assert!(made.remembered.is_none() && !made.name_made && !made.dir_made);
         let Cmd::Run { state_dir, .. } = cli.cmd else {
             panic!("not a run");
@@ -8568,7 +8671,7 @@ mod tests {
     fn compose_up_is_never_named() {
         let cmd = |args: &[&str]| {
             let mut cli = Cli::try_parse_from(["vk", "run"].iter().chain(args)).unwrap();
-            prepare_run_name(&mut cli.cmd).map(|_| cli.cmd)
+            prepare_run_name(&mut cli.cmd, false).map(|_| cli.cmd)
         };
         let Cmd::Run {
             name, state_dir, ..
@@ -8640,7 +8743,7 @@ mod tests {
     fn prepare(b: &Base, args: &[&str]) -> anyhow::Result<(Prepared, Cmd)> {
         let mut cli = Cli::try_parse_from(["vk", "run"].iter().chain(args)).unwrap();
         let places = (names::Index::at(b.0.join("names")), b.0.join("run"));
-        let made = prepare_run_name_in(&mut cli.cmd, || Ok(places))?;
+        let made = prepare_run_name_in(&mut cli.cmd, false, || Ok(places))?;
         Ok((made, cli.cmd))
     }
 

@@ -425,16 +425,16 @@ impl Index {
     }
 }
 
-/// A remembered `vk run` while it starts: its state dir, whose lock it holds from before its
-/// name was claimed until the run ends, so no other run shares the dir meanwhile; and what
-/// it publishes once its VM is first ready — the name, committed, and its recipe.
+/// Hold the state directory lock from before the name claim until the run exits. At
+/// readiness, commit the name and save the recipe for a new run.
 #[derive(Debug)]
 pub struct Remembered {
     dir: PathBuf,
     lock: std::fs::File,
     index: Index,
     name: String,
-    recipe: Recipe,
+    /// `None` for a run `vk start` replays, which keeps the recipe it was replayed from
+    recipe: Option<Recipe>,
     up: std::sync::atomic::AtomicBool,
 }
 
@@ -447,7 +447,7 @@ impl Remembered {
         lock: std::fs::File,
         index: Index,
         name: String,
-        recipe: Recipe,
+        recipe: Option<Recipe>,
     ) -> Remembered {
         Remembered {
             dir,
@@ -479,13 +479,15 @@ impl Remembered {
         self.lock.try_clone()
     }
 
-    /// Called as the run's VM is first ready: commit its name and write the recipe. Only a
-    /// run whose VM came up writes one, so a run that failed to boot never replaces the
-    /// recipe of one that worked.
+    /// Commit the name at readiness. Replays keep the original recipe, and a failed boot
+    /// never replaces a working recipe.
     pub fn publish(&self) -> Result<()> {
         self.up.store(true, std::sync::atomic::Ordering::Relaxed);
         self.index.commit(&self.name)?;
-        self.recipe.write(&self.dir)
+        match &self.recipe {
+            Some(recipe) => recipe.write(&self.dir),
+            None => Ok(()),
+        }
     }
 
     /// Whether the run's VM came up ([`Remembered::publish`]).
@@ -494,9 +496,8 @@ impl Remembered {
     }
 }
 
-/// How a remembered `vk run` was launched: its command line, where, and the project it is
-/// about. Kept as `run.json` in the state dir. Each is kept byte for byte: a string when it
-/// is UTF-8, else `{"bytes": [...]}`.
+/// `run.json` records the arguments, working directory and project of a remembered run.
+/// UTF-8 values are strings. Other values use `{"bytes": [...]}` to preserve their bytes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Recipe {
     /// `vk`'s arguments, the program name left out
@@ -644,6 +645,23 @@ impl Recipe {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
+    }
+
+    /// Insert `--detach --state-dir DIR --name NAME` before the guest command's `--`.
+    /// The last value of each option overrides any value in the saved arguments.
+    pub fn replay_args(&self, dir: &Path, name: &str) -> Vec<OsString> {
+        let ours = [
+            OsString::from("--detach"),
+            "--state-dir".into(),
+            dir.as_os_str().to_owned(),
+            "--name".into(),
+            name.into(),
+        ];
+        let mut args = self.args.clone();
+        // `vk run` takes its guest command only after `--`, and every `vk` option before it.
+        let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+        args.splice(at..at, ours);
+        args
     }
 }
 
@@ -836,6 +854,44 @@ mod tests {
         let back: Recipe = serde_json::from_str(&json).unwrap();
         assert_eq!(back, recipe);
         assert_eq!(back.args[2], odd);
+    }
+
+    #[test]
+    fn a_replay_puts_its_flags_before_the_guest_command() {
+        use std::os::unix::ffi::OsStrExt;
+        let recipe = |args: &[&OsStr]| Recipe {
+            args: args.iter().map(|a| a.to_os_string()).collect(),
+            cwd: "/w".into(),
+            project_dir: "/w".into(),
+        };
+        fn os<'a>(args: &[&'a str]) -> Vec<&'a OsStr> {
+            args.iter().map(|a| OsStr::new(*a)).collect()
+        }
+        // Neither the state dir nor an argument needs to be UTF-8.
+        let raw = OsStr::from_bytes(b"/s/\xff");
+        let dir = Path::new(raw);
+        let mut ours = os(&["--detach", "--state-dir"]);
+        ours.push(raw);
+        ours.extend(os(&["--name", "x"]));
+        let mut args = os(&["--config", "c", "run", "alpine", "--", "sh", "-c"]);
+        args.extend([raw, OsStr::new("--")]);
+        let got = recipe(&args).replay_args(dir, "x");
+        let mut want = os(&["--config", "c", "run", "alpine"]);
+        want.extend(&ours);
+        want.extend(os(&["--", "sh", "-c"]));
+        want.extend([raw, OsStr::new("--")]);
+        assert_eq!(got, want);
+        let got = recipe(&os(&["run", "alpine"])).replay_args(dir, "x");
+        let mut want = os(&["run", "alpine"]);
+        want.extend(&ours);
+        assert_eq!(got, want);
+        // A global option's value spelled `run` is not the subcommand.
+        let got =
+            recipe(&os(&["--config", "run", "run", "alpine", "--", "sh"])).replay_args(dir, "x");
+        let mut want = os(&["--config", "run", "run", "alpine"]);
+        want.extend(&ours);
+        want.extend(os(&["--", "sh"]));
+        assert_eq!(got, want);
     }
 
     #[test]

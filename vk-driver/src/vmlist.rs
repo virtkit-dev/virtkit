@@ -127,6 +127,7 @@ fn booted(svc_dir: &Path) -> bool {
 /// Build the rows using the supplied service boot check. A service qualifies when its
 /// manager reports a state other than `stopped` or a console log records an earlier start.
 /// A declaration alone, including a profiled-out or on-demand service, is insufficient.
+/// `vk start VM/SERVICE` still starts a service without a row.
 pub fn rows_with(
     live: &[Live],
     known: &[Known],

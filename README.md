@@ -575,9 +575,10 @@ Of these runs, only UEFI bundle VMs appear in `vk list` while running.
 Services-only compose runs (`--compose` without an image, `-f` or `--primary`) have no
 primary VM to name. A named run without `--state-dir` gets a directory under
 `$XDG_STATE_HOME/virtkit/run`. Once its VM is ready, `vk` saves its arguments in the state
-directory as `run.json`, readable only by its owner. `vk gc` removes a `-f` run's root image
-after `[gc] run_image_idle_days` days of inactivity (14 by default). The next `-f` run in
-that directory rebuilds it.
+directory as `run.json`, readable only by its owner. `vk start NAME` replays the saved run
+in the background unless it used `-t` or `--shell`. `vk gc` removes a `-f` run's root
+image after `[gc] run_image_idle_days` days of inactivity (14 by default). The next `-f`
+run in that directory rebuilds it.
 
 `vk` manages the whole `$XDG_STATE_HOME/virtkit/run` directory. If a run dies before its
 name is committed, a later name claim may remove its empty state directory directly under
@@ -600,12 +601,13 @@ scratch     run      stopped  -      -       -         alpine              ~/tmp
 `vk list` groups rows by PROJECT. Each primary is followed by its compose services in name
 order. A service gets a row when its manager reports it active or its console log records
 an earlier start. A dev environment's project is its workspace. A run uses `--workspace`,
-then `--workdir`, then its launch directory. A stopped VM stays listed if it has no saved
+then `--workdir`, then its launch directory. A declared service that never started has no
+row; `vk start VM/SERVICE` still starts it. A stopped VM stays listed if it has no saved
 registration. Its image and service list come from that registration when available.
 
 Use the primary's NAME to select the VM. A dev environment without a stable name uses its
-state directory's name. An unnamed running `vk run` uses its pid. `vk list`, `exec`, `cp`,
-`logs`, `status` and `publish` also accept `NAME/SERVICE`.
+state directory's name. An unnamed running `vk run` uses its pid. `vk list`, `start`, `stop`,
+`restart`, `exec`, `cp`, `logs`, `status` and `publish` also accept `NAME/SERVICE`.
 
 `--running` selects rows with status `running`. `--stopped` selects `stopped` and
 `never booted` (a dev state directory with no recorded boot). A service with no reported
@@ -627,13 +629,32 @@ the full project path and adds EXEC ADDRESS. It cannot be combined with `--json`
 
 | REF | Means |
 |---|---|
-| `app`, `shop/db`, `41877/db` | a VM name as `vk list` prints it, or a compose service selected by `NAME/SERVICE` or `PID/SERVICE` with `list`, `exec`, `cp`, `logs`, `status` or `publish` |
+| `app`, `shop/db`, `41877/db` | a VM name as `vk list` prints it, or a compose service selected by `NAME/SERVICE` or `PID/SERVICE` with `list`, `start`, `stop`, `restart`, `exec`, `cp`, `logs`, `status` or `publish` |
 | `41877` | the pid of a running VM's `vk run`. `vk atop` looks up the recorded job only if no running VM matches a directory named `41877`. |
 | `.`, `./x`, `../x`, `/abs`, `~/x` | a project or state directory, matched exactly. `list`, `stop`, `reboot`, `pause` and `resume` also match projects below it with `--recursive` (`-r`). |
 | (none) | the current directory where the command accepts a default target. `-r` includes projects below it. `vk list` alone lists every VM `vk` knows. |
 
 A bare word is a name: write `./app` for a directory called `app`. A dev environment's state
 dir name (`app-3f9c0d1e2a4b5c6d`) still works.
+
+```sh
+vk start app                  # a stopped run again, from its run.json
+vk start shop/redis           # a compose service, starting its VM first if needed
+vk stop shop                  # that VM alone, and what it publishes
+vk stop shop/redis            # one compose service
+vk restart app
+```
+
+`vk start` uses `vk dev up` with the recorded workspace, environment and config. For a run,
+it replays `run.json` in the original working directory with `--detach`. Runs recorded with
+`-t` or `--shell` need a terminal. Start those with `vk run`.
+
+`vk start NAME/SERVICE` boots the primary VM if needed, then prints its service manager's
+reply. `vk stop NAME/SERVICE` stops one service. `vk stop NAME` stops the named VM and its
+published endpoints. An explicit reference to a stopped VM exits 1 with `vk stop`.
+`vk restart` resolves each reference once. Before stopping a primary, it checks the dev
+workspace and recorded config, or the run recipe, working directory and any recorded
+`--config`. If the primary is already down, `vk restart` starts it.
 
 Without `--json` or `--field`, a reference to exactly one running primary and no stopped
 primary prints its full record. A service reference or `--running`, `--stopped` or
@@ -960,7 +981,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk, or a Windows Dockerfile into a bundle. |
 | `vk exec` | Run a command in an existing guest and return the command's exit status. |
 | `vk list` | List known VMs by project, including stopped VMs and compose services that have started. Select by name, pid or directory (`-r` includes subdirectories). Filter by status (`--running`, `--stopped`) or `--kind`. Use `-w` for the wide table or `--json` and `--field` for scripts. |
-| `vk stop` | Stop a running VM by the name `vk list` prints, its pid or project directory, or every one with `--all`. |
+| `vk start`, `vk stop`, `vk restart` | Select a VM by name, pid or directory, or a service by `NAME/SERVICE` or `PID/SERVICE`. Starting or restarting a primary requires a name. `start` and `restart` accept multiple references. `stop --all` stops every running VM. |
 | `vk reboot` | Reboot a running VM in place through its guest, or power-cycle it with `--force`. |
 | `vk status` | Probe a guest agent, or report whether its root image is stale. |
 | `vk logs` | Show a VM's console log, telling kernel, agent and guest output apart; `--level warn`, `--agent`, `--service NAME`, `-f`. |

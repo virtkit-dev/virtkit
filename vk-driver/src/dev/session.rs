@@ -788,6 +788,21 @@ pub async fn service(
     plan: &Plan,
     req: &vk_core::fleetctl::Request,
 ) -> Result<vk_core::fleetctl::Reply> {
+    // A start can build an image, so it has no socket timeout. Other requests get a
+    // 120-second I/O timeout to allow for guest shutdown.
+    let timeout = match req {
+        vk_core::fleetctl::Request::Start { .. } => None,
+        _ => Some(std::time::Duration::from_secs(120)),
+    };
+    service_within(plan, req, timeout).await
+}
+
+/// [`service`], bounding each read and write of the request by `timeout` (`None`: none).
+pub async fn service_within(
+    plan: &Plan,
+    req: &vk_core::fleetctl::Request,
+    timeout: Option<std::time::Duration>,
+) -> Result<vk_core::fleetctl::Reply> {
     let entry = running_entry(plan)?;
     let ctl = crate::vms::control_socket(&entry).ok_or_else(|| {
         anyhow::anyhow!(
@@ -799,12 +814,6 @@ pub async fn service(
             }
         )
     })?;
-    // A start may build an image; the others answer promptly, but a stop waits for a guest to
-    // power off, so give every op a generous bound rather than none.
-    let timeout = match req {
-        vk_core::fleetctl::Request::Start { .. } => None,
-        _ => Some(std::time::Duration::from_secs(120)),
-    };
     // A service's relays go with it: down before the stop, up once the start is confirmed.
     if let vk_core::fleetctl::Request::Stop { unit } = req {
         unpublish_for(plan, unit);

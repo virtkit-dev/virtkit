@@ -545,6 +545,9 @@ enum DevServiceAction {
     Down {
         /// the service
         name: String,
+        /// seconds to wait for each socket read or write while stopping the service
+        #[arg(long, default_value_t = 120, value_name = "SECS")]
+        timeout: u64,
     },
     /// Reboot a running service's guest in place (same VM, no image rebuild)
     Reboot {
@@ -787,9 +790,14 @@ async fn dev_action(
             ),
         },
         DevAction::Service {
-            action: DevServiceAction::Down { name },
+            action: DevServiceAction::Down { name, timeout },
         } => service_reply(
-            dev::service(&plan, &vk_core::fleetctl::Request::Stop { unit: name }).await,
+            dev::service_within(
+                &plan,
+                &vk_core::fleetctl::Request::Stop { unit: name },
+                Some(std::time::Duration::from_secs(timeout)),
+            )
+            .await,
         ),
         DevAction::Service {
             action: DevServiceAction::Reboot { name },

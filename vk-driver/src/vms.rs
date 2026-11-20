@@ -967,10 +967,7 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
     let dev_base = crate::dev::plan::dev_state_base()
         .map(|b| canonical(&b))
         .ok();
-    let kind_of = |dir: &Path| match canonical(dir).parent() == dev_base.as_deref() {
-        true => Kind::Dev,
-        false => Kind::Run,
-    };
+    let kind_of = |dir: &Path| kind_of(dir, dev_base.as_deref());
     // A dev environment without an indexed name uses its directory name, including during
     // first boot or a throwaway task. Other unnamed runs (older VMs and foreground UEFI
     // bundles) use their pid.
@@ -1017,18 +1014,7 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
                 warn(e);
                 None
             });
-            let (project, environment) = match kind {
-                Kind::Dev => dev_identity(dir),
-                _ => match crate::names::Recipe::read(dir) {
-                    Ok(recipe) => (recipe.map(|r| r.project_dir), None),
-                    Err(e) => {
-                        warn(e);
-                        (None, None)
-                    }
-                },
-            };
-            // Use the same project for display and directory matching, even without a recipe.
-            let project = project.or_else(|| last.as_ref().and_then(|e| e.project_dir.clone()));
+            let (project, environment) = project_of(dir, kind, last.as_ref());
             let k = Known {
                 name: name.clone(),
                 dir: dir.clone(),
@@ -1110,6 +1096,47 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
         opts.wide,
         stale,
     ))
+}
+
+/// Classify a VM by `dev.json` or `run.json`. If both or neither exist, classify direct
+/// children of the canonical dev base as dev environments. `vk list` and lifecycle commands
+/// share this rule. A run can place its state directory in the dev base, so the kind
+/// cannot establish directory ownership.
+pub(crate) fn kind_of(dir: &Path, dev_base: Option<&Path>) -> crate::vmlist::Kind {
+    use crate::vmlist::Kind;
+    let dev = dir.join("dev.json").is_file();
+    let run = dir.join(crate::names::RECIPE).is_file();
+    if dev != run {
+        return if dev { Kind::Dev } else { Kind::Run };
+    }
+    match canonical(dir).parent() == dev_base {
+        true => Kind::Dev,
+        false => Kind::Run,
+    }
+}
+
+/// Project and environment for a stopped VM in `vk list`. Use the workspace from
+/// `dev.json` or the project from `run.json`, falling back to the last registration's
+/// project for both display and directory matching.
+pub(crate) fn project_of(
+    dir: &Path,
+    kind: crate::vmlist::Kind,
+    last: Option<&VmEntry>,
+) -> (Option<PathBuf>, Option<String>) {
+    let (project, environment) = match kind {
+        crate::vmlist::Kind::Dev => dev_identity(dir),
+        _ => match crate::names::Recipe::read(dir) {
+            Ok(recipe) => (recipe.map(|r| r.project_dir), None),
+            Err(e) => {
+                eprintln!("virtkit: warning: {e:#}");
+                (None, None)
+            }
+        },
+    };
+    (
+        project.or_else(|| last.and_then(|e| e.project_dir.clone())),
+        environment,
+    )
 }
 
 /// Read the workspace and environment from `dev.json`. A missing file is normal.
@@ -1505,7 +1532,9 @@ impl Selector {
             Selector::Dir { dir, below: false } => {
                 format!("no running vk VM for {}\n", dir.display())
             }
-            Selector::Named { name, .. } => format!("{name} is not running\n"),
+            Selector::Named { name, .. } => {
+                format!("{name} is not running (`vk start {name}`)\n")
+            }
             Selector::Here { .. } => "no matching running vk VM\n".to_string(),
         }
     }
@@ -2348,7 +2377,7 @@ pub(crate) mod tests {
             dir("/home/other", false).not_found(),
             "no running vk VM for /home/other\n"
         );
-        assert_eq!(named("/s").not_found(), "x is not running\n");
+        assert_eq!(named("/s").not_found(), "x is not running (`vk start x`)\n");
     }
 
     #[test]

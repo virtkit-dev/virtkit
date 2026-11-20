@@ -594,7 +594,7 @@ workspace's environment, not its task leftovers; if that environment has no
 state, it reports nothing to remove. At first boot, an environment gets a stable name
 from its workspace directory, with `-ENV` appended for environments other than `dev`.
 Collisions add `-2`, `-3`, and so on. A listing or name lookup assigns names to older
-environments. Use that name with `vk stop` and other VM commands. `vk list` shows the
+environments. Use that name with `vk start`, `vk stop` and other VM commands. `vk list` shows the
 environment's active and previously started compose services under `NAME/SERVICE`. The state
 directory's name also works, including any leading `.` or `-`
 (e.g. `app-3f9c0d1e2a4b5c6d`, shown as `dir_name` in `vk dev list --json`). A task's leftover
