@@ -23,7 +23,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Kind::Dev => "dev",
             Kind::Run => "run",
@@ -57,6 +57,10 @@ pub struct Row {
     pub status: String,
     /// the VM a compose service belongs to; `null` for a primary
     pub parent: Option<String>,
+    /// The primary's state directory. A service and its primary share this path even
+    /// when another primary has the same display name.
+    #[serde(skip)]
+    pub primary_dir: PathBuf,
     /// the managing `vk run`'s pid, while it runs
     pub pid: Option<u32>,
     pub uptime_secs: Option<u64>,
@@ -183,6 +187,7 @@ pub fn rows_with(
             kind: l.kind,
             status: status.into(),
             parent: None,
+            primary_dir: e.state_dir.clone(),
             pid: Some(e.pid),
             uptime_secs: Some(now.saturating_sub(e.created_secs)),
             mem_used_bytes: l.mem_used,
@@ -214,6 +219,7 @@ pub fn rows_with(
                 kind: Kind::Service,
                 status: unit.map_or_else(|| "-".into(), |u| u.state.clone()),
                 parent: Some(name.clone()),
+                primary_dir: e.state_dir.clone(),
                 pid: None,
                 uptime_secs: None,
                 mem_used_bytes: None,
@@ -243,6 +249,7 @@ pub fn rows_with(
             kind: k.kind,
             status: k.status.into(),
             parent: None,
+            primary_dir: k.dir.clone(),
             pid: None,
             uptime_secs: None,
             mem_used_bytes: None,
@@ -269,6 +276,7 @@ pub fn rows_with(
                 kind: Kind::Service,
                 status: STOPPED.into(),
                 parent: Some(k.name.clone()),
+                primary_dir: k.dir.clone(),
                 pid: None,
                 uptime_secs: None,
                 mem_used_bytes: None,

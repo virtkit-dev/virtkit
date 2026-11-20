@@ -38,6 +38,8 @@ All notable changes to virtkit will be documented in this file.
   `stale_record` in JSON).
 - `vk stop --tidy` repairs stale records. On a terminal, it asks before killing a run whose
   stop timed out or was interrupted.
+- `vk list --detail` (`-d`) shows records for running and stopped primaries. A compose
+  service gets its own record when listed without its primary.
 
 ### Changed
 
@@ -71,6 +73,8 @@ All notable changes to virtkit will be documented in this file.
   WORKSPACE shows the shortest unique path suffix. Use `--wide` for full paths or `--all`
   from anywhere for the previous host-wide state inventory (`--all --json` for scripts).
   The hub uses `--all`.
+- **`vk list REF` now defaults to the table even for one running VM.** Use
+  `vk list --detail REF` for its record.
 - `vk list`, `vk dev list` and VM lookups by name or pid leave saved state untouched.
   `vk start`, `stop`, `restart` and `delete` clean up stale run records for their targets.
 

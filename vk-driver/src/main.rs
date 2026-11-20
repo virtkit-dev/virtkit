@@ -2621,14 +2621,13 @@ enum Cmd {
     /// their pid. `vk list`, `start`, `stop`, `restart`, `delete`, `exec`, `cp`, `logs`,
     /// `status` and `publish` also accept `NAME/SERVICE`.
     ///
-    /// On a running primary, MEM shows host memory used by its process tree over the recorded
+    /// In the table, a running primary's MEM shows host memory used by its process tree over the recorded
     /// boot size (`1.2G/8G`). The tree includes its service VMs and helpers. Proportional
     /// usage counts shared pages once. The fallback to resident usage can count them more than once.
     /// The table abbreviates `$HOME` to `~`. `--wide` shows full project paths and exec addresses.
     ///
-    /// Without `--json` or `--field`, a reference matching exactly one primary prints its full
-    /// record if that primary is registered. A service reference or `--running`, `--stopped`,
-    /// `--kind` or `--problems` selects table rows instead. Use `--json` or `--field` for scripts. For example,
+    /// The default is a table, even for one match. Use `--detail` for records or
+    /// `--json` or `--field` for scripts. For example,
     /// `vk list --running --kind service --field name` prints names for `vk exec`.
     #[command(display_order = 6, visible_alias = "ls")]
     List {
@@ -2655,14 +2654,24 @@ enum Cmd {
         kind: Option<crate::vmlist::Kind>,
         /// only VMs with an overdue stop or stale records
         ///
-        /// `!` marks a run still alive after a stop timed out or was interrupted. With neither
-        /// `--json` nor `--field`, recovery advice goes to stderr. `*` marks a row derived from stale VM records. Listing leaves
-        /// those records untouched.
+        /// In the table, `!` marks a run still alive after a stop timed out or was interrupted.
+        /// `*` marks a row derived from stale VM records. Detail records show ATTENTION and
+        /// STALE RECORD. Both formats print recovery advice on stderr. Listing leaves the
+        /// records untouched.
         #[arg(long)]
         problems: bool,
         /// the full table: the project path in full, and EXEC ADDRESS
         #[arg(short = 'w', long, conflicts_with_all = ["json", "field"])]
         wide: bool,
+        /// show detailed VM records
+        ///
+        /// Each record starts with NAME, KIND, STATUS, ATTENTION and STALE RECORD. A running
+        /// primary's record includes boot settings, current memory usage, compose services and
+        /// published ports. A primary without a registered run shows its image, project, state
+        /// directory, memory size and previously started services. A service gets its own
+        /// record when its primary is absent.
+        #[arg(short = 'd', long, conflicts_with_all = ["json", "field", "wide"])]
+        detail: bool,
         /// emit the rows as a JSON array instead of a table
         #[arg(long)]
         json: bool,
@@ -2680,7 +2689,7 @@ enum Cmd {
         ///
         /// Reports whether a fresh `vk run` would rebuild an image. Checking base image digests
         /// can use the network. Service rows and primaries without a live registry entry show
-        /// `-` (`null` in JSON).
+        /// `-` (`null` in JSON). With `--detail`, every record gets an IMAGE STALE line.
         #[arg(long)]
         stale: bool,
     },
@@ -4016,6 +4025,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         kind,
         problems,
         wide,
+        detail,
         json,
         field,
         stale,
@@ -4028,6 +4038,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             stale: *stale,
             fields: field.clone(),
             wide: *wide,
+            detail: *detail,
             filter: crate::vmlist::Filter {
                 running: *running,
                 stopped: *stopped,

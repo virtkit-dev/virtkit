@@ -1073,11 +1073,13 @@ pub struct ListOpts {
     pub stale: bool,
     pub fields: Vec<String>,
     pub wide: bool,
+    /// Render detail records for the selected VMs.
+    pub detail: bool,
     pub filter: crate::vmlist::Filter,
 }
 
-/// Render the rows selected by [`ListOpts`]. An unfiltered reference matching a single
-/// registered primary gets its full record unless fields or JSON were requested.
+/// Render the selected rows in the requested format. A single match still defaults to
+/// the table.
 pub fn list_report(opts: ListOpts) -> Result<String> {
     use crate::vmlist::{Filter, Kind, Known, Live};
     use crate::vmstate::Standing;
@@ -1222,10 +1224,10 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
             keep.then_some(k)
         })
         .collect();
-    let mut rows: Vec<crate::vmlist::Row> = crate::vmlist::rows(&live, &known, now)
-        .into_iter()
-        .filter(|r| filter.keeps(r))
-        .collect();
+    // `--detail` lists a stopped primary's services even when the filter drops their rows.
+    let all = crate::vmlist::rows(&live, &known, now);
+    let mut rows: Vec<crate::vmlist::Row> =
+        all.iter().filter(|r| filter.keeps(r)).cloned().collect();
     if stale {
         // Keep the requested key on every row, including unknown results.
         for r in &mut rows {
@@ -1250,7 +1252,7 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
     if opts.json {
         return Ok(serde_json::to_string_pretty(&rows).context("serializing VM list")? + "\n");
     }
-    // Keep recovery commands on stderr so stdout contains only the requested listing.
+    // Report attention on stderr for both tables and detail records.
     for r in &rows {
         if let Some(why) = &r.attention {
             eprintln!("vk: {}: {why}", r.name);
@@ -1271,21 +1273,8 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
     if let Some(note) = out_of_date(marked, unlisted) {
         eprintln!("vk: note: {note}");
     }
-    // A bare listing keeps its table even on a one-VM host.
-    if target.is_some()
-        && unfiltered
-        && known.is_empty()
-        && let [vm] = live.as_slice()
-    {
-        return Ok(detail(
-            vm.entry,
-            &vm.name.clone().unwrap_or_else(|| vm.entry.pid.to_string()),
-            vm.units.as_deref(),
-            &vm.published,
-            vm.fresh.unwrap_or(Freshness::Unknown),
-            stale,
-            vm.mem_used,
-        ));
+    if opts.detail && !rows.is_empty() {
+        return Ok(details(&rows, &all, &live, stale));
     }
     if rows.is_empty() {
         return Ok(match (&opts.target, &target) {
@@ -1333,7 +1322,7 @@ fn unlisted_entries(dead: &[PathBuf], listed: &HashSet<PathBuf>) -> usize {
 /// Summarize marked rows and stale records without a row. Return `None` if both counts are zero.
 fn out_of_date(marked: usize, unlisted: usize) -> Option<String> {
     let said: Vec<String> = [
-        (marked > 0).then(|| format!("{marked} VM(s) marked `*` listed from out-of-date records")),
+        (marked > 0).then(|| format!("{marked} VM(s) listed from out-of-date records")),
         (unlisted > 0).then(|| format!("{unlisted} out-of-date record(s) of no VM listed")),
     ]
     .into_iter()
@@ -1357,7 +1346,7 @@ fn attention(
     (standing == crate::vmstate::Standing::Overdue).then(|| {
         format!(
             "a stop {} and its run (pid {}) is still there — `vk logs {name}` and `vk list \
-             {name}` show it, `vk stop {name}` tries again, `vk stop --force {name}` insists \
+             --detail {name}` show it, `vk stop {name}` tries again, `vk stop --force {name}` insists \
              then kills it",
             t.lapse(now),
             t.pid
@@ -1416,15 +1405,143 @@ fn dev_identity(state_dir: &Path) -> (Option<PathBuf>, Option<String>) {
     (text("workspace").map(PathBuf::from), text("environment"))
 }
 
-/// The full text record for one running primary. Include all declared services (name,
-/// state, LAN and exec addresses) and publishers, with full paths at any table width.
-/// Missing boot fields and unreported service state or IP appear as `-`.
+/// Render records in table order with a blank line between them. A service gets its
+/// own record only when its primary is absent (`NAME/SERVICE` or `--kind service`).
+/// Unfiltered rows supply a stopped primary's previously started services.
+fn details(
+    rows: &[crate::vmlist::Row],
+    all: &[crate::vmlist::Row],
+    live: &[crate::vmlist::Live],
+    stale: bool,
+) -> String {
+    let primaries: HashSet<&Path> = (rows.iter())
+        .filter(|r| r.parent.is_none())
+        .map(|r| r.primary_dir.as_path())
+        .collect();
+    let records: Vec<String> = rows
+        .iter()
+        .filter(|r| r.parent.is_none() || !primaries.contains(r.primary_dir.as_path()))
+        .map(|r| {
+            if r.parent.is_some() {
+                return detail_service(r, stale);
+            }
+            match live.iter().find(|l| l.entry.state_dir == r.state_dir) {
+                Some(vm) => detail(
+                    vm.entry,
+                    &record_head(r),
+                    vm.units.as_deref(),
+                    &vm.published,
+                    vm.fresh.unwrap_or(Freshness::Unknown),
+                    stale,
+                    vm.mem_used,
+                ),
+                None => detail_unregistered(r, all, stale),
+            }
+        })
+        .collect();
+    records.join("\n")
+}
+
+/// Detail records use plain STATUS and separate fields for the table's `!` and `*` marks.
+fn record_head(r: &crate::vmlist::Row) -> Vec<(&'static str, String)> {
+    vec![
+        ("NAME", r.name.clone()),
+        ("KIND", r.kind.label().to_string()),
+        ("STATUS", r.status.clone()),
+        (
+            "ATTENTION",
+            r.attention.clone().unwrap_or_else(|| "-".into()),
+        ),
+        (
+            "STALE RECORD",
+            if r.stale_record { "yes" } else { "no" }.into(),
+        ),
+    ]
+}
+
+/// With `--stale`, the IMAGE STALE line of a record whose freshness is never checked.
+fn unknown_freshness(stale: bool) -> Option<(&'static str, String)> {
+    stale.then(|| ("IMAGE STALE", Freshness::Unknown.cell().to_string()))
+}
+
+/// For a primary without a registered run (stopped, never booted or starting), match
+/// previously started services by state directory because display names can repeat.
+fn detail_unregistered(r: &crate::vmlist::Row, all: &[crate::vmlist::Row], stale: bool) -> String {
+    let dash = || "-".to_string();
+    let services: Vec<[String; 2]> = (all.iter())
+        .filter(|s| s.parent.is_some() && s.primary_dir == r.state_dir)
+        .map(|s| {
+            let name = s.name.rsplit_once('/').map_or(&*s.name, |(_, n)| n);
+            [name.to_string(), s.status.clone()]
+        })
+        .collect();
+    let mut lines = record_head(r);
+    lines.extend([
+        ("IMAGE", r.image.clone().unwrap_or_else(dash)),
+        (
+            "PROJECT",
+            r.project
+                .as_ref()
+                .map_or_else(dash, |p| p.display().to_string()),
+        ),
+        ("STATE DIR", r.state_dir.display().to_string()),
+        ("MEM", r.mem.clone().unwrap_or_else(dash)),
+    ]);
+    lines.extend(unknown_freshness(stale));
+    lines.push(("SERVICES", block(&aligned(&services))));
+    layout(&lines)
+}
+
+/// The `--detail` record of a compose service listed without its primary.
+fn detail_service(r: &crate::vmlist::Row, stale: bool) -> String {
+    let dash = || "-".to_string();
+    let mut lines = record_head(r);
+    lines.extend([
+        (
+            "PROJECT",
+            r.project
+                .as_ref()
+                .map_or_else(dash, |p| p.display().to_string()),
+        ),
+        ("STATE DIR", r.state_dir.display().to_string()),
+        ("EXEC ADDRESS", r.exec_addr.clone().unwrap_or_else(dash)),
+        ("IP", r.ip.clone().unwrap_or_else(dash)),
+    ]);
+    lines.extend(unknown_freshness(stale));
+    lines.push(("PUBLISHED", block(&r.published)));
+    layout(&lines)
+}
+
+/// Align values two spaces past the widest key, including continuation lines.
+fn layout(rows: &[(&str, String)]) -> String {
+    let width = rows
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for (key, value) in rows {
+        let mut lines = value.lines();
+        out.push_str(&format!(
+            "{key:<width$}  {}\n",
+            lines.next().unwrap_or_default()
+        ));
+        for line in lines {
+            out.push_str(&format!("{:<width$}  {line}\n", ""));
+        }
+    }
+    out
+}
+
+/// A running primary's record includes all declared services (name, state, LAN and
+/// exec addresses) and publishers. Paths are full. Missing boot fields and unreported
+/// service state or IP appear as `-`.
 ///
 /// `MEM` is the boot-time token. `MEM USED` is the current process-tree usage from
 /// `/proc`, or `-` if unreadable. The table combines the two.
 fn detail(
     e: &VmEntry,
-    name: &str,
+    head: &[(&'static str, String)],
     units: Option<&[UnitStatus]>,
     published: &[Published],
     freshness: Freshness,
@@ -1441,8 +1558,8 @@ fn detail(
         (None, _) => dash(),
     };
     let yes_no = |b: Option<bool>| opt(b.map(|b| if b { "yes" } else { "no" }.to_string()));
-    let mut rows: Vec<(&str, String)> = vec![
-        ("NAME", name.to_string()),
+    let mut rows: Vec<(&str, String)> = head.to_vec();
+    rows.extend([
         ("IMAGE", e.label.clone()),
         ("PID", e.pid.to_string()),
         (
@@ -1460,9 +1577,9 @@ fn detail(
         ("MEM USED", opt(mem_used.map(crate::usage::fmt_bytes))),
         ("NESTED", yes_no(e.nested)),
         ("ATOP LOG", path(e.atop_log.as_deref())),
-    ];
+    ]);
     if stale {
-        rows.push(("STALE", freshness.cell().to_string()));
+        rows.push(("IMAGE STALE", freshness.cell().to_string()));
     }
     let services: Vec<[String; 4]> = e
         .services
@@ -1490,24 +1607,7 @@ fn detail(
         .collect();
     rows.push(("SERVICES", block(&aligned(&services))));
     rows.push(("PUBLISHED", block(&aligned(&published_rows))));
-
-    let width = rows
-        .iter()
-        .map(|(k, _)| k.chars().count())
-        .max()
-        .unwrap_or(0);
-    let mut out = String::new();
-    for (key, value) in &rows {
-        let mut lines = value.lines();
-        out.push_str(&format!(
-            "{key:<width$}  {}\n",
-            lines.next().unwrap_or_default()
-        ));
-        for line in lines {
-            out.push_str(&format!("{:<width$}  {line}\n", ""));
-        }
-    }
-    out
+    layout(&rows)
 }
 
 /// Pad columns to their widest cell, one line per row, with no padding on the last column.
@@ -3350,7 +3450,7 @@ MEM           8G
 MEM USED      1.6 GiB
 NESTED        yes
 ATOP LOG      /state/app/atop.log
-STALE         yes
+IMAGE STALE   yes
 SERVICES      db     running  10.0.0.3  vsock-auto:///state/app/svc-db/vsock.sock:4444
               redis  stopped  10.0.0.4  vsock-auto:///state/app/svc-redis/vsock.sock:4444
 PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 4242
@@ -3360,7 +3460,7 @@ PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 4242
         assert_eq!(
             detail(
                 &e,
-                "shop",
+                &[("NAME", "shop".into())],
                 Some(&units),
                 &published,
                 Freshness::Stale,
@@ -3398,11 +3498,159 @@ PUBLISHED     -
 ",
             up = uptime(plain.created_secs)
         );
-        // Without --stale the STALE row is absent entirely, not reported as unknown.
+        // Without --stale, omit IMAGE STALE.
         assert_eq!(
-            detail(&plain, "7", None, &[], Freshness::Unknown, false, None),
+            detail(
+                &plain,
+                &[("NAME", "7".into())],
+                None,
+                &[],
+                Freshness::Unknown,
+                false,
+                None
+            ),
             expected
         );
+    }
+
+    #[test]
+    fn details_carry_each_rows_status_and_keep_a_service_listed_alone() {
+        use crate::vmlist::{Filter, Kind, Known, Live, STOPPED};
+        let e = compose_entry();
+        let live = [Live {
+            entry: &e,
+            name: Some("shop".into()),
+            kind: Kind::Run,
+            environment: None,
+            units: Some(vec![unit("db", "running", "10.0.0.3/24")]),
+            published: Vec::new(),
+            mem_used: None,
+            fresh: None,
+            transient: Some("stopping"),
+            attention: Some("overdue".into()),
+            stale_record: false,
+        }];
+        let known = [Known {
+            name: "old".into(),
+            dir: PathBuf::from("/state/old"),
+            kind: Kind::Run,
+            status: STOPPED,
+            attention: None,
+            stale_record: true,
+            last: None,
+            project: None,
+            environment: None,
+        }];
+        let rows = crate::vmlist::rows_with(&live, &known, 100, |_| false);
+        let text = details(&rows, &rows, &live, false);
+        // The primary includes its service. Detail records spell out both table marks.
+        assert_eq!(text.matches("NAME  ").count(), 2, "{text}");
+        assert!(
+            text.starts_with(
+                "NAME          shop\nKIND          run\nSTATUS        stopping\n\
+                 ATTENTION     overdue\nSTALE RECORD  no\nIMAGE         app\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\n\nNAME          old\nKIND          run\nSTATUS        stopped\n\
+                 ATTENTION     -\nSTALE RECORD  yes\nIMAGE         -\n"
+            ),
+            "{text}"
+        );
+        // Selecting only the service gives it a record.
+        let filter = Filter {
+            service: Some("db".into()),
+            ..Filter::default()
+        };
+        let only_db: Vec<_> = rows.iter().filter(|r| filter.keeps(r)).cloned().collect();
+        let text = details(&only_db, &rows, &live, false);
+        assert!(
+            text.starts_with(
+                "NAME          shop/db\nKIND          service\nSTATUS        running\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("\nIP            10.0.0.3\n"), "{text}");
+    }
+
+    /// Two stopped compose runs both listed as `shop`, in different state directories:
+    /// `/a/shop` once started `db`, `/b/shop` once started `cache`.
+    fn same_named_stopped_runs() -> Vec<crate::vmlist::Row> {
+        use crate::vmlist::{Kind, Known, STOPPED};
+        let known = [("a", "db"), ("b", "cache")].map(|(at, svc)| {
+            let dir = PathBuf::from(format!("/{at}/shop"));
+            let mut last = entry(dir.clone(), None);
+            last.services = vec![ServiceEntry {
+                name: svc.into(),
+                exec_addr: format!("vsock-auto://{}/svc-{svc}/vsock.sock:4444", dir.display()),
+                stale_recipe: None,
+            }];
+            Known {
+                name: "shop".into(),
+                dir,
+                kind: Kind::Run,
+                status: STOPPED,
+                attention: None,
+                stale_record: false,
+                last: Some(last),
+                project: Some(PathBuf::from(format!("/project-{at}"))),
+                environment: None,
+            }
+        });
+        crate::vmlist::rows_with(&[], &known, 100, |_| true)
+    }
+
+    #[test]
+    fn a_stopped_primarys_record_lists_its_own_services_whatever_the_filter() {
+        use crate::vmlist::{Filter, Kind};
+        let all = same_named_stopped_runs();
+        let text = details(&all, &all, &[], false);
+        let records: Vec<&str> = text.split("\n\n").collect();
+        assert_eq!(records.len(), 2, "{text}");
+        assert!(records[0].contains("\nSTATE DIR     /a/shop\n"), "{text}");
+        assert!(
+            records[0].ends_with("\nSERVICES      db  stopped"),
+            "{text}"
+        );
+        assert!(records[1].contains("\nSTATE DIR     /b/shop\n"), "{text}");
+        assert!(
+            records[1].ends_with("\nSERVICES      cache  stopped\n"),
+            "{text}"
+        );
+        // With --kind run, both primary records still list their services.
+        let filter = Filter {
+            kind: Some(Kind::Run),
+            ..Filter::default()
+        };
+        let runs: Vec<_> = all.iter().filter(|r| filter.keeps(r)).cloned().collect();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(details(&runs, &all, &[], false), text);
+        // A service whose primary is not listed keeps its record, even beside another
+        // primary of the same name.
+        let mixed: Vec<_> = (all.iter())
+            .filter(|r| r.name == "shop/db" || r.state_dir == Path::new("/b/shop"))
+            .cloned()
+            .collect();
+        let text = details(&mixed, &all, &[], false);
+        assert!(text.starts_with("NAME          shop/db\n"), "{text}");
+        assert!(text.contains("\n\nNAME          shop\n"), "{text}");
+    }
+
+    #[test]
+    fn stale_puts_an_unknown_image_stale_line_on_unchecked_records() {
+        let all = same_named_stopped_runs();
+        let pick = |name: &str| -> Vec<_> {
+            let row = all.iter().find(|r| r.name == name).cloned();
+            row.into_iter().collect()
+        };
+        for rows in [pick("shop"), pick("shop/db")] {
+            let text = details(&rows, &all, &[], true);
+            assert!(text.contains("\nIMAGE STALE   -\n"), "{text}");
+            let text = details(&rows, &all, &[], false);
+            assert!(!text.contains("IMAGE STALE"), "{text}");
+        }
     }
 
     #[test]
@@ -3411,10 +3659,18 @@ PUBLISHED     -
         e.nested = Some(false);
         // A VMM the run named but whose pid it did not record prints bare.
         e.vmm = Some("libkrun".into());
-        let text = detail(&e, "app", None, &[], Freshness::Fresh, true, None);
+        let text = detail(
+            &e,
+            &[("NAME", "app".into())],
+            None,
+            &[],
+            Freshness::Fresh,
+            true,
+            None,
+        );
         assert!(text.contains("\nVMM           libkrun\n"), "{text}");
         assert!(text.contains("\nNESTED        no\n"), "{text}");
-        assert!(text.contains("\nSTALE         no\n"), "{text}");
+        assert!(text.contains("\nIMAGE STALE   no\n"), "{text}");
     }
 
     #[test]
@@ -3422,7 +3678,7 @@ PUBLISHED     -
         // The VM answered and knows of neither service, so only the recorded facts remain.
         let text = detail(
             &compose_entry(),
-            "app",
+            &[("NAME", "app".into())],
             Some(&[]),
             &[],
             Freshness::Unknown,
@@ -3437,7 +3693,7 @@ PUBLISHED     -
         );
         // Asked for but not determinable prints `-`, in the cell a fresh or stale answer
         // would fill.
-        assert!(text.contains("\nSTALE         -\n"), "{text}");
+        assert!(text.contains("\nIMAGE STALE   -\n"), "{text}");
     }
 
     #[test]
@@ -3459,7 +3715,7 @@ PUBLISHED     -
         ];
         let text = detail(
             &compose_entry(),
-            "app",
+            &[("NAME", "app".into())],
             None,
             &published,
             Freshness::Unknown,
@@ -4404,17 +4660,38 @@ PUBLISHED     -
             }
         }
 
+        fn detail(target: &OsStr) -> String {
+            list_report(ListOpts {
+                target: Some(target.to_os_string()),
+                detail: true,
+                ..ListOpts::default()
+            })
+            .unwrap()
+        }
+
         #[test]
-        fn a_full_record_is_one_running_primary_unfiltered() {
+        fn the_flags_alone_choose_a_table_or_records() {
             let homes = Homes::new("list-detail");
             let proj = project(&homes);
             let app = run_dir("app");
             let _app = up(&app, &proj, &[]);
             homes.name(&app, "app");
             let app = OsStr::new("app");
-            let record = list(Some(app), Filter::default(), &[], false);
+            // A single named VM still gets the default table.
+            let table = list(Some(app), Filter::default(), &[], false);
+            let head: Vec<&str> = table
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .take(2)
+                .collect();
+            assert_eq!(head, ["NAME", "KIND"], "{table}");
+            let record = detail(app);
+            assert!(record.starts_with("NAME          app\n"), "{record}");
+            assert!(record.contains("\nSTATUS        running\n"), "{record}");
             assert!(
-                record.starts_with("NAME          app\nIMAGE         devcontainer\n"),
+                record.contains("\nIMAGE         devcontainer\n"),
                 "{record}"
             );
             assert_eq!(
@@ -4438,6 +4715,14 @@ PUBLISHED     -
                 .map(|r| r["name"].as_str().unwrap())
                 .collect();
             assert_eq!(names, ["app", "old"]);
+            // The directory matches both primaries, including the stopped one.
+            let records = detail(dir);
+            assert!(records.starts_with("NAME          app\n"), "{records}");
+            assert!(
+                records
+                    .contains("\n\nNAME          old\nKIND          run\nSTATUS        stopped\n"),
+                "{records}"
+            );
         }
 
         // The claim can outlive a run killed during its first boot.
@@ -4728,7 +5013,7 @@ PUBLISHED     -
             assert!(recorded(&reg, &dead), "the dead entry was pruned");
             assert_eq!(
                 out_of_date(1, 0).unwrap(),
-                "1 VM(s) marked `*` listed from out-of-date records. Run `vk stop --tidy` to \
+                "1 VM(s) listed from out-of-date records. Run `vk stop --tidy` to \
                  check all stale records"
             );
             assert_eq!(out_of_date(0, 0), None);

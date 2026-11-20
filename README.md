@@ -628,7 +628,7 @@ attempt to clear stale run records for their target. `vk stop --tidy` checks all
 An unnamed dev environment uses its directory name until a boot or `vk stop --tidy`
 claims a stable name. `--problems` selects rows with either mark.
 
-On a running primary, MEM shows the resident memory of its process tree over the recorded
+In the table, a running primary's MEM shows the resident memory of its process tree over the recorded
 boot size (`--mem`). The tree includes the guest, its service VMs, the switch and forwards.
 Proportional usage counts shared pages once. When it is unavailable, resident usage can
 count shared pages more than once. An unknown half shows `-`. The whole cell shows `-`
@@ -638,7 +638,7 @@ IMAGE identifies the Dockerfile and target stage, compose primary or image ref. 
 shows each host port held by `vk publish ensure` on the row of the VM that dials the target.
 It shows `listen->to`, with `@NAME` for a service and `(unconfirmed)` if the publisher's
 liveness could not be checked. The table abbreviates `$HOME` to `~`. `--wide` (`-w`) shows
-the full project path and adds EXEC ADDRESS. It cannot be combined with `--json` or `--field`.
+the full project path and adds EXEC ADDRESS. It conflicts with `--detail`, `--json` and `--field`.
 
 **Naming a VM.** `vk list` accepts references to VMs in any listed state. `vk atop` also accepts recorded jobs.
 
@@ -710,16 +710,20 @@ some targets deleted.
 `vk reset REF` removes a stopped dev environment's boot images by default. Use
 `--storage` for persistent data or `--all` for both. `vk ls` is an alias for `vk list`.
 
-Without `--json` or `--field`, a reference matching exactly one primary prints its full
-record if that primary is registered. A service reference or `--running`, `--stopped`,
-`--kind` or `--problems` selects table rows instead. The full record shows boot settings, current memory usage and every
-declared compose service, including its state, LAN address and exec address. Each published port has
-a name, `listen->to` (`@NAME` for a service) and the publisher's pid. `(unconfirmed)` marks
-the pid in this record and the address in the table. The record prints paths in full, so
-`--wide` has no effect.
+`vk list` defaults to the table even for one match. With `--detail` (`-d`), each primary
+gets a record. A service gets its own record when its primary is absent, as in
+`vk list --detail shop/db`. Each record starts with NAME, KIND and STATUS. ATTENTION
+and STALE RECORD explain the table's `!` and `*` marks.
+
+A running primary's record shows boot settings, current memory usage and every declared
+compose service with its state, LAN address and exec address. Each published port shows
+its name, `listen->to` (`@NAME` for a service) and publisher pid. `(unconfirmed)` marks
+the pid in the record and the address in the table. A primary without a registered run
+shows its image, project, state directory, memory size and previously started services.
+Detail records use full paths. `--detail` conflicts with `--wide`, `--json` and `--field`.
 
 ```sh
-vk list shop                 # one VM, in full
+vk list --detail shop        # one VM, in full
 vk list 41877                # one VM, by pid
 vk list -r ~/work            # every VM under a tree
 vk list --stopped            # stopped VMs and environments that never booted
@@ -727,6 +731,10 @@ vk list --stopped            # stopped VMs and environments that never booted
 
 ```
 NAME          shop
+KIND          dev
+STATUS        running
+ATTENTION     -
+STALE RECORD  no
 IMAGE         devcontainer
 PID           41877
 UPTIME        35m (since 2026/09/04 08:12:03 UTC)
@@ -769,8 +777,8 @@ vk list --json | jq '.[] | select(.image == "ci")'
 
 `--stale` checks whether a fresh run would rebuild the running primary's image or a
 `build:` service's image after a change to a Dockerfile, build context or base image. It
-can resolve base image digests over the network. The table adds a STALE column and the
-full record adds a STALE line. Both show `yes`, `no` or `-` for unknown. An image-only workload
+can resolve base image digests over the network. The table shows STALE and detail records
+show IMAGE STALE. Both use `yes`, `no` or `-` for unknown. An image-only workload
 without a build recipe has unknown freshness. JSON adds `stale` to every row, with `null`
 for unknown results and for all service and stopped rows.
 
@@ -1036,7 +1044,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk run` | Boot an image, Dockerfile target, or compose fleet; run a command or shell. |
 | `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk, or a Windows Dockerfile into a bundle. |
 | `vk exec` | Run a command in an existing guest and return the command's exit status. |
-| `vk list` | List known VMs by project, including stopped VMs and compose services that have started. Select by name, pid or directory (`-r` includes subdirectories). Filter by status (`--running`, `--stopped`), `--kind` or `--problems`. Use `-w` for the wide table or `--json` and `--field` for scripts. |
+| `vk list` | List known VMs by project, including stopped VMs and compose services that have started. Select by name, pid or directory (`-r` includes subdirectories). Filter by status (`--running`, `--stopped`), `--kind` or `--problems`. Use `-w` for the wide table, `-d` for detail records, or `--json` and `--field` for scripts. |
 | `vk start`, `vk stop`, `vk restart`, `vk delete` | Select a VM by name, pid or directory. Only `stop` accepts an unnamed primary or `--all`. Select a service by `NAME/SERVICE`, or by `PID/SERVICE` for start, stop and restart. Deleting a service requires a stopped parent VM. `start`, `stop`, `restart` and `delete` accept multiple references. Use `stop --force` to escalate after 5 seconds or `stop --kill` to cut power immediately. |
 | `vk rename` | Give a VM another name. |
 | `vk reset` | Remove a stopped dev environment's boot images or persistent data. |
