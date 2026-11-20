@@ -38,8 +38,12 @@ pub(super) fn valid_dev_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// A dev environment's name: its state dir's, when the list shows that as it is.
+/// A dev environment's name: the one `vk` gives it, else its state dir's own, when the list
+/// shows that as it is. Either is what `vk dev list` names it and `vk stop` takes.
 pub(super) fn dev_name(w: &Workload) -> Option<String> {
+    if let Some(name) = w.name.as_deref().filter(|n| valid_dev_name(n)) {
+        return Some(name.to_string());
+    }
     let name = super::local::exact_state_dir(w)?.file_name()?.to_str()?;
     valid_dev_name(name).then(|| name.to_string())
 }
@@ -246,6 +250,18 @@ pub(super) mod tests {
         assert!(!row("stopped", &["pinned"]).stale());
     }
 
+    /// The name `vk` gives an environment wins over its state dir's own; a value that is no
+    /// name falls back to the directory.
+    #[test]
+    fn an_environment_is_named_as_vk_names_it() {
+        let mut w = dev_workload();
+        assert_eq!(dev_name(&w).as_deref(), Some("app-1234"));
+        w.name = Some("app".into());
+        assert_eq!(dev_name(&w).as_deref(), Some("app"));
+        w.name = Some("-rf".into());
+        assert_eq!(dev_name(&w).as_deref(), Some("app-1234"));
+    }
+
     /// The ID `vk workloads` derives from a state dir.
     pub(in crate::ui) fn id_of(dir: &str) -> String {
         use sha2::{Digest, Sha256};
@@ -271,6 +287,7 @@ pub(super) mod tests {
             ssh_alias: None,
             guest_workspace: None,
             job_url: None,
+            name: None,
         }
     }
 

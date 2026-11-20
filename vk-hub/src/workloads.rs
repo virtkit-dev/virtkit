@@ -104,6 +104,7 @@ mod tests {
             ssh_alias: None,
             guest_workspace: None,
             job_url: None,
+            name: None,
         }
     }
 

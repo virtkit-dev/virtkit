@@ -160,6 +160,18 @@ fn jobs(jobs_dir: &Path) -> Result<Vec<Job>> {
         .collect())
 }
 
+/// Give each workload the name its state dir has in the name index, if any.
+fn name(found: &mut [(Workload, Option<i32>)]) {
+    let Ok(idx) = crate::names::Index::open() else {
+        return;
+    };
+    let all = idx.all();
+    for (w, _) in found.iter_mut() {
+        let dir = Path::new(&w.state_dir);
+        w.name = all.iter().find(|(_, d)| d == dir).map(|(n, _)| n.clone());
+    }
+}
+
 /// The workloads `sources` describe, each with the process whose tree it holds. Pure.
 fn workloads(sources: &Sources) -> Vec<(Workload, Option<i32>)> {
     let text = |p: &Path| p.display().to_string();
@@ -193,6 +205,7 @@ fn workloads(sources: &Sources) -> Vec<(Workload, Option<i32>)> {
                 .map(|row| crate::dev::alias_for(&row.dir)),
             guest_workspace: dev.and_then(|row| row.workspace_folder.clone()),
             job_url: None,
+            name: None,
         };
         out.push((workload, pid.and_then(|p| i32::try_from(p).ok())));
     }
@@ -224,6 +237,7 @@ fn workloads(sources: &Sources) -> Vec<(Workload, Option<i32>)> {
             ssh_alias: None,
             guest_workspace: None,
             job_url: record.and_then(|r| r.job_url.clone()),
+            name: None,
         };
         out.push((workload, Some(j.supervisor)));
     }
@@ -398,7 +412,12 @@ impl Lister {
             &mut self.jobs_said,
             &mut self.dev_said,
         );
-        let (found, omitted) = bound_workloads(workloads(&sources));
+        let (mut found, omitted) = bound_workloads(workloads(&sources));
+        // The names `vk list` prints, for a hub to act on a VM by: the user's own index, so
+        // not for a registry given in its place.
+        if self.registry.is_none() {
+            name(&mut found);
+        }
         // Read once for every tree measured, and only when one is: without the kernel's child
         // lists it is a scan of every process on the host.
         let mut links = None;
