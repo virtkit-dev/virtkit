@@ -342,7 +342,7 @@ e.g. systemd's first-boot unit presets. `/` stays read-only until the image remo
 systemd, a `/` line with `rw` in its `/etc/fstab` (pass number 0, or `systemd-fsck-root`
 checks it first). `prepare` (`vk run --prepare`) runs a command to completion before that,
 as root on the still-writable root and with the exec channel already up: the init starts only
-if it exits 0, and otherwise the guest stays up, without it, for inspection. `vk status`
+if it exits 0, and otherwise the guest stays up, without it, for inspection. `vk ping`
 reports where that handoff stands: `pending` while the agent still holds PID 1, `done`, or
 `failed` and why. A boot is up once the guest answers and does not wait for the handoff, so a
 `prepare` can itself wait for something the host does after the boot. `persist_root` keeps the root
@@ -609,7 +609,7 @@ registration. Its image and service list come from that registration when availa
 
 Use the primary's NAME to select the VM. A dev environment without a stable name uses its
 state directory's name. An unnamed running `vk run` uses its pid. `vk list`, `start`, `stop`,
-`restart`, `delete`, `exec`, `cp`, `logs`, `status` and `publish` also accept `NAME/SERVICE`.
+`restart`, `delete`, `exec`, `cp`, `logs`, `ping` and `publish` also accept `NAME/SERVICE`.
 
 `--running` selects rows with status `running`, `starting` or `stopping`. `--stopped`
 selects `stopped` and `never booted` (a dev state directory with no recorded boot). A
@@ -644,7 +644,7 @@ the full project path and adds EXEC ADDRESS. It conflicts with `--detail`, `--js
 
 | REF | Means |
 |---|---|
-| `app`, `shop/db`, `41877/db` | a VM name from `vk list`, or a compose service selected by `NAME/SERVICE` or `PID/SERVICE` with `list`, `start`, `stop`, `restart`, `exec`, `cp`, `logs`, `status` or `publish`. To delete a service, stop its VM and use `NAME/SERVICE`. |
+| `app`, `shop/db`, `41877/db` | a VM name from `vk list`, or a compose service selected by `NAME/SERVICE` or `PID/SERVICE` with `list`, `start`, `stop`, `restart`, `exec`, `cp`, `logs`, `ping` or `publish`. To delete a service, stop its VM and use `NAME/SERVICE`. |
 | `41877` | the pid of a running VM's `vk run`. `vk atop` looks up the recorded job only if no running VM matches a directory named `41877`. |
 | `.`, `./x`, `../x`, `/abs`, `~/x` | a project or state directory, matched exactly. `list`, `stop`, `reboot`, `pause` and `resume` also match projects below it with `--recursive` (`-r`). |
 | (none) | the current directory where the command accepts a default target. `-r` includes projects below it. `vk list` alone lists every VM `vk` knows. |
@@ -959,7 +959,7 @@ hit `ENOSPC` while the host still has free disk space.
 
 The guest agent records processes killed by the guest kernel's OOM killer. The host reports
 them alongside memory figures in build-stage completion output, CI traces, completed
-`vk run` output, and `vk status` for a live VM. Each line identifies the victim, the
+`vk run` output, and `vk ping` for a live VM. Each line identifies the victim, the
 anonymous RSS reclaimed, its guest uptime at death, and the setting that raises the memory
 limit. This can explain a command that exited with signal 9.
 
@@ -1049,7 +1049,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk rename` | Give a VM another name. |
 | `vk reset` | Remove a stopped dev environment's boot images or persistent data. |
 | `vk reboot` | Reboot a running VM in place through its guest, or power-cycle it with `--force`. |
-| `vk status` | Probe a guest agent, or report whether its root image is stale. |
+| `vk ping` (alias `vk status`) | Probe a guest agent. Add `--stale` to check the VM and its service images for changes. |
 | `vk logs` | Show a VM's console log, telling kernel, agent and guest output apart; `--level warn`, `--agent`, `--service NAME`, `-f`. |
 | `vk cp`, `vk console`, `vk pause\|resume`, `vk snapshot` | Copy files into or out of a [Windows guest](#windows-guests), attach to its serial console, freeze it, or save it to restore later. |
 | `vk atop` | Follow or inspect guest resource recordings. |

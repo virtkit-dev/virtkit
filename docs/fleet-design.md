@@ -258,7 +258,7 @@ with the source `detected` where the host's size supplied or held down the value
   the registries. A job gitlab-runner gives the node reaches the registry from its guest
   through `registry.vk` with the node's guest token (`guest_credential = "job-or-node"`),
   granting what namespaces grant `guests` within the node's grants, none by default. Limits:
-  `vk status --stale` asks for base images as nobody, and reports a private one's VM as unknown;
+  `vk ping --stale` checks base images anonymously. A private base can leave an image's freshness unknown.
   Windows install media use a remote `[build] cache_registry` when configured; scoped placed
   jobs otherwise use a separate media token for this registry's file store (below).
   `[build]` takes the node's token only when it names this registry and has no credential of

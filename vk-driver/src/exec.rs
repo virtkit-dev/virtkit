@@ -1,8 +1,6 @@
-//! Host side of `vk exec`: dial a running guest's agent exec channel and run a
-//! command there, reusing the very client the embedded agent uses
-//! (`vk_core::exec::client`). So a host that already has `vk` needs no separate
-//! `vk-agent` binary to open a shell or run a command in a live VM — the same way
-//! `vk status` replaced the agent's liveness probe.
+//! `vk exec` runs a shell or command in a live VM through `vk_core::exec::client`,
+//! the same client the guest agent uses. Both `vk exec` and `vk ping` work
+//! without a separate `vk-agent` binary on the host.
 
 use std::process::ExitCode;
 

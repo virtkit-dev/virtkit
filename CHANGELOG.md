@@ -50,7 +50,7 @@ All notable changes to virtkit will be documented in this file.
   named runs and compose services each get a row. A service appears when its manager
   reports it active or its console log records a start. Filter by `--running`, `--stopped`
   or `--kind`. Use the first column to select a VM, including `NAME/SERVICE` with `list`,
-  `exec`, `cp`, `logs`, `status` and `publish`.
+  `exec`, `cp`, `logs`, `ping` and `publish`.
 - **`vk list --json` and `--field` use the new row format.** JSON has one object per
   row. Replace `guest_ip` with `ip`, `label` with `image` and `project_dir` with `project`.
 - **A directory names exactly one project's VMs.** `vk list`, `stop`, `reboot`, `pause` and
@@ -80,6 +80,7 @@ All notable changes to virtkit will be documented in this file.
   `vk list --detail REF` for its record.
 - `vk list`, `vk dev list` and VM lookups by name or pid leave saved state untouched.
   `vk start`, `stop`, `restart` and `delete` clean up stale run records for their targets.
+- **`vk status` is now `vk ping`.** The old name still works.
 
 ### Fixed
 

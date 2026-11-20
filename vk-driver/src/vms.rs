@@ -161,8 +161,7 @@ impl Freshness {
             Freshness::Unknown => "-",
         }
     }
-    /// A scriptable one-word token for `vk status --stale`, so tooling can decide with a
-    /// plain string compare.
+    /// The single token printed by `vk ping --stale`.
     pub fn as_str(self) -> &'static str {
         match self {
             Freshness::Stale => "stale",

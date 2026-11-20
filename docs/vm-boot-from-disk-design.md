@@ -330,7 +330,7 @@ Record each attempt in host-owned machine state before boot. Include a boot gene
 selected release, pair digests, layout, and reason for selection. Retain the serial log and a
 bounded failure reason. Bind guest status to the current generation so a stale socket or
 response cannot confirm a new kernel. Expose the selected and running releases, trial outcome,
-and any fallback in `vk status`.
+and any fallback in `vk ping`.
 
 Use the existing `handoff:pending`, `handoff:done`, and `handoff:failed` meanings. `done`
 represents the image init taking PID 1. The exec server tracks the pre-exec report and closure

@@ -1386,8 +1386,8 @@ enum Cmd {
     /// exercises the agent protocol, stronger than a socket stat. Selects the VM whose project
     /// is the current directory by default; pass a name, a pid or a directory to select
     /// another. A raw agent address (`vsock-auto://DIR/vsock.sock:4444`) probes it directly,
-    /// for plumbing that already knows the socket.
-    #[command(display_order = 7)]
+    /// for plumbing that already knows the socket. `vk status` is the same command.
+    #[command(name = "ping", alias = "status", display_order = 7)]
     Status {
         /// which VM: a name, a pid, a project directory, or a raw agent address
         ///
@@ -1395,7 +1395,7 @@ enum Cmd {
         /// current directory's VM); a raw agent address (`scheme://…`) is dialed directly.
         #[arg(value_name = "REF")]
         target: Option<String>,
-        /// print whether the VM's root image is `fresh`, `stale` or `unknown`
+        /// print the freshness of the VM and its service images: `fresh`, `stale` or `unknown`
         ///
         /// A single scriptable token; `stale` means a fresh `vk run` would rebuild it. Skips
         /// the agent probe but may resolve base image digests over the network; acts on a
@@ -1541,7 +1541,7 @@ enum Cmd {
     /// Publish a port on the guest's own network to the host
     ///
     /// Accepts connections on `--listen` and, for each one, asks the target VM's agent —
-    /// over the same exec control channel `vk exec`/`vk status` use — to dial `--to` and
+    /// over the same exec control channel `vk exec`/`vk ping` use — to dial `--to` and
     /// splice raw bytes back, reusing that already-open channel for the relay. The VM is
     /// selected as `vk exec` selects it (a name, a pid, a directory or a raw agent address;
     /// a compose service with `NAME/SERVICE` or `--via`), and `--to` can name any
@@ -2619,7 +2619,7 @@ enum Cmd {
     /// Use NAME with commands such as `vk start`, `vk stop` and `vk delete`. A dev environment
     /// without a stable name uses its state directory's name. Other unnamed running VMs use
     /// their pid. `vk list`, `start`, `stop`, `restart`, `delete`, `exec`, `cp`, `logs`,
-    /// `status` and `publish` also accept `NAME/SERVICE`.
+    /// `ping` and `publish` also accept `NAME/SERVICE`.
     ///
     /// In the table, a running primary's MEM shows host memory used by its process tree over the recorded
     /// boot size (`1.2G/8G`). The tree includes its service VMs and helpers. Proportional
@@ -5735,7 +5735,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 }
             }
             Ok(atop_attach::Target::Recorded(job)) => match atop::resolve(&ctx.cfg, &job) {
-                // Exit 2 for a job nothing answers to, like `vk status`/`list`/`stop` — a
+                // Exit 2 for a job nothing answers to, like `vk ping`/`list`/`stop` — a
                 // reader of the path must not be handed a success with no path.
                 Err(e) => fail(&e, 2),
                 // A recorded job names itself: its log sits in the directory the run made,
@@ -5763,9 +5763,9 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         },
-        // `--stale`: report the VM's root-image freshness as a single scriptable token — a
-        // directory-selected, host-side check that skips the agent probe. A raw address has
-        // no build recipe, so it is rejected here.
+        // `--stale` reports combined freshness for the VM and its service images in one
+        // token. The host checks the selected VM's build recipes without probing the agent.
+        // A raw agent address has no build recipe.
         Cmd::Status {
             target,
             stale: true,
@@ -5853,7 +5853,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             }
         }
         // Run a command in a live guest, reproducing its exit status as our own. The target
-        // selects the VM the same way `vk status` does (a name, pid or directory, default cwd,
+        // selects the VM the same way `vk ping` does (a name, pid or directory, default cwd,
         // or a raw agent address); the command is the trailing `-- …` group.
         Cmd::Exec {
             target,
@@ -5904,7 +5904,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                     Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
                 };
             }
-            // Resolution/usage errors exit 2, matching `vk status`/`vk list`/`vk stop` and
+            // Resolution/usage errors exit 2, matching `vk ping`/`vk list`/`vk stop` and
             // clap's own usage-error exit. Any vk-chosen code can collide with the remote
             // command's status vk reproduces below; 2 matches what the old CLI returned
             // when the positional address failed to parse.
@@ -6966,7 +6966,7 @@ fn resolve_state_dir(action: PublishAction) -> anyhow::Result<PublishAction> {
     })
 }
 
-/// `vk exec`, `cp`, `status` and `publish` resolve their target once so every check uses
+/// `vk exec`, `cp`, `ping` and `publish` resolve their target once so every check uses
 /// the same VM. A REF defaults to the current directory. Either the REF or the service
 /// option can select a compose service.
 enum ExecTarget {
@@ -7630,6 +7630,14 @@ mod tests {
                 .unwrap_err()
                 .contains("port")
         );
+    }
+
+    #[test]
+    fn status_still_reaches_ping() {
+        for name in ["ping", "status"] {
+            let cli = Cli::try_parse_from(["vk", name, "app"]).unwrap();
+            assert!(matches!(cli.cmd, Cmd::Status { .. }), "{name}");
+        }
     }
 
     // `vk paths --gitlab` must report the jobs root the executor actually uses:
@@ -8859,6 +8867,7 @@ mod tests {
                 "list",
                 "logs",
                 "pause",
+                "ping",
                 "publish",
                 "reboot",
                 "rename",
@@ -8870,7 +8879,6 @@ mod tests {
                 "ssh",
                 "ssh-config",
                 "start",
-                "status",
                 "stop",
                 "toolchain",
                 "update"

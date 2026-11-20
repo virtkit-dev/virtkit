@@ -4,7 +4,7 @@
 //! A PID 1 thread follows `/dev/kmsg`, stores OOM records in [`LOG`] on the agent's `/run`
 //! tmpfs, and serves them through `vk-agent oomkills` over the exec channel. The host reads
 //! them with [`crate::memmark`] data at stage end, after a CI job's final stage, after
-//! `vk run`, and during `vk status`.
+//! `vk run`, and during `vk ping`.
 //!
 //! The watcher is always enabled. It blocks on `/dev/kmsg` while idle, limits the log to
 //! [`MAX_KILLS`] records, and limits console warnings to [`WARN_KILLS`]. These bounds prevent

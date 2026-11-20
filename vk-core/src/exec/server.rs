@@ -582,7 +582,7 @@ async fn do_handle_conn(
             // dial the way it wraps a command, so a raw connect on it would bypass the
             // allowlist entirely instead of being subject to it. Refuse outright —
             // CmdConnect is only for a channel the dialing side already trusts fully
-            // (the guest's own control port, as `vk exec`/`vk status` already use).
+            // (the guest's own control port, as `vk exec`/`vk ping` already use).
             if wrappers.is_some() {
                 let msg = "connect is refused on a wrapped (host-exec) channel".to_string();
                 let _ = send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await;
