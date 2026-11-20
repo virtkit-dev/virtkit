@@ -15,8 +15,6 @@
 // tests and consumed by callers wiring it into commands.
 #![allow(dead_code)]
 
-use std::cell::RefCell;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -122,45 +120,19 @@ impl InodeInfo {
 }
 
 pub struct Ext4Reader {
-    source: Source,
+    source: crate::diskimg::DiskImage,
     /// 1024, 2048 or 4096.
     block_size: u64,
     /// `s_inode_size`: 128 for a revision-0 filesystem, else at least that.
     inode_size: u64,
     /// Every block pointer is checked against this before it is read.
     blocks_count: u64,
-    /// Logical image size in bytes. Bounds the filesystem at open and inode data at read time.
-    image_len: u64,
     inodes_per_group: u32,
     /// Physical block of each group's inode table (`bg_inode_table`).
     inode_tables: Vec<u64>,
     /// Whether directory entries carry their type (`filetype`); without it, that byte is the
     /// high byte of the name's length, and the type is the inode's.
     dirent_types: bool,
-}
-
-/// Filesystem source. `Qcow2::read_at` requires `&mut self` to cache L2 tables, while
-/// the reader API takes `&self`, so qcow2 uses interior mutability.
-enum Source {
-    Raw(std::fs::File),
-    Qcow2(RefCell<crate::qcow2::Qcow2>),
-}
-
-impl Source {
-    fn read_exact_at(&self, buf: &mut [u8], off: u64) -> Result<()> {
-        match self {
-            Source::Raw(f) => Ok(f.read_exact_at(buf, off)?),
-            Source::Qcow2(q) => q.borrow_mut().read_at(off, buf),
-        }
-    }
-
-    /// Logical image size: the raw file's length or the qcow2's virtual size.
-    fn len(&self) -> Result<u64> {
-        match self {
-            Source::Raw(f) => Ok(f.metadata().context("stat image for size check")?.len()),
-            Source::Qcow2(q) => Ok(q.borrow().virtual_size()),
-        }
-    }
 }
 
 fn rd16(b: &[u8], o: usize) -> u16 {
@@ -175,25 +147,21 @@ impl Ext4Reader {
     /// Read the superblock and group descriptors. Blocks must be 1, 2 or 4 KiB and inode
     /// sizes powers of two from 128 bytes to one block. The first data block must contain
     /// the superblock. Reject incompatible features outside [`INCOMPAT_KNOWN`] and invalid
-    /// descriptor sizes. Inode tables must fit the filesystem, and the filesystem its image.
+    /// descriptor sizes. Inode tables must fit the filesystem, and the filesystem its image or
+    /// window.
     pub fn open(path: &Path) -> Result<Self> {
-        let file =
-            std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        // A `.vk_ro_img` is a lazy chunk manifest, not a filesystem. Treating it as raw
-        // lets the ext4 magic check reject it like any other non-ext4 input.
-        let source = match crate::qcow2::sniff_kind(&file) {
-            crate::qcow2::ImageKind::Qcow2 => {
-                Source::Qcow2(RefCell::new(crate::qcow2::Qcow2::open(path)?))
-            }
-            crate::qcow2::ImageKind::Raw | crate::qcow2::ImageKind::Lazy => Source::Raw(file),
-        };
+        let source = crate::diskimg::DiskImage::open(path)?;
+        Self::open_image(source, &path.display().to_string())
+    }
 
+    /// Like [`Ext4Reader::open`], but accepts an open image or any window into it
+    /// (for example, a partition). Use `name` in diagnostics.
+    pub fn open_image(source: crate::diskimg::DiskImage, name: &str) -> Result<Self> {
         let mut sb = [0u8; 1024];
         source
             .read_exact_at(&mut sb, SB_OFFSET)
-            .with_context(|| format!("reading superblock of {}", path.display()))?;
+            .with_context(|| format!("reading superblock of {name}"))?;
 
-        let name = path.display();
         if rd16(&sb, 0x38) != EXT4_MAGIC {
             bail!("{name}: not an ext2/ext4 image (bad magic)");
         }
@@ -243,14 +211,14 @@ impl Ext4Reader {
         if inodes_per_group == 0 || u64::from(inodes_per_group) > block_size * 8 {
             bail!("{name}: unsupported inodes-per-group {inodes_per_group}");
         }
-        // A block within the filesystem must have a representable byte offset within the image.
-        let image_len = source.len()?;
+        // A block within the filesystem must have a representable byte offset within the window.
+        let image_len = source.len();
         if blocks_count
             .checked_mul(block_size)
             .is_none_or(|bytes| bytes > image_len)
         {
             bail!(
-                "{name}: {blocks_count} blocks of {block_size} bytes, past its {image_len}-byte image"
+                "{name}: {blocks_count} blocks of {block_size} bytes, past its {image_len}-byte window"
             );
         }
         // The superblock's own block: block 1 with 1 KiB blocks, else block 0.
@@ -309,7 +277,6 @@ impl Ext4Reader {
             inodes_per_group,
             inode_tables,
             dirent_types: incompat & INCOMPAT_FILETYPE != 0,
-            image_len,
         })
     }
 
@@ -322,7 +289,7 @@ impl Ext4Reader {
                 self.blocks_count
             );
         }
-        // Below blocks_count, which open() bounds by the image, so this cannot overflow.
+        // open_image checked that blocks_count * block_size fits the window.
         self.source
             .read_exact_at(buf, blk * self.block_size)
             .with_context(|| format!("reading block {blk}"))?;
@@ -501,17 +468,15 @@ impl Ext4Reader {
         if info.size > max {
             bail!("inode of {} bytes, over the {max} read here", info.size);
         }
-        // Reject a corrupt `i_size` larger than the logical image before it can request a
-        // gigabyte-scale allocation. For qcow2, use the virtual size rather than the
-        // smaller host file; this bound is only as tight as the run-controlled geometry.
-        if info.size > self.image_len {
+        // Bound guest-controlled `i_size` before mapping or allocating gigabytes of inode data.
+        // A whole qcow2 image uses its virtual size regardless of host file length.
+        let image_len = self.source.len();
+        if info.size > image_len {
             bail!(
-                "inode size {} exceeds image size {}",
-                info.size,
-                self.image_len
+                "inode size {} exceeds the {image_len}-byte window",
+                info.size
             );
         }
-        // Mapped only now that the size is known to fit the image.
         self.read_runs(info, &self.map_data(info)?)
     }
 
@@ -1317,6 +1282,34 @@ mod tests {
         assert_eq!(r.file_type("/f.bin").unwrap(), Some(FileType::Regular));
         assert!(r.read_file("/f.bin", 1 << 20).is_err());
         let err = r.read_file("/f.bin", u64::MAX).unwrap_err();
-        assert!(format!("{err:#}").contains("exceeds image size"), "{err:#}");
+        assert!(format!("{err:#}").contains("exceeds the"), "{err:#}");
+    }
+
+    /// Read a filesystem 1 MiB into the disk and reject a window one block too short.
+    #[test]
+    fn a_filesystem_reads_through_a_window() {
+        let scratch = Scratch::new();
+        let src = scratch.path.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("f.txt"), b"in a window").unwrap();
+        let fs_img = scratch.path.join("fs.img");
+        crate::ext4::build_from_dir(&src, &fs_img).unwrap();
+        let fs = std::fs::read(&fs_img).unwrap();
+        let mut disk = vec![0xFFu8; 1 << 20];
+        disk.extend_from_slice(&fs);
+        let disk_img = scratch.path.join("disk.img");
+        std::fs::write(&disk_img, &disk).unwrap();
+        let window = |len: u64| {
+            crate::diskimg::DiskImage::open(&disk_img)
+                .unwrap()
+                .slice(1 << 20, len)
+                .unwrap()
+        };
+        let r = Ext4Reader::open_image(window(fs.len() as u64), "p1").unwrap();
+        assert_eq!(r.read_file("/f.txt", 100).unwrap(), b"in a window");
+        let err = Ext4Reader::open_image(window(fs.len() as u64 - BLOCK), "p1")
+            .err()
+            .expect("a short window is refused");
+        assert!(format!("{err:#}").contains("window"), "{err:#}");
     }
 }

@@ -37,6 +37,7 @@ mod consolelog;
 mod cpio;
 mod detach;
 mod dev;
+mod diskimg;
 mod dockerhash;
 mod dockerimg;
 mod egress_report;
