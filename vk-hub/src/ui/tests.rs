@@ -402,6 +402,7 @@ fn workload(id: &str, label: &str) -> vk_hub_proto::Workload {
         ssh_alias: None,
         guest_workspace: None,
         job_url: None,
+        name: None,
     }
 }
 
@@ -2627,6 +2628,7 @@ fn ci_workload(id: &str, owner: &str) -> vk_hub_proto::Workload {
         ssh_alias: None,
         guest_workspace: None,
         job_url: None,
+        name: None,
     }
 }
 

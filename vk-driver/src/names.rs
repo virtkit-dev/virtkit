@@ -192,6 +192,24 @@ fn marker(name: &str) -> String {
 /// The index lock, held for as long as this lives.
 pub struct Locked(#[allow(dead_code)] std::fs::File);
 
+/// Read the symlink target. Tests can inject an I/O error for [`tests::UNREADABLE`].
+fn read_link(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    if tests::UNREADABLE.with(|u| u.borrow().as_deref().map(OsStr::new) == path.file_name()) {
+        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+    }
+    std::fs::read_link(path)
+}
+
+/// Find `dir` in an [`Index::try_all`] snapshot by its recorded or canonical path.
+pub fn name_in(named: &[(String, PathBuf)], dir: &Path) -> Option<String> {
+    let canonical = crate::vms::canonical(dir);
+    named
+        .iter()
+        .find(|(_, target)| target == dir || *target == canonical)
+        .map(|(name, _)| name.clone())
+}
+
 impl Index {
     /// The user's index, `$XDG_STATE_HOME/virtkit/names`.
     pub fn open() -> Result<Index> {
@@ -262,7 +280,8 @@ impl Index {
         self.try_all().unwrap_or_default()
     }
 
-    /// Like [`Index::all`], but propagates directory read errors. A missing index is empty.
+    /// Like [`Index::all`], but returns read errors. A missing index is empty. Entries
+    /// that disappear or are not symlinks are skipped.
     pub fn try_all(&self) -> Result<Vec<(String, PathBuf)>> {
         let read = |e| anyhow::Error::from(e).context(format!("reading {}", self.dir.display()));
         let entries = match std::fs::read_dir(&self.dir) {
@@ -279,8 +298,18 @@ impl Index {
             if validate(&name).is_err() {
                 continue;
             }
-            if let Ok(target) = std::fs::read_link(e.path()) {
-                out.push((name, target));
+            let path = e.path();
+            match read_link(&path) {
+                Ok(target) => out.push((name, target)),
+                // The entry disappeared or is not a symlink.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || e.raw_os_error() == Some(libc::EINVAL) => {}
+                Err(e) => {
+                    return Err(
+                        anyhow::Error::from(e).context(format!("reading {}", path.display()))
+                    );
+                }
             }
         }
         out.sort();
@@ -289,11 +318,7 @@ impl Index {
 
     /// The name of `dir`, if it has one.
     pub fn name_of(&self, dir: &Path) -> Option<String> {
-        let canonical = crate::vms::canonical(dir);
-        self.all()
-            .into_iter()
-            .find(|(_, target)| target == dir || *target == canonical)
-            .map(|(name, _)| name)
+        name_in(&self.all(), dir)
     }
 
     /// Give `dir` a name from `base` (`base`, `base-2`, `base-3`, …), or return the one it has.
@@ -305,7 +330,8 @@ impl Index {
 
     /// [`Index::claim`] with the lock already held.
     pub fn claim_locked(&self, dir: &Path, base: &str) -> Result<(String, bool)> {
-        if let Some(name) = self.name_of(dir) {
+        // An unreadable entry could already name this VM.
+        if let Some(name) = name_in(&self.try_all()?, dir) {
             return Ok((name, false));
         }
         let base = sanitize(base);
@@ -430,7 +456,7 @@ impl Index {
                 target.display()
             )));
         }
-        if let Some(other) = self.name_of(dir) {
+        if let Some(other) = name_in(&self.try_all()?, dir) {
             return Err(refuse(format!(
                 "{} is already named {other} — `vk rename {other} {name}`",
                 dir.display()
@@ -486,7 +512,7 @@ impl Index {
                 other.display()
             )));
         }
-        let old = self.name_of(dir);
+        let old = name_in(&self.try_all()?, dir);
         match &old {
             Some(old) if old != was => {
                 return Err(refuse(format!("{was} was renamed {old} meanwhile")));
@@ -542,7 +568,7 @@ impl Index {
     /// [`Index::release`] with the lock already held.
     pub fn release_locked(&self, dir: &Path) -> Result<()> {
         let canonical = crate::vms::canonical(dir);
-        for (name, target) in self.all() {
+        for (name, target) in self.try_all()? {
             if target == dir || target == canonical {
                 std::fs::remove_file(self.dir.join(&name))
                     .with_context(|| format!("forgetting the name {name}"))?;
@@ -797,6 +823,12 @@ impl Recipe {
 mod tests {
     use super::*;
 
+    std::thread_local! {
+        /// The index entry [`read_link`] fails to read on this thread.
+        pub(super) static UNREADABLE: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     struct Tmp(PathBuf);
     impl Drop for Tmp {
         fn drop(&mut self) {
@@ -822,6 +854,53 @@ mod tests {
         }
         assert!(validate(&"a".repeat(MAX_LEN)).is_ok());
         assert!(validate(&"a".repeat(MAX_LEN + 1)).is_err());
+    }
+
+    /// Stray files are ignored. An unreadable link fails the listing.
+    #[test]
+    fn a_link_that_cannot_be_read_fails_the_listing() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tmp("unsearchable");
+        let dir = t.0.join("names");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(t.0.join("a"), dir.join("app")).unwrap();
+        std::fs::write(dir.join("stray"), "").unwrap();
+        let idx = Index::at(&dir);
+        assert_eq!(idx.try_all().unwrap(), [("app".to_string(), t.0.join("a"))]);
+        std::fs::remove_file(dir.join("stray")).unwrap();
+        // The directory is readable but lacks search permission. Root can still read the link.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o400)).unwrap();
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        let root = unsafe { libc::geteuid() } == 0;
+        let listed = idx.try_all();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !root {
+            let err = format!("{:#}", listed.unwrap_err());
+            assert!(
+                err.contains(&dir.join("app").display().to_string()),
+                "{err}"
+            );
+        }
+    }
+
+    /// A failed index scan must leave claims and releases untouched.
+    #[test]
+    fn a_name_change_stops_at_an_unreadable_entry() {
+        let t = tmp("unreadable-claim");
+        let idx = Index::at(t.0.join("names"));
+        let (a, b) = (t.0.join("a"), t.0.join("b"));
+        assert!(idx.claim_exact(&a, "app").unwrap());
+        assert!(idx.claim_exact(&b, "other").unwrap());
+        UNREADABLE.with(|u| *u.borrow_mut() = Some("other".into()));
+        let claimed = idx.claim_exact(&a, "staging");
+        let given = idx.claim(&a, "staging");
+        let released = idx.release(&a);
+        UNREADABLE.with(|u| *u.borrow_mut() = None);
+        assert!(claimed.is_err() && given.is_err() && released.is_err());
+        assert_eq!(
+            idx.try_all().unwrap(),
+            [("app".to_string(), a), ("other".to_string(), b)]
+        );
     }
 
     #[test]

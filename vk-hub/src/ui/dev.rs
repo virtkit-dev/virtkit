@@ -38,14 +38,14 @@ pub(super) fn valid_dev_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// A dev environment's name: its state dir's, when the list shows that as it is.
+/// Valid dev state directory basename, available only when the displayed path matches the VM ID.
 pub(super) fn dev_name(w: &Workload) -> Option<String> {
     let name = super::local::exact_state_dir(w)?.file_name()?.to_str()?;
     valid_dev_name(name).then(|| name.to_string())
 }
 
-/// One row of `vk dev list --all --json`: the fields this page reads, whose names are that
-/// command's interface and are only ever added to.
+/// A row from `vk dev list --all --json` and its local action key. Input field names
+/// belong to the command's additive JSON interface.
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct DevRow {
     pub name: String,
@@ -62,6 +62,9 @@ pub(super) struct DevRow {
     /// whether `vk delete` removes its directory whole; absent from an older `vk`
     #[serde(default)]
     pub deletable: Option<bool>,
+    /// Hub action key computed by [`super::actions::resolve_dev_key`] when the listing is read.
+    #[serde(skip)]
+    pub key: Option<String>,
 }
 
 impl DevRow {
@@ -171,10 +174,21 @@ async fn dev_rows(local: &Local) -> Result<Vec<DevRow>, String> {
     }
     let rows: Vec<DevRow> = serde_json::from_str(&out.stdout)
         .map_err(|e| format!("`vk dev list` printed something this vk-hub cannot read: {e}"))?;
-    Ok(rows
+    let rows: Vec<DevRow> = rows
         .into_iter()
         .filter(|r| valid_dev_name(&r.name))
-        .collect())
+        .collect();
+    // A stalled mount can block state directory resolution.
+    tokio::task::spawn_blocking(move || {
+        rows.into_iter()
+            .map(|r| DevRow {
+                key: Some(super::actions::resolve_dev_key(&r)),
+                ..r
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| format!("resolving the dev environments' state dirs: {e}"))
 }
 
 /// `GET /dev`.
@@ -226,7 +240,7 @@ fn table(h: &mut Html, rows: &[DevRow], local: &Local, steer: Option<&Auth>) {
             .raw("</td><td>")
             .node(&r.flags.join(", "))
             .raw("</td><td>");
-        super::actions::action_line(h, local.action(&super::actions::dev_key(&r.name)).as_ref());
+        super::actions::action_line(h, local.action(&super::actions::dev_key(r)).as_ref());
         h.raw("</td>");
         if let Some(auth) = steer {
             h.raw("<td class=\"actions\">");
@@ -260,6 +274,7 @@ pub(super) mod tests {
             booted_secs: None,
             flags: flags.iter().map(|f| f.to_string()).collect(),
             deletable: None,
+            key: None,
         }
     }
 
@@ -318,6 +333,7 @@ pub(super) mod tests {
             ssh_alias: None,
             guest_workspace: None,
             job_url: None,
+            name: None,
         }
     }
 

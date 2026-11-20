@@ -1112,13 +1112,7 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
     if let Some(sel) = &target {
         vms.retain(|e| sel.matches(e));
     }
-    let name_of = |dir: &Path| {
-        let canonical = canonical(dir);
-        named
-            .iter()
-            .find(|(_, d)| *d == dir || *d == canonical)
-            .map(|(n, _)| n.clone())
-    };
+    let name_of = |dir: &Path| crate::names::name_in(&named, dir);
     let dev_base = crate::dev::plan::dev_state_base()
         .map(|b| canonical(&b))
         .ok();

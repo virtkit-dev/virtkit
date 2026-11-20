@@ -40,6 +40,9 @@ All notable changes to virtkit will be documented in this file.
   stop timed out or was interrupted.
 - `vk list --detail` (`-d`) shows records for running and stopped primaries. A compose
   service gets its own record when listed without its primary.
+- The hub shows a VM's name before its workload description (`staging — /src/app (dev)`).
+  A dev environment listed with an absolute state directory keeps its current or last hub
+  action across renames.
 
 ### Changed
 

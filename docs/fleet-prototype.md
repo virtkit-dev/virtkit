@@ -1309,6 +1309,7 @@ Workload discovery reads existing records:
 
 - the host's VM registry under `<data>/vms/`, checking each state directory's lock and
   pruning stale entries when it can lock their directories;
+- the user's VM name index, matched against running VMs' recorded state directories;
 - running dev environments' identities, as read by `vk dev list`;
 - executor job dirs with a live supervisor, and the `job.json` that `prepare` writes with
   the job's ID, project, name, image, size and page on GitLab;
@@ -1323,8 +1324,8 @@ A job of the host's own gitlab-runner gets no link: everything that would name i
 `CI_SERVER_URL` and `CI_JOB_URL`, is a variable the job can set, so a job could point its
 link anywhere. It is shown as text.
 
-Only what runs is read. A stopped dev environment's state dir and any environment's workspace
-are left alone, so a share nobody is using is not mounted, or kept mounted, by whoever lists
+The name index can include stopped VMs. A stopped dev environment's state dir and any
+environment's workspace are left alone, so an idle share stays unmounted when someone lists
 the VMs. As in `vk list`, a momentary attempt to lock the state directory can briefly
 delay a run starting there. A free lock, a known exit or a replacement run's startup
 record rules out the old entry. For older entries without a recorded process start
@@ -1341,9 +1342,9 @@ A node's list rides on the report.
 
 One bound, `bound_workloads` in `vk-hub-proto`, applies on the node and again on the hub: at
 most 256 entries and 256 KiB, CI jobs first, then the newest of the rest, stopping at the
-first that does not fit. Every string is stripped of control and invisible characters and cut
-to 256 characters; an SSH alias or guest workspace that is not display-safe is dropped rather
-than altered, and an entry whose ID is not 16 lowercase hex digits is dropped. A job's page
+first that does not fit. Display strings are stripped of control and invisible characters and cut
+to 256 characters. An unsafe SSH alias or guest workspace is dropped, as is an invalid VM name.
+An entry whose ID is not 16 lowercase hex digits is dropped. A job's page
 that is not a plain web URL is dropped too: it must be `https://` or `http://`, with a host,
 no userinfo, printable ASCII without quotes, angle brackets, backslashes or backticks, and at
 most 256 bytes. Every entry left out is counted, and the hub shows the count.

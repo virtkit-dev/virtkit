@@ -315,6 +315,7 @@ doing rather than only how full it is; [local mode](#local-mode) shows the same 
 machine it runs on. Each entry carries:
 
 - the kind — CI job, dev environment, pinned run (`vk run --state-dir`);
+- the indexed VM name, when present;
 - what it belongs to — project, job name, job ID and the job's page on GitLab for CI;
   workspace and environment for `vk dev`; the image and project directory for a run;
 - the pid of the process managing it — the `vk run`, or the job's supervisor — its vCPUs,

@@ -435,9 +435,13 @@ fn view(out: anyhow::Result<crate::local::Output>) -> View {
 /// the path's own bytes, so a shown path that hashes to the ID is the path. One that does not
 /// is shown and never acted on or read: it would name another directory, or none.
 pub(super) fn exact_state_dir(w: &Workload) -> Option<&Path> {
+    (workload_id(&w.state_dir) == w.id).then(|| Path::new(&w.state_dir))
+}
+
+/// Workload ID derived by `vk workloads` from the VM's state directory.
+pub(super) fn workload_id(dir: &str) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(w.state_dir.as_bytes());
-    (vk_hub_proto::to_hex(&digest[..8]) == w.id).then(|| Path::new(&w.state_dir))
+    vk_hub_proto::to_hex(&Sha256::digest(dir.as_bytes())[..8])
 }
 
 /// Whether `id` is a VM's ID as `vk workloads` writes one: sixteen lowercase hex digits.
@@ -619,6 +623,9 @@ fn vm_detail(w: &Workload, mem: Option<u64>, local: &Local) -> Html {
     let mut h = Html::new();
     section(&mut h, "VM");
     kv(&mut h, "Kind", crate::workloads::kind_name(w.kind));
+    if let Some(name) = &w.name {
+        kv_node(&mut h, "Name", name);
+    }
     kv_node(&mut h, "State dir", &w.state_dir);
     for (key, value) in [
         ("Image", &w.label),

@@ -4032,6 +4032,7 @@ mod tests {
             ssh_alias: Some(hostile.into()),
             guest_workspace: Some(hostile.into()),
             job_url: Some(format!("https://gitlab.example.com/{hostile}")),
+            name: None,
         };
         let report = |n: usize, omitted| Report {
             workloads: Some((0..n).map(workload).collect()),

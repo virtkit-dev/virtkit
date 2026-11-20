@@ -1548,6 +1548,22 @@ pub struct Workload {
     /// link a page may open ([`is_web_link`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_url: Option<String>,
+    /// Indexed VM name shown by `vk list` and accepted as a VM reference. CI jobs and older
+    /// unnamed runs omit it. Display validation drops values that fail [`is_vm_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// A VM name matches `[a-z0-9][a-z0-9._-]*`, fits in 40 bytes and contains a non-digit.
+pub fn is_vm_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && b.len() <= 40
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'_' | b'-')
+        })
+        && !b.iter().all(u8::is_ascii_digit)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1573,10 +1589,10 @@ pub fn is_workload_id(id: &str) -> bool {
     from_hex_lower::<WORKLOAD_ID_BYTES>(id).is_some()
 }
 
-/// Make `w` fit to show: every string [`display_safe`], except the SSH alias and guest
-/// workspace, which are put into a link as they are and so are dropped rather than altered
-/// when not display-safe already, and the job's URL, dropped unless [`is_web_link`]. `false`
-/// when its ID is not one `vk` gives ([`is_workload_id`]): such a workload is not to be listed.
+/// Apply [`display_safe`] to display text. Drop unsafe SSH aliases and guest workspaces
+/// because links need their exact values. Drop names that fail [`is_vm_name`] and URLs that
+/// fail [`is_web_link`]. Return false for an invalid workload ID ([`is_workload_id`]) so the
+/// caller omits the entry.
 pub fn make_display_safe(w: &mut Workload) -> bool {
     if !is_workload_id(&w.id) {
         return false;
@@ -1599,6 +1615,9 @@ pub fn make_display_safe(w: &mut Workload) -> bool {
         if s.as_deref().is_some_and(|v| display_safe(v) != v) {
             *s = None;
         }
+    }
+    if w.name.as_deref().is_some_and(|n| !is_vm_name(n)) {
+        w.name = None;
     }
     if w.job_url.as_deref().is_some_and(|u| !is_web_link(u)) {
         w.job_url = None;
@@ -1734,6 +1753,7 @@ mod tests {
             ssh_alias: None,
             guest_workspace: None,
             job_url: None,
+            name: None,
         }
     }
 
@@ -1776,6 +1796,7 @@ mod tests {
             ssh_alias: None,
             guest_workspace: None,
             job_url: None,
+            name: None,
         }
     }
 
@@ -3461,8 +3482,8 @@ mod tests {
         assert!(started.windows(2).all(|p| p[0] <= p[1]));
     }
 
-    /// A list exactly as long as the budget, as a JSON array, is kept whole; a byte more and
-    /// the last is cut.
+    /// The JSON array budget includes names. An exact fit keeps every entry. One extra byte
+    /// drops the last entry.
     #[test]
     fn the_byte_budget_is_the_json_array_s() {
         // A workload whose strings take `lens` bytes, each of one- and two-byte characters
@@ -3484,6 +3505,7 @@ mod tests {
                 environment: Some(text(lens[6])),
                 // As many digits for every one, so each full one is as long as the next.
                 started_at: Some(1_000_000 + i as u64),
+                name: Some("n".repeat(40)),
                 ..workload_bare()
             }
         };
@@ -3524,5 +3546,38 @@ mod tests {
         assert_eq!(bound_workloads(exact).1, 0);
         let over = bound_workloads(list(sized(rest + 1)));
         assert_eq!((over.0.len(), over.1), (k, 1));
+    }
+
+    #[test]
+    fn a_workload_name_is_kept_only_when_it_is_one() {
+        for ok in ["app", "wab-wt1", "a.b_c"] {
+            assert!(is_vm_name(ok), "{ok}");
+        }
+        for bad in ["", "App", "-rf", "123", "a/b", "a b", &"x".repeat(41)] {
+            assert!(!is_vm_name(bad), "{bad}");
+        }
+        // Older reports omit the name. An unnamed workload keeps that wire format.
+        let w: Workload = serde_json::from_str(
+            r#"{"id":"0011223344556677","kind":"dev","state_dir":"/s","label":null,"project":null,
+            "job_name":null,"job_id":null,"workspace":null,"environment":null,"pid":null,
+            "cpus":null,"mem_reserved_mib":null,"started_at":null}"#,
+        )
+        .unwrap();
+        assert_eq!(w.name, None);
+        assert!(!serde_json::to_string(&w).unwrap().contains("\"name\""));
+        let mut named = Workload {
+            name: Some("staging".into()),
+            ..workload_bare()
+        };
+        assert!(make_display_safe(&mut named));
+        assert_eq!(named.name.as_deref(), Some("staging"));
+        for bad in ["App", "123", "a\u{1b}b"] {
+            let mut w = Workload {
+                name: Some(bad.into()),
+                ..workload_bare()
+            };
+            assert!(make_display_safe(&mut w));
+            assert_eq!(w.name, None, "{bad:?}");
+        }
     }
 }

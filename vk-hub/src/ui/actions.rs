@@ -49,17 +49,40 @@ const QUESTION_LIFE: Duration = Duration::from_secs(10 * 60);
 /// The most questions kept, answered or not; the oldest goes first.
 const MAX_QUESTIONS: usize = 1024;
 
-/// What an action on `w` is keyed by: a dev environment's name, which `/dev` acts on too, or
-/// the VM's ID.
+/// The VM ID keeps the action attached across renames.
 pub(super) fn key(w: &Workload) -> String {
-    match (w.kind, dev_name(w)) {
-        (WorkloadKind::Dev, Some(name)) => dev_key(&name),
-        _ => format!("vm/{}", w.id),
-    }
+    vm_key(&w.id)
 }
 
-pub(super) fn dev_key(name: &str) -> String {
-    format!("dev/{name}")
+fn vm_key(id: &str) -> String {
+    format!("vm/{id}")
+}
+
+/// Use the key from [`resolve_dev_key`], or derive it from the row as listed.
+pub(super) fn dev_key(row: &DevRow) -> String {
+    row.key.clone().unwrap_or_else(|| key_on(row, row.dir()))
+}
+
+/// Derive the VM page's action key from the canonical state directory. The registry records
+/// that path, but `vk dev list` can reach it through a symlink under `$HOME`. Fall back to
+/// the listed absolute path, then to the environment name. Each listing resolves its rows
+/// once on a blocking worker.
+pub(super) fn resolve_dev_key(row: &DevRow) -> String {
+    let canonical = row.dir().and_then(|d| std::fs::canonicalize(d).ok());
+    key_on(
+        row,
+        canonical
+            .as_deref()
+            .and_then(std::path::Path::to_str)
+            .or(row.dir()),
+    )
+}
+
+fn key_on(row: &DevRow, dir: Option<&str>) -> String {
+    match dir {
+        Some(dir) => vm_key(&local::workload_id(dir)),
+        None => format!("dev/{}", row.name),
+    }
 }
 
 /// The actions a VM's page offers, as `(op, label)`: those [`vm_command`] has a command for.
@@ -274,7 +297,7 @@ pub(super) async fn dev_action(
         }
     }
     let act = Act {
-        key: dev_key(name),
+        key: dev_key(row),
         about: format!("dev environment {name}"),
         args,
         timeout,
@@ -774,7 +797,7 @@ mod tests {
     #[test]
     fn a_vm_is_offered_what_it_has_a_command_for() {
         let mut w = dev_workload();
-        assert_eq!(key(&w), "dev/app-1234");
+        assert_eq!(key(&w), format!("vm/{}", w.id));
         assert_eq!(vm_ops(&w), [("stop", "Stop")]);
         assert_eq!(
             vm_command(&w, "stop").unwrap(),
@@ -804,6 +827,50 @@ mod tests {
         assert_eq!(key(&w), format!("vm/{}", w.id));
         w.kind = WorkloadKind::CiJob;
         assert!(vm_ops(&w).is_empty() && vm_command(&w, "stop").is_none());
+    }
+
+    /// With an absolute state directory, both pages keep the action across renames.
+    /// Another VM can reuse the name safely.
+    #[test]
+    fn an_action_is_keyed_by_the_vm_not_its_name() {
+        let mut w = dev_workload();
+        let mut r = row("running", &[]);
+        w.name = Some("app".into());
+        let before = (key(&w), dev_key(&r));
+        assert_eq!(before.0, before.1);
+        w.name = Some("staging".into());
+        r.name = "staging".into();
+        assert_eq!((key(&w), dev_key(&r)), before);
+        let mut reused = row("running", &[]);
+        reused.dir = Some("/s/app-5678".into());
+        assert_ne!(dev_key(&reused), before.0);
+        r.dir = None;
+        assert_eq!(dev_key(&r), "dev/staging");
+    }
+
+    /// A state base reached through a symlink must yield the registry's canonical VM key.
+    #[test]
+    fn an_action_is_keyed_alike_through_a_symlinked_state_base() {
+        let tmp = std::env::temp_dir().join(format!("vk-hub-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let real = tmp.join("real");
+        std::fs::create_dir_all(real.join("app-1234")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.join("link")).unwrap();
+        let canonical = std::fs::canonicalize(real.join("app-1234")).unwrap();
+        let canonical = canonical.to_str().unwrap();
+        let mut w = dev_workload();
+        w.id = local::workload_id(canonical);
+        w.state_dir = canonical.into();
+        let mut r = row("running", &[]);
+        r.dir = Some(tmp.join("link/app-1234").to_str().unwrap().into());
+        assert_ne!(key(&w), dev_key(&r), "as listed, before it is resolved");
+        r.key = Some(resolve_dev_key(&r));
+        assert_eq!(key(&w), dev_key(&r));
+        assert_eq!(
+            r.dir.as_deref(),
+            Some(tmp.join("link/app-1234").to_str().unwrap())
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     fn pid() -> Asked {

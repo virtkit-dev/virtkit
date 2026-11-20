@@ -189,7 +189,8 @@ fn bind_loopback(port: u16) -> Result<(u16, Vec<TcpListener>), (SocketAddr, std:
 pub struct Local {
     pub vk: PathBuf,
     listing: Mutex<Listing>,
-    /// The latest action, running or ended, keyed by VM ID or dev environment name.
+    /// Latest running or completed action by VM ID, or by environment name if the dev
+    /// listing supplies no absolute state directory.
     actions: Mutex<HashMap<String, Action>>,
     /// Where actions' output goes while they run ([`ACTION_LOGS`]).
     logs: PathBuf,
@@ -1048,6 +1049,15 @@ fn parse(line: &[u8]) -> Result<WorkloadList> {
     let mut list: WorkloadList =
         serde_json::from_slice(line).context("it printed a list this vk-hub cannot read")?;
     list.workloads.truncate(vk_hub_proto::MAX_WORKLOADS);
+    // Apply the fleet hub's VM name validation to the local list.
+    for w in &mut list.workloads {
+        if w.name
+            .as_deref()
+            .is_some_and(|n| !vk_hub_proto::is_vm_name(n))
+        {
+            w.name = None;
+        }
+    }
     Ok(list)
 }
 
@@ -1770,6 +1780,24 @@ mod tests {
         let err = parse(br#"{"version":2,"workloads":"changed"}"#).unwrap_err();
         assert!(format!("{err:#}").contains("version 2"), "{err:#}");
         assert!(parse(b"virtkit: oops").is_err());
+    }
+
+    /// Valid state directory names such as `123` and `App` can still be invalid VM names.
+    #[test]
+    fn a_listed_name_is_kept_only_when_it_is_one() {
+        let line = |name: &str| {
+            format!(
+                r#"{{"version":1,"workloads":[{{"id":"0011223344556677","kind":"dev",
+                "state_dir":"/s","label":null,"project":null,"job_name":null,"job_id":null,
+                "workspace":null,"environment":null,"pid":null,"cpus":null,
+                "mem_reserved_mib":null,"started_at":null,"name":"{name}"}}]}}"#
+            )
+        };
+        let name = |n: &str| parse(line(n).as_bytes()).unwrap().workloads[0].name.clone();
+        assert_eq!(name("staging").as_deref(), Some("staging"));
+        for bad in ["123", "App"] {
+            assert_eq!(name(bad), None, "{bad}");
+        }
     }
 
     /// A child that prints two lists and ends: both are taken, and its end is a failure the

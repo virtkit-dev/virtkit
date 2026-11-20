@@ -25,18 +25,15 @@ pub(crate) fn kind_name(kind: WorkloadKind) -> &'static str {
     }
 }
 
-/// What a workload belongs to, in words: a CI job's project, name and ID, a dev
-/// environment's workspace and name, a run's image and directory. The host's strings.
+/// Host-reported workload description, prefixed with the indexed VM name when present
+/// (`staging — /src/app (dev)`). CI jobs show project, job name and ID, dev environments
+/// show workspace and environment, and runs show image and project directory.
 pub(crate) fn owner(w: &Workload) -> String {
     let join = |parts: &[Option<String>]| {
         let words: Vec<&str> = parts.iter().flatten().map(String::as_str).collect();
-        if words.is_empty() {
-            "-".to_string()
-        } else {
-            words.join(" ")
-        }
+        (!words.is_empty()).then(|| words.join(" "))
     };
-    match w.kind {
+    let about = match w.kind {
         WorkloadKind::CiJob => join(&[
             w.project.clone(),
             w.job_name.clone(),
@@ -50,6 +47,11 @@ pub(crate) fn owner(w: &Workload) -> String {
             w.label.clone(),
             w.workspace.as_ref().map(|d| format!("in {d}")),
         ]),
+    };
+    match (w.name.as_deref(), about) {
+        (Some(name), Some(about)) => format!("{name} — {about}"),
+        (Some(name), None) => name.to_string(),
+        (None, about) => about.unwrap_or_else(|| "-".to_string()),
     }
 }
 
@@ -104,6 +106,7 @@ mod tests {
             ssh_alias: None,
             guest_workspace: None,
             job_url: None,
+            name: None,
         }
     }
 
@@ -121,5 +124,29 @@ mod tests {
         assert_eq!(cells[7], "1970-01-01T00:01:40Z");
         let small = super::cells(&workload(WorkloadKind::Run), Some(4096));
         assert_eq!(small[6], "<1M");
+    }
+
+    #[test]
+    fn a_named_vm_is_shown_by_its_name() {
+        let named = |kind| Workload {
+            name: Some("staging".into()),
+            ..workload(kind)
+        };
+        assert_eq!(owner(&named(WorkloadKind::Dev)), "staging — /src/app (dev)");
+        assert_eq!(
+            owner(&named(WorkloadKind::Run)),
+            "staging — alpine:3.20 in /src/app"
+        );
+        assert_eq!(
+            cells(&named(WorkloadKind::Dev), None)[2],
+            "staging — /src/app (dev)"
+        );
+        let bare = Workload {
+            label: None,
+            workspace: None,
+            ..named(WorkloadKind::Run)
+        };
+        assert_eq!(owner(&bare), "staging");
+        assert_eq!(owner(&Workload { name: None, ..bare }), "-");
     }
 }

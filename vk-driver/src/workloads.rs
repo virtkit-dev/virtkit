@@ -2,13 +2,11 @@
 //! reports them: pinned `vk run`s and `vk dev` environments from the VM registry, CI jobs from
 //! the executor's job dirs.
 //!
-//! Everything is read from what those already keep, never kept apart: the registry's entries,
-//! checked against their state-dir locks and pruned when stale; the running dev state dirs'
-//! identities, as `vk dev list` reads them; each job dir's
-//! live supervisor and the record `prepare` leaves beside it; the admission ledger's
-//! reservations. Nothing is read for a VM that is not running: a stopped dev environment's
-//! directory and its workspace — perhaps on a share nobody else is holding up — stay
-//! untouched.
+//! Discovery checks registry entries against their state directory locks and prunes stale
+//! entries. It reads the VM name index, running dev identities as `vk dev list` reads them,
+//! live job supervisors and their `prepare` records, and admission ledger reservations. Name lookup
+//! reads index symlinks and leaves stopped dev environments and their workspaces untouched,
+//! so listing VMs does not keep an idle share mounted.
 //!
 //! What a VM holds on the host is its managing process's whole tree, counted proportionally
 //! — the figure `vk list` and `vk dev list` show. Reading it walks every process's page
@@ -65,23 +63,43 @@ struct Sources {
     jobs: Vec<Job>,
     /// Each granted reservation in the admission ledger, in MiB, by job ID.
     reserved_mib: HashMap<OsString, u64>,
+    /// Indexed names of live VMs, keyed by recorded state directory.
+    names: HashMap<PathBuf, String>,
 }
 
 impl Sources {
-    /// Read this host's, its VMs from `registry` or the user's own. `reserved_mib` is the
-    /// admission ledger's reservations as [`Lister`] last read them; a job dir listing that
-    /// fails is said to `jobs_said`, a dev state base that cannot be found to `dev_said`.
+    /// Read VMs from `registry` or the user's registry. `reserved_mib` is [`Lister`]'s last
+    /// admission ledger snapshot. Report errors reading jobs, the dev state base and the
+    /// name index through their respective warning trackers.
     fn read(
         cfg: &Config,
         registry: Option<&Path>,
         reserved_mib: HashMap<OsString, u64>,
         jobs_said: &mut Once,
         dev_said: &mut Once,
+        names_said: &mut Once,
     ) -> Sources {
         let vms = match registry {
             Some(dir) => crate::vms::running_in(dir),
             None => crate::vms::running(),
         };
+        // Only the user's registry shares the name index used by `vk list`.
+        let named = match registry {
+            Some(_) => Ok(Vec::new()),
+            None => crate::names::Index::open().and_then(|idx| idx.try_all()),
+        }
+        .map_err(|e| format!("virtkit: cannot read the VM names: {e:#}"));
+        names_said.say(named.as_ref().err().cloned());
+        let named = named.unwrap_or_default();
+        let names = vms
+            .iter()
+            .filter_map(|e| {
+                Some((
+                    e.state_dir.clone(),
+                    crate::names::name_in(&named, &e.state_dir)?,
+                ))
+            })
+            .collect();
         let dev =
             dev_rows(&vms).map_err(|e| format!("virtkit: cannot find the dev environments: {e:#}"));
         dev_said.say(dev.as_ref().err().cloned());
@@ -105,6 +123,7 @@ impl Sources {
             dev,
             jobs: jobs.unwrap_or_default(),
             reserved_mib,
+            names,
             vms,
         }
     }
@@ -193,6 +212,7 @@ fn workloads(sources: &Sources) -> Vec<(Workload, Option<i32>)> {
                 .map(|row| crate::dev::alias_for(&row.dir)),
             guest_workspace: dev.and_then(|row| row.workspace_folder.clone()),
             job_url: None,
+            name: sources.names.get(&e.state_dir).cloned(),
         };
         out.push((workload, pid.and_then(|p| i32::try_from(p).ok())));
     }
@@ -224,6 +244,7 @@ fn workloads(sources: &Sources) -> Vec<(Workload, Option<i32>)> {
             ssh_alias: None,
             guest_workspace: None,
             job_url: record.and_then(|r| r.job_url.clone()),
+            name: None,
         };
         out.push((workload, Some(j.supervisor)));
     }
@@ -334,6 +355,7 @@ pub(crate) struct Lister {
     anomalies_said: Once,
     jobs_said: Once,
     dev_said: Once,
+    names_said: Once,
 }
 
 impl Lister {
@@ -347,6 +369,7 @@ impl Lister {
             anomalies_said: Once::default(),
             jobs_said: Once::default(),
             dev_said: Once::default(),
+            names_said: Once::default(),
         }
     }
 
@@ -397,6 +420,7 @@ impl Lister {
             self.reserved_mib.clone().unwrap_or_default(),
             &mut self.jobs_said,
             &mut self.dev_said,
+            &mut self.names_said,
         );
         let (found, omitted) = bound_workloads(workloads(&sources));
         // Read once for every tree measured, and only when one is: without the kernel's child
@@ -774,9 +798,12 @@ mod tests {
         assert_eq!(entry(Path::new("/s/x"), 100).pid_start_ticks, None);
     }
 
+    /// Include an indexed name in the budget fixtures.
     fn vm(i: usize, kind: WorkloadKind) -> (Workload, Option<i32>) {
+        let dir = PathBuf::from(format!("/s/{i}"));
         let mut w = workloads(&Sources {
-            vms: vec![entry(&PathBuf::from(format!("/s/{i}")), i as u64)],
+            vms: vec![entry(&dir, i as u64)],
+            names: HashMap::from([(dir, format!("vm-{i}"))]),
             ..Sources::default()
         })
         .remove(0);
@@ -827,6 +854,7 @@ mod tests {
         let (kept, omitted) = bound_workloads(all);
         assert!(omitted > 0 && !kept.is_empty());
         assert_eq!(kept.len() + omitted as usize, MAX_WORKLOADS);
+        assert!(kept.iter().all(|(w, _)| w.name.is_some()));
         let w = &kept[0].0;
         assert_eq!(w.state_dir.chars().count(), vk_hub_proto::MAX_DISPLAY);
         assert!(!w.state_dir.contains('\u{1b}'));
@@ -889,6 +917,34 @@ mod tests {
         let (kept, omitted) = bound_workloads(all);
         assert_eq!((kept.len(), omitted), (n, 2));
         assert!(kept.iter().all(|(w, _)| w.started_at >= Some(1000)));
+    }
+
+    /// Name lookup precedes display sanitization, even when paths collide or are truncated.
+    #[test]
+    fn a_name_follows_the_recorded_state_dir() {
+        let plain = PathBuf::from("/s/ab");
+        let control = PathBuf::from("/s/a\u{1}b");
+        let long = PathBuf::from(format!("/s/{}", "d".repeat(vk_hub_proto::MAX_DISPLAY)));
+        let (found, _) = bound_workloads(workloads(&Sources {
+            vms: vec![entry(&plain, 1), entry(&control, 2), entry(&long, 3)],
+            names: HashMap::from([
+                (control.clone(), "other".to_string()),
+                (long.clone(), "deep".to_string()),
+            ]),
+            ..Sources::default()
+        }));
+        let name = |dir: &Path| {
+            let w = &found
+                .iter()
+                .find(|(w, _)| w.id == crate::vms::slug(dir))
+                .unwrap()
+                .0;
+            w.name.clone()
+        };
+        assert_eq!(found[0].0.state_dir, found[1].0.state_dir);
+        assert_eq!(name(&plain), None);
+        assert_eq!(name(&control).as_deref(), Some("other"));
+        assert_eq!(name(&long).as_deref(), Some("deep"));
     }
 
     /// What a link is built of is listed as it is or not at all.
