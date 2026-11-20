@@ -325,7 +325,12 @@ fn pivot_to_real_root() -> Result<bool> {
     // /dev/fd/<n> until the image's own init got around to creating the links.
     link_dev_std_fds();
     std::fs::create_dir_all("/newroot")?;
-    mount(&dev, "/newroot", "ext4", 0).with_context(|| format!("mounting real root {dev}"))?;
+    // If the image kernel builds btrfs as a module, preinit must load it before this mount.
+    let fstype = vk_core::fsprobe::fstype_of(Path::new(&dev))
+        .with_context(|| format!("reading the superblock of {dev}"))?
+        .with_context(|| format!("{dev}: the superblock is neither ext4 nor btrfs"))?;
+    mount(&dev, "/newroot", fstype, 0)
+        .with_context(|| format!("mounting real root {dev} ({fstype})"))?;
     std::env::set_current_dir("/newroot").context("chdir /newroot")?;
     mount(".", "/", "", libc::MS_MOVE).context("mount --move /newroot /")?;
     let rc = unsafe { libc::chroot(c".".as_ptr()) };
