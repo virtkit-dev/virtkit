@@ -265,8 +265,10 @@ vk dev exec --user root -- id
 ready. Concurrent callers join an in-flight boot; `up --no-wait` fails promptly
 instead. Use `up` for the first boot. `start` reuses a running environment or boots it
 without building images. If the boot needs a build, it exits 3 and attempts to restore
-the previous boot record. `start --service NAME` then starts that service without building.
-Primary `exec`, `shell` and `code` bring the environment up when needed.
+the previous boot record.
+`stop` (also `down`) powers off the environment and its services and keeps its state.
+`restart` runs `stop`, then `start`. Primary `exec`, `shell` and `code` bring the
+environment up when needed.
 Commands use the configured user and `exec-env`; a host working directory inside
 the checkout maps to its corresponding guest directory. `--dir` overrides that
 mapping. `exec` passes arguments directly and reproduces the command's exit
@@ -387,18 +389,32 @@ service exec, and every other command to the host policy, which never sees it.
 
 ```sh
 vk dev service status
-vk dev service up runner
+vk dev up runner
 vk dev endpoints --service runner
 vk dev open runner.https
 vk dev exec --service runner --user root -- id
 vk dev shell --service runner
 vk dev logs --service runner -f
 vk dev service reboot runner
-vk dev service down runner
+vk dev stop runner cache
+vk dev start runner
 ```
 
-`service up` brings up the environment if needed, builds the requested service on
-first use, and returns once the service's agent answers. `reboot` restarts the
+`up`, `start`, `stop` (`down`) and `restart` take names: the compose services of the
+environment, an environment of this workspace as `vk list` names it (`app-test`), or
+`ENV/SERVICE`, a service of that environment's own compose file. The primary's own
+service name is the environment. A name that is both a service and an environment is
+refused until `--service NAME` or `--name NAME` says which; a name given twice is acted
+on once. These commands refuse VMs outside the workspace. Use `vk stop NAME`, `vk start NAME`
+or `vk restart NAME` for any VM. `vk dev service up NAME` and `vk dev service down NAME`
+remain available. A target lookup error exits 2 before any target runs. Once targets
+resolve, a command exits 3 if every failure requires a build, or 1 for any other failure.
+
+For a sibling service, `up NAME` runs `up` on its environment first, even if it is already
+running, so the freshness policy applies. It creates a new environment if needed, builds
+the service on first use and returns once its agent answers. `start NAME` requires a prior
+environment boot and an already built service image. Stopping a sibling leaves its
+environment running. Stopping the primary stops the environment. `service reboot` restarts the
 guest in place without rebuilding its image. Other service commands do not boot
 the environment. Service `exec` and `shell` require a running service and wait if
 it is still booting. They do not inherit the primary's user, workspace directory
@@ -958,14 +974,15 @@ Use `vk dev COMMAND --help` for individual options.
 | Command | Purpose |
 | --- | --- |
 | `init` | Import or validate a config; `--from`, `--image`, `--force`. |
-| `up` | Ensure the environment is ready; `--no-wait`. |
-| `start` | Boot from what is already built (exit 3 when a build is needed); `--service NAME`. |
+| `up [NAME…]` | Ensure the environment, or named services or environments, are up, building what is needed; `--no-wait`. |
+| `start [NAME…]` | Boot from what is already built (exit 3 when a build is needed). |
+| `restart [NAME…]` | `stop`, then `start`. |
 | `exec -- ARG…` | Run a command; `--dir`, `--user`, `--service`, `-t`. |
 | `shell` | Boot if needed and open an interactive shell; `--service` opens one in a running service. |
 | `code` | Boot if needed and open VS Code; `--editor`. |
 | `editor status`, `editor log`, `editor retry`, `editor reset` | Follow or retry editor reconciliation, or start the server over, without booting. |
 | `build` | Build the primary or `--service NAME` into cache. |
-| `service up/down/reboot NAME`, `service status [NAME]` | Control compose services. |
+| `service up/down/reboot NAME`, `service status [NAME]` | Start, stop or reboot a compose service, or show its status. |
 | `endpoints` | Show publication state; `--primary`, `--service`, `--json`. |
 | `open NAME` | Open an endpoint URL, or `--print` it. |
 | `task NAME -- ARG…` | Run a declared project task. |
@@ -975,7 +992,7 @@ Use `vk dev COMMAND --help` for individual options.
 | `logs` | Read or follow primary/service console output. |
 | `doctor` | Check the host and resolved requirements. |
 | `plan` | Inspect the resolved config; `--explain`, `--diff`, `--format`, `--show-secrets`. |
-| `stop [NAME]` | Stop the environment and publishers, or another environment of this workspace; `--timeout SECONDS`. |
+| `stop [NAME…]`, `down` | Stop the environment and publishers, or named services or environments of this workspace; `--timeout SECONDS`. |
 | `storage list`, `storage reset NAME` | Inspect storage or destroy a durable item's data. |
 | `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. `NAME` selects a stopped environment in this workspace. Use `vk reset NAME` for a stopped dev environment with a valid identity and no run recipe in any workspace. |
 | `list` | Host-wide environment inventory (on-disk sizes by default); `--no-sizes`, `--json`. |

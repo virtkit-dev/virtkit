@@ -544,14 +544,14 @@ vk dev init                         # write a first config from devcontainer.jso
 vk dev shell                        # boot if needed, then a login shell as the config's user
 vk dev exec -- cargo test           # a command in the environment, exit status reproduced
 vk dev code                         # VS Code over Remote-SSH, extensions and settings reconciled
-vk dev service up runner            # a profiled compose service, built on first use
+vk dev up runner                    # a profiled compose service, built on first use
 vk dev endpoints                    # the stable host addresses its ports are published on
 vk dev task pre-commit -- "$@"      # a project command under its declared execution policy
 vk dev status                       # what is running and whether its configuration matches
 vk dev plan                         # inspect the resolved configuration without running it
 vk dev doctor                       # check the host and configuration requirements
 vk dev refresh                      # rebuild and restart into the current config
-vk dev stop
+vk dev stop                         # or `down`; `vk dev stop db redis` stops two services
 vk dev start                        # boot again without building images
 vk dev prune --dry-run              # preview local boot-image cleanup; --storage selects data
 vk dev list                         # every environment this host keeps state for, from anywhere

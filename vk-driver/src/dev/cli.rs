@@ -54,8 +54,13 @@ impl Dev {
     }
 }
 
-/// `vk dev`: the entry point `main` dispatches to.
-pub async fn run(dev: Dev, host_cfg: &crate::config::Config) -> ExitCode {
+/// `vk dev`: the entry point `main` dispatches to. `host_config` is the global `--config`
+/// this `vk` was given, for the `vk dev` it runs on a named environment.
+pub async fn run(
+    dev: Dev,
+    host_cfg: &crate::config::Config,
+    host_config: Option<&Path>,
+) -> ExitCode {
     let over = dev::Overrides {
         cache_registry: dev.cache_registry,
         cache_insecure: dev.cache_insecure,
@@ -71,6 +76,7 @@ pub async fn run(dev: Dev, host_cfg: &crate::config::Config) -> ExitCode {
         &dev.environment,
         &over,
         host_cfg,
+        host_config,
     )
     .await
 }
@@ -105,20 +111,35 @@ enum DevAction {
     /// the same configuration is a no-op; one running a different configuration, or created
     /// by an older vk, is handled as the config's `freshness` (or `--freshness`) says. To
     /// rebuild and restart one that matches, use `vk dev refresh`.
+    ///
+    /// Names select services or environments in this workspace. For a service, `up` first
+    /// applies the environment's freshness policy, then builds the service image if needed.
     Up {
         /// fail promptly when a boot someone else started is in flight, instead of joining it
         #[arg(long)]
         no_wait: bool,
+        #[command(flatten)]
+        targets: Targets,
     },
     /// Start the environment from what is already built
     ///
     /// Use `up` for the first boot. Reuse a running environment even if its config changed.
     /// A stopped environment can restore images from the build cache. If the boot needs a
-    /// build, attempt to restore its previous boot record and exit 3.
+    /// build, attempt to restore its previous boot record and exit 3. With NAMEs, start those compose
+    /// services or environments of this workspace without building.
     Start {
-        /// then start this compose service the same way, from what is already built
-        #[arg(long, value_name = "NAME")]
-        service: Option<String>,
+        #[command(flatten)]
+        targets: Targets,
+    },
+    /// Stop the environment, then start it from what is already built
+    ///
+    /// `stop`, then `start`. With NAMEs, restarts those compose services or environments.
+    Restart {
+        #[command(flatten)]
+        targets: Targets,
+        /// seconds to wait per environment stop, or per service-stop socket read or write
+        #[arg(long, default_value_t = super::boot::STOP_TIMEOUT_SECS)]
+        timeout: u64,
     },
     /// Run a command in the environment, bringing it up first
     ///
@@ -372,23 +393,28 @@ enum DevAction {
     /// source and mount paths, free host ports for the endpoints, the state directory, and
     /// the host variables the config refers to. Exits 1 when a check fails.
     Doctor,
-    /// Stop the environment and everything published from it
+    /// Stop the environment and everything published from it (`down` is the same)
     ///
-    /// Powers off the guest and stops its publishers. The next `vk dev up` reuses its storage,
-    /// keys and identity. Use `vk dev gc` to remove the state directory. Stopping an environment
-    /// that is already down succeeds.
+    /// Powers off the guest, its compose services with it, and stops its publishers. The
+    /// next `vk dev start` or `up` reuses its storage, keys and identity. Use `vk dev gc` to
+    /// remove the state directory. Stopping an environment that is already down succeeds.
     ///
-    /// With no NAME, works on this workspace's environment, from its config. NAME stops
-    /// another environment of this workspace, as `vk list` names it. A VM of another
-    /// workspace, or one whose workspace is gone, is `vk stop NAME`'s.
+    /// Stopping a sibling service leaves its environment up. The primary service name stops
+    /// the whole environment. Use `vk stop NAME` for a VM outside this workspace, including
+    /// one whose workspace is gone.
+    #[command(visible_alias = "down")]
     Stop {
-        /// an environment of this workspace, as `vk list` names it [default: this one]
-        #[arg(value_name = "NAME")]
-        name: Option<String>,
+        #[command(flatten)]
+        targets: Targets,
         /// plumbing: the environment on this state dir alone, whatever its workspace
-        #[arg(long, value_name = "DIR", hide = true, conflicts_with = "name")]
+        #[arg(
+            long,
+            value_name = "DIR",
+            hide = true,
+            conflicts_with_all = ["names", "services", "vms"]
+        )]
         state_dir: Option<PathBuf>,
-        /// seconds to wait for it to go
+        /// seconds to wait per environment stop, or per service-stop socket read or write
         #[arg(long, default_value_t = super::boot::STOP_TIMEOUT_SECS)]
         timeout: u64,
     },
@@ -492,7 +518,10 @@ impl DevAction {
             // A task boots only under `policy = "require"`, which is in the config rather
             // than on the command line; the fork is where a boot *may* happen, and the
             // policies that boot nothing leave the work to the parent (see `dev_up`).
-            Self::Up { .. } | Self::Start { .. } | Self::Code { .. } | Self::Task { .. } => true,
+            // Named services and environments are reached from this process: it boots none
+            // itself (see `act_on`).
+            Self::Up { targets, .. } | Self::Start { targets } => targets.is_empty(),
+            Self::Code { .. } | Self::Task { .. } => true,
             // A service exec or shell reaches a running service and boots nothing.
             Self::Exec { service, .. } | Self::Shell { service } => service.is_none(),
             // Of the service operations only `up` boots the environment.
@@ -512,12 +541,39 @@ impl DevAction {
             | Self::Logs { .. }
             | Self::Doctor
             | Self::Stop { .. }
+            | Self::Restart { .. }
             | Self::List { .. }
             | Self::Gc { .. }
             | Self::Prune { .. }
             | Self::Plan { .. }
             | Self::Schema => false,
         }
+    }
+}
+
+/// What `up`, `start`, `stop` and `restart` act on, by name: compose services of the
+/// environment, or environments of this workspace. None means the environment itself.
+#[derive(Args, Debug, Default)]
+struct Targets {
+    /// compose services, or environments of this workspace [default: the environment]
+    ///
+    /// A service by its compose name (the primary's is the environment itself), an
+    /// environment as `vk list` names it, or `ENV/SERVICE`. A name that is both is refused:
+    /// `--service` or `--name` says which. A VM of another workspace is refused too: `vk`
+    /// itself (`vk start NAME`, `vk stop NAME`) reaches any VM.
+    #[arg(value_name = "NAME")]
+    names: Vec<String>,
+    /// a compose service of the environment (repeatable)
+    #[arg(long = "service", value_name = "SERVICE")]
+    services: Vec<String>,
+    /// an environment of this workspace, as `vk list` names it (repeatable)
+    #[arg(long = "name", value_name = "NAME")]
+    vms: Vec<String>,
+}
+
+impl Targets {
+    fn is_empty(&self) -> bool {
+        self.names.is_empty() && self.services.is_empty() && self.vms.is_empty()
     }
 }
 
@@ -655,19 +711,6 @@ fn service_reply(reply: anyhow::Result<vk_core::fleetctl::Reply>) -> ExitCode {
     }
 }
 
-/// [`service_reply`] for a cached start: one refused because its image is not built exits 3,
-/// saying that `vk dev {build}` builds it.
-fn cached_reply(reply: anyhow::Result<vk_core::fleetctl::Reply>, build: &str) -> ExitCode {
-    match reply {
-        Ok(reply) if reply.not_built => {
-            eprintln!("{}", reply.message);
-            eprintln!("vk: hint: `vk dev {build}` builds it");
-            exit_code(3)
-        }
-        reply => service_reply(reply),
-    }
-}
-
 /// `--environment ENV ` for an environment other than `dev`, for a command to repeat.
 fn environment_flag(environment: &str) -> String {
     match environment {
@@ -684,6 +727,7 @@ async fn dev_action(
     environment: &str,
     over: &dev::Overrides,
     host_cfg: &crate::config::Config,
+    host_config: Option<&Path>,
 ) -> ExitCode {
     // Return the embedded schema before resolving cwd, even if that directory was deleted.
     if matches!(action, DevAction::Schema) {
@@ -789,27 +833,43 @@ async fn dev_action(
         Ok(p) => p,
         Err(e) => return fail(&e, 2),
     };
+    let globals = Globals {
+        loaded: &loaded,
+        over,
+        host_config,
+    };
     match action {
+        DevAction::Up { no_wait, targets } if !targets.is_empty() => {
+            act_on(Verb::Up { no_wait }, &targets, 0, &plan, &globals).await
+        }
+        DevAction::Start { targets } if !targets.is_empty() => {
+            act_on(Verb::Start, &targets, 0, &plan, &globals).await
+        }
         DevAction::Stop {
-            name: Some(name),
-            timeout,
-            ..
-        } => match in_scope(&plan.workspace, std::slice::from_ref(&name), "vk stop") {
-            Ok(dirs) => stop_dir(&dirs[0], timeout),
-            Err(code) => code,
-        },
+            targets, timeout, ..
+        } if !targets.is_empty() => act_on(Verb::Stop, &targets, timeout, &plan, &globals).await,
+        DevAction::Restart { targets, timeout } if !targets.is_empty() => {
+            act_on(Verb::Restart, &targets, timeout, &plan, &globals).await
+        }
+        DevAction::Restart { timeout, .. } => {
+            let env = plan.environment.clone();
+            match restart_env(&env, &plan.state_dir, timeout, &globals) {
+                Ok(report) => write_report(&report),
+                Err(e) => fail(&e, if build::not_cached(&e) { 3 } else { 1 }),
+            }
+        }
         // Only a bare `prune` gets here: a named one returned before the plan.
         DevAction::Prune { options, .. } => match super::prune::run(&plan, &options) {
             Ok(report) => write_report(&report),
             Err(e) => fail(&e, 1),
         },
-        DevAction::Up { no_wait } => {
+        DevAction::Up { no_wait, .. } => {
             match dev_up(&plan, host_cfg, over, false, !no_wait, true).await {
                 Ready::Act => ExitCode::SUCCESS,
                 Ready::Done(code) => code,
             }
         }
-        DevAction::Start { service } => {
+        DevAction::Start { .. } => {
             // Check before boot. The process released at guest readiness can race
             // publication of the new identity.
             let up = format!("vk dev {}up", environment_flag(&plan.environment));
@@ -826,21 +886,13 @@ async fn dev_action(
                 no_build: true,
                 ..over.clone()
             };
-            match dev_up(&plan, host_cfg, &over, false, true, service.is_none()).await {
+            match dev_up(&plan, host_cfg, &over, false, true, true).await {
+                Ready::Act => ExitCode::SUCCESS,
                 Ready::Done(code) if code == exit_code(3) => {
                     eprintln!("vk: hint: `{up}` builds it");
                     code
                 }
                 Ready::Done(code) => code,
-                Ready::Act => match service {
-                    None => ExitCode::SUCCESS,
-                    Some(unit) => {
-                        let hint =
-                            format!("{}service up {unit}", environment_flag(&plan.environment));
-                        let req = vk_core::fleetctl::Request::StartCached { unit };
-                        cached_reply(dev::service(&plan, &req).await, &hint)
-                    }
-                },
             }
         }
         DevAction::Refresh { dry_run: true } => match dev::plan_diff(&plan) {
@@ -1210,11 +1262,7 @@ async fn dev_action(
             let code = write_report(&report);
             if ok { code } else { exit_code(1) }
         }
-        DevAction::Stop {
-            name: None,
-            timeout,
-            ..
-        } => stop_dir(&plan.state_dir, timeout),
+        DevAction::Stop { timeout, .. } => stop_dir(&plan.state_dir, timeout),
         // Only a bare `gc` gets here; named runs are above and `--all-stale` returned before
         // the config. Selected by the plan's own state dir, which no other environment shares.
         DevAction::Gc { yes, .. } => dev_gc(yes, Gc::Dirs(std::slice::from_ref(&plan.state_dir))),
@@ -1394,17 +1442,336 @@ fn refuse_outside(name: &str, global: &str) -> ExitCode {
     fail(&e, 2)
 }
 
-/// The state dirs of `names`, each an environment of this workspace, as `stop`, `gc` and
-/// `prune` take them. What is resolved here is what they act on: a name is not looked up
+/// The state dirs of `names`, each an environment of this workspace, as `gc` and `prune`
+/// take them. What is resolved here is what they act on: a name is not looked up
 /// again, so one given to another environment meanwhile does not redirect them.
 fn in_scope(workspace: &Path, names: &[String], global: &str) -> Result<Vec<PathBuf>, ExitCode> {
-    let scope = super::targets::envs(workspace).map_err(|e| fail(&e, 1))?;
+    let scope = super::targets::Scope {
+        envs: super::targets::recorded(workspace).map_err(|e| fail(&e, 1))?,
+        ..Default::default()
+    };
     match super::targets::pick_envs(&scope, names, &super::targets::known_anywhere) {
         Ok(envs) => Ok(envs.into_iter().map(|e| e.dir).collect()),
         Err(e) => Err(match e.downcast_ref::<super::targets::Outside>() {
             Some(o) => refuse_outside(&o.0, global),
             None => fail(&e, 2),
         }),
+    }
+}
+
+/// What the commands acting on named VMs carry from `vk`'s and `vk dev`'s own options.
+#[derive(Clone, Copy)]
+struct Globals<'a> {
+    loaded: &'a config::Loaded,
+    over: &'a dev::Overrides,
+    /// the global `--config` this `vk` was given
+    host_config: Option<&'a Path>,
+}
+
+/// A lifecycle verb on named services and environments.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verb {
+    Up { no_wait: bool },
+    Start,
+    Stop,
+    Restart,
+}
+
+impl Verb {
+    /// The `vk` command that does the same to a VM of any workspace.
+    fn global(self) -> &'static str {
+        match self {
+            Verb::Up { .. } => "vk start --build",
+            Verb::Start => "vk start",
+            Verb::Stop => "vk stop",
+            Verb::Restart => "vk restart",
+        }
+    }
+
+    /// The `vk dev` verb that boots an environment for this one.
+    fn boot(self) -> &'static [&'static str] {
+        match self {
+            Verb::Up { no_wait: true } => &["up", "--no-wait"],
+            Verb::Up { no_wait: false } => &["up"],
+            Verb::Start | Verb::Stop | Verb::Restart => &["start"],
+        }
+    }
+}
+
+/// `vk dev up | start | stop | restart NAME…`: act on each named service or environment in
+/// turn, each once. An environment that has to boot does so in a `vk dev` of its own, so this
+/// process boots nothing and can go on to the next name. The exit status is
+/// [`crate::lifecycle::worst`] of theirs: 3 when all that failed were not built.
+async fn act_on(
+    verb: Verb,
+    targets: &Targets,
+    timeout: u64,
+    plan: &plan::Plan,
+    g: &Globals<'_>,
+) -> ExitCode {
+    use super::targets::Pick;
+    let (scope, picks) = match picks(verb, targets, plan, g) {
+        Ok(p) => p,
+        Err(e) => {
+            return match e.downcast_ref::<super::targets::Outside>() {
+                Some(o) => refuse_outside(&o.0, verb.global()),
+                None => fail(&e, 2),
+            };
+        }
+    };
+    let mut codes = Vec::new();
+    for pick in picks {
+        let (Pick::Env(env) | Pick::Service(env, _)) = &pick;
+        // Stopping a resolved environment still works if its recorded config is gone.
+        let own = match (&pick, verb) {
+            (Pick::Env(_), Verb::Stop) => Ok(None),
+            _ => own_config(env, scope.current.as_ref(), g),
+        };
+        let done = match own {
+            Err(e) => Err(e),
+            Ok(own) => {
+                let g = &Globals {
+                    loaded: own.as_ref().unwrap_or(g.loaded),
+                    ..*g
+                };
+                match &pick {
+                    Pick::Env(env) => env_verb(verb, env, timeout, g),
+                    Pick::Service(env, service) => {
+                        service_verb(verb, env, service, timeout, g).await
+                    }
+                }
+            }
+        };
+        codes.push(match done {
+            Ok(report) => u8::from(write_report(&report) != ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("vk: {e:#}");
+                if build::not_cached(&e) { 3 } else { 1 }
+            }
+        });
+    }
+    crate::lifecycle::worst(codes)
+}
+
+/// What the names `verb` was given resolve to, each once, and the scope they resolved in.
+/// Another environment's services are what the config it last booted from declares.
+fn picks(
+    verb: Verb,
+    targets: &Targets,
+    plan: &plan::Plan,
+    g: &Globals<'_>,
+) -> anyhow::Result<(super::targets::Scope, Vec<super::targets::Pick>)> {
+    use super::targets::{Env, catalog, pick, scope};
+    let scope = scope(plan)?;
+    let catalog_of = |env: &Env| {
+        let own = own_config(env, scope.current.as_ref(), g)?;
+        catalog(&plan::resolve(
+            own.as_ref().unwrap_or(g.loaded),
+            &env.environment,
+        )?)
+    };
+    let picks = pick(
+        &scope,
+        &targets.names,
+        &targets.services,
+        &targets.vms,
+        matches!(verb, Verb::Up { .. }),
+        &super::targets::known_anywhere,
+        &catalog_of,
+    )?;
+    Ok((scope, picks))
+}
+
+/// The config `env` was last booted from, when it is another environment of this workspace
+/// and that is not the config this command read: its services, and how it boots again, are
+/// that config's. `None` for the environment this command is about, and for one that
+/// recorded no config.
+fn own_config(
+    env: &super::targets::Env,
+    current: Option<&super::targets::Env>,
+    g: &Globals<'_>,
+) -> anyhow::Result<Option<config::Loaded>> {
+    use anyhow::Context;
+    let Some(recorded) = env.config.as_deref() else {
+        return Ok(None);
+    };
+    let canonical = crate::vms::canonical;
+    if current == Some(env) || canonical(recorded) == canonical(&g.loaded.files.config) {
+        return Ok(None);
+    }
+    let workspace = &g.loaded.files.workspace;
+    config::discover(workspace, Some(workspace), Some(recorded))
+        .and_then(config::load)
+        .map(Some)
+        .with_context(|| format!("{} was booted with {}", env.name, recorded.display()))
+}
+
+/// Forward the target's workspace and config and the caller's overrides to [`dev_child`].
+/// Keep paths as OS strings so non-UTF-8 paths survive the child invocation.
+fn dev_child_args(environment: &str, verb: &[&str], g: &Globals<'_>) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    let joined = |flag: &str, value: &std::ffi::OsStr| {
+        let mut arg = OsString::from(flag);
+        arg.push("=");
+        arg.push(value);
+        arg
+    };
+    let mut args = Vec::new();
+    if let Some(config) = g.host_config {
+        args.push(joined("--config", config.as_os_str()));
+    }
+    args.push("dev".into());
+    let files = &g.loaded.files;
+    args.push(joined("--workspace", files.workspace.as_os_str()));
+    args.push(joined("--dev-config", files.config.as_os_str()));
+    args.push(joined("--environment", environment.as_ref()));
+    if let Some(f) = g.over.freshness {
+        args.push(joined("--freshness", f.as_str().as_ref()));
+    }
+    if let Some(r) = &g.over.cache_registry {
+        args.push(joined("--cache-registry", r.as_ref()));
+    }
+    if g.over.cache_insecure {
+        args.push("--cache-insecure".into());
+    }
+    args.extend(verb.iter().map(OsString::from));
+    args
+}
+
+/// Run `vk dev <verb>` on `environment` of this workspace in a process of its own, its
+/// output ours. One that exits 3 found something not built: a [`build::NotBuilt`].
+fn dev_child(environment: &str, verb: &[&str], g: &Globals<'_>) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let exe = std::env::current_exe().context("resolving the running vk")?;
+    let status = std::process::Command::new(exe)
+        .args(dev_child_args(environment, verb, g))
+        .status()
+        .context("running vk")?;
+    let flag = hint_flags(environment, g);
+    let ran = format!("`vk dev {flag}{}` {status}", verb.join(" "));
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(3) => Err(build::NotBuilt(format!("{ran}: `vk dev {flag}up` builds it")).into()),
+        _ => anyhow::bail!("{ran}"),
+    }
+}
+
+/// The `vk dev` options a hint names `environment` with: `--environment` but for `dev`, and
+/// `--dev-config` for a config other than the workspace's own, which the command read.
+fn hint_flags(environment: &str, g: &Globals<'_>) -> String {
+    let files = &g.loaded.files;
+    let config = match files.config == files.workspace.join(config::CONFIG_FILE) {
+        true => String::new(),
+        false => format!("--dev-config {} ", files.config.display()),
+    };
+    format!("{config}{}", environment_flag(environment))
+}
+
+/// Stop the environment on `dir`, then start it again from what is built.
+fn restart_env(
+    environment: &str,
+    dir: &Path,
+    timeout: u64,
+    g: &Globals<'_>,
+) -> anyhow::Result<String> {
+    let stopped = dev::stop(dir, timeout)?;
+    if !stopped.all_down {
+        anyhow::bail!("{}it did not stop", stopped.report);
+    }
+    if write_report(&stopped.report) != ExitCode::SUCCESS {
+        anyhow::bail!("writing what was stopped");
+    }
+    dev_child(environment, &["start"], g)?;
+    Ok(String::new())
+}
+
+/// `verb` on an environment of this workspace.
+fn env_verb(
+    verb: Verb,
+    env: &super::targets::Env,
+    timeout: u64,
+    g: &Globals<'_>,
+) -> anyhow::Result<String> {
+    match verb {
+        Verb::Up { .. } | Verb::Start => {
+            dev_child(&env.environment, verb.boot(), g)?;
+            Ok(String::new())
+        }
+        Verb::Stop => {
+            let stopped = dev::stop(&env.dir, timeout)?;
+            if !stopped.all_down {
+                anyhow::bail!("{}{} did not stop", stopped.report, env.name);
+            }
+            Ok(stopped.report)
+        }
+        Verb::Restart => restart_env(&env.environment, &env.dir, timeout, g),
+    }
+}
+
+/// `verb` on the compose service `service` of `env`: a start brings the environment up
+/// first, a stop leaves it up. `timeout` bounds each read and write of a stop's request.
+async fn service_verb(
+    verb: Verb,
+    env: &super::targets::Env,
+    service: &str,
+    timeout: u64,
+    g: &Globals<'_>,
+) -> anyhow::Result<String> {
+    use vk_core::fleetctl::Request;
+    let plan = plan::resolve(g.loaded, &env.environment)?;
+    let shown = format!("{}/{service}", env.name);
+    let up = super::targets::running(&env.dir);
+    let unit = service.to_string();
+    let stop = Request::Stop { unit: unit.clone() };
+    let start = |cached| match cached {
+        true => Request::StartCached { unit: unit.clone() },
+        false => Request::Start { unit: unit.clone() },
+    };
+    let reqs: Vec<Request> = match verb {
+        Verb::Stop if !up => return Ok(format!("{shown} is not running\n")),
+        Verb::Stop => vec![stop],
+        Verb::Up { .. } => vec![start(false)],
+        Verb::Start => vec![start(true)],
+        Verb::Restart if up => vec![stop, start(true)],
+        Verb::Restart => vec![start(true)],
+    };
+    if boots_first(verb, up) {
+        dev_child(&env.environment, verb.boot(), g)?;
+    }
+    let mut out = String::new();
+    for req in &reqs {
+        let reply = match req {
+            Request::Stop { .. } => {
+                let within = Some(std::time::Duration::from_secs(timeout));
+                dev::service_within(&plan, req, within).await?
+            }
+            _ => dev::service(&plan, req).await?,
+        };
+        let (lines, note) = render_service_reply(&reply);
+        out.push_str(&lines);
+        let said = note.unwrap_or_else(|| reply.message.clone());
+        if reply.not_built {
+            let flag = hint_flags(&env.environment, g);
+            return Err(build::NotBuilt(format!(
+                "{out}{shown}: {said} — `vk dev {flag}up --service {service}` builds it"
+            ))
+            .into());
+        }
+        if !reply.ok {
+            anyhow::bail!("{out}{shown}: {said}");
+        }
+    }
+    Ok(out)
+}
+
+/// Whether `verb` on a service brings its environment up first, in a `vk dev` of its own: `up`
+/// always, as `vk dev service up` does, so a running environment meets the freshness policy
+/// before its manager is asked for the service; a start only when it is not running.
+fn boots_first(verb: Verb, running: bool) -> bool {
+    match verb {
+        Verb::Up { .. } => true,
+        Verb::Start | Verb::Restart => !running,
+        Verb::Stop => false,
     }
 }
 
@@ -1498,23 +1865,61 @@ mod tests {
     }
 
     #[test]
-    fn stop_takes_an_optional_name_selector() {
+    fn lifecycle_verbs_take_names_services_and_vms() {
         // No name is this workspace's environment, resolved from a config.
         assert!(matches!(
             parse(&["vk", "dev", "stop"]).action,
-            DevAction::Stop { name: None, .. }
+            DevAction::Stop { targets, .. } if targets.is_empty()
         ));
-        // A name selects another environment of this workspace.
+        // `down` is `stop`.
         assert!(matches!(
-            parse(&["vk", "dev", "stop", "myenv-1a2b"]).action,
-            DevAction::Stop { name: Some(n), .. } if n == "myenv-1a2b"
+            parse(&["vk", "dev", "down", "db", "redis"]).action,
+            DevAction::Stop { targets, .. } if targets.names == ["db", "redis"]
         ));
         // A local UI's: one state dir, never with a name.
         assert!(matches!(
             parse(&["vk", "dev", "stop", "--state-dir=/s/app-1234"]).action,
-            DevAction::Stop { name: None, state_dir: Some(d), .. } if d == Path::new("/s/app-1234")
+            DevAction::Stop { targets, state_dir: Some(d), .. }
+                if targets.is_empty() && d == Path::new("/s/app-1234")
         ));
-        assert!(Harness::try_parse_from(["vk", "dev", "stop", "--state-dir=/s/a", "a"]).is_err());
+        for named in [&["a"][..], &["--service", "a"], &["--name", "a"]] {
+            let mut args = vec!["vk", "dev", "stop", "--state-dir=/s/a"];
+            args.extend(named);
+            assert!(Harness::try_parse_from(args).is_err());
+        }
+        let Dev {
+            action: DevAction::Start { targets },
+            ..
+        } = parse(&[
+            "vk",
+            "dev",
+            "start",
+            "db",
+            "--service",
+            "web",
+            "--name",
+            "app-test",
+            "--service",
+            "cache",
+        ])
+        else {
+            panic!("not a start");
+        };
+        assert_eq!(targets.names, ["db"]);
+        assert_eq!(targets.services, ["web", "cache"]);
+        assert_eq!(targets.vms, ["app-test"]);
+        assert!(matches!(
+            parse(&["vk", "dev", "restart", "db"]).action,
+            DevAction::Restart { targets, .. } if targets.names == ["db"]
+        ));
+        assert!(matches!(
+            parse(&["vk", "dev", "up", "--no-wait", "db"]).action,
+            DevAction::Up { no_wait: true, targets } if targets.names == ["db"]
+        ));
+        // Only a bare `up` or `start` boots in this process.
+        assert!(parse(&["vk", "dev", "start"]).boots());
+        assert!(!parse(&["vk", "dev", "start", "db"]).boots());
+        assert!(!parse(&["vk", "dev", "up", "--service", "db"]).boots());
     }
 
     #[test]
@@ -1571,6 +1976,7 @@ mod tests {
                     "dev",
                     &dev::Overrides::default(),
                     &crate::config::Config::default(),
+                    None,
                 ))
             };
             let files = config::discover(&cwd, Some(&cwd), None).unwrap();
@@ -1626,6 +2032,7 @@ mod tests {
                 "dev",
                 &dev::Overrides::default(),
                 &crate::config::Config::default(),
+                None,
             ));
             assert_eq!(pruned, ExitCode::SUCCESS);
             assert_eq!(
@@ -1670,8 +2077,8 @@ mod tests {
         assert!(output.status.success(), "{output:?}");
     }
 
-    /// A named stop takes only this workspace's environments: a VM of another workspace, a
-    /// name nothing has, and a name that cannot be one are refused alike. Outside any
+    /// A named stop takes only this workspace's services and environments: a VM of another
+    /// workspace, a name nothing has, and a name that cannot be one are refused alike. Outside any
     /// workspace, a `vk dev` command that needs one exits 5.
     #[test]
     fn a_named_stop_stays_in_its_workspace() {
@@ -1684,7 +2091,10 @@ mod tests {
             let stop = |name: &str, workspace: Option<&Path>| {
                 runtime.block_on(dev_action(
                     DevAction::Stop {
-                        name: Some(name.into()),
+                        targets: Targets {
+                            names: vec![name.into()],
+                            ..Targets::default()
+                        },
                         state_dir: None,
                         timeout: 0,
                     },
@@ -1693,6 +2103,7 @@ mod tests {
                     "dev",
                     &dev::Overrides::default(),
                     &crate::config::Config::default(),
+                    None,
                 ))
             };
             assert_eq!(stop("known", Some(&cwd)), ExitCode::SUCCESS);
@@ -1752,22 +2163,179 @@ mod tests {
         );
     }
 
+    /// A named environment boots in a `vk dev` of its own, given what this one was: the global
+    /// `--config` and the `vk dev` options, with every path as it is, bytes and all.
     #[test]
-    fn start_takes_an_optional_service_and_says_how_to_build_one() {
-        assert!(matches!(
-            parse(&["vk", "dev", "start"]).action,
-            DevAction::Start { service: None }
-        ));
-        assert!(matches!(
-            parse(&["vk", "dev", "start", "--service", "db"]).action,
-            DevAction::Start { service: Some(s) } if s == "db"
-        ));
+    fn a_child_boot_carries_this_one_s_options_and_paths() {
+        use std::ffi::{OsStr, OsString};
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = crate::dev::testutil::scratch("child-args");
+        let ws = tmp.0.join(OsStr::from_bytes(b"ws-\xff"));
+        std::fs::create_dir_all(ws.join(".virtkit")).unwrap();
+        std::fs::write(
+            ws.join(config::CONFIG_FILE),
+            "schema = 1\n[dev]\nimage = \"x\"\nworkspace = \"/w\"\n",
+        )
+        .unwrap();
+        let loaded = config::load(config::discover(&ws, Some(&ws), None).unwrap()).unwrap();
+        let host = tmp.0.join(OsStr::from_bytes(b"vk-\xfe.toml"));
+        let over = dev::Overrides {
+            freshness: Some(config::Freshness::Reuse),
+            cache_registry: Some("none".into()),
+            cache_insecure: true,
+            ..Default::default()
+        };
+        let g = Globals {
+            loaded: &loaded,
+            over: &over,
+            host_config: Some(&host),
+        };
+        let joined = |flag: &str, path: &Path| {
+            let mut arg = OsString::from(flag);
+            arg.push(path.as_os_str());
+            arg
+        };
+        assert_eq!(
+            dev_child_args("test", &["up", "--no-wait"], &g),
+            [
+                joined("--config=", &host),
+                "dev".into(),
+                joined("--workspace=", &loaded.files.workspace),
+                joined("--dev-config=", &loaded.files.config),
+                "--environment=test".into(),
+                "--freshness=reuse".into(),
+                "--cache-registry=none".into(),
+                "--cache-insecure".into(),
+                "up".into(),
+                "--no-wait".into(),
+            ]
+        );
+        let g = Globals {
+            host_config: None,
+            over: &dev::Overrides::default(),
+            ..g
+        };
+        assert_eq!(dev_child_args("dev", &["start"], &g)[0], "dev");
         assert_eq!(environment_flag("dev"), "");
         assert_eq!(environment_flag("test"), "--environment test ");
-        let refused = vk_core::fleetctl::Reply::not_built("db is not built");
-        assert_eq!(cached_reply(Ok(refused), "service up db"), exit_code(3));
-        let failed = vk_core::fleetctl::Reply::err("db crashed");
-        assert_eq!(cached_reply(Ok(failed), "service up db"), exit_code(1));
+    }
+
+    /// Another environment of this workspace goes by the config it was booted with: two
+    /// configs giving `test` different primaries, `ENV/SERVICE` and the child boot follow the
+    /// one `shop-test` recorded, not the one this command read.
+    #[test]
+    fn another_environment_goes_by_the_config_it_was_booted_with() {
+        let homes = crate::dev::testutil::Homes::new("own-config");
+        let ws = homes.dir().join("shop");
+        std::fs::create_dir_all(ws.join(".virtkit")).unwrap();
+        std::fs::write(
+            ws.join("compose.yaml"),
+            "services:\n  app:\n    image: x\n  db:\n    image: y\n",
+        )
+        .unwrap();
+        let config = |primary: &str| {
+            format!(
+                "schema = 1\n[dev]\ncompose = \"compose.yaml\"\nservice = \"app\"\n\
+                 [environments.test]\ncompose = \"compose.yaml\"\nservice = \"{primary}\"\n"
+            )
+        };
+        std::fs::write(ws.join(config::CONFIG_FILE), config("db")).unwrap();
+        let alt = ws.join(".virtkit/alt.toml");
+        std::fs::write(&alt, config("app")).unwrap();
+        let loaded = config::load(config::discover(&ws, Some(&ws), None).unwrap()).unwrap();
+        let plan = plan::resolve(&loaded, "dev").unwrap();
+        let base = plan.state_dir.parent().unwrap().to_path_buf();
+        let recorded = |dir: &Path, config: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            let identity = dev::Identity {
+                digest: "d".into(),
+                booted_secs: 0,
+                created_by: String::new(),
+                generation: String::new(),
+                manifest: serde_json::json!({
+                    "workspace": ws,
+                    "environment": "test",
+                    "config": config,
+                }),
+                storage_backings: Some(Vec::new()),
+                readied_by_its_boot: true,
+            };
+            std::fs::write(dir.join("dev.json"), serde_json::to_vec(&identity).unwrap()).unwrap();
+        };
+        recorded(&base.join("shop-test"), &alt);
+        let over = dev::Overrides::default();
+        let g = Globals {
+            loaded: &loaded,
+            over: &over,
+            host_config: None,
+        };
+        let targets = Targets {
+            names: vec!["shop-test/db".into()],
+            ..Targets::default()
+        };
+        let (scope, picked) = picks(Verb::Stop, &targets, &plan, &g).unwrap();
+        let [super::super::targets::Pick::Service(env, service)] = picked.as_slice() else {
+            panic!("{picked:?}");
+        };
+        assert_eq!((env.name.as_str(), service.as_str()), ("shop-test", "db"));
+        assert_eq!(hint_flags("test", &g), "--environment test ");
+        let own = own_config(env, scope.current.as_ref(), &g)
+            .unwrap()
+            .unwrap();
+        let g = Globals { loaded: &own, ..g };
+        let args = dev_child_args("test", &["start"], &g);
+        let mut want = std::ffi::OsString::from("--dev-config=");
+        want.push(&own.files.config);
+        assert!(args.contains(&want), "{args:?}");
+        // What it finds not built, an `up` from that config builds.
+        assert_eq!(
+            hint_flags("test", &g),
+            format!(
+                "--dev-config {} --environment test ",
+                own.files.config.display()
+            )
+        );
+        assert_eq!(
+            crate::vms::canonical(&own.files.config),
+            crate::vms::canonical(&alt)
+        );
+        // Booted with the config this command read: nothing else to read.
+        recorded(&base.join("shop-test"), &loaded.files.config);
+        let (_, picked) = picks(Verb::Stop, &targets, &plan, &g).unwrap();
+        assert!(
+            matches!(picked.as_slice(), [super::super::targets::Pick::Env(_)]),
+            "{picked:?}"
+        );
+        // A stop of the environment needs only its state dir: the config it was booted with,
+        // gone since, does not stand in its way. A restart reads it.
+        recorded(&base.join("shop-test"), &alt);
+        std::fs::remove_file(&alt).unwrap();
+        let g = Globals {
+            loaded: &loaded,
+            over: &over,
+            host_config: None,
+        };
+        let targets = Targets {
+            vms: vec!["shop-test".into()],
+            ..Targets::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let act = |verb| runtime.block_on(act_on(verb, &targets, 0, &plan, &g));
+        assert_eq!(act(Verb::Stop), ExitCode::SUCCESS);
+        assert_eq!(act(Verb::Restart), ExitCode::from(1));
+    }
+
+    /// `up` of a service brings its environment up first even while it runs, so the freshness
+    /// policy applies before its manager is asked; a start does only when it is down.
+    #[test]
+    fn a_service_up_goes_through_its_environment_s_up() {
+        assert!(boots_first(Verb::Up { no_wait: false }, true));
+        assert!(boots_first(Verb::Up { no_wait: false }, false));
+        assert!(!boots_first(Verb::Start, true) && boots_first(Verb::Start, false));
+        assert!(!boots_first(Verb::Restart, true) && boots_first(Verb::Restart, false));
+        assert!(!boots_first(Verb::Stop, false));
     }
 
     #[test]
@@ -1828,8 +2396,11 @@ mod tests {
     const ACTIONS: &[(&[&str], bool)] = &[
         (&["init"], false),
         (&["up"], true),
+        (&["up", "db"], false),
         (&["start"], true),
-        (&["start", "--service", "db"], true),
+        (&["start", "--service", "db"], false),
+        (&["restart"], false),
+        (&["restart", "db"], false),
         (&["exec", "--", "true"], true),
         (&["exec", "--service", "db", "--", "true"], false),
         (&["shell"], true),
@@ -1856,6 +2427,7 @@ mod tests {
         (&["logs", "-f"], false),
         (&["doctor"], false),
         (&["stop"], false),
+        (&["down", "db"], false),
         (&["list"], false),
         (&["gc", "--all-stale", "--yes"], false),
         (&["prune"], false),

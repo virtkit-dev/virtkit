@@ -102,6 +102,12 @@ pub struct Row {
     /// `vk dev list --json`
     #[serde(skip)]
     pub workspace_folder: Option<String>,
+    /// the `--dev-config` the boot read, as it recorded it; not part of `vk dev list --json`
+    #[serde(skip)]
+    pub config: Option<PathBuf>,
+    /// the primary compose service recorded at boot, omitted from `vk dev list --json`
+    #[serde(skip)]
+    pub primary: Option<String>,
     pub environment: Option<String>,
     pub status: Status,
     /// the `vk` that booted it, as it recorded itself
@@ -324,6 +330,10 @@ fn row(dir: &Path, running: &[Running], with_sizes: bool, with_flags: bool) -> R
         dir: dir.to_path_buf(),
         workspace,
         workspace_folder: manifest("workspace_folder"),
+        config: manifest("config").map(PathBuf::from),
+        primary: (identity.as_ref())
+            .and_then(|i| i.manifest.pointer("/source/Compose/service")?.as_str())
+            .map(String::from),
         environment: manifest("environment"),
         status: match (live.is_some(), identity.is_some()) {
             (true, _) => Status::Running,

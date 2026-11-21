@@ -5944,7 +5944,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 Err(e) => fail(&e, 1),
             }
         }
-        Cmd::Dev(dev) => crate::dev::cli::run(dev, &ctx.cfg).await,
+        Cmd::Dev(dev) => crate::dev::cli::run(dev, &ctx.cfg, cli.config.as_deref()).await,
         Cmd::Publish {
             action: Some(action),
             ..
