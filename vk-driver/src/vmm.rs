@@ -25,6 +25,29 @@ pub const BOOT_SPEC_ENV: &str = "VIRTKIT_BOOT_SPEC";
 /// stage, an image, or a compose service).
 pub const DEFAULT_VM_NAME_TEMPLATE: &str = "vk:{name}";
 
+/// Match the exact [`BOOT_SPEC_ENV`] variable in a process's NUL-separated
+/// `/proc/<pid>/environ`. [`Libkrun::command`] sets it for VMMs. Their process names
+/// are configurable with `--vm-name`.
+fn is_vmm_environ(environ: &[u8]) -> bool {
+    environ.split(|b| *b == 0).any(|var| {
+        var.strip_prefix(BOOT_SPEC_ENV.as_bytes())
+            .is_some_and(|rest| rest.first() == Some(&b'='))
+    })
+}
+
+/// Find the primary, compose service and build VMMs under `root` by their boot
+/// environments. Skip processes whose environments cannot be read. A rebootable VM has
+/// a keeper and a boot child (see `libkrun_sys::keep`), returned in that order. Other
+/// VMs have one VMM process.
+pub fn processes_under(root: i32) -> Vec<i32> {
+    crate::usage::descendants_of(root)
+        .into_iter()
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| is_vmm_environ(&env))
+        })
+        .collect()
+}
+
 /// The `--vm-name` template, set once per process from the CLI. Booting happens across
 /// several call sites (run, compose siblings, stage builds) that all share this process,
 /// so a process-global spares threading the template through every signature. Separate
@@ -1015,6 +1038,19 @@ mod tests {
         assert!(format!("{err:#}").contains("not a disk"), "{err:#}");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_vmm_is_told_by_the_boot_spec_in_its_environment() {
+        assert!(is_vmm_environ(
+            b"PATH=/bin\0VIRTKIT_BOOT_SPEC={}\0HOME=/h\0"
+        ));
+        assert!(is_vmm_environ(b"VIRTKIT_BOOT_SPEC=\0"));
+        // Its name alone, a variable merely starting with it, or its value elsewhere: no.
+        assert!(!is_vmm_environ(b"PATH=/bin\0HOME=/h\0"));
+        assert!(!is_vmm_environ(b"VIRTKIT_BOOT_SPEC_PATH=/x\0"));
+        assert!(!is_vmm_environ(b"NOTE=VIRTKIT_BOOT_SPEC=1\0"));
+        assert!(!is_vmm_environ(b""));
     }
 
     #[test]

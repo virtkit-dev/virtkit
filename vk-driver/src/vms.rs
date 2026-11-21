@@ -1595,6 +1595,37 @@ fn prune_gone(dir: &Path, entry: &VmEntry) {
     }
 }
 
+/// How `vk stop` goes about stopping a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StopHow {
+    /// Send SIGTERM once and wait for the run to shut down its guests
+    #[default]
+    Graceful,
+    /// `--force`: SIGTERM once a second for [`FORCE_TERM_SECS`], then kill
+    Force,
+    /// `--kill`: kill right away — the VMMs first, the run only if it does not follow
+    Kill,
+}
+
+/// How long `--force` keeps asking with SIGTERM before it kills.
+pub const FORCE_TERM_SECS: u64 = 5;
+
+/// Seconds for runs to finish cleanup after the VMM batch. After SIGKILL to the runs,
+/// only the command deadline limits the wait.
+pub const KILL_WAIT_SECS: u64 = 5;
+
+/// Intervals before killing VMMs and before killing the surviving runs.
+#[derive(Debug, Clone, Copy)]
+struct Pace {
+    term: Duration,
+    kill_wait: Duration,
+}
+
+const PACE: Pace = Pace {
+    term: Duration::from_secs(FORCE_TERM_SECS),
+    kill_wait: Duration::from_secs(KILL_WAIT_SECS),
+};
+
 /// Where the stop of one run stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Fate {
@@ -1611,6 +1642,8 @@ struct RunStop {
     /// the run, held from the moment it is identified
     run: Option<Held>,
     fate: Fate,
+    /// VMMs whose exit must be confirmed before reporting the run down
+    vmms: Vec<Held>,
 }
 
 impl RunStop {
@@ -1620,37 +1653,83 @@ impl RunStop {
             Ok(None) => (None, Fate::Down),
             Err(why) => (None, Fate::Failed(why)),
         };
-        RunStop { entry, run, fate }
+        RunStop {
+            entry,
+            run,
+            fate,
+            vmms: Vec::new(),
+        }
     }
 
-    /// Send the run `signal`, if it is still being stopped.
+    /// Signal a run still stopping. [`RunStop::check`] also waits for its VMMs to exit.
     fn signal(&mut self, signal: libc::c_int) {
         let (Fate::Stopping, Some(run)) = (&self.fate, &self.run) else {
             return;
         };
         match run.signal(signal) {
-            Ok(true) => {}
-            Ok(false) => self.fate = Fate::Down,
+            Ok(_) => {}
             Err(e) => {
                 self.fate = Fate::Failed(format!("cannot signal pid {}: {e}", self.entry.pid))
             }
         }
     }
 
-    /// Mark it down once its run has exited.
+    /// Cut power to the primary, compose service and build VMs. The registry identifies only
+    /// the primary's VMM. [`crate::vmm::processes_under`] finds the others by their boot
+    /// environments. Recheck the held run after collecting the VMM pidfds.
+    ///
+    /// Signal in reverse acquisition order so a boot child discovered with or after its
+    /// keeper gets SIGKILL first. A child forked after the final scan is missed. It arms
+    /// parent-death SIGTERM after fork, so delivery depends on when the keeper exits.
+    /// The run can finish cleanup after its VMs exit.
+    fn kill_vmms(&mut self) {
+        let (Fate::Stopping, Some(run)) = (&self.fate, &self.run) else {
+            return;
+        };
+        let Ok(pid) = i32::try_from(self.entry.pid) else {
+            return;
+        };
+        let killed = hold_vmms(|| crate::vmm::processes_under(pid)).and_then(|held| {
+            if run.exited() {
+                return Ok(None);
+            }
+            let mut killed = Vec::new();
+            // Signal newly discovered children before their keepers.
+            for (vmm, h) in held.into_iter().rev() {
+                h.signal(libc::SIGKILL)
+                    .map_err(|e| format!("cannot kill its VMM pid {vmm}: {e}"))?;
+                killed.push(h);
+            }
+            Ok(Some(killed))
+        });
+        match killed {
+            Ok(Some(killed)) => self.vmms.extend(killed),
+            Ok(None) => self.fate = Fate::Down,
+            Err(why) => self.fate = Fate::Failed(why),
+        }
+    }
+
+    /// Mark the run down once it and its targeted VMMs have exited.
     fn check(&mut self) {
-        if self.fate == Fate::Stopping && self.run.as_ref().is_some_and(Held::exited) {
+        if self.fate == Fate::Stopping
+            && self.run.as_ref().is_some_and(Held::exited)
+            && self.vmms.iter().all(Held::exited)
+        {
             self.fate = Fate::Down;
         }
     }
 
-    /// What to say of it, after `waited` seconds of stopping.
-    fn line(&self, waited: u64) -> String {
+    /// Report the outcome after `waited` seconds, with a retry hint for a plain stop.
+    fn line(&self, waited: u64, how: StopHow) -> String {
         let RunStop { entry, .. } = self;
+        let next = match how {
+            StopHow::Graceful => format!(" (`vk stop --force {}` insists, then kills)", entry.pid),
+            StopHow::Force | StopHow::Kill => String::new(),
+        };
         match &self.fate {
             Fate::Down => format!("stopped {} (pid {})\n", entry.label, entry.pid),
             Fate::Stopping => format!(
-                "{} (pid {}) did not stop after {waited}s\n",
+                "{} (pid {}) did not stop after {waited}s{next}\n",
                 entry.label, entry.pid
             ),
             Fate::Failed(why) => format!("{} (pid {}): {why}\n", entry.label, entry.pid),
@@ -1686,44 +1765,133 @@ fn unpublish(
     })
 }
 
+/// Open pidfds for newly listed VMMs. Rescan until every listed PID is already held, so
+/// a boot child forked between scans can be included. Return the handles still listed,
+/// in acquisition order. Fail if the last scan still contains a new PID.
+fn hold_vmms(mut scan: impl FnMut() -> Vec<i32>) -> std::result::Result<Vec<(i32, Held)>, String> {
+    let mut held: Vec<(i32, Held)> = Vec::new();
+    for _ in 0..VMM_SCANS {
+        let now = scan();
+        let new: Vec<i32> = (now.iter().copied())
+            .filter(|vmm| !held.iter().any(|(h, _)| h == vmm))
+            .collect();
+        if new.is_empty() {
+            held.retain(|(vmm, _)| now.contains(vmm));
+            return Ok(held);
+        }
+        for vmm in new {
+            match Held::open(vmm) {
+                Ok(Some(h)) => held.push((vmm, h)),
+                Ok(None) => {}
+                Err(e) => return Err(format!("cannot hold its VMM pid {vmm}: {e}")),
+            }
+        }
+    }
+    Err(format!(
+        "its VMMs still changed after {VMM_SCANS} listings, so none was killed"
+    ))
+}
+
+/// How many times at most [`hold_vmms`] lists them.
+const VMM_SCANS: usize = 8;
+
 /// Runs stopped together: every one is told to stop ([`Stops::begin`]) before any is waited
-/// for ([`Stops::finish`]), and one deadline bounds both.
+/// for ([`Stops::finish`]), and one deadline bounds both. The deadline never kills: a run
+/// still there when it passes is reported, whatever `how`.
 pub(crate) struct Stops {
     runs: Vec<RunStop>,
     deadline: Deadline,
     /// where their records are pruned once they are gone
     registry: Option<PathBuf>,
     began: Instant,
+    how: StopHow,
+    pace: Pace,
+    /// start of the retry interval and number of SIGTERM rounds, including the initial round
+    asked: (Instant, u32),
+    /// when the batch of VMM kill attempts finished
+    vmms_killed: Option<Instant>,
+    /// whether the run SIGKILL round has been attempted
+    runs_killed: bool,
     /// the stop of their publishers, under way beside the wait
     unpublishing: std::thread::JoinHandle<()>,
 }
 
 impl Stops {
-    /// Send every run in `entries` SIGTERM, then stop the managed publishers of each, and
-    /// those left on record in each of `stale`, a state dir no run holds.
-    pub(crate) fn begin(entries: Vec<VmEntry>, stale: Vec<PathBuf>, deadline: Deadline) -> Self {
-        Self::begin_in(registry_dir().ok(), entries, stale, deadline)
+    /// Send every run in `entries` SIGTERM, or with [`StopHow::Kill`] kill its VMMs, then
+    /// stop the managed publishers of each, and those left on record in each of `stale`, a
+    /// state dir no run holds.
+    pub(crate) fn begin(
+        entries: Vec<VmEntry>,
+        stale: Vec<PathBuf>,
+        deadline: Deadline,
+        how: StopHow,
+    ) -> Self {
+        Self::begin_in(registry_dir().ok(), entries, stale, deadline, how, PACE)
     }
 
-    /// [`Stops::begin`], against the registry at `registry`.
+    /// [`Stops::begin`], against the registry at `registry`, at `pace`.
     fn begin_in(
         registry: Option<PathBuf>,
         entries: Vec<VmEntry>,
         stale: Vec<PathBuf>,
         deadline: Deadline,
+        how: StopHow,
+        pace: Pace,
     ) -> Self {
         let began = Instant::now();
         let mut runs: Vec<RunStop> = entries.into_iter().map(RunStop::of).collect();
-        for r in &mut runs {
-            r.signal(libc::SIGTERM);
-        }
+        let vmms_killed = match how {
+            StopHow::Kill => {
+                runs.iter_mut().for_each(RunStop::kill_vmms);
+                Some(Instant::now())
+            }
+            StopHow::Graceful | StopHow::Force => {
+                runs.iter_mut().for_each(|r| r.signal(libc::SIGTERM));
+                None
+            }
+        };
         let unpublishing = unpublish(&runs, stale, deadline);
         Stops {
             runs,
             deadline,
             registry,
             began,
+            how,
+            pace,
+            asked: (Instant::now(), 1),
+            vmms_killed,
+            runs_killed: false,
             unpublishing,
+        }
+    }
+
+    /// Start the shared cleanup interval after attempting every run's VMMs.
+    fn kill_vmms(&mut self) {
+        self.runs.iter_mut().for_each(RunStop::kill_vmms);
+        self.vmms_killed = Some(Instant::now());
+    }
+
+    /// Retry SIGTERM during the force interval, then kill the VMMs. Give all runs one
+    /// cleanup interval before SIGKILL. The command deadline bounds subsequent waits.
+    fn escalate(&mut self) {
+        match (self.how, self.vmms_killed, self.runs_killed) {
+            (StopHow::Graceful, ..) => {}
+            (StopHow::Force, None, _) => {
+                let (at, terms) = self.asked;
+                let asking = at.elapsed();
+                if asking >= self.pace.term {
+                    self.kill_vmms();
+                } else if asking >= Duration::from_secs(u64::from(terms)) {
+                    // A run may handle signals only between build or boot steps.
+                    self.runs.iter_mut().for_each(|r| r.signal(libc::SIGTERM));
+                    self.asked.1 = terms.saturating_add(1);
+                }
+            }
+            (_, Some(at), false) if at.elapsed() >= self.pace.kill_wait => {
+                self.runs.iter_mut().for_each(|r| r.signal(libc::SIGKILL));
+                self.runs_killed = true;
+            }
+            _ => {}
         }
     }
 
@@ -1736,6 +1904,7 @@ impl Stops {
             if self.runs.iter().all(|r| r.fate != Fate::Stopping) || self.deadline.passed() {
                 break;
             }
+            self.escalate();
             std::thread::sleep(self.deadline.cap(STOP_POLL));
         }
         // It ends by the deadline too; a panic there is not the stop's to report.
@@ -1746,7 +1915,7 @@ impl Stops {
             if let (Fate::Down, Some(registry)) = (&r.fate, &self.registry) {
                 prune_gone(registry, &r.entry);
             }
-            out.push_str(&r.line(waited));
+            out.push_str(&r.line(waited, self.how));
         }
         let down = self.runs.iter().all(|r| r.fate == Fate::Down);
         (out, down)
@@ -2111,14 +2280,19 @@ fn select_vms(target: Option<Selector>, all: bool) -> Result<Selection> {
 }
 
 /// Stop VMs selected by `--all`, a pid or project directory, or the current directory by
-/// default, all at once, with `deadline` bounding the whole of it. Returns the summary and
-/// whether every selected VM went down.
-pub fn stop_cmd(target: Option<Selector>, all: bool, deadline: Deadline) -> Result<(String, bool)> {
+/// default, all at once and as `how` says, with `deadline` bounding the whole of it. Returns
+/// the summary and whether every selected VM went down.
+pub fn stop_cmd(
+    target: Option<Selector>,
+    all: bool,
+    deadline: Deadline,
+    how: StopHow,
+) -> Result<(String, bool)> {
     let selected = match select_vms(target, all)? {
         Selection::Matched(v) => v,
         Selection::Empty(out, ok) => return Ok((out, ok)),
     };
-    Ok(Stops::begin(selected, Vec::new(), deadline).finish())
+    Ok(Stops::begin(selected, Vec::new(), deadline, how).finish())
 }
 
 /// Whether procfs identifies a different pid holding the state-directory lock. An unknown
@@ -2137,7 +2311,7 @@ pub(crate) fn stop_entry(entry: &VmEntry, timeout: u64) -> Option<(String, bool)
         return None;
     }
     let deadline = Deadline::in_secs(timeout);
-    Some(Stops::begin(vec![entry.clone()], Vec::new(), deadline).finish())
+    Some(Stops::begin(vec![entry.clone()], Vec::new(), deadline, StopHow::Graceful).finish())
 }
 
 /// The running VMs `sel` selects, and what to say when it selects none.
@@ -3406,8 +3580,14 @@ PUBLISHED     -
             record_in(&reg, e).unwrap();
         }
         let began = Instant::now();
-        let deadline = Deadline::in_secs(2);
-        let stops = Stops::begin_in(Some(reg.clone()), entries.clone(), Vec::new(), deadline);
+        let stops = Stops::begin_in(
+            Some(reg.clone()),
+            entries.clone(),
+            Vec::new(),
+            Deadline::in_secs(2),
+            StopHow::Graceful,
+            PACE,
+        );
         let (out, down) = stops.finish();
         assert!(began.elapsed() < Duration::from_secs(4), "{out}");
         assert!(!down, "{out}");
@@ -3444,8 +3624,14 @@ PUBLISHED     -
         record_in(&reg, &gone).unwrap();
         // Publishers are stopped once their operation lock is free, by then the replacement's.
         let op = crate::publish::hold_op_lock(&dir);
-        let deadline = Deadline::in_secs(30);
-        let stops = Stops::begin_in(Some(reg.clone()), vec![gone.clone()], Vec::new(), deadline);
+        let stops = Stops::begin_in(
+            Some(reg.clone()),
+            vec![gone.clone()],
+            Vec::new(),
+            Deadline::in_secs(30),
+            StopHow::Graceful,
+            PACE,
+        );
         while first.alive() {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -3470,7 +3656,7 @@ PUBLISHED     -
     }
 
     /// A pid that names another process than the recorded run is never signalled, nor
-    /// reported stopped while something else holds the run's state dir.
+    /// reported stopped while something else holds the run's state dir, forced or not.
     #[test]
     fn a_pid_that_is_no_longer_its_run_is_never_signalled() {
         use crate::dev::testutil::StandIn;
@@ -3481,10 +3667,14 @@ PUBLISHED     -
         let mut other = StandIn::spawn();
         let mut e = run_entry(&dir, &other);
         e.pid_start_ticks = e.pid_start_ticks.map(|t| t + 1);
-        let (out, down) = Stops::begin_in(None, vec![e], Vec::new(), Deadline::in_secs(1)).finish();
-        assert!(!down, "{out}");
-        assert!(out.contains("nothing was signalled"), "{out}");
-        assert!(other.alive());
+        for how in [StopHow::Graceful, StopHow::Kill] {
+            let deadline = Deadline::in_secs(1);
+            let stops = Stops::begin_in(None, vec![e.clone()], Vec::new(), deadline, how, PACE);
+            let (out, down) = stops.finish();
+            assert!(!down, "{out}");
+            assert!(out.contains("nothing was signalled"), "{out}");
+            assert!(other.alive());
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3503,7 +3693,8 @@ PUBLISHED     -
         let ops = [&stale, &a_dir].map(|d| crate::publish::hold_op_lock(d));
         let stale_dirs = vec![stale.clone()];
         let stops = std::thread::spawn(move || {
-            Stops::begin_in(None, entries, stale_dirs, Deadline::in_secs(30)).finish()
+            let deadline = Deadline::in_secs(30);
+            Stops::begin_in(None, entries, stale_dirs, deadline, StopHow::Graceful, PACE).finish()
         });
         let began = Instant::now();
         while a.alive() || b.alive() {
@@ -3518,6 +3709,162 @@ PUBLISHED     -
         let (out, down) = stops.join().unwrap();
         assert!(down, "{out}");
         for d in [a_dir, b_dir, stale] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A shell that holds the state-directory lock while running `script`. With
+    /// `ignores_term`, the shell and its children inherit an ignored SIGTERM.
+    struct FakeRun(std::process::Child);
+
+    impl FakeRun {
+        fn spawn(dir: &Path, script: &str, ignores_term: bool) -> Self {
+            use std::os::unix::process::CommandExt;
+            let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+            let mut cmd = std::process::Command::new("sh");
+            // Keep the children in one process group for cleanup.
+            cmd.args(["-c", script]).process_group(0);
+            // SAFETY: only `signal`, `open` and `flock` run between fork and exec, all
+            // async-signal-safe; the locked descriptor is left open across the exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if ignores_term && libc::signal(libc::SIGTERM, libc::SIG_IGN) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let fd = libc::open(dir.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
+                    if fd < 0 || libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            FakeRun(cmd.spawn().unwrap())
+        }
+
+        fn pid(&self) -> i32 {
+            i32::try_from(self.0.id()).unwrap()
+        }
+
+        /// Its VMM and the other process it started, held, once both are up.
+        fn children(&self) -> (Held, Held) {
+            let began = Instant::now();
+            loop {
+                let all = crate::usage::descendants_of(self.pid());
+                let vmms = crate::vmm::processes_under(self.pid());
+                if let ([vmm], 2) = (vmms.as_slice(), all.len()) {
+                    let other = all.iter().find(|p| *p != vmm).unwrap();
+                    let hold = |pid: i32| Held::open(pid).unwrap().unwrap();
+                    return (hold(*vmm), hold(*other));
+                }
+                assert!(
+                    began.elapsed() < Duration::from_secs(10),
+                    "{all:?} {vmms:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Its record, with its start time.
+        fn entry(&self, dir: &Path) -> VmEntry {
+            let mut e = entry(dir.to_path_buf(), None);
+            e.pid = self.0.id();
+            e.pid_start_ticks = crate::usage::proc_starttime(self.pid());
+            e
+        }
+    }
+
+    impl Drop for FakeRun {
+        fn drop(&mut self) {
+            // Kill the group, including reparented children. The unreaped leader reserves the
+            // group ID. Members that have already exited need no cleanup.
+            // SAFETY: kill only delivers a signal.
+            unsafe { libc::kill(-self.pid(), libc::SIGKILL) };
+            let _ = self.0.wait();
+        }
+    }
+
+    /// The other process a fake run started outlives its stop: it is ended here.
+    fn end(other: &Held) {
+        assert!(!other.exited(), "a process that is no VMM was killed");
+        other.signal(libc::SIGKILL).unwrap();
+    }
+
+    /// An immediate kill targets the VMM. The run exits on its own and its other child survives.
+    #[test]
+    fn a_kill_takes_the_vmms_and_leaves_the_run_to_follow() {
+        let _env = crate::dev::testutil::env_guard();
+        let dir = tmpdir("stops-kill");
+        let var = crate::vmm::BOOT_SPEC_ENV;
+        let script = format!("sleep 600 & {var}=x sleep 600 & wait $!");
+        let run = FakeRun::spawn(&dir, &script, false);
+        let (vmm, other) = run.children();
+        let pace = Pace {
+            term: Duration::from_millis(300),
+            kill_wait: Duration::from_secs(5),
+        };
+        let began = Instant::now();
+        let stops = Stops::begin_in(
+            None,
+            vec![run.entry(&dir)],
+            Vec::new(),
+            Deadline::in_secs(30),
+            StopHow::Kill,
+            pace,
+        );
+        let (out, down) = stops.finish();
+        assert!(down, "{out}");
+        assert!(
+            began.elapsed() < pace.kill_wait,
+            "the run was killed: {out}"
+        );
+        assert!(vmm.exited());
+        end(&other);
+        drop(run);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Both runs share each escalation interval, even while a publisher lock is held.
+    /// Their other children survive.
+    #[test]
+    fn a_forced_stop_escalates_on_every_run_together() {
+        let _env = crate::dev::testutil::env_guard();
+        let var = crate::vmm::BOOT_SPEC_ENV;
+        let script = format!("{var}=x sleep 600 & sleep 600 & wait");
+        let dirs = [tmpdir("stops-force-a"), tmpdir("stops-force-b")];
+        let runs: Vec<FakeRun> = dirs
+            .iter()
+            .map(|d| FakeRun::spawn(d, &script, true))
+            .collect();
+        let held: Vec<(Held, Held)> = runs.iter().map(FakeRun::children).collect();
+        let entries = runs.iter().zip(&dirs).map(|(r, d)| r.entry(d)).collect();
+        let pace = Pace {
+            term: Duration::from_millis(500),
+            kill_wait: Duration::from_secs(1),
+        };
+        let op = crate::publish::hold_op_lock(&dirs[0]);
+        let began = Instant::now();
+        let stops = std::thread::spawn(move || {
+            let deadline = Deadline::in_secs(30);
+            let stops = Stops::begin_in(None, entries, Vec::new(), deadline, StopHow::Force, pace);
+            stops.finish()
+        });
+        while !held.iter().all(|(vmm, _)| vmm.exited()) {
+            assert!(began.elapsed() < Duration::from_secs(10), "not killed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(op);
+        let (out, down) = stops.join().unwrap();
+        let took = began.elapsed();
+        assert!(down, "{out}");
+        // Asked first, then the VMMs, then the runs: one wait for all of them.
+        assert!(took >= pace.term + pace.kill_wait, "{took:?}");
+        assert!(took < pace.term + pace.kill_wait * 2, "{took:?}");
+        for (vmm, other) in &held {
+            assert!(vmm.exited());
+            end(other);
+        }
+        drop(runs);
+        for d in dirs {
             std::fs::remove_dir_all(d).ok();
         }
     }
@@ -3581,6 +3928,70 @@ PUBLISHED     -
         let conn = Control::open(&ctl, Deadline::in_secs(30), None, Some(&this)).unwrap();
         assert_eq!(conn.request(&req, |_| {}).unwrap().message, "db stopped");
         assert!(serve.join().unwrap().contains("db"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A keeper that forks its boot child between two listings has the child held too,
+    /// listed after it.
+    #[test]
+    fn a_vmm_forked_between_listings_is_held() {
+        use crate::dev::testutil::StandIn;
+        let _env = crate::dev::testutil::env_guard();
+
+        let (keeper, child) = (StandIn::spawn(), StandIn::spawn());
+        let ids = [keeper.id(), child.id()].map(|p| i32::try_from(p).unwrap());
+        let mut listings = vec![vec![ids[0]], ids.to_vec(), ids.to_vec()].into_iter();
+        let held = hold_vmms(|| listings.next().unwrap()).unwrap();
+        let pids: Vec<i32> = held.iter().map(|(p, _)| *p).collect();
+        assert_eq!(pids, ids);
+        assert_eq!(listings.len(), 0, "listed until nothing new showed");
+    }
+
+    /// A new VMM on the final scan fails the batch and releases its pidfds.
+    #[test]
+    fn vmms_that_never_settle_are_not_held() {
+        use crate::dev::testutil::StandIn;
+        let _env = crate::dev::testutil::env_guard();
+
+        let all: Vec<StandIn> = (0..VMM_SCANS).map(|_| StandIn::spawn()).collect();
+        let ids: Vec<i32> = all.iter().map(|s| i32::try_from(s.id()).unwrap()).collect();
+        let mut listed = 0;
+        let held = hold_vmms(|| {
+            listed += 1;
+            ids[..listed].to_vec()
+        });
+        let Err(err) = held else {
+            panic!("held VMMs that kept changing")
+        };
+        assert!(err.contains("none was killed"), "{err}");
+    }
+
+    /// A run is down only once every VMM of it that was killed is gone too.
+    #[test]
+    fn a_run_is_down_only_with_its_vmms() {
+        use crate::dev::testutil::StandIn;
+        let _env = crate::dev::testutil::env_guard();
+
+        let dir = tmpdir("stops-vmms");
+        let run = StandIn::spawn();
+        let vmm = StandIn::spawn();
+        let hold = |s: &StandIn| Held::open(i32::try_from(s.id()).unwrap()).unwrap().unwrap();
+        let mut r = RunStop {
+            entry: run_entry(&dir, &run),
+            run: Some(hold(&run)),
+            fate: Fate::Stopping,
+            vmms: vec![hold(&vmm)],
+        };
+        drop(run);
+        r.check();
+        assert_eq!(r.fate, Fate::Stopping);
+        // Nor does the run's last signal, finding it gone, take it for down.
+        r.signal(libc::SIGKILL);
+        r.check();
+        assert_eq!(r.fate, Fate::Stopping);
+        drop(vmm);
+        r.check();
+        assert_eq!(r.fate, Fate::Down);
         std::fs::remove_dir_all(&dir).ok();
     }
 

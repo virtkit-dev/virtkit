@@ -693,7 +693,12 @@ enum Stopping {
 /// a running VM without a name by its pid; one that is not running is an error. A pid or a
 /// directory takes every running VM it matches, and none is an error. A dev environment
 /// already down is added to `stale`, for what it published to be cleared.
-fn stopping(sel: Selector, service: Option<String>, stale: &mut Vec<PathBuf>) -> Result<Stopping> {
+fn stopping(
+    sel: Selector,
+    service: Option<String>,
+    how: vms::StopHow,
+    stale: &mut Vec<PathBuf>,
+) -> Result<Stopping> {
     if !matches!(sel, Selector::Named { .. }) && service.is_none() {
         let (matched, none) = vms::running_selected(sel)?;
         if matched.is_empty() {
@@ -702,6 +707,14 @@ fn stopping(sel: Selector, service: Option<String>, stale: &mut Vec<PathBuf>) ->
         return Ok(Stopping::Vms(matched));
     }
     let (t, found) = resolve_running(sel, service, Among::ProjectVm, true)?;
+    if how != vms::StopHow::Graceful && t.service.is_some() {
+        bail!(
+            "{} is a compose service, stopped by its VM's service manager: --force and --kill \
+             act on a VM's own run (`vk stop --force {}`)",
+            t.shown(),
+            t.name
+        );
+    }
     let entry = found.or_else(|| running_on(&t.dir));
     if entry.is_none() && t.kind == Kind::Dev && t.service.is_none() {
         // What an environment published can outlive it on record: cleared, as
@@ -791,19 +804,20 @@ fn succeeds_by(mut cmd: std::process::Command, what: &str, deadline: vms::Deadli
 /// `vk stop REF…`, each REF already read. Every REF is resolved first. Every VM is then told
 /// to stop, compose services stop through their managers one after the other, and only
 /// then is any VM waited for. A service whose VM is stopped too goes down with it.
-/// `deadline` bounds the whole command. Exits 1 when a REF selects nothing running or
-/// something is not confirmed stopped.
+/// One deadline covers all targets. Exit 1 if a REF selects nothing running or a stop fails
+/// to confirm shutdown.
 pub fn stop(
     refs: Vec<(Selector, Option<String>)>,
     config: Option<&Path>,
     deadline: vms::Deadline,
+    how: vms::StopHow,
 ) -> ExitCode {
     let mut ok = true;
     let mut entries: Vec<VmEntry> = Vec::new();
     let mut services = Vec::new();
     let mut stale = Vec::new();
     for (sel, service) in refs {
-        match stopping(sel, service, &mut stale) {
+        match stopping(sel, service, how, &mut stale) {
             Ok(Stopping::Service(s)) => services.push(s),
             Ok(Stopping::Vms(found)) => {
                 for e in found {
@@ -820,7 +834,7 @@ pub fn stop(
     }
     services.retain(|s| !entries.iter().any(|e| e.state_dir == s.entry.state_dir));
     // VMs first: a service slow to stop holds none of them back.
-    let vms = vms::Stops::begin(entries, stale, deadline);
+    let vms = vms::Stops::begin(entries, stale, deadline, how);
     for s in &services {
         ok &= report(stop_service(s, config, deadline));
     }

@@ -2676,7 +2676,7 @@ enum Cmd {
     },
     /// Stop running VMs or compose services
     ///
-    /// For a running VM, send SIGTERM to its `vk run` process and wait for it to exit. This
+    /// By default, stopping a VM sends SIGTERM to its `vk run` process and waits for it to exit. This
     /// also stops its compose siblings. Use `NAME/SERVICE` to stop one service through its
     /// manager. The current project is the default. Use `--all` to stop every running VM.
     /// Every REF is resolved first, then every VM is told to stop before any is waited for.
@@ -2696,13 +2696,29 @@ enum Cmd {
         /// stop every running vk VM
         #[arg(long, conflicts_with = "targets")]
         all: bool,
+        /// send SIGTERM once a second for 5 seconds, then kill the VMMs
+        ///
+        /// Use this for a VM that does not answer a plain stop. SIGKILL cuts power to the VM
+        /// and its compose services, losing unwritten guest data. After the whole batch,
+        /// surviving `vk run` processes get 5 seconds to finish cleanup before SIGKILL.
+        /// Select whole VMs with this option.
+        #[arg(short = 'f', long, conflicts_with = "kill")]
+        force: bool,
+        /// kill the VMMs immediately
+        ///
+        /// Send SIGKILL to the VMMs without requesting guest shutdown. This cuts power to
+        /// the VM and its compose services, losing unwritten guest data. After the whole
+        /// batch, surviving `vk run` processes get 5 seconds to finish cleanup before
+        /// SIGKILL. Select whole VMs with this option.
+        #[arg(long)]
+        kill: bool,
         /// give up after this many seconds in all; 0 waits as long as it takes
         ///
-        /// All VMs and services share this deadline. If a stop is unconfirmed when time
-        /// runs out, vk reports it and exits 1. Shutdowns already in progress continue.
-        /// Linux guests get up to one minute to power off. Windows guests get three
-        /// minutes, then up to 10 seconds to flush their disks. A shorter timeout can
-        /// expire while a guest is still shutting down.
+        /// All VMs and services share this deadline. If a stop is unconfirmed when time runs
+        /// out, vk reports it and exits 1. Expiry alone never triggers a kill. Shutdowns
+        /// already in progress continue. During graceful shutdown, Linux guests get up to one
+        /// minute to power off. Windows guests get three minutes, then up to 10 seconds to
+        /// flush their disks. A shorter timeout can expire while a guest is shutting down.
         #[arg(long, default_value_t = 210, value_name = "SECS")]
         timeout: u64,
     },
@@ -4052,14 +4068,21 @@ async fn cli_main(cli: Cli) -> ExitCode {
             targets,
             recursive,
             all,
+            force,
+            kill,
             timeout,
         } => {
+            let how = match (*force, *kill) {
+                (_, true) => vms::StopHow::Kill,
+                (true, false) => vms::StopHow::Force,
+                (false, false) => vms::StopHow::Graceful,
+            };
             let deadline = match *timeout {
                 0 => vms::Deadline::NEVER,
                 secs => vms::Deadline::in_secs(secs),
             };
             let config = cli.config.as_deref();
-            return stop_refs(targets, *recursive, *all, config, deadline);
+            return stop_refs(targets, *recursive, *all, config, deadline, how);
         }
         _ => {}
     }
@@ -6297,24 +6320,25 @@ fn act_on_vms(
 /// `vk stop [REF…]`. Each REF is read once, all of them before anything is stopped (a REF
 /// that cannot be read exits 2), then stopped together by [`lifecycle::stop`]. With none,
 /// the current directory's VMs, or `--all`, stop as [`vms::stop_cmd`] selects them.
-/// `deadline` bounds the whole of it.
+/// One deadline covers all targets.
 fn stop_refs(
     targets: &[std::ffi::OsString],
     recursive: bool,
     all: bool,
     config: Option<&Path>,
     deadline: vms::Deadline,
+    how: vms::StopHow,
 ) -> ExitCode {
     if targets.is_empty() {
         let selector = recursive.then_some(vms::Selector::Here { below: true });
-        return report_vms(vms::stop_cmd(selector, all, deadline));
+        return report_vms(vms::stop_cmd(selector, all, deadline, how));
     }
     let read: anyhow::Result<Vec<_>> = targets
         .iter()
         .map(|t| vms::Ref::parse(t).and_then(|r| vms::Selector::from_ref(r, recursive)))
         .collect();
     match read {
-        Ok(refs) => lifecycle::stop(refs, config, deadline),
+        Ok(refs) => lifecycle::stop(refs, config, deadline, how),
         Err(e) => {
             eprintln!("vk: {e:#}");
             exit_code(2)
@@ -8638,6 +8662,7 @@ mod tests {
                 false,
                 None,
                 vms::Deadline::in_secs(1),
+                vms::StopHow::Graceful,
             );
             assert_eq!(code, exit_code(1), "{r:?}");
         }
@@ -8648,8 +8673,14 @@ mod tests {
     #[test]
     fn recursive_without_a_ref_is_the_current_directory_and_below() {
         let _homes = crate::dev::testutil::Homes::new("recursive");
-        let stop =
-            |sel: Option<vms::Selector>| vms::stop_cmd(sel, false, vms::Deadline::in_secs(1));
+        let stop = |sel: Option<vms::Selector>| {
+            vms::stop_cmd(
+                sel,
+                false,
+                vms::Deadline::in_secs(1),
+                vms::StopHow::Graceful,
+            )
+        };
         // Nothing running: `-r` alone is done already, as plain `vk stop` is; `-r .` names
         // a directory and says nothing was there.
         assert_eq!(act_on_vms(None, true, stop), ExitCode::SUCCESS);

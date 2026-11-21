@@ -399,7 +399,7 @@ pub fn tree(root: i32) -> Option<Usage> {
     Some(usage)
 }
 
-/// `root` and every process descending from it, in no particular order. A pid in `skip` is
+/// `root` and every process descending from it, each child after its parent. A pid in `skip` is
 /// left out along with everything under it — nothing descends through a process the caller
 /// has disowned, which is how a [`Meter`] ignores what was already running. Empty when
 /// `root` itself is gone.
@@ -408,6 +408,15 @@ fn descendants(root: i32, skip: &HashSet<i32>) -> Vec<i32> {
         return Vec::new();
     }
     descendants_in(root, skip, &Links::read())
+}
+
+/// Every process descending from `root`, `root` itself left out, each after its parent.
+/// Empty when `root` is gone.
+pub(crate) fn descendants_of(root: i32) -> Vec<i32> {
+    descendants(root, &HashSet::new())
+        .into_iter()
+        .skip(1)
+        .collect()
 }
 
 /// How the walk from a process to its children goes: the kernel's own child lists, or —

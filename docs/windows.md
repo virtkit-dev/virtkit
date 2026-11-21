@@ -96,7 +96,7 @@ The run directory of a Windows machine holds its overlays (`disk0.qcow2`), `uefi
 (`vmm.sock`), the serial console (`console.log`, `console.sock`) and the VMM's own log
 (`console.vmm.log`).
 
-A stop presses the ACPI power button and, if Windows is still up 10 seconds later, asks
+A graceful stop presses the ACPI power button and, if Windows is still up 10 seconds later, asks
 qemu-ga to shut it down. Three minutes after the button (ten for a build step's guest), vk asks
 the VMM to quit, which flushes the disks (a kill would leave a qcow2 overlay's cached metadata
 unwritten, and the next run of a kept disk would corrupt it), and kills it only if it is still

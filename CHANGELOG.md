@@ -18,6 +18,8 @@ All notable changes to virtkit will be documented in this file.
   Use `--dry-run` to preview or `-y` or `-f` to confirm without a terminal.
 - `vk rename` changes a VM's name, and `vk ls` lists VMs.
 - `vk stop` takes several REFs and signals every VM before waiting for any.
+- `vk stop --force` retries shutdown for 5 seconds before cutting guest power.
+  `vk stop --kill` cuts power immediately. Both options apply to whole VMs.
 - `vk reset` removes a stopped dev environment's boot images or persistent data by name.
 - `vk dev start` boots a stopped environment without building images or reuses a running one.
   If a build is needed, it exits 3 unless another target failed for a different reason.
