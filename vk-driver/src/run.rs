@@ -603,6 +603,8 @@ pub struct RunArgs {
     pub state_dir: Option<PathBuf>,
     /// the state directory lock and the name and recipe to publish at readiness
     pub remembered: Option<std::sync::Arc<crate::names::Remembered>>,
+    /// `vk dev start` holds this `state_dir` lock across identity removal and restoration on a miss
+    pub state_lock: Option<std::sync::Arc<std::fs::File>>,
     /// the run's workspace root, which a compose file reads as `${VK_WORKSPACE}`;
     /// None = the launch cwd
     pub workspace: Option<PathBuf>,
@@ -728,6 +730,7 @@ impl Default for RunArgs {
             ssh_alias: "vk-run".to_string(),
             state_dir: None,
             remembered: None,
+            state_lock: None,
             workspace: None,
             volumes: Vec::new(),
             symlinks: Vec::new(),
@@ -803,8 +806,9 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
     crate::vmm::set_vm_name_template(args.vm_name.clone());
     let mut work = match &args.state_dir {
         Some(dir) => {
-            let held = match &args.remembered {
-                Some(r) if r.dir() == crate::vms::canonical(dir) => Some(r.lock()?),
+            let held = match (&args.remembered, &args.state_lock) {
+                (Some(r), _) if r.dir() == crate::vms::canonical(dir) => Some(r.lock()?),
+                (_, Some(lock)) => Some(lock.try_clone().context("holding the state dir lock")?),
                 _ => None,
             };
             WorkDir::pinned(dir.clone(), held)?
@@ -2624,6 +2628,7 @@ async fn build_and_boot(
             mgr,
             &planned.start,
             &start_deps,
+            args.require_cached,
             signalled.as_mut(),
             signals(false),
         )
@@ -3348,11 +3353,13 @@ async fn build_and_boot(
 /// failed start in its own. On any error the caller must call `stop_all` again: a start under
 /// way at this function's own `stop_all` may boot its guest after it. `again`, a further
 /// signal during that stop, exits at once — a Windows guest takes up to three minutes to power
-/// off — and leaves the VMMs to their parent-death signal.
+/// off — and leaves the VMMs to their parent-death signal. `cached` starts only what is built:
+/// a service whose image is not fails with a [`crate::build::NotBuilt`].
 async fn start_eager(
     mgr: &std::sync::Arc<crate::manager::Manager>,
     names: &[String],
     deps: &std::collections::HashMap<String, Vec<String>>,
+    cached: bool,
     stop: impl std::future::Future<Output = Stopped>,
     again: impl std::future::Future<Output = Stopped>,
 ) -> Result<()> {
@@ -3364,13 +3371,16 @@ async fn start_eager(
                 &names,
                 &deps,
                 &boot,
-                |name| mgr.start(name),
+                |name| mgr.start_streamed(name, None, cached),
                 || mgr.stop_all(),
             );
-            if let Err((name, message)) = started {
-                bail!("booting service {name}: {message}");
+            match started {
+                Ok(()) => Ok(()),
+                Err((name, message, true)) => {
+                    Err(crate::build::NotBuilt(format!("booting service {name}: {message}")).into())
+                }
+                Err((name, message, false)) => bail!("booting service {name}: {message}"),
             }
-            Ok(())
         }
     });
     // Biased: a stop that comes with the last start still reports the stop.
@@ -3530,8 +3540,8 @@ struct Boot {
 struct BootProgress {
     /// The services whose start succeeded.
     up: std::collections::HashSet<String>,
-    /// The first service whose start failed, with its error.
-    failure: Option<(String, String)>,
+    /// First failed service, its error, and its [`vk_core::fleetctl::Reply::not_built`] flag.
+    failure: Option<(String, String, bool)>,
     /// Set by [`Boot::stop`]: no further service starts.
     stopping: bool,
 }
@@ -3557,7 +3567,7 @@ fn start_services(
     boot: &Boot,
     start: impl Fn(&str) -> vk_core::fleetctl::Reply + Sync,
     stop_all: impl Fn() + Sync,
-) -> std::result::Result<(), (String, String)> {
+) -> std::result::Result<(), (String, String, bool)> {
     let (start, stop_all) = (&start, &stop_all);
     std::thread::scope(|scope| {
         for name in names {
@@ -3582,7 +3592,7 @@ fn start_services(
                     p.up.insert(name.clone());
                     boot.changed.notify_all();
                 } else if p.failure.is_none() {
-                    p.failure = Some((name.clone(), reply.message));
+                    p.failure = Some((name.clone(), reply.message, reply.not_built));
                     boot.changed.notify_all();
                     drop(p);
                     stop_all();
@@ -4243,6 +4253,7 @@ async fn compose_up(
         &mgr,
         &planned.start,
         &start_deps,
+        args.require_cached,
         stop.as_mut(),
         signals(false),
     )
@@ -4352,7 +4363,7 @@ pub(crate) fn service_build_options(
 /// contexts, target, output, and job limit while retaining its cache, egress policy, and
 /// build arguments. `--build-audit-egress` audits this build's RUN egress;
 /// `--audit-egress` audits the booted guest, matching `--net`/`--build-net`.
-fn dockerfile_build_options(
+pub(crate) fn dockerfile_build_options(
     args: &RunArgs,
     kernel: &Path,
     agent: &Path,
@@ -7028,6 +7039,7 @@ mod tests {
                 &mgr,
                 &[],
                 &Default::default(),
+                false,
                 std::future::ready(Stopped(signal)),
                 std::future::pending(),
             )
@@ -7040,6 +7052,7 @@ mod tests {
             &mgr,
             &[],
             &Default::default(),
+            false,
             std::future::pending(),
             std::future::pending(),
         )
@@ -7048,10 +7061,9 @@ mod tests {
     }
 
     fn reply(ok: bool) -> vk_core::fleetctl::Reply {
-        vk_core::fleetctl::Reply {
-            ok,
-            message: if ok { "up" } else { "boom" }.into(),
-            units: Vec::new(),
+        match ok {
+            true => vk_core::fleetctl::Reply::ok("up"),
+            false => vk_core::fleetctl::Reply::err("boom"),
         }
     }
 
@@ -7113,7 +7125,19 @@ mod tests {
                 stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             },
         );
-        assert_eq!(r, Err(("A".to_string(), "boom".to_string())));
+        assert_eq!(r, Err(("A".to_string(), "boom".to_string(), false)));
+        // Preserve the cache miss so the run exits 3.
+        let r = start_services(
+            &names(&["A"]),
+            &Default::default(),
+            &Boot::default(),
+            |_| vk_core::fleetctl::Reply::not_built("A is not built"),
+            || {},
+        );
+        assert_eq!(
+            r,
+            Err(("A".to_string(), "A is not built".to_string(), true))
+        );
         assert_eq!(stops.into_inner(), 1);
     }
 
@@ -7134,7 +7158,7 @@ mod tests {
                 stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             },
         );
-        assert!(matches!(r, Err((ref name, _)) if name == "A" || name == "C"));
+        assert!(matches!(r, Err((ref name, _, false)) if name == "A" || name == "C"));
         assert_eq!(stops.into_inner(), 1);
     }
 
@@ -7319,6 +7343,38 @@ mod tests {
         assert_eq!(project_dir(&args), Some(cwd));
         args.workspace = Some(PathBuf::from("/"));
         assert_eq!(project_dir(&args), Some(PathBuf::from("/")));
+    }
+
+    /// An `image:` primary misses before its first `up`. After `up`, cache-only acquisition
+    /// reuses the keyed `root.qcow2` export left for the next boot.
+    #[test]
+    fn an_image_primary_starts_again_from_what_its_up_exported() {
+        let tmp = std::env::temp_dir().join(format!("vk-run-image-primary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let (kernel, agent) = (tmp.join("kernel"), tmp.join("agent"));
+        for asset in [&kernel, &agent] {
+            std::fs::write(asset, "").unwrap();
+        }
+        let yaml = "services:\n  app:\n    image: scratch\n";
+        let units = crate::compose::parse(yaml, &tmp, &|_| None, None).unwrap();
+        let mut args = bare_args();
+        args.cache = crate::build::CacheOpts {
+            registry: Some(tmp.join("cache").display().to_string()),
+            ..Default::default()
+        };
+        let acquire = |args: &RunArgs| {
+            build_compose_images(args, &tmp, &kernel, &agent, &units, Some(0)).map(drop)
+        };
+        args.require_cached = true;
+        let err = acquire(&args).unwrap_err();
+        assert!(crate::build::not_cached(&err), "{err:#}");
+        args.require_cached = false;
+        acquire(&args).unwrap();
+        assert!(tmp.join("root.qcow2").is_file());
+        args.require_cached = true;
+        acquire(&args).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

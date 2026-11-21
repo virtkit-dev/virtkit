@@ -451,10 +451,24 @@ impl std::fmt::Display for NotCached {
 
 impl std::error::Error for NotCached {}
 
-/// Whether `e` is a `--require-cached` refusal: the CLI gives those their own exit code (3)
-/// and `vk dev task` falls back on them. Checked at the chain root — contexts wrap the error.
+/// A cache miss reported by a service manager ([`vk_core::fleetctl::Reply::not_built`]) or
+/// a child `vk` (exit 3). [`not_cached`] preserves that exit status across both boundaries.
+#[derive(Debug)]
+pub struct NotBuilt(pub String);
+
+impl std::fmt::Display for NotBuilt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotBuilt {}
+
+/// Check the root cause for [`NotCached`] or [`NotBuilt`] through any added context.
+/// The CLI exits 3 for either error, and `vk dev task` falls back on both.
 pub fn not_cached(e: &anyhow::Error) -> bool {
-    e.root_cause().downcast_ref::<NotCached>().is_some()
+    let root = e.root_cause();
+    root.downcast_ref::<NotCached>().is_some() || root.downcast_ref::<NotBuilt>().is_some()
 }
 
 /// Where a placed job's build records its egress for the node's report, and what its stage

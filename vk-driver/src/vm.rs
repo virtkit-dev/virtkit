@@ -922,6 +922,7 @@ pub(crate) fn build_image_sources(
         audit,
         record: build_record(ctx, service.as_deref())?,
         base_registry: cfg.registry.clone(),
+        require_cached: false,
     };
     let (dir, guard) = crate::ensure::ensure_build_tier(
         cfg.state_dir(),
@@ -1550,6 +1551,7 @@ fn build_compose_unit(
         cfg.image_cache_idle(),
         &build,
         None,
+        false,
     )?;
     if private && let Some(dir) = built.0.parent() {
         note_private_build(&ctx.job_dir, dir)?;

@@ -112,6 +112,9 @@ pub struct Overrides {
     pub cache_insecure: bool,
     /// what to do about a running environment that no longer matches, over the config's `freshness`
     pub freshness: Option<Freshness>,
+    /// boot only what is already built: a stage is restored from the cache or the boot fails
+    /// (`vk dev start`)
+    pub no_build: bool,
 }
 
 /// The fixtures every submodule's tests build on: a scratch directory that removes itself,

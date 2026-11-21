@@ -14,7 +14,8 @@ use super::hooks::{Where, check_requirements, note_lock, run_hook};
 use super::identity::{
     COMPOSE_SNAPSHOT, Config, LeftBehind, NotReady, VmTie, applied_on_attach, claim_not_ready,
     clear_not_ready, drift, identity_of, identity_path, left_behind, live_identity,
-    note_older_creator, older_creator, read_not_ready, same_config, sha256_hex, try_read_identity,
+    note_older_creator, older_creator, read_not_ready, restore_identity, same_config, sha256_hex,
+    try_read_identity,
 };
 use super::session::{ask_on_terminal, on_terminal, running_vm};
 use super::{GENERATION_MARKER, INFLIGHT_POLL, Identity, Overrides, TRANSITION_WAIT, Transition};
@@ -363,6 +364,7 @@ fn run_args(
             args.require_cached = plan.cached_only;
         }
     }
+    args.require_cached |= over.no_build;
     // A compose primary lives as long as its service's command; an image or build alone has
     // no command to live by, so the run keeps the VM until `vk dev stop`.
     if !matches!(plan.source, Source::Compose { .. }) {
@@ -1254,7 +1256,42 @@ pub async fn boot(
         }
     }
 
-    note_booted_when_ready(plan, parent_pid, &config.manifest);
+    boot_anew(
+        plan,
+        cfg,
+        over,
+        &config.manifest,
+        snapshot.as_ref().map(|(p, _)| p.as_path()),
+        parent_pid,
+        async |args| crate::run::run_or_exit_on_stop(args, cfg).await,
+    )
+    .await
+}
+
+/// Replace the previous boot record and boot the VM with `run`. When a cache-only start
+/// saves an identity, it holds the state directory lock across removal, image acquisition
+/// and [`restore_identity`] on a cache miss. `run` shares the lock so `gc` cannot remove
+/// the directory while its identity is missing.
+async fn boot_anew(
+    plan: &Plan,
+    cfg: &crate::config::Config,
+    over: &Overrides,
+    manifest: &serde_json::Value,
+    wrapper: Option<&Path>,
+    parent_pid: u32,
+    run: impl AsyncFnOnce(&crate::run::RunArgs) -> Result<()>,
+) -> Result<()> {
+    let last = match over.no_build {
+        true => std::fs::read(identity_path(plan)).ok(),
+        false => None,
+    };
+    let lock = match &last {
+        Some(_) => Some(std::sync::Arc::new(crate::run::lock_state_dir(
+            &plan.state_dir,
+        )?)),
+        None => None,
+    };
+    note_booted_when_ready(plan, parent_pid, manifest);
     // What was recorded describes an environment that is about to be replaced, and nothing
     // describes the new one until `after_boot` has it ready or leaves it marked not ready.
     // Removing both now is what a joining `vk dev` waits on (see `wait_for_boot`); a removal
@@ -1272,14 +1309,9 @@ pub async fn boot(
     if plan.egress.is_none() {
         let _ = std::fs::remove_file(plan.state_dir.join(crate::dev::plan::EGRESS_FILE));
     }
-    let mut args = run_args(
-        plan,
-        snapshot.as_ref().map(|(p, _)| p.as_path()),
-        over,
-        cfg,
-        CheckoutMode::Shared,
-    )?;
+    let mut args = run_args(plan, wrapper, over, cfg, CheckoutMode::Shared)?;
     args.compose_snapshot = compose_snapshot(plan);
+    args.state_lock = lock.clone();
     // Resolve `[dev.ssh]` here using the host agent and $HOME: forward the whole agent or
     // whitelisted keys and inject a matching guest ~/.ssh/config. Keep `run_args` pure so
     // builds and tasks that reuse it neither enumerate the agent nor write files.
@@ -1298,7 +1330,13 @@ pub async fn boot(
             Err(e) => eprintln!("virtkit: [dev.ssh] agent forwarding disabled: {e:#}"),
         }
     }
-    crate::run::run_or_exit_on_stop(&args, cfg).await
+    let result = run(&args).await;
+    if let (Err(e), Some(last)) = (&result, &last)
+        && crate::build::not_cached(e)
+    {
+        restore_identity(plan, last);
+    }
+    result
 }
 
 /// Build the environment's images into the cache, running nothing.
@@ -2000,6 +2038,7 @@ mod tests {
             cache_registry: Some("/var/cache/vk".into()),
             cache_insecure: false,
             freshness: None,
+            no_build: false,
         };
         let args = run_args(&plan, None, &over, &cfg, CheckoutMode::Shared).unwrap();
         let opts = crate::run::service_build_options(&args, Path::new("/k"), Path::new("/a"));
@@ -2432,6 +2471,112 @@ mod tests {
                 session_only: false
             }
         );
+    }
+
+    /// Acquiring a Dockerfile primary with an empty cache returns [`crate::build::NotCached`]
+    /// before any instruction runs. Restoring the record lets `start` retry and protects the
+    /// directory from `gc --all-stale`. A build-enabled boot replaces the record.
+    #[tokio::test]
+    async fn a_start_that_cannot_boot_from_the_cache_keeps_the_last_boot() {
+        const CHILD: &str = "VK_TEST_START_KEEPS_BOOT";
+        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let tmp = scratch("start-keeps");
+            crate::dev::testutil::in_child(
+                "dev::boot::tests::a_start_that_cannot_boot_from_the_cache_keeps_the_last_boot",
+                CHILD,
+                &tmp.0,
+            );
+            return;
+        };
+        let mut plan = plan_in(&tmp);
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("f"), "x").unwrap();
+        std::fs::write(repo.join("Dockerfile"), "FROM scratch\nCOPY f /f\n").unwrap();
+        plan.source = Source::Build {
+            context: repo.clone(),
+            dockerfile: repo.join("Dockerfile"),
+            target: None,
+            args: Vec::new(),
+        };
+        for asset in ["kernel", "agent"] {
+            std::fs::write(tmp.join(asset), "").unwrap();
+        }
+        std::fs::create_dir_all(&plan.state_dir).unwrap();
+        let config = identity_of(&plan, None).unwrap();
+        let recorded = serde_json::to_vec(&Identity {
+            digest: config.digest,
+            booted_secs: 1,
+            created_by: String::new(),
+            generation: String::new(),
+            manifest: config.manifest.clone(),
+            storage_backings: Some(Vec::new()),
+            readied_by_its_boot: true,
+        })
+        .unwrap();
+        std::fs::write(identity_path(&plan), &recorded).unwrap();
+        let cfg = crate::config::Config::default();
+        let start = Overrides {
+            freshness: Some(Freshness::Reuse),
+            cache_registry: Some(tmp.join("cache").display().to_string()),
+            no_build: true,
+            ..Default::default()
+        };
+        // What `vk run` does with a Dockerfile primary: build it into the boot's root image.
+        let acquire = async |args: &crate::run::RunArgs| {
+            assert!(args.require_cached);
+            let out = plan.state_dir.join("root.qcow2");
+            let opts = crate::run::dockerfile_build_options(
+                args,
+                &tmp.join("kernel"),
+                &tmp.join("agent"),
+                out,
+                None,
+            );
+            crate::build::build(&opts).map(drop)
+        };
+        let stale = || {
+            let rows = crate::dev::list::scan(&tmp, &[], false);
+            crate::dev::list::select_gc(rows, &[], true, |_| Ok(None)).unwrap()
+        };
+        let is_stale = || stale().iter().any(|r| r.dir == plan.state_dir);
+        // GC lists the directory while the identity is missing and rechecks it after unlock.
+        let listed = std::cell::RefCell::new(Vec::new());
+        let acquire = async |args: &crate::run::RunArgs| {
+            assert!(crate::dev::list::try_lock_state_dir(&plan.state_dir).is_none());
+            *listed.borrow_mut() = stale();
+            acquire(args).await
+        };
+        // Twice: the retry finds the record its first attempt put back.
+        for _ in 0..2 {
+            let manifest = &config.manifest;
+            let err = boot_anew(&plan, &cfg, &start, manifest, None, 4242, acquire)
+                .await
+                .unwrap_err();
+            let missed = err.root_cause().downcast_ref::<crate::build::NotCached>();
+            assert!(missed.is_some(), "{err:#}");
+            assert_eq!(std::fs::read(identity_path(&plan)).unwrap(), recorded);
+            assert!(!is_stale());
+            let listed: Vec<_> = listed
+                .take()
+                .into_iter()
+                .filter(|r| r.dir == plan.state_dir)
+                .collect();
+            assert_eq!(listed.len(), 1);
+            let idx = crate::names::Index::at(tmp.join("names"));
+            let removed = crate::dev::list::remove(&listed, &idx).unwrap();
+            assert!(removed.contains("kept"), "{removed}");
+            assert_eq!(std::fs::read(identity_path(&plan)).unwrap(), recorded);
+        }
+        let manifest = &config.manifest;
+        let over = Overrides::default();
+        boot_anew(&plan, &cfg, &over, manifest, None, 4242, async |_| {
+            bail!("boom")
+        })
+        .await
+        .unwrap_err();
+        assert!(!identity_path(&plan).exists());
+        assert!(is_stale());
     }
 
     /// Waiting for another boot gives the same decision as finding it ready on arrival, except

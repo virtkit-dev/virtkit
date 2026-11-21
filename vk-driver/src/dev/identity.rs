@@ -324,6 +324,22 @@ pub(super) fn clear_not_ready(plan: &Plan) {
     let _ = std::fs::remove_file(not_ready_path(plan));
 }
 
+/// Restore the previous identity on a cache miss so `start` can retry and `gc --all-stale`
+/// keeps the directory. The caller has held the state directory lock since removing `last`.
+/// Preserve any identity or not-ready marker published in the meantime.
+pub(super) fn restore_identity(plan: &Plan, last: &[u8]) {
+    let Ok(_marker) = lock_not_ready(plan) else {
+        return;
+    };
+    let path = identity_path(plan);
+    if path.symlink_metadata().is_ok() || not_ready_path(plan).symlink_metadata().is_ok() {
+        return;
+    }
+    if let Err(e) = vk_fs::write_atomic(&path, last, 0o600) {
+        eprintln!("virtkit: putting back the last boot's identity: {e:#}");
+    }
+}
+
 /// What the last boot recorded for this environment. A file that is absent or unreadable —
 /// a state dir never booted, or one an older `vk` wrote in another shape — means nothing to
 /// compare against, which callers report as unknown rather than mistake for a match.

@@ -788,10 +788,10 @@ pub async fn service(
     plan: &Plan,
     req: &vk_core::fleetctl::Request,
 ) -> Result<vk_core::fleetctl::Reply> {
-    // A start can build an image, so it has no socket timeout. Other requests get a
-    // 120-second I/O timeout to allow for guest shutdown.
+    // Both forms of start have no socket timeout. Other requests get 120 seconds for guest shutdown.
     let timeout = match req {
-        vk_core::fleetctl::Request::Start { .. } => None,
+        vk_core::fleetctl::Request::Start { .. }
+        | vk_core::fleetctl::Request::StartCached { .. } => None,
         _ => Some(std::time::Duration::from_secs(120)),
     };
     service_within(plan, req, timeout).await
@@ -827,7 +827,8 @@ pub async fn service_within(
         let _ = publish_for(plan, &entry, Some(unit)).await;
     }
     let reply = result?;
-    if let vk_core::fleetctl::Request::Start { unit } = req
+    if let vk_core::fleetctl::Request::Start { unit }
+    | vk_core::fleetctl::Request::StartCached { unit } = req
         && reply.ok
     {
         let failed = publish_for(plan, &entry, Some(unit)).await?;

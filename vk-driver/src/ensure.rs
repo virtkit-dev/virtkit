@@ -81,6 +81,9 @@ pub struct BuildRecipe {
     pub record: Option<crate::build::EgressRecord>,
     /// [`crate::build::Options::base_registry`].
     pub base_registry: Option<crate::config::Registry>,
+    /// [`crate::build::Options::require_cached`]: restore from the instruction cache, or fail
+    /// with its [`crate::build::NotCached`] before any instruction runs.
+    pub require_cached: bool,
 }
 
 /// A unit image is fresh when its UUID is the expected fingerprint *and* its runtime
@@ -139,7 +142,7 @@ pub fn ensure_unit_build(
         audit: recipe.audit,
         record: recipe.record.clone(),
         base_registry: recipe.base_registry.clone(),
-        require_cached: false,
+        require_cached: recipe.require_cached,
         build_jobs: None,
         debug: false,
         progress_sink,
@@ -331,6 +334,7 @@ mod tests {
             audit: false,
             record: None,
             base_registry: None,
+            require_cached: false,
         };
         let key = "deadbeef";
         let expected = fingerprint(&[key]);
@@ -343,6 +347,48 @@ mod tests {
         ensure_unit_build(&recipe, Some("svc"), key, &out, None).unwrap();
         // a different stage key -> stale again.
         assert!(ensure_unit_build(&recipe, Some("svc"), "other", &out, None).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A missing config sidecar invalidates an otherwise fresh image. With an empty
+    /// instruction cache, a cache-only build must fail before running any instruction.
+    #[test]
+    fn a_cached_unit_build_refuses_what_the_cache_lacks() {
+        let tmp = std::env::temp_dir().join(format!("vk-ensure-cached-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let ctx = tmp.join("ctx");
+        std::fs::create_dir_all(&ctx).unwrap();
+        std::fs::write(ctx.join("f"), "x").unwrap();
+        std::fs::write(ctx.join("Dockerfile"), "FROM scratch\nCOPY f /f\n").unwrap();
+        for asset in ["kernel", "agent"] {
+            std::fs::write(tmp.join(asset), "").unwrap();
+        }
+        let recipe = BuildRecipe {
+            dockerfiles: vec![ctx.join("Dockerfile")],
+            contexts: vec![ctx.clone()],
+            build_contexts: Vec::new(),
+            build_args: vec![],
+            kernel: Some(tmp.join("kernel")),
+            agent: Some(tmp.join("agent")),
+            cache: crate::build::CacheDest::Configured(crate::build::CacheOpts {
+                registry: Some(tmp.join("cache").display().to_string()),
+                insecure: false,
+                auth: Default::default(),
+            }),
+            local_scope: None,
+            net: crate::build::BuildNet::All,
+            audit: false,
+            record: None,
+            base_registry: None,
+            require_cached: true,
+        };
+        let key = "deadbeef";
+        let out = tmp.join("out").join(UNIT_IMAGE);
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        crate::ext4::build_from_dir(&ctx, &out).unwrap();
+        crate::ext4::set_uuid(&out, &parse_uuid(&fingerprint(&[key])).unwrap()).unwrap();
+        let err = ensure_unit_build(&recipe, None, key, &out, None).unwrap_err();
+        assert!(crate::build::not_cached(&err), "{err:#}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -372,6 +418,7 @@ mod tests {
             audit: false,
             record: None,
             base_registry: None,
+            require_cached: false,
         };
         let key = "will-fail";
         let result = ensure_build_tier(
@@ -434,6 +481,7 @@ mod tests {
             audit: false,
             record: None,
             base_registry: None,
+            require_cached: false,
         };
         let (got_dir, guard) = ensure_build_tier(
             &state_dir,

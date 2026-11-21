@@ -26,6 +26,8 @@ pub struct Opts<'a> {
     pub config: Option<&'a Path>,
     /// seconds to wait for VM shutdown or for each socket operation during a service stop
     pub timeout: u64,
+    /// a start builds what is not built yet, as `vk dev up` does, instead of failing
+    pub build: bool,
 }
 
 /// A VM a lifecycle verb acts on.
@@ -54,7 +56,7 @@ pub enum Among {
     /// refuse, and name them: for a verb that removes something
     One,
     /// the project's own VM, its `dev` environment, when there is exactly one: what
-    /// `vk dev up` in that directory would start
+    /// `vk dev start` in that directory would start
     ProjectVm,
 }
 
@@ -211,13 +213,13 @@ fn running_on(dir: &Path) -> Option<VmEntry> {
 /// One step of a start or a stop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
-    /// `vk dev --workspace W --environment E up`
+    /// `vk dev --workspace W --environment E start` (`up` with `--build`)
     DevUp,
-    /// `vk dev … service up|down S`
+    /// `vk dev … start --service S` (`service up S` with `--build`), or `vk dev … service down S`
     DevService { up: bool },
-    /// replay `run.json`
+    /// replay `run.json` (with `--require-cached` unless `--build`)
     Replay,
-    /// a `Start`/`Stop` to the run's service manager
+    /// a `StartCached`, `Start` or `Stop` request to the run's service manager
     Control { up: bool },
     /// stop the VM on the target's state dir — that one alone — and what it publishes
     StopVm,
@@ -390,6 +392,21 @@ fn dev_args(dir: &Path, o: Opts) -> Result<Vec<OsString>> {
     Ok(args)
 }
 
+/// Make a replayed `vk run` follow the start's build policy rather than the recipe's: with
+/// `build`, no `--require-cached`; without, exactly one. Both before the guest command's `--`.
+fn build_policy(args: &mut Vec<OsString>, build: bool) {
+    let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let mut options: Vec<OsString> = args
+        .drain(..at)
+        .filter(|a| a != "--require-cached")
+        .collect();
+    if !build {
+        options.push("--require-cached".into());
+    }
+    options.append(args);
+    *args = options;
+}
+
 /// Validate the recorded `vk run` and its detached replay with the CLI parser.
 /// `-t` and `--shell` require a terminal. Return the replay arguments and working directory.
 fn replay(t: &Target) -> Result<(Vec<OsString>, PathBuf)> {
@@ -479,8 +496,14 @@ fn startable(t: &Target, steps: &[Step]) -> Result<()> {
 }
 
 /// Run this `vk` with `args`, in `cwd`, its output ours; fail unless it succeeds, saying
-/// that `what` did not happen.
-fn vk(what: &str, args: &[OsString], cwd: Option<&Path>, from_recipe: bool) -> Result<()> {
+/// that `what` did not happen. A `cached` start that exits 3 found something not built.
+fn vk(
+    what: &str,
+    args: &[OsString],
+    cwd: Option<&Path>,
+    from_recipe: bool,
+    cached: bool,
+) -> Result<()> {
     let exe = std::env::current_exe().context("resolving the running vk")?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args);
@@ -490,39 +513,57 @@ fn vk(what: &str, args: &[OsString], cwd: Option<&Path>, from_recipe: bool) -> R
     if from_recipe {
         cmd.env(crate::FROM_RECIPE_ENV, "1");
     }
-    succeeds(cmd, what)
+    succeeds(cmd, what, cached)
 }
 
 /// Report the child status and operation. The child inherits stderr, and its arguments
-/// may contain `--password`.
-fn succeeds(mut cmd: std::process::Command, what: &str) -> Result<()> {
+/// may contain `--password`. A `cached` start's exit 3 is a [`crate::build::NotBuilt`], so
+/// it keeps that status here.
+fn succeeds(mut cmd: std::process::Command, what: &str, cached: bool) -> Result<()> {
     let status = cmd
         .status()
         .with_context(|| format!("{what}: running vk"))?;
-    if !status.success() {
-        bail!("{what}: vk {status}");
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(3) if cached => Err(crate::build::NotBuilt(format!("{what}: vk {status}")).into()),
+        _ => bail!("{what}: vk {status}"),
     }
-    Ok(())
 }
 
-/// Return the service manager's reply, or its error with the service name. For stops,
-/// `timeout` bounds each socket read and write in seconds.
-fn control_unit(ctl: &Path, shown: &str, unit: &str, up: bool, timeout: u64) -> Result<String> {
-    let req = match up {
-        true => vk_core::fleetctl::Request::Start { unit: unit.into() },
-        false => vk_core::fleetctl::Request::Stop { unit: unit.into() },
+/// Return the service manager's reply, or its error with the service name. A `cached`
+/// start boots only an image already built: one that is not fails with a
+/// [`crate::build::NotBuilt`]. For stops, `timeout` bounds each socket read and write in
+/// seconds.
+fn control_unit(
+    ctl: &Path,
+    shown: &str,
+    unit: &str,
+    up: bool,
+    cached: bool,
+    timeout: u64,
+) -> Result<String> {
+    use vk_core::fleetctl::Request;
+    let unit = unit.to_string();
+    let req = match (up, cached) {
+        (true, false) => Request::Start { unit },
+        (true, true) => Request::StartCached { unit },
+        (false, _) => Request::Stop { unit },
     };
     let timeout = (!up).then(|| Duration::from_secs(timeout));
     let reply = vms::control(ctl, &req, timeout, |line| eprintln!("{line}"))
         .with_context(|| format!("{shown}: asking its VM's service manager"))?;
+    if reply.not_built {
+        return Err(crate::build::NotBuilt(format!("{shown}: {}", reply.message)).into());
+    }
     if !reply.ok {
         bail!("{shown}: {}", reply.message);
     }
     Ok(reply.message)
 }
 
-/// Carry out `steps` on `t`.
+/// Carry out `steps` on `t`. A start boots only what is already built, unless `o.build`.
 fn execute(t: &Target, steps: &[Step], o: Opts) -> Result<String> {
+    let start = if o.build { "up" } else { "start" };
     let mut out = String::new();
     for step in steps {
         match step {
@@ -530,23 +571,42 @@ fn execute(t: &Target, steps: &[Step], o: Opts) -> Result<String> {
             Step::DevUp => {
                 let mut args =
                     dev_args(&t.dir, o).with_context(|| format!("cannot start {}", t.name))?;
-                args.push("up".into());
-                vk(&format!("starting {}", t.name), &args, None, false)?;
+                args.push(start.into());
+                vk(
+                    &format!("starting {}", t.name),
+                    &args,
+                    None,
+                    false,
+                    !o.build,
+                )?;
             }
             Step::DevService { up } => {
                 let mut args = dev_args(&t.dir, o)?;
                 let service = t.service.clone().unwrap_or_default();
-                let op = if *up { "up" } else { "down" };
-                args.extend(["service".into(), op.into(), service.into()]);
-                if !up {
-                    args.extend(["--timeout".into(), o.timeout.to_string().into()]);
+                match (*up, o.build) {
+                    (true, false) => {
+                        args.extend(["start".into(), "--service".into(), service.into()])
+                    }
+                    (true, true) => args.extend(["service".into(), "up".into(), service.into()]),
+                    (false, _) => {
+                        args.extend(["service".into(), "down".into(), service.into()]);
+                        args.extend(["--timeout".into(), o.timeout.to_string().into()]);
+                    }
                 }
                 let what = if *up { "starting" } else { "stopping" };
-                vk(&format!("{what} {}", t.shown()), &args, None, false)?;
+                let cached = *up && !o.build;
+                vk(&format!("{what} {}", t.shown()), &args, None, false, cached)?;
             }
             Step::Replay => {
-                let (args, cwd) = replay(t)?;
-                vk(&format!("starting {}", t.name), &args, Some(&cwd), true)?;
+                let (mut args, cwd) = replay(t)?;
+                build_policy(&mut args, o.build);
+                vk(
+                    &format!("starting {}", t.name),
+                    &args,
+                    Some(&cwd),
+                    true,
+                    !o.build,
+                )?;
             }
             Step::Control { up } => {
                 let entry =
@@ -554,7 +614,7 @@ fn execute(t: &Target, steps: &[Step], o: Opts) -> Result<String> {
                 let ctl = vms::control_socket(&entry)
                     .with_context(|| format!("{} runs no compose services", t.name))?;
                 let unit = t.service.clone().unwrap_or_default();
-                let said = control_unit(&ctl, &t.shown(), &unit, *up, o.timeout)?;
+                let said = control_unit(&ctl, &t.shown(), &unit, *up, !o.build, o.timeout)?;
                 out.push_str(&format!("{said}\n"));
             }
             Step::StopVm => {
@@ -576,18 +636,18 @@ fn execute(t: &Target, steps: &[Step], o: Opts) -> Result<String> {
     Ok(out)
 }
 
-/// `vk start` on each REF in turn; the exit status says whether every one started.
+/// `vk start` on each REF in turn; the exit status is [`worst`] of theirs.
 pub fn start(refs: &[OsString], o: Opts) -> ExitCode {
-    let mut ok = true;
+    let mut codes = Vec::new();
     for r in refs {
         // A project directory means its own VM: one REF starts one VM at most.
         let result = resolve(r, Among::ProjectVm).and_then(|t| {
             let steps = plan(Verb::Start, &t, running_on(&t.dir).is_some())?;
             execute(&t, &steps, o)
         });
-        ok &= report(result);
+        codes.push(outcome(result, "start", r));
     }
-    exit(ok)
+    worst(codes)
 }
 
 /// `vk stop` of a REF already read that names a VM or a compose service: through its kind.
@@ -616,6 +676,34 @@ fn report(result: Result<String>) -> bool {
     }
 }
 
+/// Report one target's outcome. On a cache miss, print the build command and return 3.
+/// Other failures return 1.
+fn outcome(result: Result<String>, verb: &str, r: &OsString) -> u8 {
+    match result {
+        Err(e) if crate::build::not_cached(&e) => {
+            eprintln!("vk: {e:#}");
+            eprintln!(
+                "vk: hint: `vk {verb} --build {}` builds what is missing",
+                r.to_string_lossy()
+            );
+            3
+        }
+        result => u8::from(!report(result)),
+    }
+}
+
+/// Return 0 if all targets succeeded, 3 if only cache misses failed, or 1 for any other failure.
+pub(crate) fn worst(codes: impl IntoIterator<Item = u8>) -> ExitCode {
+    let code = codes
+        .into_iter()
+        .fold(0, |worst, code| match (worst, code) {
+            (worst, 0) => worst,
+            (0 | 3, 3) => 3,
+            _ => 1,
+        });
+    ExitCode::from(code)
+}
+
 /// The exit status for whether everything went through.
 fn exit(ok: bool) -> ExitCode {
     if ok {
@@ -625,14 +713,14 @@ fn exit(ok: bool) -> ExitCode {
     }
 }
 
-/// Restart each REF in order. Continue after failures and return 1 if any failed.
+/// Restart each REF in order. Continue after failures; the exit status is [`worst`] of theirs.
 pub fn restart(refs: &[OsString], o: Opts) -> ExitCode {
-    let mut ok = true;
+    let mut codes = Vec::new();
     for r in refs {
         let result = resolve(r, Among::ProjectVm).and_then(|t| restart_one(&t, o));
-        ok &= report(result);
+        codes.push(outcome(result, "restart", r));
     }
-    exit(ok)
+    worst(codes)
 }
 
 /// Keep the resolved target across the stop. Check the primary's boot inputs before
@@ -1323,9 +1411,32 @@ mod tests {
     fn a_failed_child_never_shows_its_arguments() {
         let mut cmd = std::process::Command::new("sh");
         cmd.args(["-c", "exit 3", "--password=s3cret-sentinel"]);
-        let err = format!("{:#}", succeeds(cmd, "starting app").unwrap_err());
+        let err = succeeds(cmd, "starting app", false).unwrap_err();
+        assert!(!crate::build::not_cached(&err));
+        let err = format!("{err:#}");
         assert!(!err.contains("s3cret-sentinel"), "{err}");
         assert!(err.contains("starting app") && err.contains('3'), "{err}");
+    }
+
+    /// A start that boots only what is built keeps its child's exit 3, and the exit status of
+    /// several is 3 only when each that failed was not built.
+    #[test]
+    fn a_start_not_built_exits_3_through_its_child_and_its_peers() {
+        let child = |code: u8| {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", &format!("exit {code}")]);
+            cmd
+        };
+        let err = succeeds(child(3), "starting app", true).unwrap_err();
+        assert!(crate::build::not_cached(&err), "{err:#}");
+        assert!(!crate::build::not_cached(
+            &succeeds(child(1), "starting app", true).unwrap_err()
+        ));
+        assert_eq!(worst([]), ExitCode::SUCCESS);
+        assert_eq!(worst([0, 0]), ExitCode::SUCCESS);
+        assert_eq!(worst([0, 3, 3]), ExitCode::from(3));
+        assert_eq!(worst([3, 1]), ExitCode::from(1));
+        assert_eq!(worst([1, 3, 0]), ExitCode::from(1));
     }
 
     /// A manager that cannot be asked, and one that refuses a unit it does not know, are
@@ -1335,7 +1446,8 @@ mod tests {
         use std::io::{BufRead, Write};
         let t = crate::dev::testutil::scratch("control");
         let gone = t.0.join("gone.sock");
-        let err = control_unit(&gone, "app/db", "db", false, 1).unwrap_err();
+        let err = control_unit(&gone, "app/db", "db", false, false, 1).unwrap_err();
+        assert!(!crate::build::not_cached(&err));
         assert!(format!("{err:#}").contains("service manager"), "{err:#}");
         let ctl = t.0.join("ctl.sock");
         let listener = std::os::unix::net::UnixListener::bind(&ctl).unwrap();
@@ -1343,6 +1455,7 @@ mod tests {
             for reply in [
                 vk_core::fleetctl::Reply::err("no such unit \"nope\""),
                 vk_core::fleetctl::Reply::ok("db already running (10.0.2.3)"),
+                vk_core::fleetctl::Reply::not_built("db is not built"),
             ] {
                 let (mut conn, _) = listener.accept().unwrap();
                 let mut line = String::new();
@@ -1353,10 +1466,13 @@ mod tests {
                 conn.write_all(text.as_bytes()).unwrap();
             }
         });
-        let err = control_unit(&ctl, "app/nope", "nope", false, 5).unwrap_err();
+        let err = control_unit(&ctl, "app/nope", "nope", false, false, 5).unwrap_err();
         assert!(err.to_string().contains("app/nope: no such unit"), "{err}");
-        let said = control_unit(&ctl, "app/db", "db", true, 5).unwrap();
+        let said = control_unit(&ctl, "app/db", "db", true, false, 5).unwrap();
         assert_eq!(said, "db already running (10.0.2.3)");
+        let err = control_unit(&ctl, "app/db", "db", true, true, 5).unwrap_err();
+        assert!(crate::build::not_cached(&err), "{err:#}");
+        assert!(err.to_string().contains("app/db: db is not built"), "{err}");
         serve.join().unwrap();
     }
 
@@ -1398,6 +1514,36 @@ mod tests {
             assert!(!err.contains("s3cret"), "{err}");
             assert!(startable(&t, &[Step::Replay]).is_err());
         }
+        // A recipe run cache-only replays as the start asks: `--build` builds.
+        write(&[
+            "run",
+            "--require-cached",
+            "alpine",
+            "--",
+            "--require-cached",
+        ]);
+        let (recorded, _) = replay(&t).unwrap();
+        let cached = |a: &[OsString]| a.iter().filter(|a| *a == "--require-cached").count();
+        let mut args = recorded.clone();
+        build_policy(&mut args, true);
+        assert_eq!(cached(&args), 1);
+        assert_eq!(args.last().unwrap(), "--require-cached");
+        let at = args.iter().position(|a| a == "--").unwrap();
+        assert!(
+            !args[..at].iter().any(|a| a == "--require-cached"),
+            "{args:?}"
+        );
+        build_policy(&mut args, false);
+        assert_eq!(cached(&args), 2);
+        build_policy(&mut args, false);
+        assert_eq!(cached(&args), 2);
+        // A recipe that built replays cache-only unless `--build`.
+        write(&["run", "alpine"]);
+        let (mut args, _) = replay(&t).unwrap();
+        build_policy(&mut args, false);
+        assert_eq!(cached(&args), 1);
+        build_policy(&mut args, true);
+        assert_eq!(cached(&args), 0);
         write(&["list"]);
         assert!(replay(&t).is_err());
         // One whose working directory is gone would fail once started: refused before.
@@ -1486,6 +1632,7 @@ mod tests {
     const O: Opts = Opts {
         config: None,
         timeout: 5,
+        build: false,
     };
 
     /// A stopped run named `name`, in a state dir `vk` made for it under the run base, whose

@@ -18,6 +18,8 @@ All notable changes to virtkit will be documented in this file.
   Use `--dry-run` to preview or `-y` or `-f` to confirm without a terminal.
 - `vk rename` changes a VM's name, and `vk ls` lists VMs.
 - `vk reset` removes a stopped dev environment's boot images or persistent data by name.
+- `vk dev start` boots a stopped environment without building images or reuses a running one.
+  `--service NAME` then starts that compose service. If a build is needed, it exits 3.
 - `$VIRTKIT_WORKSPACE` names the `vk dev` workspace. A `vk dev` command that needs a
   workspace and has none exits 5.
 - In `vk dev list --json`, `deletable` tells whether `vk delete` recognizes the state
@@ -35,6 +37,8 @@ All notable changes to virtkit will be documented in this file.
 - **A directory names exactly one project's VMs.** `vk list`, `stop`, `reboot`, `pause` and
   `resume` take the VMs of the directories below it only with `--recursive` (`-r`). A bare
   word is a VM name: write `./dir` for a directory.
+- `vk start` and `vk restart` build missing images only with `--build`. They exit 3
+  when at least one target needs a build and no target failed for another reason.
 - `vk dev stop NAME`, `vk dev gc NAME` and `vk dev prune NAME` refuse VMs outside the
   selected workspace (exit 2). Across workspaces, use `vk stop` to stop a VM, `vk delete`
   to remove a stopped VM or `vk reset` to prune a stopped dev environment.

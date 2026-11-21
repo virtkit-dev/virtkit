@@ -18,7 +18,13 @@ pub enum Request {
     Status {
         unit: String,
     },
+    /// Start a unit, building its image first when that is needed.
     Start {
+        unit: String,
+    },
+    /// Start without building. A cache miss for a `build:` unit returns [`Reply::not_built`].
+    /// Older managers reject this variant, so they cannot build the image by mistake.
+    StartCached {
         unit: String,
     },
     Stop {
@@ -52,6 +58,9 @@ pub struct Reply {
     pub message: String,
     #[serde(default)]
     pub units: Vec<UnitStatus>,
+    /// A [`Request::StartCached`] cache miss (exit 3). Omitted from the reply when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_built: bool,
 }
 
 /// What `vk service` asks the manager, one variant per subcommand.
@@ -143,6 +152,7 @@ impl Reply {
             ok: true,
             message: message.into(),
             units: Vec::new(),
+            not_built: false,
         }
     }
     pub fn err(message: impl Into<String>) -> Self {
@@ -150,6 +160,14 @@ impl Reply {
             ok: false,
             message: message.into(),
             units: Vec::new(),
+            not_built: false,
+        }
+    }
+    /// The refusal of a [`Request::StartCached`] whose image is not built.
+    pub fn not_built(message: impl Into<String>) -> Self {
+        Reply {
+            not_built: true,
+            ..Reply::err(message)
         }
     }
     pub fn list(units: Vec<UnitStatus>) -> Self {
@@ -157,6 +175,7 @@ impl Reply {
             ok: true,
             message: String::new(),
             units,
+            not_built: false,
         }
     }
 }
@@ -317,6 +336,54 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The requests a manager from before [`Request::StartCached`] reads, as it declared them.
+    #[allow(dead_code)]
+    #[derive(Deserialize)]
+    enum OldRequest {
+        List,
+        Status { unit: String },
+        Start { unit: String },
+        Stop { unit: String },
+        Restart { unit: String },
+        Reboot { unit: String },
+        Logs { unit: String, lines: usize },
+    }
+
+    /// The reply such a manager sends, and a peer as old reads.
+    #[allow(dead_code)]
+    #[derive(Serialize, Deserialize)]
+    struct OldReply {
+        ok: bool,
+        message: String,
+        #[serde(default)]
+        units: Vec<UnitStatus>,
+    }
+
+    /// A manager that predates cached starts refuses one, rather than taking it for a start
+    /// that may build; a start, and every reply, reads the same to either side.
+    #[test]
+    fn an_older_manager_refuses_a_cached_start() {
+        let wire = |r: &Request| serde_json::to_string(r).unwrap();
+        let cached = wire(&Request::StartCached { unit: "db".into() });
+        assert!(serde_json::from_str::<OldRequest>(&cached).is_err());
+        let plain = wire(&Request::Start { unit: "db".into() });
+        assert_eq!(plain, r#"{"Start":{"unit":"db"}}"#);
+        assert!(serde_json::from_str::<OldRequest>(&plain).is_ok());
+
+        let refused = serde_json::to_string(&Reply::not_built("db is not built")).unwrap();
+        let old: OldReply = serde_json::from_str(&refused).unwrap();
+        assert!(!old.ok && old.message == "db is not built");
+        let ok = serde_json::to_string(&Reply::ok("up")).unwrap();
+        assert!(!ok.contains("not_built"), "{ok}");
+        let from_old = serde_json::to_string(&OldReply {
+            ok: false,
+            message: "boom".into(),
+            units: Vec::new(),
+        })
+        .unwrap();
+        assert!(!serde_json::from_str::<Reply>(&from_old).unwrap().not_built);
+    }
 
     #[test]
     fn service_op_parses_vk_service_args() {

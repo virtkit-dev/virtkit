@@ -188,6 +188,7 @@ fn build_recipe(
         audit: build.is_some_and(|b| b.audit),
         record: build.and_then(|b| b.record.clone()),
         base_registry: registry.cloned(),
+        require_cached: false,
     };
     Ok((recipe, target.clone(), key))
 }
@@ -246,13 +247,15 @@ pub fn unit_image_id(
 /// profiled-down `build:` service the first time it is brought up). Concurrent first-starts
 /// of the same stage serialize inside `ensure_build_tier` (a per-stage pull lock), and share
 /// the one tier entry. Errors for an `image:` unit: those need the async pull and are
-/// materialized up front, not on demand.
+/// materialized up front, not on demand. In cached mode, a missing instruction-cache entry
+/// returns [`crate::build::NotCached`] before any instruction runs.
 pub fn ensure_unit_build_sync(
     unit: &crate::compose::Unit,
     state_dir: &Path,
     idle: std::time::Duration,
     build: &BuildOpts,
     sink: Option<crate::build::ProgressSink>,
+    cached: bool,
 ) -> Result<(PathBuf, RunConfig, crate::cachelock::Guard)> {
     if let crate::compose::Source::Image(_) | crate::compose::Source::Bundle { .. } = &unit.source {
         anyhow::bail!(
@@ -261,12 +264,13 @@ pub fn ensure_unit_build_sync(
             unit.name
         );
     }
-    let (recipe, target, key) = build_recipe(
+    let (mut recipe, target, key) = build_recipe(
         unit,
         &build.build_args,
         Some(build),
         build.base_registry.as_ref(),
     )?;
+    recipe.require_cached = cached;
     let (dir, guard) = crate::ensure::ensure_build_tier(
         state_dir,
         idle,
@@ -943,6 +947,7 @@ mod tests {
             std::time::Duration::from_secs(1800),
             &opts,
             None,
+            false,
         )
         .unwrap_err();
         assert!(

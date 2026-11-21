@@ -167,6 +167,7 @@ impl Manager {
             Request::List => self.list(),
             Request::Status { unit } => self.status(&unit),
             Request::Start { unit } => self.start(&unit),
+            Request::StartCached { unit } => self.start_streamed(&unit, None, true),
             Request::Stop { unit } => self.stop(&unit),
             Request::Restart { unit } => {
                 let _ = self.stop(&unit);
@@ -208,20 +209,21 @@ impl Manager {
     }
 
     pub fn start(&self, name: &str) -> Reply {
-        self.start_streamed(name, None)
+        self.start_streamed(name, None, false)
     }
 
-    /// Start a service, building its image first if it is not already materialized (a
-    /// profiled-down `build:` service, brought up on demand) — streaming that build's
-    /// progress to `sink` when set. The image build is long and runs WITHOUT the units lock
-    /// held (only `list`/`status` would otherwise stall behind it); the lock is re-taken for
-    /// the quick boot. A fresh image skips the build, so an already-materialized service
-    /// (every eager start) just boots, exactly as before. Concurrent first-starts of the same
-    /// `build:` stage are serialized inside `ensure_unit_build_sync` (the shared build tier's
-    /// per-stage pull lock), not by the units lock — so they cannot race the tier write, and
-    /// share the one tier entry. An `image:` unit was resolved/pulled at provisioning, so it
-    /// skips the build and just boots.
-    pub fn start_streamed(&self, name: &str, sink: Option<crate::build::ProgressSink>) -> Reply {
+    /// Start a service and send build progress to `sink` when supplied. An `image:` unit
+    /// was pulled at provisioning. A `build:` unit reuses a fresh image or materializes
+    /// one on demand. In cached mode, a miss returns [`Reply::not_built`] before building.
+    /// The build runs outside the units lock so `list` and `status` can proceed. The
+    /// per-stage pull lock lets concurrent starts share one build-tier entry. Reacquire
+    /// the units lock for boot.
+    pub fn start_streamed(
+        &self,
+        name: &str,
+        sink: Option<crate::build::ProgressSink>,
+        cached: bool,
+    ) -> Reply {
         // Snapshot the unit under the lock, then release it for the (possibly long) build.
         let (unit, stops) = {
             let mut u = self.units_guard();
@@ -248,8 +250,12 @@ impl Manager {
                 self.idle,
                 &self.build,
                 sink,
+                cached,
             ) {
                 Ok(built) => Some(built),
+                Err(e) if cached && crate::build::not_cached(&e) => {
+                    return Reply::not_built(format!("{name} is not built: {e:#}"));
+                }
                 Err(e) => return Reply::err(format!("building {name}: {e:#}")),
             }
         } else {
@@ -851,8 +857,9 @@ async fn handle_control(conn: tokio::net::UnixStream, mgr: Arc<Manager>) -> Resu
         match req {
             // Start/Restart may build the image on demand — a long, blocking op whose
             // progress streams back as Progress frames, then a terminal Done.
-            Request::Start { unit } => stream_start(&mut wr, &mgr, unit, false).await?,
-            Request::Restart { unit } => stream_start(&mut wr, &mgr, unit, true).await?,
+            Request::Start { unit } => stream_start(&mut wr, &mgr, unit, false, false).await?,
+            Request::StartCached { unit } => stream_start(&mut wr, &mgr, unit, false, true).await?,
+            Request::Restart { unit } => stream_start(&mut wr, &mgr, unit, true, false).await?,
             // Stop holds the units lock while the guest powers off. Run every other request
             // outside the runtime too, so a status waiting on that lock does not occupy a
             // runtime worker for the grace period.
@@ -867,17 +874,15 @@ async fn handle_control(conn: tokio::net::UnixStream, mgr: Arc<Manager>) -> Resu
     }
 }
 
-/// Handle a Start/Restart by running the (possibly image-building) start on a blocking
-/// thread and forwarding its build progress to the peer as `Progress` frames, then the
-/// terminal `Done`. The build sink pushes lines onto an unbounded channel this drains until
-/// the blocking task finishes and drops it; a write error (peer gone) abandons the stream
-/// while the detached build runs to completion. A successful start sends its `Done` only once
-/// the unit's agent answers (`Manager::wait_ready`), within the boot timeout.
+/// Run a start or restart on a blocking thread. Drain its unbounded progress channel into
+/// `Progress` frames until the task drops its sink. If the peer disconnects, the build
+/// continues. Send a successful `Done` after the agent answers within the boot timeout.
 async fn stream_start(
     wr: &mut (impl tokio::io::AsyncWriteExt + Unpin),
     mgr: &Arc<Manager>,
     unit: String,
     restart: bool,
+    cached: bool,
 ) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let sink: crate::build::ProgressSink = Arc::new(move |line: &str| {
@@ -889,7 +894,7 @@ async fn stream_start(
             if restart {
                 let _ = mgr.stop(&unit);
             }
-            let reply = mgr.start_streamed(&unit, Some(sink));
+            let reply = mgr.start_streamed(&unit, Some(sink), cached);
             let dir = mgr.units_guard().get(&unit).map(|st| st.dir.clone());
             (reply, dir)
         }

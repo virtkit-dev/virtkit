@@ -552,6 +552,7 @@ vk dev plan                         # inspect the resolved configuration without
 vk dev doctor                       # check the host and configuration requirements
 vk dev refresh                      # rebuild and restart into the current config
 vk dev stop
+vk dev start                        # boot again without building images
 vk dev prune --dry-run              # preview local boot-image cleanup; --storage selects data
 vk dev list                         # every environment this host keeps state for, from anywhere
 vk dev gc --all-stale               # review/remove stale state; asks on a terminal
@@ -650,9 +651,12 @@ vk rename app web
 vk reset shop --storage       # remove the stopped environment's persistent data
 ```
 
-`vk start` uses `vk dev up` with the recorded workspace, environment and config. For a run,
-it replays `run.json` in the original working directory with `--detach`. Runs recorded with
-`-t` or `--shell` need a terminal. Start those with `vk run`.
+To boot a stopped dev environment, `vk start` runs `vk dev start` with its recorded
+workspace, environment and config. With `--build`, it runs `vk dev up`. For a run,
+it replays `run.json` in its original working directory with `--detach`. Runs recorded
+with `-t` or `--shell` need a terminal. Start those with `vk run`. `vk start` and
+`vk restart` build missing images only with `--build`. Without it, they exit 3 if a
+build is needed and no target failed for another reason.
 
 `vk start NAME/SERVICE` boots the primary VM if needed, then prints its service manager's
 reply. `vk stop NAME/SERVICE` stops one service. `vk stop NAME` stops the named VM and its

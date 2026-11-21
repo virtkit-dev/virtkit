@@ -591,6 +591,11 @@ pub fn remove(selected: &[Row], index: &crate::names::Index) -> Result<String> {
     }
     let mut out = String::new();
     for (row, lock) in locked {
+        // A cache-only start may have restored the identity since GC listed this directory.
+        if row.stale() && !self::row(&row.dir, &[], false, true).stale() {
+            out.push_str(&format!("kept {}: it is no longer stale\n", row.name));
+            continue;
+        }
         crate::publish::stop_all_quietly(&row.dir, PUBLISH_STOP);
         let names = index.lock()?;
         std::fs::remove_dir_all(&row.dir)

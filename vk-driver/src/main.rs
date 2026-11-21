@@ -2705,10 +2705,12 @@ enum Cmd {
     },
     /// Start a VM vk knows, or one of its compose services
     ///
-    /// Start a dev environment with its recorded workspace, environment and config. Replay a
-    /// run's `run.json` in its original directory with `--detach`. Runs recorded with `-t` or
-    /// `--shell` need a terminal. Start those with `vk run`. Starting a running primary is a
-    /// no-op. Starting a service boots its primary if needed.
+    /// Use the dev environment's recorded workspace, environment and config for `vk dev start`
+    /// (`vk dev up` with `--build`). Replay a run's `run.json` in its original directory with `--detach`.
+    /// Runs recorded with `-t` or `--shell` need a terminal. Start those with `vk run`.
+    /// Starting a running primary is a no-op. Starting a service boots its primary if needed.
+    /// Only what is already built boots: an image that would have to be built fails the
+    /// start unless `--build`, with exit 3 when no target failed otherwise.
     #[command(display_order = 8)]
     Start {
         /// one or more VMs or compose services
@@ -2716,12 +2718,17 @@ enum Cmd {
         /// Select a VM by name, pid or directory, or a service by `NAME/SERVICE` or `PID/SERVICE`.
         #[arg(value_name = "REF", required = true)]
         targets: Vec<std::ffi::OsString>,
+        /// build what is not built yet, as `vk dev up` does, instead of failing
+        #[arg(long)]
+        build: bool,
     },
     /// Restart a VM or a compose service
     ///
     /// Resolve each REF once, in order. Before stopping a primary, check its dev workspace
     /// and recorded config, or its run recipe, working directory and recorded `--config`.
-    /// Start a stopped primary directly. Restarting a service leaves a running primary up.
+    /// Start a stopped primary directly. Restarting a sibling service normally leaves the
+    /// primary running. With `--build`, a dev environment's freshness policy can restart it too.
+    /// Like `start`, boots only what is already built unless `--build`.
     #[command(display_order = 8)]
     Restart {
         /// one or more VMs or compose services
@@ -2729,6 +2736,9 @@ enum Cmd {
         /// Select a VM by name, pid or directory, or a service by `NAME/SERVICE` or `PID/SERVICE`.
         #[arg(value_name = "REF", required = true)]
         targets: Vec<std::ffi::OsString>,
+        /// build what is not built yet, as `vk dev up` does, instead of failing
+        #[arg(long)]
+        build: bool,
         /// seconds to wait for VM shutdown or for each socket operation during a service stop
         #[arg(long, default_value_t = 210, value_name = "SECS")]
         timeout: u64,
@@ -3993,10 +4003,29 @@ async fn cli_main(cli: Cli) -> ExitCode {
     let opts = |timeout| lifecycle::Opts {
         config: cli.config.as_deref(),
         timeout,
+        build: false,
     };
     match &cli.cmd {
-        Cmd::Start { targets } => return lifecycle::start(targets, opts(210)),
-        Cmd::Restart { targets, timeout } => return lifecycle::restart(targets, opts(*timeout)),
+        Cmd::Start { targets, build } => {
+            return lifecycle::start(
+                targets,
+                lifecycle::Opts {
+                    build: *build,
+                    ..opts(210)
+                },
+            );
+        }
+        Cmd::Restart {
+            targets,
+            build,
+            timeout,
+        } => {
+            let o = lifecycle::Opts {
+                build: *build,
+                ..opts(*timeout)
+            };
+            return lifecycle::restart(targets, o);
+        }
         Cmd::Delete {
             targets,
             force,
@@ -4452,6 +4481,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             ssh_user: ssh_user.clone(),
             state_dir: state_dir.clone(),
             remembered: remembered.clone(),
+            state_lock: None,
             workspace: workspace.clone(),
             volumes,
             symlinks,
@@ -8591,6 +8621,7 @@ mod tests {
         let opts = lifecycle::Opts {
             config: None,
             timeout: 1,
+            build: false,
         };
         for r in [std::ffi::OsStr::new("app"), dir.as_os_str()] {
             assert_eq!(stop_ref(Some(r), false, false, opts), exit_code(1), "{r:?}");

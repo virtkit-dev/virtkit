@@ -263,7 +263,10 @@ vk dev exec --user root -- id
 
 `up` builds and boots in the foreground, then returns once the environment is
 ready. Concurrent callers join an in-flight boot; `up --no-wait` fails promptly
-instead. Primary `exec`, `shell` and `code` bring the environment up when needed.
+instead. Use `up` for the first boot. `start` reuses a running environment or boots it
+without building images. If the boot needs a build, it exits 3 and attempts to restore
+the previous boot record. `start --service NAME` then starts that service without building.
+Primary `exec`, `shell` and `code` bring the environment up when needed.
 Commands use the configured user and `exec-env`; a host working directory inside
 the checkout maps to its corresponding guest directory. `--dir` overrides that
 mapping. `exec` passes arguments directly and reproduces the command's exit
@@ -956,6 +959,7 @@ Use `vk dev COMMAND --help` for individual options.
 | --- | --- |
 | `init` | Import or validate a config; `--from`, `--image`, `--force`. |
 | `up` | Ensure the environment is ready; `--no-wait`. |
+| `start` | Boot from what is already built (exit 3 when a build is needed); `--service NAME`. |
 | `exec -- ARG…` | Run a command; `--dir`, `--user`, `--service`, `-t`. |
 | `shell` | Boot if needed and open an interactive shell; `--service` opens one in a running service. |
 | `code` | Boot if needed and open VS Code; `--editor`. |

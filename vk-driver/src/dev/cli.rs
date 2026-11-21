@@ -60,6 +60,7 @@ pub async fn run(dev: Dev, host_cfg: &crate::config::Config) -> ExitCode {
         cache_registry: dev.cache_registry,
         cache_insecure: dev.cache_insecure,
         freshness: dev.freshness,
+        no_build: false,
     };
     let workspace =
         config::chosen_workspace(dev.workspace, std::env::var_os(config::WORKSPACE_ENV));
@@ -108,6 +109,16 @@ enum DevAction {
         /// fail promptly when a boot someone else started is in flight, instead of joining it
         #[arg(long)]
         no_wait: bool,
+    },
+    /// Start the environment from what is already built
+    ///
+    /// Use `up` for the first boot. Reuse a running environment even if its config changed.
+    /// A stopped environment can restore images from the build cache. If the boot needs a
+    /// build, attempt to restore its previous boot record and exit 3.
+    Start {
+        /// then start this compose service the same way, from what is already built
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
     },
     /// Run a command in the environment, bringing it up first
     ///
@@ -481,7 +492,7 @@ impl DevAction {
             // A task boots only under `policy = "require"`, which is in the config rather
             // than on the command line; the fork is where a boot *may* happen, and the
             // policies that boot nothing leave the work to the parent (see `dev_up`).
-            Self::Up { .. } | Self::Code { .. } | Self::Task { .. } => true,
+            Self::Up { .. } | Self::Start { .. } | Self::Code { .. } | Self::Task { .. } => true,
             // A service exec or shell reaches a running service and boots nothing.
             Self::Exec { service, .. } | Self::Shell { service } => service.is_none(),
             // Of the service operations only `up` boots the environment.
@@ -644,6 +655,27 @@ fn service_reply(reply: anyhow::Result<vk_core::fleetctl::Reply>) -> ExitCode {
     }
 }
 
+/// [`service_reply`] for a cached start: one refused because its image is not built exits 3,
+/// saying that `vk dev {build}` builds it.
+fn cached_reply(reply: anyhow::Result<vk_core::fleetctl::Reply>, build: &str) -> ExitCode {
+    match reply {
+        Ok(reply) if reply.not_built => {
+            eprintln!("{}", reply.message);
+            eprintln!("vk: hint: `vk dev {build}` builds it");
+            exit_code(3)
+        }
+        reply => service_reply(reply),
+    }
+}
+
+/// `--environment ENV ` for an environment other than `dev`, for a command to repeat.
+fn environment_flag(environment: &str) -> String {
+    match environment {
+        "dev" => String::new(),
+        env => format!("--environment {env} "),
+    }
+}
+
 /// `vk dev`: resolve the workspace's config, then act on the plan.
 async fn dev_action(
     action: DevAction,
@@ -775,6 +807,40 @@ async fn dev_action(
             match dev_up(&plan, host_cfg, over, false, !no_wait, true).await {
                 Ready::Act => ExitCode::SUCCESS,
                 Ready::Done(code) => code,
+            }
+        }
+        DevAction::Start { service } => {
+            // Check before boot. The process released at guest readiness can race
+            // publication of the new identity.
+            let up = format!("vk dev {}up", environment_flag(&plan.environment));
+            if !crate::detach::after_boot() && !plan.state_dir.join("dev.json").exists() {
+                let e = anyhow::anyhow!(
+                    "the {} environment has no finished boot to start again: `{up}` builds \
+                     and starts it",
+                    plan.environment
+                );
+                return fail(&e, 1);
+            }
+            let over = dev::Overrides {
+                freshness: Some(config::Freshness::Reuse),
+                no_build: true,
+                ..over.clone()
+            };
+            match dev_up(&plan, host_cfg, &over, false, true, service.is_none()).await {
+                Ready::Done(code) if code == exit_code(3) => {
+                    eprintln!("vk: hint: `{up}` builds it");
+                    code
+                }
+                Ready::Done(code) => code,
+                Ready::Act => match service {
+                    None => ExitCode::SUCCESS,
+                    Some(unit) => {
+                        let hint =
+                            format!("{}service up {unit}", environment_flag(&plan.environment));
+                        let req = vk_core::fleetctl::Request::StartCached { unit };
+                        cached_reply(dev::service(&plan, &req).await, &hint)
+                    }
+                },
             }
         }
         DevAction::Refresh { dry_run: true } => match dev::plan_diff(&plan) {
@@ -1347,7 +1413,7 @@ fn in_scope(workspace: &Path, names: &[String], global: &str) -> Result<Vec<Path
 /// was nothing to boot it is finished too, and the parent — released once the guest is ready
 /// — is what goes on to run the command.
 ///
-/// `announce_reuse` prints the already-running note for `up`; other commands suppress it.
+/// Set `announce_reuse` to print a note when reusing a running environment.
 async fn dev_up(
     plan: &crate::dev::plan::Plan,
     host_cfg: &crate::config::Config,
@@ -1687,6 +1753,24 @@ mod tests {
     }
 
     #[test]
+    fn start_takes_an_optional_service_and_says_how_to_build_one() {
+        assert!(matches!(
+            parse(&["vk", "dev", "start"]).action,
+            DevAction::Start { service: None }
+        ));
+        assert!(matches!(
+            parse(&["vk", "dev", "start", "--service", "db"]).action,
+            DevAction::Start { service: Some(s) } if s == "db"
+        ));
+        assert_eq!(environment_flag("dev"), "");
+        assert_eq!(environment_flag("test"), "--environment test ");
+        let refused = vk_core::fleetctl::Reply::not_built("db is not built");
+        assert_eq!(cached_reply(Ok(refused), "service up db"), exit_code(3));
+        let failed = vk_core::fleetctl::Reply::err("db crashed");
+        assert_eq!(cached_reply(Ok(failed), "service up db"), exit_code(1));
+    }
+
+    #[test]
     fn prune_takes_an_optional_name_selector() {
         assert!(matches!(
             parse(&["vk", "dev", "prune"]).action,
@@ -1712,6 +1796,7 @@ mod tests {
             ok: true,
             message: "runner is up".into(),
             units: vec![unit("runner", "running", "127.0.0.2")],
+            not_built: false,
         });
         let line = format!("{:<16} {:<9} {}\n", "runner", "running", "127.0.0.2");
         assert_eq!(out, format!("{line}runner is up\n"));
@@ -1722,6 +1807,7 @@ mod tests {
             ok: false,
             message: "no such service".into(),
             units: vec![],
+            not_built: false,
         });
         assert_eq!(out, "");
         assert_eq!(note.as_deref(), Some("no such service"));
@@ -1731,6 +1817,7 @@ mod tests {
             ok: false,
             message: String::new(),
             units: vec![],
+            not_built: false,
         });
         assert!(note.is_some());
     }
@@ -1741,6 +1828,8 @@ mod tests {
     const ACTIONS: &[(&[&str], bool)] = &[
         (&["init"], false),
         (&["up"], true),
+        (&["start"], true),
+        (&["start", "--service", "db"], true),
         (&["exec", "--", "true"], true),
         (&["exec", "--service", "db", "--", "true"], false),
         (&["shell"], true),
