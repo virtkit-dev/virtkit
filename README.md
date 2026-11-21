@@ -624,8 +624,9 @@ Without `--json` or `--field`, vk prints recovery advice on stderr. Use the JSON
 
 A `*` marks a row derived from stale VM records (`stale_record` in JSON).
 Listing leaves the records untouched. `vk start`, `stop`, `restart` and `delete`
-attempt to clear stale run records for their target. An unnamed dev environment uses its
-directory name until a boot claims a stable name. `--problems` selects rows with either mark.
+attempt to clear stale run records for their target. `vk stop --tidy` checks all VMs.
+An unnamed dev environment uses its directory name until a boot or `vk stop --tidy`
+claims a stable name. `--problems` selects rows with either mark.
 
 On a running primary, MEM shows the resident memory of its process tree over the recorded
 boot size (`--mem`). The tree includes the guest, its service VMs, the switch and forwards.
@@ -684,6 +685,12 @@ and loses unwritten data. After the whole batch, surviving runs get 5 seconds to
 cleanup before SIGKILL. Both options require whole-VM targets.
 If a primary is already starting, `vk start` reports that and returns successfully.
 `stop`, `restart`, `delete` and service starts refuse it until it registers.
+
+`vk stop --tidy` repairs stale records across all VMs. On a terminal, it asks before using
+`--kill` on a run whose stop timed out or was interrupted. It exits 1 if an overdue stop
+remains or it reports a repair error. It skips dev directories without a valid `dev.json`
+when assigning names. `--tidy` takes no REF or other stop option.
+
 `vk restart` resolves each reference once. Before stopping a primary, it checks the dev
 workspace and recorded config, or the run recipe, working directory and any recorded
 `--config`. If the primary is already down, `vk restart` starts it.

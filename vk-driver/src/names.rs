@@ -326,28 +326,58 @@ impl Index {
         unreachable!("u32 suffixes exhausted")
     }
 
-    /// Under the index lock, reclaim only the requested name. A provisional claim expires
-    /// when its directory is unlocked or missing. A committed claim expires only for a
-    /// missing direct child of `run/` or `dev/`. Checking other targets could block on a
-    /// hung mount or lose a name while its filesystem is unmounted.
+    /// Under the index lock, check only the name being claimed. Reclaim a provisional name
+    /// if its directory is unlocked or missing, and a committed name only if its directory
+    /// is a missing direct child of `run/` or `dev/`. Skipping other committed paths preserves
+    /// names across unmounts and prevents a hung mount from blocking claims. `vk stop --tidy`
+    /// applies the same rules across the index.
     fn forget_removed(&self, name: &str) {
+        let named = self.lookup(name).map(|target| (name.to_string(), target));
+        // A claim ignores cleanup errors. A name still present remains taken until a later retry.
+        let _ = self.forget_in(named.into_iter().collect());
+    }
+
+    /// Return the number of names forgotten and a diagnostic for each failed removal.
+    fn forget_in(&self, names: Vec<(String, PathBuf)>) -> (usize, Vec<String>) {
         let run_root = self.roots().map(|[run, _]| run);
-        let Some(target) = self.lookup(name) else {
-            return;
-        };
-        if !self.forgettable(name, &target) {
-            return;
+        let mut forgotten = 0;
+        let mut failed = Vec::new();
+        for (name, target) in names {
+            if !self.forgettable(&name, &target) {
+                continue;
+            }
+            let provisional = self.dir.join(marker(&name));
+            if std::fs::symlink_metadata(&provisional).is_ok()
+                && target.parent() == run_root.as_deref()
+            {
+                // Direct children of run/ qualify regardless of who created them. Keep
+                // directories containing anything besides the allocation mark.
+                remove_bare(&target);
+            }
+            let gone = |path: PathBuf| match std::fs::remove_file(&path) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(format!("{}: {e}", path.display())),
+            };
+            match gone(self.dir.join(&name)).and_then(|f| gone(provisional).map(|_| f)) {
+                Ok(true) => forgotten += 1,
+                Ok(false) => {}
+                Err(why) => failed.push(format!(
+                    "name {name} of {} not forgotten: {why}",
+                    target.display()
+                )),
+            }
         }
-        let provisional = self.dir.join(marker(name));
-        if std::fs::symlink_metadata(&provisional).is_ok() && target.parent() == run_root.as_deref()
-        {
-            // Direct children of run/ qualify regardless of who created them. Keep
-            // directories containing anything besides the allocation mark.
-            remove_bare(&target);
-        }
-        // A failed unlink leaves the name taken until another claim retries.
-        let _ = std::fs::remove_file(self.dir.join(name));
-        let _ = std::fs::remove_file(provisional);
+        (forgotten, failed)
+    }
+
+    /// Check all names under the index lock, skipping directories selected by `keep`.
+    /// Return the number forgotten and a diagnostic for each failed removal.
+    pub fn forget_all_removed(&self, keep: impl Fn(&Path) -> bool) -> Result<(usize, Vec<String>)> {
+        let _lock = self.lock()?;
+        let mut names = self.try_all()?;
+        names.retain(|(_, dir)| !keep(dir));
+        Ok(self.forget_in(names))
     }
 
     /// The `run/` and `dev/` directories beside the index.

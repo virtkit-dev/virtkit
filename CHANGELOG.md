@@ -36,6 +36,8 @@ All notable changes to virtkit will be documented in this file.
   to retry. While a VM is starting, vk refuses stop, restart, delete and service start.
 - `vk list --problems` shows overdue stops (`!`) and VMs with stale records (`*`,
   `stale_record` in JSON).
+- `vk stop --tidy` repairs stale records. On a terminal, it asks before killing a run whose
+  stop timed out or was interrupted.
 
 ### Changed
 

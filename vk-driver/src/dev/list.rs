@@ -280,7 +280,52 @@ impl Row {
     }
 }
 
+/// Assign missing dev names in boot order so the oldest gets the unsuffixed name if free.
+/// An up-to-date index needs no writes. Until named, each environment resolves by its
+/// state directory name.
+pub fn name_unnamed() -> Result<()> {
+    let base = crate::dev::plan::dev_state_base()?;
+    name_unnamed_in(&base, &crate::names::Index::open()?)
+}
+
+/// Only directories with a readable, valid `dev.json` qualify for a name.
+pub(crate) fn name_unnamed_in(base: &Path, idx: &crate::names::Index) -> Result<()> {
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", base.display())),
+    };
+    let named: std::collections::HashSet<PathBuf> =
+        idx.try_all()?.into_iter().map(|(_, dir)| dir).collect();
+    let mut todo: Vec<(u64, PathBuf, String)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| crate::vms::canonical(&e.path()))
+        .filter(|dir| !named.contains(dir))
+        .filter_map(|dir| {
+            let bytes = std::fs::read(dir.join("dev.json")).ok()?;
+            let identity: crate::dev::Identity = serde_json::from_slice(&bytes).ok()?;
+            let text = |key: &str| identity.manifest.get(key)?.as_str().map(str::to_string);
+            let base = default_name(
+                Path::new(&text("workspace").unwrap_or_default()),
+                &text("environment").unwrap_or_else(|| "dev".into()),
+            );
+            Some((identity.booted_secs, dir, base))
+        })
+        .collect();
+    if todo.is_empty() {
+        return Ok(());
+    }
+    todo.sort();
+    let _lock = idx.lock()?;
+    for (_, dir, base) in todo {
+        idx.claim_locked(&dir, &base)?;
+    }
+    Ok(())
+}
+
 /// List unindexed dev state directories by directory name and presence of `dev.json`.
+/// Includes both candidates for [`name_unnamed`] and directories without a recorded boot.
 /// A missing dev base is empty. Other directory read errors propagate.
 pub fn unnamed_dirs(named: &[(String, PathBuf)]) -> Result<Vec<(String, PathBuf, bool)>> {
     let base = crate::dev::plan::dev_state_base()?;
@@ -1124,7 +1169,33 @@ mod tests {
     }
 
     #[test]
-    fn a_default_name_comes_from_the_workspace_and_environment() {
+    fn unnamed_environments_get_names_oldest_boot_first_and_ephemeral_ones_none() {
+        let tmp = scratch("names");
+        let base = tmp.0.join("dev");
+        let idx = crate::names::Index::at(tmp.0.join("names"));
+        let with = |name: &str, ws: &str, env: &str, booted: u64| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let identity = serde_json::json!({
+                "digest": "d", "booted_secs": booted,
+                "manifest": {"workspace": ws, "environment": env},
+            });
+            std::fs::write(dir.join("dev.json"), identity.to_string()).unwrap();
+            crate::vms::canonical(&dir)
+        };
+        // Two checkouts named `app`: the one booted first keeps the plain name.
+        let newer = with("app-1111", "/a/app", "dev", 200);
+        let older = with("app-2222", "/b/app", "dev", 100);
+        let ci = with("app-ci-3333", "/a/app", "ci", 300);
+        ephemeral(&base, "app-task-x-44");
+        name_unnamed_in(&base, &idx).unwrap();
+        assert_eq!(idx.name_of(&older).as_deref(), Some("app"));
+        assert_eq!(idx.name_of(&newer).as_deref(), Some("app-2"));
+        assert_eq!(idx.name_of(&ci).as_deref(), Some("app-ci"));
+        assert_eq!(idx.all().len(), 3);
+        // Run again, nothing changes.
+        name_unnamed_in(&base, &idx).unwrap();
+        assert_eq!(idx.all().len(), 3);
         assert_eq!(default_name(Path::new("/x/My Repo"), "dev"), "my-repo");
         assert_eq!(default_name(Path::new("/"), "e2e"), "workspace-e2e");
     }

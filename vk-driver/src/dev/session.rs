@@ -251,7 +251,7 @@ async fn ready_booted(plan: &Plan, readying: &Readying) -> Result<()> {
 
 /// Claim a stable name after recording the environment's identity. Only direct children
 /// of the dev base are discoverable by name. If the claim fails, the directory name
-/// remains usable, and a later start retries the claim.
+/// remains usable, and a later start or `vk stop --tidy` retries the claim.
 fn name_environment(plan: &Plan) {
     let named = crate::dev::plan::dev_state_base().and_then(|base| {
         let parent = plan.state_dir.parent().map(crate::vms::canonical);

@@ -122,6 +122,13 @@ impl Transient {
     }
 }
 
+impl Transient {
+    /// Whether the run it is about is known to have exited.
+    pub fn run_gone(&self) -> bool {
+        there(self.pid, self.pid_start_ticks) == Some(false)
+    }
+}
+
 /// Whether `pid`, started at `ticks`, is still running; `None` when that cannot be told: no
 /// start time to compare, or procfs neither shows it nor shows it gone.
 fn there(pid: u32, ticks: Option<u64>) -> Option<bool> {
@@ -155,8 +162,36 @@ pub fn stopping(
     pid_start_ticks: Option<u64>,
     left: Option<std::time::Duration>,
 ) {
+    let record = stop_of(pid, pid_start_ticks, left);
+    // If the writer lock is busy, keep the existing record.
+    let _ = locked(dir, Wait::No, |d, recorded| {
+        match recorded.is_none_or(|r| r.is_of(pid, pid_start_ticks)) {
+            true => d.write(&record),
+            false => Ok(()),
+        }
+    });
+}
+
+/// Claim the stop the user reviewed. Under the record lock, replace it with this process's
+/// stop record only if it still matches `expected`. Return `Ok(false)` if it changed.
+pub fn claim(
+    dir: &Path,
+    expected: &Transient,
+    left: Option<std::time::Duration>,
+) -> anyhow::Result<bool> {
+    let record = stop_of(expected.pid, expected.pid_start_ticks, left);
+    locked(dir, Wait::Block, |d, recorded| {
+        match recorded.as_ref() == Some(expected) {
+            true => d.write(&record).map(|()| true),
+            false => Ok(false),
+        }
+    })
+}
+
+/// The record of a stop by this process of the run `pid` started at `pid_start_ticks`.
+fn stop_of(pid: u32, pid_start_ticks: Option<u64>, left: Option<std::time::Duration>) -> Transient {
     let now = crate::vms::unix_now();
-    let record = Transient {
+    Transient {
         state: State::Stopping,
         pid,
         pid_start_ticks,
@@ -166,14 +201,7 @@ pub fn stopping(
             .map(|l| now.saturating_add(l.as_secs() + u64::from(l.subsec_nanos() > 0))),
         by_pid: Some(std::process::id()),
         by_start_ticks: crate::vms::own_start_ticks(),
-    };
-    // If the writer lock is busy, keep the existing record.
-    let _ = locked(dir, Wait::No, |d, recorded| {
-        match recorded.is_none_or(|r| r.is_of(pid, pid_start_ticks)) {
-            true => d.write(&record),
-            false => Ok(()),
-        }
-    });
+    }
 }
 
 /// Clear the stopped run's record if its pid and start time still match. As in
@@ -208,7 +236,7 @@ pub fn clear_own(dir: &Path) {
 /// Return `Ok(true)` on removal and propagate lock and removal errors. The lock is
 /// nonblocking so cleanup before signalling cannot consume the stop deadline.
 pub fn clear_if_stale(dir: &Path) -> anyhow::Result<bool> {
-    let Some((judged, Standing::Gone)) = peek(dir) else {
+    let Some((judged, Standing::Gone)) = try_peek(dir)? else {
         return Ok(false);
     };
     locked(dir, Wait::No, |d, recorded| {
@@ -230,7 +258,15 @@ pub fn read(dir: &Path) -> Option<Transient> {
 
 /// What is recorded for the VM on `dir`, and where it stands. Writes nothing.
 pub fn peek(dir: &Path) -> Option<(Transient, Standing)> {
-    let record = read_raw(dir)?;
+    // Listing skips unreadable records. `vk stop --tidy` reports them.
+    try_peek(dir).ok().flatten()
+}
+
+/// Distinguish an unreadable record from a missing one so repair can report the failure.
+fn try_peek(dir: &Path) -> anyhow::Result<Option<(Transient, Standing)>> {
+    let Some(record) = read_raw(dir)? else {
+        return Ok(None);
+    };
     let standing = record.standing(
         crate::vms::unix_now(),
         there(record.pid, record.pid_start_ticks),
@@ -238,7 +274,7 @@ pub fn peek(dir: &Path) -> Option<(Transient, Standing)> {
             .by_pid
             .and_then(|by| there(by, record.by_start_ticks)),
     );
-    Some((record, standing))
+    Ok(Some((record, standing)))
 }
 
 /// Whether [`locked`] waits for [`LOCK`].
@@ -316,8 +352,15 @@ fn locked<T>(
     f(&d, d.read())
 }
 
-fn read_raw(dir: &Path) -> Option<Transient> {
-    serde_json::from_slice(&std::fs::read(dir.join(FILE)).ok()?).ok()
+fn read_raw(dir: &Path) -> anyhow::Result<Option<Transient>> {
+    use anyhow::Context as _;
+    let path = dir.join(FILE);
+    let json = match std::fs::read(&path) {
+        Ok(json) => json,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    (serde_json::from_slice(&json).map(Some)).with_context(|| format!("reading {}", path.display()))
 }
 
 #[cfg(test)]
@@ -458,6 +501,26 @@ mod tests {
         drop(held);
         assert!(clear_if_stale(dir).unwrap());
         assert_eq!(peek(dir), None);
+    }
+
+    /// A stop is taken over only while its record is still the one expected.
+    #[test]
+    fn a_claim_takes_only_the_record_it_expects() {
+        let t = crate::dev::testutil::scratch("vmstate-claim");
+        let dir = &t.0;
+        let (me, ticks) = (std::process::id(), crate::vms::own_start_ticks());
+        stopping(dir, me, ticks, None);
+        let asked = read(dir).unwrap();
+        let mut since = asked.clone();
+        since.since_secs += 1;
+        assert!(
+            !claim(dir, &since, None).unwrap(),
+            "another stop began since"
+        );
+        assert_eq!(read(dir).as_ref(), Some(&asked));
+        let left = Some(std::time::Duration::from_secs(10));
+        assert!(claim(dir, &asked, left).unwrap());
+        assert!(read(dir).unwrap().deadline_secs.is_some());
     }
 
     #[test]

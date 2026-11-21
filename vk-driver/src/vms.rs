@@ -318,23 +318,36 @@ fn remove_in(dir: &Path, state_dir: &Path) {
 }
 
 fn load_all_in(dir: &Path) -> Vec<VmEntry> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    // Listing and ordinary VM operations skip unreadable registry entries.
+    try_load_all_in(dir).map(|(all, _)| all).unwrap_or_default()
+}
+
+/// Return readable registry entries and a diagnostic for each unreadable entry.
+/// A missing registry is empty. Other directory read errors propagate.
+fn try_load_all_in(dir: &Path) -> Result<(Vec<VmEntry>, Vec<String>)> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
     };
-    let mut out = Vec::new();
-    for e in rd.flatten() {
+    let (mut out, mut unread) = (Vec::new(), Vec::new());
+    for e in rd {
+        let e = e.with_context(|| format!("reading {}", dir.display()))?;
         let p = e.path();
         if p.extension().and_then(|s| s.to_str()) != Some("json") {
             continue; // skip the .tmp write-and-rename staging files
         }
-        let Ok(bytes) = std::fs::read(&p) else {
-            continue;
-        };
-        if let Ok(entry) = serde_json::from_slice::<VmEntry>(&bytes) {
-            out.push(entry);
+        let read = std::fs::read(&p)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| {
+                serde_json::from_slice::<VmEntry>(&bytes).map_err(anyhow::Error::from)
+            });
+        match read {
+            Ok(entry) => out.push(entry),
+            Err(e) => unread.push(format!("registry entry {} not read: {e}", p.display())),
         }
     }
-    out
+    Ok((out, unread))
 }
 
 /// True while the managing `vk run` is alive. The run holds an exclusive `flock` on its state
@@ -1326,7 +1339,12 @@ fn out_of_date(marked: usize, unlisted: usize) -> Option<String> {
     .into_iter()
     .flatten()
     .collect();
-    (!said.is_empty()).then(|| said.join("; "))
+    (!said.is_empty()).then(|| {
+        format!(
+            "{}. Run `vk stop --tidy` to check all stale records",
+            said.join("; ")
+        )
+    })
 }
 
 /// Recovery advice for an overdue stop whose run is still alive.
@@ -1725,22 +1743,63 @@ pub const STOP_RUN_ENV: &str = "VIRTKIT_STOP_RUN";
 /// only while the record is still that run's.
 /// A record whose state dir cannot be locked, or is gone, is left: a run may be creating it
 /// again.
-fn prune_gone(dir: &Path, entry: &VmEntry) {
-    let Ok(lock) = std::fs::File::open(&entry.state_dir) else {
-        return;
+fn prune_gone(dir: &Path, entry: &VmEntry) -> Pruned {
+    let lock = match std::fs::File::open(&entry.state_dir) {
+        Ok(lock) => lock,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Pruned::DirGone,
+        Err(e) => return Pruned::Failed(format!("{}: {e}", entry.state_dir.display())),
     };
     // SAFETY: the fd is owned by `lock`, which outlives the call; LOCK_NB never blocks. The
     // lock is released when `lock` drops.
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return;
+        return Pruned::Held;
     }
     let path = dir.join(format!("{}.json", slug(&entry.state_dir)));
-    let recorded = std::fs::read(&path)
-        .ok()
-        .and_then(|json| serde_json::from_slice::<VmEntry>(&json).ok());
-    if recorded.is_some_and(|r| same_run(&r, entry)) {
-        remove_in(dir, &entry.state_dir);
+    let recorded = match std::fs::read(&path) {
+        Ok(json) => serde_json::from_slice::<VmEntry>(&json),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Pruned::Replaced,
+        Err(e) => return Pruned::Failed(format!("{}: {e}", path.display())),
+    };
+    match recorded {
+        Ok(r) if same_run(&r, entry) => {}
+        Ok(_) => return Pruned::Replaced,
+        Err(e) => return Pruned::Failed(format!("{}: {e}", path.display())),
     }
+    match std::fs::remove_file(&path) {
+        Ok(()) => Pruned::Removed,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Pruned::Replaced,
+        Err(e) => Pruned::Failed(format!("{}: {e}", path.display())),
+    }
+}
+
+/// What [`prune_gone`] did with an entry whose run is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pruned {
+    Removed,
+    /// the entry is another run's now, or another command removed it first
+    Replaced,
+    /// left: its state dir is gone, and a run may be making it again
+    DirGone,
+    /// left because the state directory could not be locked
+    Held,
+    /// left: why it could not be removed
+    Failed(String),
+}
+
+/// Pruning outcomes by state directory and diagnostics for unreadable entries.
+pub type Pruning = (Vec<(PathBuf, Pruned)>, Vec<String>);
+
+/// Try to remove dead entries as [`running`] does and report each outcome to `vk stop --tidy`.
+pub fn prune_dead() -> Result<Pruning> {
+    let dir = registry_dir()?;
+    let (all, unread) = try_load_all_in(&dir)?;
+    let pruned = (all.into_iter().filter(|e| !alive(e)))
+        .map(|e| {
+            let pruned = prune_gone(&dir, &e);
+            (e.state_dir, pruned)
+        })
+        .collect();
+    Ok((pruned, unread))
 }
 
 /// How `vk stop` goes about stopping a run.
@@ -4669,7 +4728,8 @@ PUBLISHED     -
             assert!(recorded(&reg, &dead), "the dead entry was pruned");
             assert_eq!(
                 out_of_date(1, 0).unwrap(),
-                "1 VM(s) marked `*` listed from out-of-date records"
+                "1 VM(s) marked `*` listed from out-of-date records. Run `vk stop --tidy` to \
+                 check all stale records"
             );
             assert_eq!(out_of_date(0, 0), None);
             // A removed directory still counts as an unlisted registration.

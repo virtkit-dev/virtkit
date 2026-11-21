@@ -104,6 +104,7 @@ mod term;
 mod termclean;
 #[cfg(test)]
 mod testutil;
+mod tidy;
 mod timing;
 mod toolchain;
 mod uefi;
@@ -2705,6 +2706,14 @@ enum Cmd {
         /// stop every registered running vk VM
         #[arg(long, conflicts_with = "targets")]
         all: bool,
+        /// repair stale records and review timed-out or interrupted stops
+        ///
+        /// Forgets abandoned name claims and names of missing managed directories, clears stale
+        /// state and registry records, and names dev environments with a valid recorded identity. On a
+        /// terminal, asks before killing a run whose stop timed out or was interrupted (`!` in
+        /// `vk list`). Exits 1 if an overdue stop remains or a repair fails.
+        #[arg(long, conflicts_with_all = ["targets", "all", "recursive", "force", "kill", "timeout"])]
+        tidy: bool,
         /// send SIGTERM once a second for 5 seconds, then kill the VMMs
         ///
         /// Use this for a VM that does not answer a plain stop. SIGKILL cuts power to the VM
@@ -4081,10 +4090,32 @@ async fn cli_main(cli: Cli) -> ExitCode {
             targets,
             recursive,
             all,
+            tidy,
             force,
             kill,
             timeout,
         } => {
+            if *tidy {
+                let (report, settled) = tidy::thorough(|o| {
+                    if !dev::on_terminal() {
+                        return tidy::Decision::NoTerminal;
+                    }
+                    let question = format!(
+                        "{} (pid {}): a stop {} and its run is still there. Kill its VM?",
+                        o.name,
+                        o.record.pid,
+                        o.record.lapse(vms::unix_now())
+                    );
+                    match dev::ask_on_terminal(&question) {
+                        Ok(true) => tidy::Decision::End,
+                        _ => tidy::Decision::Leave,
+                    }
+                });
+                return match write_report(&report) {
+                    ExitCode::SUCCESS if !settled => exit_code(1),
+                    code => code,
+                };
+            }
             let how = match (*force, *kill) {
                 (_, true) => vms::StopHow::Kill,
                 (true, false) => vms::StopHow::Force,
@@ -7689,6 +7720,25 @@ mod tests {
         );
         // Without the `--` nothing runs at all.
         assert!(Cli::try_parse_from(["vk", "service-exec", "/job", "vk", "exec"]).is_err());
+    }
+
+    /// `--tidy` takes no REF, timeout or other stop option.
+    #[test]
+    fn stop_tidy_takes_nothing_else() {
+        let parse = |args: &[&str]| Cli::try_parse_from([&["vk", "stop", "--tidy"], args].concat());
+        assert!(matches!(
+            parse(&[]).unwrap().cmd,
+            Cmd::Stop { tidy: true, .. }
+        ));
+        for other in [
+            &["app"][..],
+            &["--timeout", "5"],
+            &["--all"],
+            &["--kill"],
+            &["-r"],
+        ] {
+            assert!(parse(other).is_err(), "{other:?}");
+        }
     }
 
     /// Before `--`, `--allow` selects the wrapper's forms; after it, `--allow` belongs to
