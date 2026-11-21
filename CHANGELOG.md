@@ -31,6 +31,9 @@ All notable changes to virtkit will be documented in this file.
   workspace and has none exits 5.
 - In `vk dev list --json`, `deletable` tells whether `vk delete` recognizes the state
   directory as belonging to the environment.
+- `vk list` shows VMs that are `starting` or `stopping`. If a whole-VM stop times out or
+  is interrupted while the run is still alive, `stopping!` marks it and vk suggests how
+  to retry. While a VM is starting, vk refuses stop, restart, delete and service start.
 
 ### Changed
 

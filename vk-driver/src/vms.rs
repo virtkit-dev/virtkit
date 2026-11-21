@@ -14,7 +14,7 @@
 //! entries whose owner is gone. Entries live under `<data base>/vms/` (the same
 //! `$XDG_DATA_HOME/virtkit` home `vk run`'s image cache uses), one JSON file per VM.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt;
@@ -340,9 +340,27 @@ fn load_all_in(dir: &Path) -> Vec<VmEntry> {
 /// True while the managing `vk run` is alive. The run holds an exclusive `flock` on its state
 /// dir for its whole lifetime, so if we can take that lock the owner has exited (and the entry
 /// is stale). A missing state dir also counts as dead. Pid-reuse-proof, unlike signalling the
-/// recorded pid blind.
+/// recorded pid blind. The lock may be another run's, which took the dir over from one that
+/// was killed: an entry whose process is known to have exited is dead whoever holds it.
 pub fn alive(entry: &VmEntry) -> bool {
-    dir_locked(&entry.state_dir)
+    dir_locked(&entry.state_dir) && !exited(entry) && !superseded(entry)
+}
+
+/// Whether the run `entry` records is known to have exited: its pid is gone, or is another
+/// process's now. `false` when that cannot be told (no start time recorded).
+fn exited(entry: &VmEntry) -> bool {
+    let pid = i32::try_from(entry.pid).ok();
+    (pid.zip(entry.pid_start_ticks))
+        .is_some_and(|(pid, ticks)| crate::usage::proc_exited(pid, ticks))
+}
+
+/// Whether another run has taken `entry`'s state dir and is starting on it: the lock that
+/// makes the entry look alive is that run's, and the entry is left from a run that was
+/// killed.
+fn superseded(entry: &VmEntry) -> bool {
+    crate::vmstate::read(&entry.state_dir).is_some_and(|t| {
+        t.state == crate::vmstate::State::Starting && !t.is_of(entry.pid, entry.pid_start_ticks)
+    })
 }
 
 /// Whether a run holds `dir`'s state-dir lock — the one [`alive`] reads — including a run that
@@ -432,15 +450,18 @@ pub fn register(entry: VmEntry) -> Registration {
     if let Err(e) = record_last(&entry) {
         eprintln!("virtkit: warning: could not keep the VM's entry in its state dir: {e:#}");
     }
-    match registry_dir().and_then(|dir| record_in(&dir, &entry)) {
+    let registration = match registry_dir().and_then(|dir| record_in(&dir, &entry)) {
         Ok(()) => Registration {
-            state_dir: Some(entry.state_dir),
+            state_dir: Some(entry.state_dir.clone()),
         },
         Err(e) => {
             eprintln!("virtkit: warning: could not record VM in the registry: {e:#}");
             Registration { state_dir: None }
         }
-    }
+    };
+    // Attempt registration before clearing startup so a successful handoff has no gap.
+    crate::vmstate::started(&entry.state_dir, entry.pid, entry.pid_start_ticks);
+    registration
 }
 
 /// Point a service's recorded build recipe at the image it actually booted. The entry is
@@ -1017,10 +1038,11 @@ pub struct ListOpts {
     pub filter: crate::vmlist::Filter,
 }
 
-/// Render the VM rows selected by [`ListOpts`]. Without fields, JSON or row filters, a
-/// selector matching one running primary and no stopped primary gets a full record.
+/// Render the rows selected by [`ListOpts`]. An unfiltered reference matching a single
+/// registered primary gets its full record unless fields or JSON were requested.
 pub fn list_report(opts: ListOpts) -> Result<String> {
     use crate::vmlist::{Filter, Kind, Known, Live};
+    use crate::vmstate::Standing;
     check_fields(&opts.fields)?;
     let mut filter = opts.filter;
     let target = match &opts.target {
@@ -1033,15 +1055,26 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
         None => selector_of(None, opts.recursive)?.map(Selector::resolved),
     };
     let stale = opts.stale;
+    let idx = crate::names::Index::open()?;
+    crate::dev::list::name_unnamed();
+    let named = idx.try_all()?;
+    // An unindexed dev directory is still selectable by its directory name.
+    let unnamed = crate::dev::list::unnamed_dirs(&named)?;
+    // Read startup records before the registry. Registration attempts to publish the
+    // entry before it clears startup.
+    let transients: HashMap<&Path, (crate::vmstate::Transient, Standing)> = (named.iter())
+        .map(|(_, dir)| dir)
+        .chain(unnamed.iter().map(|(_, dir, _)| dir))
+        .filter_map(|dir| Some((dir.as_path(), crate::vmstate::peek(dir)?)))
+        // One that describes nothing any more is read past.
+        .filter(|(_, (_, standing))| *standing != Standing::Gone)
+        .collect();
     let mut vms = running();
     // Exclude every running directory from stopped results, even if the selector misses it.
     let running_dirs: HashSet<PathBuf> = vms.iter().map(|e| e.state_dir.clone()).collect();
     if let Some(sel) = &target {
         vms.retain(|e| sel.matches(e));
     }
-    let idx = crate::names::Index::open()?;
-    crate::dev::list::name_unnamed();
-    let named = idx.try_all()?;
     let name_of = |dir: &Path| {
         let canonical = canonical(dir);
         named
@@ -1062,38 +1095,53 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
             (kind_of(&e.state_dir) == Kind::Dev).then(|| dir_name.to_string())
         })
     };
+    let now = unix_now();
     let live: Vec<Live> = vms
         .iter()
-        .map(|e| Live {
-            entry: e,
-            name: listed_name(e),
-            kind: kind_of(&e.state_dir),
-            environment: dev_identity(&e.state_dir).1,
-            units: service_units(e),
-            published: published(e),
-            mem_used: i32::try_from(e.pid)
-                .ok()
-                .and_then(crate::usage::tree_resident),
-            fresh: stale.then(|| freshness_all(e)),
+        .map(|e| {
+            let name = listed_name(e);
+            // A registered VM is running unless its pid has an active or overdue stop record.
+            let stopping = crate::vmstate::peek(&e.state_dir).filter(|(t, standing)| {
+                t.state == crate::vmstate::State::Stopping
+                    && t.pid == e.pid
+                    && *standing != Standing::Gone
+            });
+            let shown = name.clone().unwrap_or_else(|| e.pid.to_string());
+            Live {
+                entry: e,
+                name,
+                kind: kind_of(&e.state_dir),
+                environment: dev_identity(&e.state_dir).1,
+                units: service_units(e),
+                published: published(e),
+                mem_used: i32::try_from(e.pid)
+                    .ok()
+                    .and_then(crate::usage::tree_resident),
+                fresh: stale.then(|| freshness_all(e)),
+                transient: stopping.as_ref().map(|(t, _)| t.state.label()),
+                attention: stopping.and_then(|(t, s)| attention(&t, s, &shown, now)),
+            }
         })
         .collect();
-    // An unindexed dev directory is still selectable by its directory name.
-    let unnamed = crate::dev::list::unnamed_dirs(&named)?;
     let warn = |e: anyhow::Error| eprintln!("virtkit: warning: {e:#}");
     let known: Vec<Known> = named
         .iter()
-        // An uncommitted claim can belong to a starting or abandoned run.
-        .filter(|(name, _)| !idx.is_provisional(name))
-        .map(|(name, dir)| (name, dir, crate::vmlist::STOPPED))
+        .map(|(name, dir)| (name, dir, crate::vmlist::STOPPED, idx.is_provisional(name)))
         .chain(unnamed.iter().map(|(name, dir, booted)| match booted {
-            true => (name, dir, crate::vmlist::STOPPED),
-            false => (name, dir, crate::vmlist::NEVER_BOOTED),
+            true => (name, dir, crate::vmlist::STOPPED, false),
+            false => (name, dir, crate::vmlist::NEVER_BOOTED, false),
         }))
-        // The directory lock also catches runs that registered after the live snapshot.
-        .filter(|(_, dir, _)| {
-            dir.is_dir() && !running_dirs.contains(&canonical(dir)) && !dir_locked(dir)
-        })
-        .filter_map(|(name, dir, status)| {
+        .filter(|(_, dir, ..)| dir.is_dir() && !running_dirs.contains(&canonical(dir)))
+        .filter_map(|(name, dir, at_rest, provisional)| {
+            // On its way up or down, with no VM registered: as its record words it.
+            let transient = transients.get(dir.as_path());
+            // Otherwise an uncommitted claim belongs to an abandoned run, and a held lock to a
+            // run that registers no VM, or took the directory after its record was read.
+            if transient.is_none() && (provisional || dir_locked(dir)) {
+                return None;
+            }
+            let status = transient.map_or(at_rest, |(t, _)| t.state.label());
+            let attention = transient.and_then(|(t, s)| attention(t, *s, name, now));
             let kind = kind_of(dir);
             let last = last_entry(dir).unwrap_or_else(|e| {
                 warn(e);
@@ -1105,6 +1153,7 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
                 dir: dir.clone(),
                 kind,
                 status,
+                attention,
                 last,
                 project,
                 environment,
@@ -1125,7 +1174,7 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
             keep.then_some(k)
         })
         .collect();
-    let mut rows: Vec<crate::vmlist::Row> = crate::vmlist::rows(&live, &known, unix_now())
+    let mut rows: Vec<crate::vmlist::Row> = crate::vmlist::rows(&live, &known, now)
         .into_iter()
         .filter(|r| filter.keeps(r))
         .collect();
@@ -1138,12 +1187,25 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
     if !opts.fields.is_empty() {
         let views = rows
             .iter()
-            .map(|r| serde_json::to_value(r).context("serializing VM row"))
+            .map(|r| {
+                let mut view = serde_json::to_value(r).context("serializing VM row")?;
+                // An explicitly selected attention field is null when the full row omits it.
+                if let Some(fields) = view.as_object_mut() {
+                    fields.entry("attention").or_insert(serde_json::Value::Null);
+                }
+                Ok(view)
+            })
             .collect::<Result<Vec<_>>>()?;
         return fields_report(&views, &opts.fields, opts.json);
     }
     if opts.json {
         return Ok(serde_json::to_string_pretty(&rows).context("serializing VM list")? + "\n");
+    }
+    // Keep recovery commands on stderr so stdout contains only the requested listing.
+    for r in &rows {
+        if let Some(why) = &r.attention {
+            eprintln!("vk: {}: {why}", r.name);
+        }
     }
     // A bare listing keeps its table even on a one-VM host.
     let unfiltered = filter == Filter::default();
@@ -1198,6 +1260,24 @@ pub(crate) fn kind_of(dir: &Path, dev_base: Option<&Path>) -> crate::vmlist::Kin
         true => Kind::Dev,
         false => Kind::Run,
     }
+}
+
+/// Recovery advice for an overdue stop whose run is still alive.
+fn attention(
+    t: &crate::vmstate::Transient,
+    standing: crate::vmstate::Standing,
+    name: &str,
+    now: u64,
+) -> Option<String> {
+    (standing == crate::vmstate::Standing::Overdue).then(|| {
+        format!(
+            "a stop {} and its run (pid {}) is still there — `vk logs {name}` and `vk list \
+             {name}` show it, `vk stop {name}` tries again, `vk stop --force {name}` insists \
+             then kills it",
+            t.lapse(now),
+            t.pid
+        )
+    })
 }
 
 /// Project and environment for a stopped VM in `vk list`. Use the workspace from
@@ -1543,8 +1623,9 @@ pub(crate) fn held_run(entry: &VmEntry) -> std::result::Result<Option<Held>, Str
     };
     match identity(entry, pid) {
         Identity::Run => Ok(Some(held)),
-        // A run holds its state-dir lock as long as it lives: with the lock free, it is gone.
-        _ if !alive(entry) => Ok(None),
+        // A free lock or a replacement run's startup record identifies a departed run.
+        // Otherwise report an unconfirmed identity without signalling the lock holder.
+        _ if !dir_locked(&entry.state_dir) || superseded(entry) => Ok(None),
         Identity::Other => {
             Err("another process holds its state dir now, so nothing was signalled".to_string())
         }
@@ -1840,6 +1921,12 @@ impl Stops {
     ) -> Self {
         let began = Instant::now();
         let mut runs: Vec<RunStop> = entries.into_iter().map(RunStop::of).collect();
+        // Record each held run before signalling it. The stop becomes overdue if its run
+        // outlives the deadline or the stop command.
+        for r in runs.iter().filter(|r| r.fate == Fate::Stopping) {
+            let e = &r.entry;
+            crate::vmstate::stopping(&e.state_dir, e.pid, e.pid_start_ticks, deadline.left());
+        }
         let vmms_killed = match how {
             StopHow::Kill => {
                 runs.iter_mut().for_each(RunStop::kill_vmms);
@@ -1914,6 +2001,11 @@ impl Stops {
         for r in &self.runs {
             if let (Fate::Down, Some(registry)) = (&r.fate, &self.registry) {
                 prune_gone(registry, &r.entry);
+            }
+            // Leave unfinished stops on record so listing can report them as overdue.
+            if r.fate != Fate::Stopping {
+                let e = &r.entry;
+                crate::vmstate::clear_of(&e.state_dir, e.pid, e.pid_start_ticks);
             }
             out.push_str(&r.line(waited, self.how));
         }
@@ -3638,6 +3730,20 @@ PUBLISHED     -
         let mut second = StandIn::locking(&dir, true);
         let replacement = run_entry(&dir, &second);
         record_in(&reg, &replacement).unwrap();
+        // The replacement says it is starting, over the stop's record of the first run: that
+        // stays its own.
+        let pid = replacement.pid;
+        let starting = crate::vmstate::Transient {
+            state: crate::vmstate::State::Starting,
+            pid,
+            pid_start_ticks: replacement.pid_start_ticks,
+            since_secs: unix_now(),
+            deadline_secs: None,
+            by_pid: None,
+            by_start_ticks: None,
+        };
+        let file = dir.join(crate::vmstate::FILE);
+        std::fs::write(file, serde_json::to_vec(&starting).unwrap()).unwrap();
         let mut relay = StandIn::spawn();
         let addr = "tcp://127.0.0.1:8601";
         let _relay =
@@ -3650,6 +3756,8 @@ PUBLISHED     -
         assert!(second.alive());
         assert!(relay.alive(), "the replacement's publisher was stopped");
         assert!(recorded(&reg, &replacement));
+        let kept = crate::vmstate::peek(&dir).map(|(t, _)| t.pid);
+        assert_eq!(kept, Some(pid), "the replacement's record was cleared");
         drop(second);
         std::fs::remove_dir_all(&reg).ok();
         std::fs::remove_dir_all(&dir).ok();
@@ -4359,6 +4467,98 @@ PUBLISHED     -
             };
             assert_eq!(list(None, running, &["name"], false), "odd\n");
             drop(lock);
+        }
+
+        /// A run on its way up is listed `starting`, its first boot's claim and lock
+        /// notwithstanding, until it registers; a stop of it is listed `stopping`, and once
+        /// that stop is overdue, with what can be done.
+        #[test]
+        fn a_vm_on_its_way_up_or_down_says_so() {
+            let homes = Homes::new("list-transient");
+            let proj = project(&homes);
+            let dir = canonical(&run_dir("boot"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let held = crate::dev::list::try_lock_state_dir(&dir).unwrap();
+            let idx = crate::names::Index::open().unwrap();
+            assert!(idx.provisional().claim_exact(&dir, "boot").unwrap());
+            crate::vmstate::starting(&dir);
+            let running = Filter {
+                running: true,
+                ..Filter::default()
+            };
+            let fields = ["name", "status", "attention"];
+            assert_eq!(
+                list(None, running.clone(), &fields, false),
+                "boot\tstarting\tnull\n"
+            );
+            idx.commit("boot").unwrap();
+            let mut e = entry(dir.clone(), Some(proj));
+            e.pid_start_ticks = own_start_ticks();
+            let _reg = register(e.clone());
+            assert_eq!(crate::vmstate::peek(&dir), None, "registered is running");
+            assert_eq!(
+                list(None, Filter::default(), &fields, false),
+                "boot\trunning\tnull\n"
+            );
+            // A stop of this very run that timed out a minute ago.
+            let now = unix_now();
+            let overdue = crate::vmstate::Transient {
+                state: crate::vmstate::State::Stopping,
+                pid: e.pid,
+                pid_start_ticks: e.pid_start_ticks,
+                since_secs: now - 270,
+                deadline_secs: Some(now - 60),
+                by_pid: None,
+                by_start_ticks: None,
+            };
+            let file = dir.join(crate::vmstate::FILE);
+            std::fs::write(&file, serde_json::to_vec(&overdue).unwrap()).unwrap();
+            let json: serde_json::Value =
+                serde_json::from_str(&list(None, running.clone(), &[], true)).unwrap();
+            assert_eq!(json[0]["status"], "stopping");
+            let why = json[0]["attention"].as_str().unwrap();
+            assert!(why.starts_with("a stop timed out 1m ago"), "{why}");
+            // A stop of another run, which this one replaced, says nothing of this one.
+            let other = crate::vmstate::Transient {
+                pid: e.pid + 1,
+                ..overdue
+            };
+            std::fs::write(&file, serde_json::to_vec(&other).unwrap()).unwrap();
+            assert_eq!(
+                list(None, running.clone(), &fields, false),
+                "boot\trunning\tnull\n"
+            );
+            drop(held);
+        }
+
+        /// An entry left by a run that was killed is not taken for the run now starting on its
+        /// directory, whose lock it would otherwise pass for its own.
+        #[test]
+        fn a_new_start_is_not_the_old_run_that_registered() {
+            let homes = Homes::new("list-superseded");
+            let dir = stopped(&homes, "app", &project(&homes));
+            let dir = canonical(&dir);
+            let mut old = entry(dir.clone(), None);
+            old.pid += 1;
+            record_in(&registry_dir().unwrap(), &old).unwrap();
+            let held = crate::dev::list::try_lock_state_dir(&dir).unwrap();
+            crate::vmstate::starting(&dir);
+            assert!(!alive(&old));
+            // Nor one of an earlier run that had this run's pid.
+            let mut reused = entry(dir.clone(), None);
+            reused.pid = std::process::id();
+            reused.pid_start_ticks = own_start_ticks().map(|t| t - 1);
+            assert!(!alive(&reused));
+            reused.pid_start_ticks = own_start_ticks();
+            assert!(
+                alive(&reused),
+                "the run starting is alive once it registers"
+            );
+            assert_eq!(
+                list(None, Filter::default(), &["name", "status", "pid"], false),
+                "app\tstarting\tnull\n"
+            );
+            drop(held);
         }
 
         // A run can acquire its state lock after the registry snapshot.

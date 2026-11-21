@@ -815,6 +815,11 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
         }
         None => launch_dir(&default_scratch_base()?)?,
     };
+    // No primary (no image, no -f, no --primary) + a compose file = compose up:
+    // services only, held until ctrl-c.
+    let services_only =
+        args.image.is_empty() && args.dockerfiles.is_empty() && args.primary.is_none();
+    work.say_starting(!services_only);
     // The byte channel is a sum over everything appended to it, and a work dir can outlive the
     // run that made it: `--state-dir` is created-or-reused and never removed, and a run killed
     // by a signal leaves its `launch-<pid>` behind for a recycled pid to find. Cleared here so
@@ -887,9 +892,7 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
     // pass finds it in use rather than an environment to reclaim.
     crate::autogc::maybe_start(cfg, &state_dir);
 
-    // No primary (no image, no -f, no --primary) + a compose file = compose up:
-    // services only, held until ctrl-c.
-    if args.image.is_empty() && args.dockerfiles.is_empty() && args.primary.is_none() {
+    if services_only {
         if args.root_image.is_some() {
             bail!(
                 "--root-image is the primary VM's root, and a services-only compose run boots none"
@@ -1233,6 +1236,13 @@ impl WorkDir {
         })
     }
 
+    /// Record startup for pinned runs that register a primary. Services-only runs never register.
+    fn say_starting(&self, registers: bool) {
+        if self.pinned && registers {
+            crate::vmstate::starting(&self.path);
+        }
+    }
+
     /// Hold the dir's lock, which a pinned dir already does, so its run can be registered.
     fn lock(&mut self) -> Result<()> {
         if self._lock.is_none() {
@@ -1452,6 +1462,8 @@ impl Drop for WorkDir {
     fn drop(&mut self) {
         if self.pinned {
             mark_active(&self.path);
+            // At rest again, whether it ran, was stopped or never came up.
+            crate::vmstate::clear_own(&self.path);
         } else {
             let _ = std::fs::remove_dir_all(&self.path);
         }
@@ -9113,6 +9125,21 @@ mod tests {
         assert!(work.path.is_absolute() && work.path.is_dir());
         drop(work);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A pinned primary records startup. Dropping its work directory clears the record even
+    /// if the primary never registered. Services-only runs leave no startup record.
+    #[test]
+    fn only_a_run_that_registers_a_vm_is_starting() {
+        let t = crate::dev::testutil::scratch("starting");
+        let starting = |dir: &Path| crate::vmstate::read(dir).map(|r| r.state);
+        let work = WorkDir::pinned(t.0.clone(), None).unwrap();
+        work.say_starting(false);
+        assert_eq!(starting(&t.0), None, "services only");
+        work.say_starting(true);
+        assert_eq!(starting(&t.0), Some(crate::vmstate::State::Starting));
+        drop(work);
+        assert_eq!(starting(&t.0), None, "the run is over");
     }
 
     /// A remembered run's lock is on the dir `main` named: gone since, it is not made again

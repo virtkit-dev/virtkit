@@ -116,6 +116,7 @@ mod vmm;
 mod vmmctl;
 mod vmmthreads;
 mod vms;
+mod vmstate;
 mod winbuild;
 mod wincache;
 mod wineval;
@@ -2624,8 +2625,8 @@ enum Cmd {
     /// usage counts shared pages once. The fallback to resident usage can count them more than once.
     /// The table abbreviates `$HOME` to `~`. `--wide` shows full project paths and exec addresses.
     ///
-    /// Without `--json` or `--field`, a reference to exactly one running primary and no stopped
-    /// primary prints its full record. A service reference or `--running`, `--stopped` or
+    /// Without `--json` or `--field`, a reference matching exactly one primary prints its full
+    /// record if that primary is registered. A service reference or `--running`, `--stopped` or
     /// `--kind` selects table rows instead. Use `--json` or `--field` for scripts. For example,
     /// `vk list --running --kind service --field name` prints names for `vk exec`.
     #[command(display_order = 6, visible_alias = "ls")]
@@ -2640,7 +2641,7 @@ enum Cmd {
         /// with a directory (default: the current one), also every VM whose project is below it
         #[arg(short = 'r', long)]
         recursive: bool,
-        /// only the VMs reported running
+        /// only the VMs reported running, starting or stopping
         ///
         /// A service counts by its own state; one whose state could not be read is left out.
         #[arg(long, conflicts_with = "stopped")]
@@ -2670,7 +2671,8 @@ enum Cmd {
         /// check running primaries and their build services for stale images
         ///
         /// Reports whether a fresh `vk run` would rebuild an image. Checking base image digests
-        /// can use the network. Service and stopped rows show `-` (`null` in JSON).
+        /// can use the network. Service rows and primaries without a live registry entry show
+        /// `-` (`null` in JSON).
         #[arg(long)]
         stale: bool,
     },
@@ -2678,7 +2680,7 @@ enum Cmd {
     ///
     /// By default, stopping a VM sends SIGTERM to its `vk run` process and waits for it to exit. This
     /// also stops its compose siblings. Use `NAME/SERVICE` to stop one service through its
-    /// manager. The current project is the default. Use `--all` to stop every running VM.
+    /// manager. The current project is the default. Use `--all` to stop every registered running VM.
     /// Every REF is resolved first, then every VM is told to stop before any is waited for.
     #[command(display_order = 8)]
     Stop {
@@ -2687,13 +2689,13 @@ enum Cmd {
         /// Select a VM by name or pid, or a service by `NAME/SERVICE` or `PID/SERVICE`. A path
         /// (absolute or starting with `./`, `../` or `~`) selects a project or state directory.
         /// Directories match exactly unless `--recursive`. Stopping a named VM also stops its
-        /// published endpoints. An explicit reference to a stopped VM exits 1.
+        /// published endpoints. An explicit reference to a stopped or still-starting VM exits 1.
         #[arg(value_name = "REF")]
         targets: Vec<std::ffi::OsString>,
         /// with a directory (default: the current one), also every VM whose project is below it
         #[arg(short = 'r', long, conflicts_with = "all")]
         recursive: bool,
-        /// stop every running vk VM
+        /// stop every registered running vk VM
         #[arg(long, conflicts_with = "targets")]
         all: bool,
         /// send SIGTERM once a second for 5 seconds, then kill the VMMs
@@ -2714,11 +2716,12 @@ enum Cmd {
         kill: bool,
         /// give up after this many seconds in all; 0 waits as long as it takes
         ///
-        /// All VMs and services share this deadline. If a stop is unconfirmed when time runs
-        /// out, vk reports it and exits 1. Expiry alone never triggers a kill. Shutdowns
+        /// All VMs and services share this deadline. If a stop is unconfirmed at expiry, vk
+        /// reports it and exits 1. The list table marks a recorded, overdue whole-VM stop
+        /// `stopping!` while the run is alive. Expiry alone never triggers a kill. Shutdowns
         /// already in progress continue. During graceful shutdown, Linux guests get up to one
-        /// minute to power off. Windows guests get three minutes, then up to 10 seconds to
-        /// flush their disks. A shorter timeout can expire while a guest is shutting down.
+        /// minute to power off, Windows guests three minutes plus up to 10 seconds to flush
+        /// their disks. A shorter timeout can expire during shutdown.
         #[arg(long, default_value_t = 210, value_name = "SECS")]
         timeout: u64,
     },
@@ -2727,7 +2730,8 @@ enum Cmd {
     /// Use the dev environment's recorded workspace, environment and config for `vk dev start`
     /// (`vk dev up` with `--build`). Replay a run's `run.json` in its original directory with `--detach`.
     /// Runs recorded with `-t` or `--shell` need a terminal. Start those with `vk run`.
-    /// Starting a running primary is a no-op. Starting a service boots its primary if needed.
+    /// Starting a running primary is a no-op. If it is already starting, vk reports that and
+    /// returns successfully. A service start boots a stopped primary and refuses one still starting.
     /// Only what is already built boots: an image that would have to be built fails the
     /// start unless `--build`, with exit 3 when no target failed otherwise.
     #[command(display_order = 8)]

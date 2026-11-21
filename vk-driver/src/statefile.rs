@@ -1,6 +1,6 @@
-//! Permissions for run recipes, state directories and the name index directory. A state
-//! directory holds control sockets with root access to the guest. A recipe can contain
-//! passwords from the command line. Both are private to the owner.
+//! Permissions for run recipes, state directories, transient state records and the name
+//! index directory. A state directory holds control sockets with root access to the guest.
+//! A recipe can contain passwords from the command line. All are private to the owner.
 
 use std::path::Path;
 

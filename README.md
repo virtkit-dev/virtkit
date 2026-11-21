@@ -611,9 +611,16 @@ Use the primary's NAME to select the VM. A dev environment without a stable name
 state directory's name. An unnamed running `vk run` uses its pid. `vk list`, `start`, `stop`,
 `restart`, `delete`, `exec`, `cp`, `logs`, `status` and `publish` also accept `NAME/SERVICE`.
 
-`--running` selects rows with status `running`. `--stopped` selects `stopped` and
-`never booted` (a dev state directory with no recorded boot). A service with no reported
-state shows `-` and matches neither filter. `--kind dev|run|service` selects one kind.
+`--running` selects rows with status `running`, `starting` or `stopping`. `--stopped`
+selects `stopped` and `never booted` (a dev state directory with no recorded boot). A
+service with no reported state shows `-` and matches neither filter. `--kind
+dev|run|service` selects one kind.
+
+For a primary with a persistent state directory, STATUS shows `starting` during pull,
+build or boot before registration. A recorded whole-VM stop shows `stopping`. If the
+stop times out or is interrupted while the run is alive, the table shows `stopping!`.
+Without `--json` or `--field`, vk prints recovery advice on stderr. Use the JSON
+`attention` key or `--field attention` to read it in scripts.
 
 On a running primary, MEM shows the resident memory of its process tree over the recorded
 boot size (`--mem`). The tree includes the guest, its service VMs, the switch and forwards.
@@ -627,7 +634,7 @@ It shows `listen->to`, with `@NAME` for a service and `(unconfirmed)` if the pub
 liveness could not be checked. The table abbreviates `$HOME` to `~`. `--wide` (`-w`) shows
 the full project path and adds EXEC ADDRESS. It cannot be combined with `--json` or `--field`.
 
-**Naming a VM.** `vk list` accepts references to running and stopped VMs. `vk atop` also accepts recorded jobs.
+**Naming a VM.** `vk list` accepts references to VMs in any listed state. `vk atop` also accepts recorded jobs.
 
 | REF | Means |
 |---|---|
@@ -641,7 +648,7 @@ dir name (`app-3f9c0d1e2a4b5c6d`) still works.
 
 ```sh
 vk start app                  # a stopped run again, from its run.json
-vk start shop/redis           # a compose service, starting its VM first if needed
+vk start shop/redis           # a compose service, booting its VM first if stopped
 vk stop shop                  # that VM alone, and what it publishes
 vk stop shop/redis            # one compose service
 vk stop app shop --timeout 60 # both at once, 60 s in all
@@ -660,7 +667,7 @@ with `-t` or `--shell` need a terminal. Start those with `vk run`. `vk start` an
 `vk restart` build missing images only with `--build`. Without it, they exit 3 if a
 build is needed and no target failed for another reason.
 
-`vk start NAME/SERVICE` boots the primary VM if needed, then prints its service manager's
+`vk start NAME/SERVICE` boots a stopped primary VM, then prints its service manager's
 reply. `vk stop NAME/SERVICE` stops one service. `vk stop NAME` stops the named VM and its
 published endpoints. An explicit reference to a stopped VM exits 1 with `vk stop`.
 `vk stop REF…` resolves all references and signals every selected VM before waiting.
@@ -670,6 +677,8 @@ If time runs out, vk reports unconfirmed stops and exits 1. Shutdowns in progres
 SIGKILL to its VMMs. `--kill` sends SIGKILL to the VMMs immediately. This cuts guest power
 and loses unwritten data. After the whole batch, surviving runs get 5 seconds to finish
 cleanup before SIGKILL. Both options require whole-VM targets.
+If a primary is already starting, `vk start` reports that and returns successfully.
+`stop`, `restart`, `delete` and service starts refuse it until it registers.
 `vk restart` resolves each reference once. Before stopping a primary, it checks the dev
 workspace and recorded config, or the run recipe, working directory and any recorded
 `--config`. If the primary is already down, `vk restart` starts it.
@@ -689,8 +698,8 @@ some targets deleted.
 `vk reset REF` removes a stopped dev environment's boot images by default. Use
 `--storage` for persistent data or `--all` for both. `vk ls` is an alias for `vk list`.
 
-Without `--json` or `--field`, a reference to exactly one running primary and no stopped
-primary prints its full record. A service reference or `--running`, `--stopped` or
+Without `--json` or `--field`, a reference matching exactly one primary prints its full
+record if that primary is registered. A service reference or `--running`, `--stopped` or
 `--kind` selects table rows instead. The full record shows boot settings, current memory usage and every
 declared compose service, including its state, LAN address and exec address. Each published port has
 a name, `listen->to` (`@NAME` for a service) and the publisher's pid. `(unconfirmed)` marks
@@ -729,7 +738,8 @@ PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 42011
 `parent` (the primary's name for a service, `null` for a primary), `pid`, `uptime_secs`,
 `mem_used_bytes`, `mem`, `image`, `project`, `environment`, `state_dir`, `exec_addr`,
 `ssh_addr`, `ip` and `published` (an array of `listen->to` strings). A path that is not
-UTF-8 is encoded as `{"bytes": [...]}`.
+UTF-8 is encoded as `{"bytes": [...]}`. An overdue whole-VM stop adds `attention` with
+recovery advice. An explicit `--field attention` returns `null` when no advice applies.
 
 Repeat `--field` to print tab-separated values in flag order, one line per row. With
 `--json`, each object contains only the requested fields. A dotted path such as

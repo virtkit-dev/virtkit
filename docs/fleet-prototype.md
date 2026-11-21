@@ -1325,10 +1325,11 @@ link anywhere. It is shown as text.
 
 Only what runs is read. A stopped dev environment's state dir and any environment's workspace
 are left alone, so a share nobody is using is not mounted, or kept mounted, by whoever lists
-the VMs. A registry entry is told live by its state dir's lock, as `vk list` tells it: taken
-for an instant, which a `vk run` starting on that dir at that moment waits out. A registry
-entry whose pid now names a process started after the entry was written — its lock outlived
-the run in a child — is reported without the pid.
+the VMs. As in `vk list`, a momentary attempt to lock the state directory can briefly
+delay a run starting there. A free lock, a known exit or a replacement run's startup
+record rules out the old entry. For older entries without a recorded process start
+time, a child may still hold the lock. If the pid now belongs to a newer process,
+the workload is reported without that pid.
 
 Compose services are not listed on their own: whether a declared service is up takes a
 question to its run's control socket, and what a running one holds is counted in its

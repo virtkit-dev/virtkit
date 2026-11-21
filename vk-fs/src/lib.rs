@@ -568,7 +568,7 @@ fn write_atomic_with(
     mode: u32,
     durability: Durability,
     publish: Publish,
-    mut next_name: impl FnMut() -> Result<String, anyhow::Error>,
+    next_name: impl FnMut() -> Result<String, anyhow::Error>,
     fill: impl FnOnce(&mut std::fs::File) -> Result<(), anyhow::Error>,
 ) -> Result<(), anyhow::Error> {
     let Some(final_name) = path.file_name() else {
@@ -577,6 +577,50 @@ fn write_atomic_with(
     let final_name = cstr(final_name)?;
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     let parent_fd = open_dir(parent.unwrap_or(Path::new(".")))?;
+    write_atomic_at(
+        parent_fd.as_fd(),
+        &final_name,
+        path,
+        mode,
+        durability,
+        publish,
+        next_name,
+        fill,
+    )
+}
+
+/// [`write_atomic_unsynced`] relative to an open directory descriptor. `name` must be
+/// nonempty and contain no slash.
+pub fn write_atomic_unsynced_in(
+    dir: BorrowedFd<'_>,
+    name: &OsStr,
+    contents: &[u8],
+    mode: u32,
+) -> Result<(), anyhow::Error> {
+    write_atomic_at(
+        dir,
+        &one_name(name)?,
+        Path::new(name),
+        mode,
+        Durability::Unsynced,
+        Publish::Replace,
+        staging_names(),
+        |staged| Ok(std::io::Write::write_all(staged, contents)?),
+    )
+}
+
+/// [`write_atomic_with`] of `final_name` in the open `parent_fd`; `path` names it in errors.
+#[allow(clippy::too_many_arguments)]
+fn write_atomic_at(
+    parent_fd: BorrowedFd<'_>,
+    final_name: &CString,
+    path: &Path,
+    mode: u32,
+    durability: Durability,
+    publish: Publish,
+    mut next_name: impl FnMut() -> Result<String, anyhow::Error>,
+    fill: impl FnOnce(&mut std::fs::File) -> Result<(), anyhow::Error>,
+) -> Result<(), anyhow::Error> {
     let mut fill = Some(fill);
     for _ in 0..STAGING_ATTEMPTS {
         let name = cstr(OsStr::new(&next_name()?))?;
@@ -631,7 +675,7 @@ fn write_atomic_with(
                             Err(std::io::Error::last_os_error())
                         }
                     }
-                    Publish::NoReplace => rename_noreplace(parent_fd.as_fd(), &name, &final_name),
+                    Publish::NoReplace => rename_noreplace(parent_fd.as_fd(), &name, final_name),
                 }
                 .map_err(|e| anyhow!(e).context(format!("publishing {path:?}")))
             });

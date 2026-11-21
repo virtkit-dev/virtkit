@@ -221,6 +221,25 @@ fn running_on(dir: &Path) -> Option<VmEntry> {
     vms::running().into_iter().find(|e| e.state_dir == dir)
 }
 
+/// The pid in the current startup record, if any.
+fn starting_run(dir: &Path) -> Option<u32> {
+    crate::vmstate::read(dir)
+        .filter(|now| now.state == crate::vmstate::State::Starting)
+        .map(|now| now.pid)
+}
+
+/// Reject the operation until the starting primary registers.
+fn not_starting(t: &Target, primary_up: bool, what: &str) -> Result<()> {
+    match starting_run(&t.dir).filter(|_| !primary_up) {
+        Some(pid) => bail!(
+            "{} is starting (pid {pid}): {what} {} once it is up",
+            t.name,
+            t.shown()
+        ),
+        None => Ok(()),
+    }
+}
+
 /// One step of a start or a stop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
@@ -664,14 +683,22 @@ fn execute(t: &Target, steps: &[Step], o: Opts) -> Result<String> {
 pub fn start(refs: &[OsString], o: Opts) -> ExitCode {
     let mut codes = Vec::new();
     for r in refs {
-        // A project directory means its own VM: one REF starts one VM at most.
-        let result = resolve(r, Among::ProjectVm).and_then(|t| {
-            let steps = plan(Verb::Start, &t, running_on(&t.dir).is_some())?;
-            execute(&t, &steps, o)
-        });
-        codes.push(outcome(result, "start", r));
+        codes.push(outcome(start_one(r, o), "start", r));
     }
     worst(codes)
+}
+
+fn start_one(r: &OsStr, o: Opts) -> Result<String> {
+    // A project directory means its own VM: one REF starts one VM at most.
+    let t = resolve(r, Among::ProjectVm)?;
+    let up = running_on(&t.dir).is_some();
+    // A repeated primary start succeeds. Reject service starts until registration.
+    if t.service.is_none() && !up && starting_run(&t.dir).is_some() {
+        return Ok(format!("{} is starting\n", t.name));
+    }
+    not_starting(&t, up, "start")?;
+    let steps = plan(Verb::Start, &t, up)?;
+    execute(&t, &steps, o)
 }
 
 /// A compose service `vk stop` stops through its VM's service manager, and the run of that
@@ -716,6 +743,7 @@ fn stopping(
         );
     }
     let entry = found.or_else(|| running_on(&t.dir));
+    not_starting(&t, entry.is_some(), "stop")?;
     if entry.is_none() && t.kind == Kind::Dev && t.service.is_none() {
         // What an environment published can outlive it on record: cleared, as
         // `vk dev stop` does for one already down.
@@ -905,6 +933,7 @@ pub fn restart(refs: &[OsString], o: Opts) -> ExitCode {
 /// stopping it, and skip the stop when the primary is down.
 fn restart_one(t: &Target, o: Opts) -> Result<String> {
     let up = running_on(&t.dir).is_some();
+    not_starting(t, up, "restart")?;
     // A service's VM stays up across the service's restart.
     startable(t, &plan(Verb::Start, t, up && t.service.is_some())?)?;
     let mut out = String::new();
@@ -1035,7 +1064,9 @@ fn plan_one(r: &OsStr, force: bool) -> Result<Planned> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("opening {}", t.dir.display())),
     };
-    let (stop, removal) = plan_delete(&t, running_on(&t.dir).is_some(), force, made(&t))?;
+    let up = running_on(&t.dir).is_some();
+    not_starting(&t, up, "delete")?;
+    let (stop, removal) = plan_delete(&t, up, force, made(&t))?;
     let mut svc = None;
     if removal == Removal::Service {
         declared(&t)?;
@@ -2034,6 +2065,35 @@ mod tests {
             ExitCode::from(1)
         );
         assert_eq!(idx.lookup("mine"), Some(vms::canonical(&mine)));
+    }
+
+    /// Repeated primary starts succeed. Service start, stop, restart and delete refuse a starting VM.
+    #[test]
+    fn a_starting_vm_is_left_to_come_up() {
+        let homes = crate::dev::testutil::Homes::new("starting");
+        let dir = stopped_run(&homes, "app", &["db"]);
+        // This process is the run that holds the dir and has registered nothing yet.
+        let _held = crate::dev::list::try_lock_state_dir(&dir).unwrap();
+        crate::vmstate::starting(&dir);
+        assert_eq!(start_one(&os("app"), O).unwrap(), "app is starting\n");
+        let refused = |e: anyhow::Error, what: &str| {
+            let e = format!("{e:#}");
+            let pid = std::process::id();
+            assert!(
+                e.contains(&format!("app is starting (pid {pid}): {what}")),
+                "{e}"
+            );
+        };
+        refused(start_one(&os("app/db"), O).unwrap_err(), "start app/db");
+        refused(plan_one(&os("app"), false).err().unwrap(), "delete app");
+        let t = resolve(&os("app"), Among::ProjectVm).unwrap();
+        refused(restart_one(&t, O).unwrap_err(), "restart app");
+        let sel = vms::Selector::from_ref(vms::Ref::parse(&os("app")).unwrap(), false)
+            .unwrap()
+            .0;
+        let stop = stopping(sel, None, vms::StopHow::Graceful, &mut Vec::new());
+        refused(stop.err().unwrap(), "stop app");
+        assert!(dir.exists());
     }
 
     /// A run whose `--state-dir` is in the dev base is a run: forgotten, its dir and what
