@@ -1307,8 +1307,8 @@ For the fields reported and their ownership, see the [workload design](fleet-des
 
 Workload discovery reads existing records:
 
-- the host's VM registry under `<data>/vms/`, checking each state dir's lock and pruning
-  stale entries as `vk list` does;
+- the host's VM registry under `<data>/vms/`, checking each state directory's lock and
+  pruning stale entries when it can lock their directories;
 - running dev environments' identities, as read by `vk dev list`;
 - executor job dirs with a live supervisor, and the `job.json` that `prepare` writes with
   the job's ID, project, name, image, size and page on GitLab;

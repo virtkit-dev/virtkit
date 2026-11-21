@@ -317,10 +317,13 @@ pub fn known_anywhere(name: &str) -> Result<bool> {
     Ok(crate::names::resolve(vm)?.is_some())
 }
 
-/// Whether a VM runs on the state dir `dir`.
+/// Whether a VM runs on the state directory `dir`. Leaves the registry untouched.
 pub fn running(dir: &Path) -> bool {
     let dir = crate::vms::canonical(dir);
-    crate::vms::running().iter().any(|e| e.state_dir == dir)
+    crate::vms::registered()
+        .0
+        .iter()
+        .any(|e| e.state_dir == dir)
 }
 
 #[cfg(test)]

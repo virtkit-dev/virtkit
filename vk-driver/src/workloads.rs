@@ -3,8 +3,8 @@
 //! the executor's job dirs.
 //!
 //! Everything is read from what those already keep, never kept apart: the registry's entries,
-//! checked against their state-dir locks as `vk list` checks them (and pruned as it prunes
-//! them); the running dev state dirs' identities, as `vk dev list` reads them; each job dir's
+//! checked against their state-dir locks and pruned when stale; the running dev state dirs'
+//! identities, as `vk dev list` reads them; each job dir's
 //! live supervisor and the record `prepare` leaves beside it; the admission ledger's
 //! reservations. Nothing is read for a VM that is not running: a stopped dev environment's
 //! directory and its workspace — perhaps on a share nobody else is holding up — stay
@@ -522,8 +522,7 @@ mod tests {
         f
     }
 
-    /// A registry entry counts only while its state dir's lock is held: a stale one is not
-    /// reported, and is pruned as `vk list` prunes it.
+    /// The workload scan omits dead registrations and prunes their registry entries.
     #[test]
     fn only_a_live_registry_entry_is_a_workload() {
         let tmp = scratch("registry");

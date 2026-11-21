@@ -204,6 +204,22 @@ pub fn clear_own(dir: &Path) {
     clear_where(dir, Wait::Block, |r| r.is_of(pid, ticks));
 }
 
+/// Remove a transient record classified as [`Standing::Gone`]. Keep overdue stops.
+/// Return `Ok(true)` on removal and propagate lock and removal errors. The lock is
+/// nonblocking so cleanup before signalling cannot consume the stop deadline.
+pub fn clear_if_stale(dir: &Path) -> anyhow::Result<bool> {
+    let Some((judged, Standing::Gone)) = peek(dir) else {
+        return Ok(false);
+    };
+    locked(dir, Wait::No, |d, recorded| {
+        // A new run may have replaced the record since the liveness check.
+        match recorded == Some(judged) {
+            true => d.remove().map(|()| true),
+            false => Ok(false),
+        }
+    })
+}
+
 /// The transient state of the VM on `dir` that still holds, if any.
 pub fn read(dir: &Path) -> Option<Transient> {
     match peek(dir)? {
@@ -423,6 +439,24 @@ mod tests {
         assert!(read(dir).is_some());
         drop(held);
         clear_of(dir, me, ticks);
+        assert_eq!(peek(dir), None);
+
+        // Nor to clear a stale record of its target before signalling it.
+        let stale = Transient {
+            pid: me,
+            pid_start_ticks: Some(1),
+            ..record(State::Starting, None)
+        };
+        std::fs::write(dir.join(FILE), serde_json::to_vec(&stale).unwrap()).unwrap();
+        let held = std::fs::File::create(dir.join(LOCK)).unwrap();
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let began = std::time::Instant::now();
+        assert!(clear_if_stale(dir).is_err());
+        assert!(began.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(peek(dir).map(|(r, _)| r), Some(stale));
+        drop(held);
+        assert!(clear_if_stale(dir).unwrap());
         assert_eq!(peek(dir), None);
     }
 

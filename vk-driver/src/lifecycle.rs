@@ -215,10 +215,17 @@ fn resolve_running(
     Ok((t, found))
 }
 
-/// The running VM on `dir`, if any.
+/// Find the running VM without changing state, including during a delete preview.
 fn running_on(dir: &Path) -> Option<VmEntry> {
     let dir = vms::canonical(dir);
-    vms::running().into_iter().find(|e| e.state_dir == dir)
+    vms::registered().0.into_iter().find(|e| e.state_dir == dir)
+}
+
+/// Clear stale transient and registry records for `dir`. The name index is separate.
+fn repair(dir: &Path) {
+    // Readers skip stale records, and a later run can replace them if cleanup fails.
+    let _ = crate::vmstate::clear_if_stale(dir);
+    vms::forget_if_gone(dir);
 }
 
 /// The pid in the current startup record, if any.
@@ -691,6 +698,7 @@ pub fn start(refs: &[OsString], o: Opts) -> ExitCode {
 fn start_one(r: &OsStr, o: Opts) -> Result<String> {
     // A project directory means its own VM: one REF starts one VM at most.
     let t = resolve(r, Among::ProjectVm)?;
+    repair(&t.dir);
     let up = running_on(&t.dir).is_some();
     // A repeated primary start succeeds. Reject service starts until registration.
     if t.service.is_none() && !up && starting_run(&t.dir).is_some() {
@@ -742,6 +750,7 @@ fn stopping(
             t.name
         );
     }
+    repair(&t.dir);
     let entry = found.or_else(|| running_on(&t.dir));
     not_starting(&t, entry.is_some(), "stop")?;
     if entry.is_none() && t.kind == Kind::Dev && t.service.is_none() {
@@ -932,6 +941,7 @@ pub fn restart(refs: &[OsString], o: Opts) -> ExitCode {
 /// Keep the resolved target across the stop. Check the primary's boot inputs before
 /// stopping it, and skip the stop when the primary is down.
 fn restart_one(t: &Target, o: Opts) -> Result<String> {
+    repair(&t.dir);
     let up = running_on(&t.dir).is_some();
     not_starting(t, up, "restart")?;
     // A service's VM stays up across the service's restart.
@@ -1354,6 +1364,7 @@ pub fn delete(refs: &[OsString], force: bool, yes: bool, dry_run: bool, o: Opts)
     }
     for p in &planned {
         ok &= report(execute(&p.t, &p.stop, o));
+        repair(&p.t.dir);
     }
     let mut held = Vec::new();
     for p in &planned {
@@ -2094,6 +2105,85 @@ mod tests {
         let stop = stopping(sel, None, vms::StopHow::Graceful, &mut Vec::new());
         refused(stop.err().unwrap(), "stop app");
         assert!(dir.exists());
+    }
+
+    /// Delete previews and preflight failures preserve all records. Once confirmed, delete can
+    /// prune its own registration while the state directory still exists.
+    #[test]
+    fn only_a_delete_that_goes_ahead_writes() {
+        let homes = crate::dev::testutil::Homes::new("rm-preview");
+        let app = stopped_run(&homes, "app", &[]);
+        let idx = crate::names::Index::open().unwrap();
+        let abandoned = crate::names::run_base().unwrap().join("boot-00000000");
+        std::fs::create_dir_all(&abandoned).unwrap();
+        std::fs::write(abandoned.join(crate::names::MADE), b"").unwrap();
+        assert!(idx.provisional().claim_exact(&abandoned, "boot").unwrap());
+        let reg = vms::registry_dir().unwrap();
+        std::fs::create_dir_all(&reg).unwrap();
+        let mut dead = entry(&app, std::process::id(), &[]);
+        dead.pid_start_ticks = Some(1);
+        let slug = reg.join(format!("{}.json", vms::slug(&app)));
+        std::fs::write(&slug, serde_json::to_vec(&dead).unwrap()).unwrap();
+        let untouched = || {
+            assert!(abandoned.exists() && idx.lookup("boot").is_some());
+            assert!(app.exists() && slug.exists());
+        };
+        assert_eq!(
+            delete(&[os("app")], false, true, true, O),
+            ExitCode::SUCCESS
+        );
+        untouched();
+        assert_eq!(
+            delete(&[os("app"), os("nope")], false, true, false, O),
+            ExitCode::from(1)
+        );
+        untouched();
+        assert!(deleted(&[os("app")]));
+        assert!(!app.exists() && !slug.exists());
+        assert!(abandoned.exists());
+    }
+
+    /// Stopping a VM or selecting an empty project preserves other VMs' registrations and names.
+    #[test]
+    fn a_stop_repairs_only_its_own_vm() {
+        let homes = crate::dev::testutil::Homes::new("stop-local");
+        let app = stopped_run(&homes, "app", &[]);
+        let legacy = crate::dev::plan::dev_state_base().unwrap().join("old-1111");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let identity = serde_json::json!({
+            "digest": "d", "booted_secs": 1,
+            "manifest": {"workspace": "/a/old", "environment": "dev"},
+        });
+        std::fs::write(legacy.join("dev.json"), identity.to_string()).unwrap();
+        let legacy = vms::canonical(&legacy);
+        let gone = stopped_run(&homes, "gone", &[]);
+        let reg = vms::registry_dir().unwrap();
+        std::fs::create_dir_all(&reg).unwrap();
+        let mut dead = entry(&gone, std::process::id(), &[]);
+        dead.pid_start_ticks = Some(1);
+        let slug = reg.join(format!("{}.json", vms::slug(&gone)));
+        std::fs::write(&slug, serde_json::to_vec(&dead).unwrap()).unwrap();
+        let idx = crate::names::Index::open().unwrap();
+        let untouched = || {
+            assert_eq!(idx.name_of(&legacy), None);
+            assert!(slug.exists(), "another run's entry was dropped");
+        };
+
+        let mut stand_in = crate::dev::testutil::StandIn::locking(&app, false);
+        let _registered = vms::register(run_of(&app, &stand_in, &[]));
+        let sel = Selector::parse(&os("app")).unwrap();
+        let deadline = vms::Deadline::in_secs(10);
+        let code = stop(vec![(sel, None)], None, deadline, vms::StopHow::Graceful);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(!stand_in.alive());
+        untouched();
+        let project = Selector::Dir {
+            dir: homes.dir().to_path_buf(),
+            below: true,
+        };
+        let deadline = vms::Deadline::in_secs(10);
+        vms::stop_cmd(Some(project), false, deadline, vms::StopHow::Graceful).unwrap();
+        untouched();
     }
 
     /// A run whose `--state-dir` is in the dev base is a run: forgotten, its dir and what

@@ -251,7 +251,7 @@ async fn ready_booted(plan: &Plan, readying: &Readying) -> Result<()> {
 
 /// Claim a stable name after recording the environment's identity. Only direct children
 /// of the dev base are discoverable by name. If the claim fails, the directory name
-/// still works and the next listing or name lookup retries.
+/// remains usable, and a later start retries the claim.
 fn name_environment(plan: &Plan) {
     let named = crate::dev::plan::dev_state_base().and_then(|base| {
         let parent = plan.state_dir.parent().map(crate::vms::canonical);
@@ -1014,10 +1014,10 @@ pub fn stop(state_dir: &Path, timeout: u64) -> Result<Stopped> {
 
 /// The VM up on `state_dir`, matched as recorded or canonicalized: the registry records
 /// the canonical path, while the state base, from `$HOME` or `$XDG_STATE_HOME`, may pass
-/// through a symlink.
+/// through a symlink. Lookup leaves the registry untouched.
 fn vm_at(state_dir: &Path) -> Option<crate::vms::VmEntry> {
     let canonical = crate::vms::canonical(state_dir);
-    crate::vms::running()
+    (crate::vms::registered().0)
         .into_iter()
         .find(|e| e.state_dir.as_path() == state_dir || e.state_dir == canonical)
 }
@@ -1516,6 +1516,25 @@ mod tests {
         assert!(run.alive(), "{}", stopped.report);
         let again = stop(&plan.state_dir, 5).unwrap();
         assert!(again.all_down && again.report.contains("not running"));
+    }
+
+    /// Starting a dev environment must preserve other VMs' stale registrations.
+    #[test]
+    fn looking_its_vm_up_leaves_another_vm_s_dead_entry() {
+        let homes = crate::dev::testutil::Homes::new("session-lookup-local");
+        let plan = plan_in(homes.dir());
+        let gone = homes.dir().join("gone");
+        std::fs::create_dir_all(&gone).unwrap();
+        let mut dead = crate::vms::tests::entry(crate::vms::canonical(&gone), None);
+        dead.pid = std::process::id();
+        dead.pid_start_ticks = Some(1);
+        let reg = crate::vms::registry_dir().unwrap();
+        std::fs::create_dir_all(&reg).unwrap();
+        let slug = reg.join(format!("{}.json", crate::vms::slug(&dead.state_dir)));
+        std::fs::write(&slug, serde_json::to_vec(&dead).unwrap()).unwrap();
+        assert!(running_vm(&plan).is_none());
+        assert!(!crate::dev::targets::running(&plan.state_dir));
+        assert!(slug.exists(), "another VM's entry was dropped");
     }
 
     #[test]

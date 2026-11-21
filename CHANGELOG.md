@@ -34,6 +34,8 @@ All notable changes to virtkit will be documented in this file.
 - `vk list` shows VMs that are `starting` or `stopping`. If a whole-VM stop times out or
   is interrupted while the run is still alive, `stopping!` marks it and vk suggests how
   to retry. While a VM is starting, vk refuses stop, restart, delete and service start.
+- `vk list --problems` shows overdue stops (`!`) and VMs with stale records (`*`,
+  `stale_record` in JSON).
 
 ### Changed
 
@@ -67,6 +69,8 @@ All notable changes to virtkit will be documented in this file.
   WORKSPACE shows the shortest unique path suffix. Use `--wide` for full paths or `--all`
   from anywhere for the previous host-wide state inventory (`--all --json` for scripts).
   The hub uses `--all`.
+- `vk list`, `vk dev list` and VM lookups by name or pid leave saved state untouched.
+  `vk start`, `stop`, `restart` and `delete` clean up stale run records for their targets.
 
 ### Fixed
 

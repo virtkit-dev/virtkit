@@ -83,18 +83,24 @@ pub struct Row {
     /// Unknown results, services and stopped VMs have a JSON value of `null`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale: Option<Option<bool>>,
+    /// row derived from a stale registration or transient record, or a booted dev environment
+    /// without an indexed name. Omitted from plain JSON when false
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stale_record: bool,
     /// Reason and recovery commands for an overdue stop on a live run. Omitted from full
     /// JSON rows when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attention: Option<String>,
 }
 
-/// A row's STATUS as printed: its status, with `!` when the VM needs attention. `--json`
-/// keeps the word, and says why in `attention`.
+/// Append `!` for attention and `*` for stale records. JSON keeps both flags separate from status.
 fn status_cell(r: &Row) -> String {
     let mut cell = r.status.clone();
     if r.attention.is_some() {
         cell.push('!');
+    }
+    if r.stale_record {
+        cell.push('*');
     }
     cell
 }
@@ -121,6 +127,8 @@ pub struct Live<'a> {
     pub transient: Option<&'static str>,
     /// what needs attention about it (see [`Row::attention`])
     pub attention: Option<String>,
+    /// whether the row uses stale records (see [`Row::stale_record`])
+    pub stale_record: bool,
 }
 
 /// A primary without a live registry entry, identified by its indexed name or dev directory name.
@@ -132,6 +140,8 @@ pub struct Known {
     pub status: &'static str,
     /// what needs attention about it (see [`Row::attention`])
     pub attention: Option<String>,
+    /// whether the row uses stale records (see [`Row::stale_record`])
+    pub stale_record: bool,
     /// the registry entry it last ran with, if it left one
     pub last: Option<VmEntry>,
     /// its project, as listed and as a directory REF matches it
@@ -187,6 +197,7 @@ pub fn rows_with(
             published: own.into_iter().map(published_text).collect(),
             stale: l.fresh.map(Freshness::json),
             attention: l.attention.clone(),
+            stale_record: l.stale_record,
         });
         for s in &e.services {
             let unit = l
@@ -220,6 +231,7 @@ pub fn rows_with(
                     .map(|p| published_text(p))
                     .collect(),
                 stale: None,
+                stale_record: false,
                 attention: None,
             });
         }
@@ -245,6 +257,7 @@ pub fn rows_with(
             published: Vec::new(),
             stale: None,
             attention: k.attention.clone(),
+            stale_record: k.stale_record,
         });
         for s in last.map(|e| e.services.as_slice()).unwrap_or_default() {
             let dir = k.dir.join(format!("svc-{}", s.name));
@@ -269,6 +282,7 @@ pub fn rows_with(
                 ip: None,
                 published: Vec::new(),
                 stale: None,
+                stale_record: false,
                 attention: None,
             });
         }
@@ -320,6 +334,8 @@ pub struct Filter {
     pub kind: Option<Kind>,
     /// only the compose service of this name, of whichever VM the REF selected
     pub service: Option<String>,
+    /// only rows with an attention message or stale records
+    pub problems: bool,
 }
 
 impl Filter {
@@ -331,6 +347,7 @@ impl Filter {
                 .service
                 .as_ref()
                 .is_none_or(|s| service_of(r) == Some(s.as_str()))
+            && (!self.problems || r.attention.is_some() || r.stale_record)
     }
 }
 
@@ -428,6 +445,7 @@ mod tests {
             fresh: None,
             transient: None,
             attention: None,
+            stale_record: false,
         }
     }
 
@@ -451,6 +469,7 @@ mod tests {
             kind: Kind::Run,
             status: STOPPED,
             attention: None,
+            stale_record: false,
             last: Some(entry("/s/zeta", "/w/app", 13, &["cache"])),
             project: Some("/w/app".into()),
             environment: None,
@@ -500,6 +519,7 @@ mod tests {
             kind: Kind::Run,
             status: STOPPED,
             attention: None,
+            stale_record: false,
             last: Some(entry("/s/zeta", "/w/app", 13, &["cache", "never"])),
             project: None,
             environment: None,
@@ -545,6 +565,7 @@ mod tests {
             kind: Kind::Dev,
             status,
             attention: None,
+            stale_record: status == NEVER_BOOTED,
             last: None,
             project: None,
             environment: None,
@@ -583,14 +604,20 @@ mod tests {
         assert_eq!(keep(running), ["app", "coming", "hung"]);
         assert_eq!(keep(stopped), ["task-1a2b"]);
         assert_eq!(status("hung"), "stopping");
-        // The stopped filter preserves the distinct `never booted` status; a VM that needs
-        // attention says so beside its status, and in `--json`.
+        let problems = Filter {
+            problems: true,
+            ..Filter::default()
+        };
+        assert_eq!(keep(problems), ["hung", "task-1a2b"]);
+        // Markers decorate table cells. JSON retains the status, including `never booted`.
         let table = render(&rows, None, false, false);
-        assert!(table.contains("task-1a2b  dev   never booted "), "{table}");
+        assert!(table.contains("task-1a2b  dev   never booted*"), "{table}");
         assert!(table.contains("stopping!"), "{table}");
         let json = serde_json::to_string(&rows).unwrap();
         assert!(json.contains("\"status\":\"never booted\""), "{json}");
         assert_eq!(json.matches("\"attention\"").count(), 1, "{json}");
+        assert_eq!(json.matches("\"stale_record\":true").count(), 1, "{json}");
+        assert!(!json.contains("\"stale_record\":false"), "{json}");
     }
 
     #[test]
@@ -686,6 +713,7 @@ mod tests {
                 kind: Kind::Run,
                 status: STOPPED,
                 attention: None,
+                stale_record: false,
                 last: None,
                 project: Some(odd),
                 environment: None,
@@ -753,6 +781,7 @@ mod tests {
             kind: Kind::Run,
             status: STOPPED,
             attention: None,
+            stale_record: false,
             last: Some(scratch.clone()),
             project: scratch.project_dir.clone(),
             environment: None,

@@ -389,6 +389,32 @@ pub fn running() -> Vec<VmEntry> {
     running_in(&dir)
 }
 
+/// Live registrations, oldest first, and the state directories of dead registrations.
+/// Readers leave both intact. [`running`] also prunes dead registrations it can lock.
+pub fn registered() -> (Vec<VmEntry>, Vec<PathBuf>) {
+    let Ok(dir) = registry_dir() else {
+        return (Vec::new(), Vec::new());
+    };
+    let (mut alive_ones, dead): (Vec<VmEntry>, Vec<VmEntry>) =
+        load_all_in(&dir).into_iter().partition(alive);
+    alive_ones.sort_by_key(|e| e.created_secs);
+    (alive_ones, dead.into_iter().map(|e| e.state_dir).collect())
+}
+
+/// Prune a dead registration for `state_dir` without scanning other VMs.
+pub fn forget_if_gone(state_dir: &Path) {
+    let Ok(dir) = registry_dir() else {
+        return;
+    };
+    let path = dir.join(format!("{}.json", slug(&canonical(state_dir))));
+    let entry = std::fs::read(path)
+        .ok()
+        .and_then(|json| serde_json::from_slice::<VmEntry>(&json).ok());
+    if let Some(entry) = entry.filter(|e| !alive(e)) {
+        prune_gone(&dir, &entry);
+    }
+}
+
 /// [`running`], for the registry at `dir`.
 pub(crate) fn running_in(dir: &Path) -> Vec<VmEntry> {
     let mut out = Vec::new();
@@ -426,7 +452,7 @@ pub fn last_entry(state_dir: &Path) -> Result<Option<VmEntry>> {
 }
 
 /// RAII handle: removes the VM's registry entry when the run drops it (clean exit or unwind).
-/// A `SIGKILL` skips this — those stale entries are pruned by `alive` on the next read.
+/// A `SIGKILL` leaves the entry for a later pruning scan or target repair.
 pub struct Registration {
     state_dir: Option<PathBuf>,
 }
@@ -555,8 +581,7 @@ pub fn matching(dir: Option<&Path>) -> Result<(PathBuf, Vec<VmEntry>)> {
         Some(d) => canonical(d),
         None => std::env::current_dir().context("resolving the current directory")?,
     };
-    let matched = running()
-        .into_iter()
+    let matched = (registered().0.into_iter())
         .filter(|e| matches_dir(e, &target, false))
         .collect();
     Ok((target, matched))
@@ -633,9 +658,9 @@ pub(crate) fn service_units(entry: &VmEntry) -> Option<Vec<UnitStatus>> {
 }
 
 /// The VM's managed publishers (`vk publish ensure`), or none if its records cannot be read.
-/// Like `vk publish list`, this prunes the records of publishers that have exited.
+/// Read past exited publishers and leave their files intact.
 fn published(entry: &VmEntry) -> Vec<Published> {
-    match crate::publish::live(&entry.state_dir) {
+    match crate::publish::snapshot(&entry.state_dir) {
         Ok(published) => published,
         // Report the failure; the VM is still listed, just without its ports.
         Err(e) => {
@@ -1056,7 +1081,6 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
     };
     let stale = opts.stale;
     let idx = crate::names::Index::open()?;
-    crate::dev::list::name_unnamed();
     let named = idx.try_all()?;
     // An unindexed dev directory is still selectable by its directory name.
     let unnamed = crate::dev::list::unnamed_dirs(&named)?;
@@ -1066,10 +1090,8 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
         .map(|(_, dir)| dir)
         .chain(unnamed.iter().map(|(_, dir, _)| dir))
         .filter_map(|dir| Some((dir.as_path(), crate::vmstate::peek(dir)?)))
-        // One that describes nothing any more is read past.
-        .filter(|(_, (_, standing))| *standing != Standing::Gone)
         .collect();
-    let mut vms = running();
+    let (mut vms, dead) = registered();
     // Exclude every running directory from stopped results, even if the selector misses it.
     let running_dirs: HashSet<PathBuf> = vms.iter().map(|e| e.state_dir.clone()).collect();
     if let Some(sel) = &target {
@@ -1100,6 +1122,10 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
         .iter()
         .map(|e| {
             let name = listed_name(e);
+            // An unindexed dev environment is stale only after it records a boot.
+            let unnamed = name_of(&e.state_dir).is_none()
+                && kind_of(&e.state_dir) == Kind::Dev
+                && e.state_dir.join("dev.json").is_file();
             // A registered VM is running unless its pid has an active or overdue stop record.
             let stopping = crate::vmstate::peek(&e.state_dir).filter(|(t, standing)| {
                 t.state == crate::vmstate::State::Stopping
@@ -1120,21 +1146,26 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
                 fresh: stale.then(|| freshness_all(e)),
                 transient: stopping.as_ref().map(|(t, _)| t.state.label()),
                 attention: stopping.and_then(|(t, s)| attention(&t, s, &shown, now)),
+                stale_record: unnamed,
             }
         })
         .collect();
     let warn = |e: anyhow::Error| eprintln!("virtkit: warning: {e:#}");
     let known: Vec<Known> = named
         .iter()
-        .map(|(name, dir)| (name, dir, crate::vmlist::STOPPED, idx.is_provisional(name)))
+        .map(|(name, dir)| {
+            let provisional = idx.is_provisional(name);
+            (name, dir, crate::vmlist::STOPPED, provisional, false)
+        })
         .chain(unnamed.iter().map(|(name, dir, booted)| match booted {
-            true => (name, dir, crate::vmlist::STOPPED, false),
-            false => (name, dir, crate::vmlist::NEVER_BOOTED, false),
+            true => (name, dir, crate::vmlist::STOPPED, false, true),
+            false => (name, dir, crate::vmlist::NEVER_BOOTED, false, false),
         }))
         .filter(|(_, dir, ..)| dir.is_dir() && !running_dirs.contains(&canonical(dir)))
-        .filter_map(|(name, dir, at_rest, provisional)| {
-            // On its way up or down, with no VM registered: as its record words it.
-            let transient = transients.get(dir.as_path());
+        .filter_map(|(name, dir, at_rest, provisional, owed_name)| {
+            let recorded = transients.get(dir.as_path());
+            // Use a transient state while its liveness check still accepts the record.
+            let transient = recorded.filter(|(_, s)| *s != Standing::Gone);
             // Otherwise an uncommitted claim belongs to an abandoned run, and a held lock to a
             // run that registers no VM, or took the directory after its record was read.
             if transient.is_none() && (provisional || dir_locked(dir)) {
@@ -1142,6 +1173,9 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
             }
             let status = transient.map_or(at_rest, |(t, _)| t.state.label());
             let attention = transient.and_then(|(t, s)| attention(t, *s, name, now));
+            let stale_record = owed_name
+                || (recorded.is_some() && transient.is_none())
+                || dead.contains(&canonical(dir));
             let kind = kind_of(dir);
             let last = last_entry(dir).unwrap_or_else(|e| {
                 warn(e);
@@ -1154,6 +1188,7 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
                 kind,
                 status,
                 attention,
+                stale_record,
                 last,
                 project,
                 environment,
@@ -1192,6 +1227,7 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
                 // An explicitly selected attention field is null when the full row omits it.
                 if let Some(fields) = view.as_object_mut() {
                     fields.entry("attention").or_insert(serde_json::Value::Null);
+                    fields.entry("stale_record").or_insert(false.into());
                 }
                 Ok(view)
             })
@@ -1207,8 +1243,22 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
             eprintln!("vk: {}: {why}", r.name);
         }
     }
-    // A bare listing keeps its table even on a one-VM host.
     let unfiltered = filter == Filter::default();
+    // An unfiltered host-wide listing also counts abandoned or dangling names and dead
+    // registrations without a listed VM.
+    let marked = rows.iter().filter(|r| r.stale_record).count();
+    let unlisted = match target.is_none() && unfiltered {
+        true => {
+            let listed: HashSet<PathBuf> = known.iter().map(|k| canonical(&k.dir)).collect();
+            let names = named.iter().filter(|(n, d)| idx.forgettable(n, d)).count();
+            names + unlisted_entries(&dead, &listed)
+        }
+        false => 0,
+    };
+    if let Some(note) = out_of_date(marked, unlisted) {
+        eprintln!("vk: note: {note}");
+    }
+    // A bare listing keeps its table even on a one-VM host.
     if target.is_some()
         && unfiltered
         && known.is_empty()
@@ -1260,6 +1310,23 @@ pub(crate) fn kind_of(dir: &Path, dev_base: Option<&Path>) -> crate::vmlist::Kin
         true => Kind::Dev,
         false => Kind::Run,
     }
+}
+
+/// Count dead registrations without a listed VM, including those whose directories were removed.
+fn unlisted_entries(dead: &[PathBuf], listed: &HashSet<PathBuf>) -> usize {
+    dead.iter().filter(|d| !listed.contains(*d)).count()
+}
+
+/// Summarize marked rows and stale records without a row. Return `None` if both counts are zero.
+fn out_of_date(marked: usize, unlisted: usize) -> Option<String> {
+    let said: Vec<String> = [
+        (marked > 0).then(|| format!("{marked} VM(s) marked `*` listed from out-of-date records")),
+        (unlisted > 0).then(|| format!("{unlisted} out-of-date record(s) of no VM listed")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!said.is_empty()).then(|| said.join("; "))
 }
 
 /// Recovery advice for an overdue stop whose run is still alive.
@@ -2230,7 +2297,9 @@ fn select_running(target: Option<Selector>) -> Result<(Selector, Vec<VmEntry>)> 
             below: false,
         },
     };
-    let matched = running().into_iter().filter(|e| sel.matches(e)).collect();
+    let matched = (registered().0.into_iter())
+        .filter(|e| sel.matches(e))
+        .collect();
     Ok((sel, matched))
 }
 
@@ -2346,7 +2415,7 @@ enum Selection {
 /// Resolve `--all`, a pid or project directory, or the current directory (the default) into
 /// the running VMs to act on. Shared by [`stop_cmd`] and [`reboot_cmd`].
 fn select_vms(target: Option<Selector>, all: bool) -> Result<Selection> {
-    let vms = running();
+    let vms = registered().0;
     let explicit = matches!(&target, Some(sel) if !matches!(sel, Selector::Here { .. }));
     let target = target.map(Selector::resolved);
     let selected: Vec<VmEntry> = match (all, &target) {
@@ -4529,6 +4598,84 @@ PUBLISHED     -
                 "boot\trunning\tnull\n"
             );
             drop(held);
+        }
+
+        /// Listings and lookups preserve dead registrations, transient records and publisher files.
+        /// A dead registration or transient marks the VM stale. A dead publisher alone does not.
+        /// Selecting `stale_record` returns a boolean for both rows.
+        #[test]
+        fn a_listing_writes_nothing_and_marks_what_is_out_of_date() {
+            let homes = Homes::new("list-readonly");
+            let proj = project(&homes);
+            let app = canonical(&run_dir("app"));
+            let _app = up(&app, &proj, &[]);
+            homes.name(&app, "app");
+            drop(crate::publish::fake_publisher(
+                &app,
+                "web",
+                "tcp://127.0.0.1:1",
+                "vsock://80",
+                1,
+                None,
+            ));
+            let publish = app.join("publish");
+            std::fs::write(publish.join("web.log"), "kept").unwrap();
+            // The killed run left both its registration and its stopping record.
+            let gone = canonical(&stopped(&homes, "gone", &proj));
+            let mut dead = entry(gone.clone(), Some(proj.clone()));
+            dead.pid_start_ticks = Some(1);
+            let reg = registry_dir().unwrap();
+            record_in(&reg, &dead).unwrap();
+            let lapsed = crate::vmstate::Transient {
+                state: crate::vmstate::State::Stopping,
+                pid: dead.pid,
+                pid_start_ticks: Some(1),
+                since_secs: 0,
+                deadline_secs: None,
+                by_pid: None,
+                by_start_ticks: None,
+            };
+            let file = gone.join(crate::vmstate::FILE);
+            std::fs::write(&file, serde_json::to_vec(&lapsed).unwrap()).unwrap();
+            let fields = ["name", "status", "stale_record"];
+            assert_eq!(
+                list(None, Filter::default(), &fields, false),
+                "app\trunning\tfalse\ngone\tstopped\ttrue\n"
+            );
+            let problems = Filter {
+                problems: true,
+                ..Filter::default()
+            };
+            assert_eq!(list(None, problems, &["name"], false), "gone\n");
+            let table = list(None, Filter::default(), &[], false);
+            assert!(table.contains("stopped*"), "{table}");
+            assert!(!list(Some(OsStr::new("app")), Filter::default(), &[], false).is_empty());
+            assert_eq!(
+                at_most_one(Some(Selector::Pid(std::process::id())))
+                    .unwrap()
+                    .1
+                    .unwrap()
+                    .state_dir,
+                app
+            );
+            for kept in [
+                publish.join("web.json"),
+                publish.join("web.lock"),
+                publish.join("web.log"),
+                file,
+            ] {
+                assert!(kept.exists(), "{} was removed", kept.display());
+            }
+            assert!(recorded(&reg, &dead), "the dead entry was pruned");
+            assert_eq!(
+                out_of_date(1, 0).unwrap(),
+                "1 VM(s) marked `*` listed from out-of-date records"
+            );
+            assert_eq!(out_of_date(0, 0), None);
+            // A removed directory still counts as an unlisted registration.
+            std::fs::remove_dir_all(&gone).unwrap();
+            let listed = HashSet::from([app.clone()]);
+            assert_eq!(unlisted_entries(&registered().1, &listed), 1);
         }
 
         /// An entry left by a run that was killed is not taken for the run now starting on its

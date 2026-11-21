@@ -1437,7 +1437,7 @@ fn dev_list(
             Some(declared_environments(&loaded).map_err(|e| fail(&e, 2))?)
         }
     };
-    let live = crate::vms::running();
+    let (live, _) = crate::vms::registered();
     let rows = match &here {
         None => crate::dev::list::state_in(&live, sizes),
         Some((here, declared)) => crate::dev::list::state_in(&live, false).map(|mut rows| {

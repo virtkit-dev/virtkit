@@ -137,11 +137,9 @@ pub fn sanitize(raw: &str) -> String {
     out
 }
 
-/// The state dir a word stands for: a name from the index, or the directory name a dev
-/// environment's state dir has under the dev base (its name before names existed). `None`
-/// when the word names nothing; an error when it names two different directories.
+/// Resolve an indexed name or a dev state directory's basename without claiming a name.
+/// Return `None` for no match and an error if the two names resolve to different directories.
 pub fn resolve(word: &str) -> Result<Option<PathBuf>> {
-    crate::dev::list::name_unnamed();
     resolve_in(&Index::open()?, &crate::dev::plan::dev_state_base()?, word)
 }
 
@@ -307,7 +305,6 @@ impl Index {
 
     /// [`Index::claim`] with the lock already held.
     pub fn claim_locked(&self, dir: &Path, base: &str) -> Result<(String, bool)> {
-        self.forget_removed();
         if let Some(name) = self.name_of(dir) {
             return Ok((name, false));
         }
@@ -321,6 +318,7 @@ impl Index {
                     format!("{}{suffix}", base[..keep].trim_end_matches('-'))
                 }
             };
+            self.forget_removed(&name);
             if self.link(&name, dir)? {
                 return Ok((name, true));
             }
@@ -328,46 +326,56 @@ impl Index {
         unreachable!("u32 suffixes exhausted")
     }
 
-    /// Under the index lock, reclaim provisional names whose state directory is unlocked
-    /// or missing. Reclaim committed names only for missing direct children of `run/`
-    /// and `dev/`. A committed name on another mount survives an unmount, and scanning
-    /// it must not block other claims on a hung mount.
-    fn forget_removed(&self) {
-        let Some(base) = self.dir.parent() else {
+    /// Under the index lock, reclaim only the requested name. A provisional claim expires
+    /// when its directory is unlocked or missing. A committed claim expires only for a
+    /// missing direct child of `run/` or `dev/`. Checking other targets could block on a
+    /// hung mount or lose a name while its filesystem is unmounted.
+    fn forget_removed(&self, name: &str) {
+        let run_root = self.roots().map(|[run, _]| run);
+        let Some(target) = self.lookup(name) else {
             return;
         };
-        let roots = [
+        if !self.forgettable(name, &target) {
+            return;
+        }
+        let provisional = self.dir.join(marker(name));
+        if std::fs::symlink_metadata(&provisional).is_ok() && target.parent() == run_root.as_deref()
+        {
+            // Direct children of run/ qualify regardless of who created them. Keep
+            // directories containing anything besides the allocation mark.
+            remove_bare(&target);
+        }
+        // A failed unlink leaves the name taken until another claim retries.
+        let _ = std::fs::remove_file(self.dir.join(name));
+        let _ = std::fs::remove_file(provisional);
+    }
+
+    /// The `run/` and `dev/` directories beside the index.
+    fn roots(&self) -> Option<[PathBuf; 2]> {
+        let base = self.dir.parent()?;
+        Some([
             crate::vms::canonical(&base.join("run")),
             crate::vms::canonical(&base.join("dev")),
-        ];
-        for (name, target) in self.all() {
-            let managed = target
-                .parent()
-                .is_some_and(|p| roots.iter().any(|r| r == p));
-            let provisional = self.dir.join(marker(&name));
-            let dead = if std::fs::symlink_metadata(&provisional).is_ok() {
-                // Its run holds the dir's lock until it ends.
-                let ended =
-                    crate::dev::list::try_lock_state_dir(&target).is_some() || !target.exists();
-                if ended && target.parent() == Some(roots[0].as_path()) {
-                    // Direct children of run/ qualify regardless of who created them. Keep directories
-                    // containing anything besides the allocation mark.
-                    remove_bare(&target);
-                }
-                ended
-            } else {
-                managed
-                    && matches!(
-                        std::fs::symlink_metadata(&target),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound
-                    )
-            };
-            if dead {
-                // A link that stays only keeps a dead name taken; the next claim retries it.
-                let _ = std::fs::remove_file(self.dir.join(&name));
-                let _ = std::fs::remove_file(provisional);
-            }
+        ])
+    }
+
+    /// Test whether [`Index::forget_removed`] would reclaim `name` without changing the index.
+    /// Probe a provisional claim's directory lock without waiting.
+    pub fn forgettable(&self, name: &str, target: &Path) -> bool {
+        if std::fs::symlink_metadata(self.dir.join(marker(name))).is_ok() {
+            // Its run holds the dir's lock until it ends.
+            return crate::dev::list::try_lock_state_dir(target).is_some() || !target.exists();
         }
+        let managed = (self.roots()).is_some_and(|roots| {
+            target
+                .parent()
+                .is_some_and(|p| roots.iter().any(|r| r == p))
+        });
+        managed
+            && matches!(
+                std::fs::symlink_metadata(target),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            )
     }
 
     /// Give `dir` exactly `name`. `true` when this call gave it, `false` when `name` already
@@ -376,7 +384,7 @@ impl Index {
     pub fn claim_exact(&self, dir: &Path, name: &str) -> Result<bool> {
         validate(name)?;
         let _lock = self.lock()?;
-        self.forget_removed();
+        self.forget_removed(name);
         let canonical = crate::vms::canonical(dir);
         if let Some(target) = self.lookup(name) {
             if target == canonical || target == dir {

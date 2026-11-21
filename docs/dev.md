@@ -623,9 +623,9 @@ recorded dev environment from any workspace, even if the workspace directory is 
 bare `gc` takes only this workspace's environment, not its task leftovers; if that
 environment has no state, it reports nothing to remove. At first boot, an environment gets a stable name
 from its workspace directory, with `-ENV` appended for environments other than `dev`.
-Collisions add `-2`, `-3`, and so on. A listing or name lookup assigns names to older
-environments. Use `vk rename` to change an environment's name. Use that name with `vk start`, `vk stop`, `vk delete`
-and other VM commands. `vk list` shows the
+Collisions add `-2`, `-3`, and so on. Older environments use their directory names until
+a boot claims a stable name. Use `vk rename` to change an environment's name, then use it
+with `vk start`, `vk stop`, `vk delete` and other VM commands. `vk list` shows the
 environment's active and previously started compose services under `NAME/SERVICE`. The state
 directory's name also works, including any leading `.` or `-`
 (e.g. `app-3f9c0d1e2a4b5c6d`, shown as `dir_name` in `vk dev list --json`). A task's leftover

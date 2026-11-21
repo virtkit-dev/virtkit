@@ -2626,8 +2626,8 @@ enum Cmd {
     /// The table abbreviates `$HOME` to `~`. `--wide` shows full project paths and exec addresses.
     ///
     /// Without `--json` or `--field`, a reference matching exactly one primary prints its full
-    /// record if that primary is registered. A service reference or `--running`, `--stopped` or
-    /// `--kind` selects table rows instead. Use `--json` or `--field` for scripts. For example,
+    /// record if that primary is registered. A service reference or `--running`, `--stopped`,
+    /// `--kind` or `--problems` selects table rows instead. Use `--json` or `--field` for scripts. For example,
     /// `vk list --running --kind service --field name` prints names for `vk exec`.
     #[command(display_order = 6, visible_alias = "ls")]
     List {
@@ -2652,6 +2652,13 @@ enum Cmd {
         /// only VMs of this kind
         #[arg(long, value_name = "KIND")]
         kind: Option<crate::vmlist::Kind>,
+        /// only VMs with an overdue stop or stale records
+        ///
+        /// `!` marks a run still alive after a stop timed out or was interrupted. With neither
+        /// `--json` nor `--field`, recovery advice goes to stderr. `*` marks a row derived from stale VM records. Listing leaves
+        /// those records untouched.
+        #[arg(long)]
+        problems: bool,
         /// the full table: the project path in full, and EXEC ADDRESS
         #[arg(short = 'w', long, conflicts_with_all = ["json", "field"])]
         wide: bool,
@@ -3998,6 +4005,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         running,
         stopped,
         kind,
+        problems,
         wide,
         json,
         field,
@@ -4016,6 +4024,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 stopped: *stopped,
                 kind: *kind,
                 service: None,
+                problems: *problems,
             },
         };
         return match vms::list_report(opts) {
@@ -8960,6 +8969,29 @@ mod tests {
         };
         assert!(e.downcast_ref::<names::Refused>().is_some(), "{e:#}");
         assert_eq!(std::fs::read_dir(b.0.join("run")).unwrap().count(), 1);
+    }
+
+    /// Replaying a named run or claiming an explicit name preserves unrelated claims and directories.
+    #[test]
+    fn a_claim_leaves_another_vm_s_abandoned_claim() {
+        let b = base("local-claim");
+        let idx = names::Index::at(b.0.join("names"));
+        let boot = b.0.join("run/boot-00000000");
+        std::fs::create_dir_all(&boot).unwrap();
+        std::fs::write(boot.join(names::MADE), b"").unwrap();
+        assert!(idx.provisional().claim_exact(&boot, "boot").unwrap());
+        let app = b.0.join("app");
+        std::fs::create_dir(&app).unwrap();
+        assert!(idx.claim_exact(&app, "app").unwrap());
+        let d = app.to_str().unwrap();
+        let replay = ["--detach", "--state-dir", d, "--name", "app", "alpine"];
+        let (made, _) = prepare(&b, &replay).unwrap();
+        assert!(!made.name_made);
+        made.settle();
+        let (made, _) = prepare(&b, &["--name", "web", "alpine"]).unwrap();
+        assert!(made.name_made);
+        made.settle();
+        assert!(boot.exists() && idx.lookup("boot").is_some());
     }
 
     /// A run holds its state dir from before it claims the name until it ends, so a second

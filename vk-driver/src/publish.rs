@@ -324,6 +324,11 @@ impl Liveness {
 ///
 /// The caller must hold [`op_lock`] so liveness claims cannot race an `ensure` handover.
 fn live_entries(state_dir: &Path) -> Vec<(Entry, Liveness)> {
+    entries(state_dir, true)
+}
+
+/// Publishers not known to be gone, stale records removed only with `prune`.
+fn entries(state_dir: &Path, prune: bool) -> Vec<(Entry, Liveness)> {
     let Ok(rd) = std::fs::read_dir(dir_of(state_dir)) else {
         return Vec::new();
     };
@@ -350,10 +355,20 @@ fn live_entries(state_dir: &Path) -> Vec<(Entry, Liveness)> {
             );
             continue;
         }
-        match claim(state_dir, &entry.name) {
-            // A claim proves the record stale. Remove its unused lock and log as well.
-            Ok(Some(_)) => forget_entry(state_dir, &entry.name),
-            Ok(None) => out.push((entry, Liveness::Held)),
+        let held = match prune {
+            true => claim(state_dir, &entry.name).map(|claimed| match claimed {
+                // A claim proves the record stale. Remove its unused lock and log as well.
+                Some(_) => {
+                    forget_entry(state_dir, &entry.name);
+                    false
+                }
+                None => true,
+            }),
+            false => held_lock(&dir_of(state_dir).join(format!("{}.lock", entry.name))),
+        };
+        match held {
+            Ok(false) => {}
+            Ok(true) => out.push((entry, Liveness::Held)),
             Err(e) => {
                 warn!("publish: {}: {e:#}", entry.name);
                 out.push((entry, Liveness::Unknown));
@@ -712,6 +727,51 @@ pub fn live(state_dir: &Path) -> Result<Vec<(Entry, Liveness)>> {
         Some(_op) => live_entries(state_dir),
         None => Vec::new(),
     })
+}
+
+/// Read publishers without pruning records or creating files. Like [`live`], wait for any
+/// `ensure` or `stop` holding the operation lock.
+pub fn snapshot(state_dir: &Path) -> Result<Vec<(Entry, Liveness)>> {
+    let _op = match open_existing(&dir_of(state_dir).join(".op.lock"))? {
+        Some(op) => {
+            // SAFETY: as `op_lock_by`; released when `op` drops.
+            if unsafe { libc::flock(op.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(std::io::Error::last_os_error()).context("locking publishers");
+            }
+            Some(op)
+        }
+        None => None,
+    };
+    Ok(entries(state_dir, false))
+}
+
+/// Open the existing lock without following symlinks. Return `None` if it is missing.
+fn open_existing(path: &Path) -> Result<Option<std::fs::File>> {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("opening {}", path.display())),
+    }
+}
+
+/// Probe the lock without creating it. A missing lock is unheld.
+fn held_lock(path: &Path) -> Result<bool> {
+    let Some(f) = open_existing(path)? else {
+        return Ok(false);
+    };
+    // SAFETY: as `try_flock`; released when `f` drops.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(false);
+    }
+    let err = std::io::Error::last_os_error();
+    match err.kind() {
+        std::io::ErrorKind::WouldBlock => Ok(true),
+        _ => Err(err).with_context(|| format!("locking {}", path.display())),
+    }
 }
 
 /// `vk publish list`: what is published for this state dir, dead records pruned.
@@ -1531,8 +1591,7 @@ mod tests {
         assert!(!entry_path(&t.0, "ghost").exists());
     }
 
-    /// `vk list` reads publishers through `live`: none for a state dir that never published
-    /// (and no `publish/` dir appears for asking), the held ones once it has.
+    /// `live` leaves a fresh state directory empty and reports publishers that hold their locks.
     #[test]
     fn live_lists_the_held_publishers_and_creates_nothing() {
         let t = state("live");

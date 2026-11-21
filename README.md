@@ -622,6 +622,11 @@ stop times out or is interrupted while the run is alive, the table shows `stoppi
 Without `--json` or `--field`, vk prints recovery advice on stderr. Use the JSON
 `attention` key or `--field attention` to read it in scripts.
 
+A `*` marks a row derived from stale VM records (`stale_record` in JSON).
+Listing leaves the records untouched. `vk start`, `stop`, `restart` and `delete`
+attempt to clear stale run records for their target. An unnamed dev environment uses its
+directory name until a boot claims a stable name. `--problems` selects rows with either mark.
+
 On a running primary, MEM shows the resident memory of its process tree over the recorded
 boot size (`--mem`). The tree includes the guest, its service VMs, the switch and forwards.
 Proportional usage counts shared pages once. When it is unavailable, resident usage can
@@ -699,8 +704,8 @@ some targets deleted.
 `--storage` for persistent data or `--all` for both. `vk ls` is an alias for `vk list`.
 
 Without `--json` or `--field`, a reference matching exactly one primary prints its full
-record if that primary is registered. A service reference or `--running`, `--stopped` or
-`--kind` selects table rows instead. The full record shows boot settings, current memory usage and every
+record if that primary is registered. A service reference or `--running`, `--stopped`,
+`--kind` or `--problems` selects table rows instead. The full record shows boot settings, current memory usage and every
 declared compose service, including its state, LAN address and exec address. Each published port has
 a name, `listen->to` (`@NAME` for a service) and the publisher's pid. `(unconfirmed)` marks
 the pid in this record and the address in the table. The record prints paths in full, so
@@ -740,6 +745,7 @@ PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 42011
 `ssh_addr`, `ip` and `published` (an array of `listen->to` strings). A path that is not
 UTF-8 is encoded as `{"bytes": [...]}`. An overdue whole-VM stop adds `attention` with
 recovery advice. An explicit `--field attention` returns `null` when no advice applies.
+Plain JSON omits `stale_record` when false. Selecting it with `--field` returns `false`.
 
 Repeat `--field` to print tab-separated values in flag order, one line per row. With
 `--json`, each object contains only the requested fields. A dotted path such as
@@ -1023,7 +1029,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk run` | Boot an image, Dockerfile target, or compose fleet; run a command or shell. |
 | `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk, or a Windows Dockerfile into a bundle. |
 | `vk exec` | Run a command in an existing guest and return the command's exit status. |
-| `vk list` | List known VMs by project, including stopped VMs and compose services that have started. Select by name, pid or directory (`-r` includes subdirectories). Filter by status (`--running`, `--stopped`) or `--kind`. Use `-w` for the wide table or `--json` and `--field` for scripts. |
+| `vk list` | List known VMs by project, including stopped VMs and compose services that have started. Select by name, pid or directory (`-r` includes subdirectories). Filter by status (`--running`, `--stopped`), `--kind` or `--problems`. Use `-w` for the wide table or `--json` and `--field` for scripts. |
 | `vk start`, `vk stop`, `vk restart`, `vk delete` | Select a VM by name, pid or directory. Only `stop` accepts an unnamed primary or `--all`. Select a service by `NAME/SERVICE`, or by `PID/SERVICE` for start, stop and restart. Deleting a service requires a stopped parent VM. `start`, `stop`, `restart` and `delete` accept multiple references. Use `stop --force` to escalate after 5 seconds or `stop --kill` to cut power immediately. |
 | `vk rename` | Give a VM another name. |
 | `vk reset` | Remove a stopped dev environment's boot images or persistent data. |
