@@ -978,27 +978,26 @@ pub struct Stopped {
     pub all_down: bool,
 }
 
-/// Stop the environment at `state_dir` and its publishers. Taking a directory rather
-/// than a plan lets `vk dev stop NAME` work host-wide without a config.
+/// Stop the environment at `state_dir` and its publishers: the VM on that state dir alone,
+/// never one whose project directory it is. Taking a directory rather than a plan lets
+/// `vk stop NAME` stop an environment of any workspace.
 pub fn stop(state_dir: &Path, timeout: u64) -> Result<Stopped> {
     // Stopping what is already stopped is the state asked for, not a failure — a script
     // that ends a session need not know whether the VM outlived it. Relays cannot outlive
     // the VM, but their records can; clear those too.
-    if vm_at(state_dir).is_none() {
+    let Some(vm) = vm_at(state_dir) else {
         crate::publish::stop_all_quietly(state_dir, Duration::from_secs(5));
         return Ok(Stopped {
             report: format!("dev environment not running ({})\n", state_dir.display()),
             all_down: true,
         });
-    }
-    let (report, all_down) = crate::vms::stop_cmd(
-        Some(crate::vms::Selector::Dir {
-            dir: state_dir.to_path_buf(),
-            below: false,
-        }),
-        false,
-        timeout,
-    )?;
+    };
+    let (report, all_down) = crate::vms::stop_entry(&vm, timeout).with_context(|| {
+        format!(
+            "the environment on {} is held by another run",
+            state_dir.display()
+        )
+    })?;
     Ok(Stopped { report, all_down })
 }
 
@@ -1477,6 +1476,35 @@ mod tests {
             read_not_ready(&plan).is_none(),
             "the readier's marker is dropped"
         );
+    }
+
+    /// A stop takes the VM on its state dir alone, not a run whose project that dir is; one
+    /// already down is the state asked for.
+    #[test]
+    fn stop_takes_the_vm_on_its_state_dir_alone() {
+        let homes = crate::dev::testutil::Homes::new("session-stop-exact");
+        let plan = plan_in(homes.dir());
+        let (_env, mut env) = crate::dev::testutil::register_vm_in_child(&plan, false);
+        // A `vk run` started from inside the environment's state dir.
+        let run_dir = homes.dir().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut run = crate::dev::testutil::StandIn::locking(&run_dir, false);
+        let entry = serde_json::from_value(serde_json::json!({
+            "state_dir": crate::vms::canonical(&run_dir),
+            "project_dir": crate::vms::canonical(&plan.state_dir),
+            "pid": run.id(),
+            "label": "run",
+            "exec_addr": "unused",
+            "created_secs": 7
+        }))
+        .unwrap();
+        let _run = crate::vms::register(entry);
+        let stopped = stop(&plan.state_dir, 5).unwrap();
+        assert!(stopped.all_down, "{}", stopped.report);
+        assert!(!env.alive(), "{}", stopped.report);
+        assert!(run.alive(), "{}", stopped.report);
+        let again = stop(&plan.state_dir, 5).unwrap();
+        assert!(again.all_down && again.report.contains("not running"));
     }
 
     #[test]

@@ -1541,7 +1541,7 @@ async fn ask_with(
         "{}",
         reply.body
     );
-    let asked: String = ["pid", "started", "booted", "keep_images"]
+    let asked: String = ["pid", "started", "booted", "dir", "keep_images"]
         .into_iter()
         .filter(|f| reply.body.contains(&format!("name=\"{f}\"")))
         .map(|f| format!("&{f}={}", hidden(&reply.body, f)))
@@ -1939,7 +1939,8 @@ esac"#,
 
 /// `/dev` lists what `vk dev list` lists, stopped environments too: a stopped one starts in
 /// its workspace with no question, a running one stops once a question about its boot is
-/// answered, and only a stale one is offered for removal.
+/// answered, and only a stale one `vk` says `vk delete` removes whole is offered for removal.
+/// Stop and Remove use the confirmed state directory.
 #[tokio::test(flavor = "multi_thread")]
 async fn dev_environments_are_started_stopped_and_cleaned_up() {
     let vk = stub_vk(
@@ -1950,13 +1951,17 @@ booted=$(cat "$d/booted" 2>/dev/null || echo 1790755000)
 case "$1 $2" in
 "dev list") cat <<JSON
 [{"name":"app-1111","dir":"/s/app-1111","workspace":"/src/app","environment":"dev","status":"stopped","created_by":null,"booted_secs":1790755279,"age_secs":5,"mem_used_bytes":null,"mem":null,"flags":[]},
- {"name":"old-2222","dir":"/s/old-2222","workspace":"/gone/old","environment":"dev","status":"stopped","created_by":null,"booted_secs":null,"age_secs":null,"mem_used_bytes":null,"mem":null,"flags":["workspace-missing"]},
+ {"name":"old-2222","dir":"$(cat "$d/old" 2>/dev/null || echo /s/old-2222)","workspace":"/gone/old","environment":"dev","status":"stopped","created_by":null,"booted_secs":null,"age_secs":null,"mem_used_bytes":null,"mem":null,"flags":["workspace-missing"],"deletable":true},
  {"name":"run-3333","dir":"/s/run-3333","workspace":"/src/run","environment":"dev","status":"running","booted_secs":$booted,"flags":[]},
  {"name":"dash-4444","dir":"/s/dash-4444","workspace":"-w","environment":"--yes","status":"stopped","booted_secs":1,"flags":[]},
+ {"name":"tmp-5555","dir":"/s/tmp-5555","workspace":null,"environment":null,"status":"never-booted","flags":["ephemeral"]},
+ {"name":"aged-6666","dir":"/s/aged-6666","workspace":"/gone/aged","environment":"dev","status":"stopped","booted_secs":1,"flags":["workspace-missing"]},
+ {"name":"nodir-7777","workspace":"/gone/nodir","environment":"dev","status":"stopped","booted_secs":1,"flags":["workspace-missing"],"deletable":true},
+ {"name":"mix-9999","dir":"/s/mix-9999","workspace":"/gone/mix","environment":"dev","status":"stopped","booted_secs":1,"flags":["workspace-missing"],"deletable":false},
  {"name":"../evil","dir":"/x","workspace":null,"environment":null,"status":"stopped","flags":[]}]
 JSON
 ;;
-"dev up"|"dev gc"|"dev stop") ;;
+"dev up"|"dev stop"|"delete --yes") ;;
 *) exit 3 ;;
 esac"#,
     );
@@ -2003,6 +2008,25 @@ esac"#,
         "{}",
         page.body
     );
+    // One that never booted is left to `vk dev gc --all-stale`, which removes it whole.
+    assert!(
+        page.body.contains("<code>vk dev gc --all-stale</code>"),
+        "{}",
+        page.body
+    );
+    // A run recipe, missing ownership information or a missing state directory disables Remove.
+    for name in ["tmp-5555", "mix-9999", "aged-6666", "nodir-7777"] {
+        let reply = post_action(
+            addr,
+            &origin,
+            &cookie,
+            &format!("/dev/{name}/action"),
+            &format!("_csrf={csrf}&op=gc&confirm=yes"),
+            true,
+        )
+        .await;
+        assert_eq!(reply.status, 400, "{name}: {}", reply.body);
+    }
 
     let reply = post_action(
         addr,
@@ -2065,6 +2089,24 @@ esac"#,
     )
     .await;
     assert!(reply.body.contains("cannot be undone"), "{}", reply.body);
+    // The name taken by another state dir since the question: the answer is refused.
+    let old = vk.parent().unwrap().join("old");
+    let confirmed = ask(addr, &origin, &cookie, &csrf, "/dev/old-2222/action", "gc").await;
+    assert!(confirmed.contains("&dir=/s/old-2222&"), "{confirmed}");
+    std::fs::write(&old, "/s/new-2222").unwrap();
+    let reply = post_action(
+        addr,
+        &origin,
+        &cookie,
+        "/dev/old-2222/action",
+        &confirmed,
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    std::fs::remove_file(&old).unwrap();
+    // Removed by its state dir: a name taken by another VM as the command starts does not
+    // redirect it.
     let confirmed = ask(addr, &origin, &cookie, &csrf, "/dev/old-2222/action", "gc").await;
     let reply = post_action(
         addr,
@@ -2078,7 +2120,7 @@ esac"#,
     assert_eq!(reply.status, 200, "{}", reply.body);
     audited(
         &hub,
-        "`vk dev gc --yes -- old-2222` on dev environment old-2222 succeeded",
+        "`vk delete --yes -- /s/old-2222` on dev environment old-2222 succeeded",
     )
     .await;
 
@@ -2109,7 +2151,7 @@ esac"#,
     assert_eq!(reply.status, 200, "{}", reply.body);
     audited(
         &hub,
-        "`vk dev stop -- run-3333` on dev environment run-3333 succeeded",
+        "`vk dev stop --state-dir=/s/run-3333` on dev environment run-3333 succeeded",
     )
     .await;
 

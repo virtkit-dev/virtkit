@@ -121,6 +121,8 @@ pub struct Row {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
     pub flags: Vec<Flag>,
+    /// whether the directory passes the ownership check for deletion ([`owned`])
+    pub deletable: bool,
 }
 
 impl Row {
@@ -230,6 +232,27 @@ pub fn default_name(workspace: &Path, environment: &str) -> String {
     }
 }
 
+/// A recorded dev identity and the absence of a run recipe make `dir` a dev environment's
+/// alone, which `vk delete` removes whole. Forgetting a run recipe still leaves a directory
+/// with an unreadable identity ineligible.
+pub fn owned(dir: &Path) -> Result<()> {
+    let recipe = dir.join(crate::names::RECIPE);
+    match std::fs::symlink_metadata(&recipe) {
+        Ok(_) => bail!(
+            "{} also holds a run's {}: it is not known to be only a dev environment's",
+            dir.display(),
+            crate::names::RECIPE
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("inspecting {}", recipe.display())),
+    }
+    let path = dir.join("dev.json");
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_slice::<crate::dev::Identity>(&bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(())
+}
+
 /// A top-level entry of a state directory, for the listing `gc` prints before it removes.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Entry {
@@ -317,6 +340,7 @@ fn row(dir: &Path, running: &[Running], with_sizes: bool, with_flags: bool) -> R
         mem: live.and_then(|r| r.mem.clone()),
         size_bytes: with_sizes.then(|| crate::dev::storage::dir_size(dir)),
         flags,
+        deletable: owned(dir).is_ok(),
     }
 }
 
@@ -450,8 +474,7 @@ pub fn select_gc(
     all_stale: bool,
     resolve: impl Fn(&str) -> Result<Option<PathBuf>>,
 ) -> Result<Vec<Row>> {
-    // Unreachable from the CLI, where a bare `gc` passes its workspace's name; kept so an
-    // empty selection is an error, not a no-op.
+    // The CLI calls this only for `--all-stale`. Reject an empty selection from other callers.
     if names.is_empty() && !all_stale {
         bail!("name an environment to remove (`vk dev list`), or pass --all-stale");
     }
@@ -467,13 +490,14 @@ pub fn select_gc(
     refuse_running(selected)
 }
 
-/// Bare `gc` selects by the workspace's state directory to avoid name collisions.
-/// A workspace without state yields an empty selection.
-pub fn select_dir(rows: Vec<Row>, dir: &Path) -> Result<Vec<Row>> {
-    let dir = crate::vms::canonical(dir);
+/// The rows on the state dirs `dirs`, as `gc` resolved them in this workspace: by directory,
+/// so a name taken by another environment meanwhile does not redirect it. A dir without state
+/// selects nothing.
+pub fn select_dirs(rows: Vec<Row>, dirs: &[PathBuf]) -> Result<Vec<Row>> {
+    let dirs: Vec<PathBuf> = dirs.iter().map(|d| crate::vms::canonical(d)).collect();
     refuse_running(
         rows.into_iter()
-            .filter(|r| crate::vms::canonical(&r.dir) == dir)
+            .filter(|r| dirs.contains(&crate::vms::canonical(&r.dir)))
             .collect(),
     )
 }
@@ -481,14 +505,13 @@ pub fn select_dir(rows: Vec<Row>, dir: &Path) -> Result<Vec<Row>> {
 /// `selected`, unless one of them is running.
 fn refuse_running(selected: Vec<Row>) -> Result<Vec<Row>> {
     if let Some(row) = selected.iter().find(|r| r.status == Status::Running) {
-        bail!("{} is running — `vk dev stop {}` first", row.name, row.name);
+        bail!("{} is running — `vk stop {}` first", row.name, row.name);
     }
     Ok(selected)
 }
 
-/// The row `word` names, resolved by `resolve` — [`crate::names::resolve`], as `vk dev stop`
-/// resolves it — so a word that is one VM's name and another's state dir name is refused
-/// here as there, rather than one of them picked to destroy.
+/// Resolve `word` to a directory before selecting its row. [`crate::names::resolve`]
+/// rejects a VM name that also names a different state directory.
 pub fn find<'a>(
     rows: &'a [Row],
     word: &str,
@@ -563,7 +586,7 @@ pub fn remove(selected: &[Row], index: &crate::names::Index) -> Result<String> {
     for (row, _) in &locked {
         let canonical = std::fs::canonicalize(&row.dir).unwrap_or_else(|_| row.dir.clone());
         if running.iter().any(|r| *r == row.dir || *r == canonical) {
-            bail!("{} is running — `vk dev stop {}` first", row.name, row.name);
+            bail!("{} is running — `vk stop {}` first", row.name, row.name);
         }
     }
     let mut out = String::new();
@@ -820,6 +843,27 @@ mod tests {
         assert_eq!(rows[0].workspace, None);
         assert_eq!(rows[0].booted_secs, None);
         assert!(rows[0].stale());
+        assert!(!rows[0].deletable);
+    }
+
+    /// `vk delete` removes whole only a directory that recorded its boot and holds no run's
+    /// recipe beside it; the row says so with the same check.
+    #[test]
+    fn only_a_directory_that_is_a_dev_environment_s_alone_is_deletable() {
+        let tmp = scratch("deletable");
+        let base = tmp.0.join("state");
+        std::fs::create_dir_all(&base).unwrap();
+        let gone = tmp.0.join("gone");
+        booted(&base, "alone-aaaa", &gone, "vk 1");
+        let mixed = booted(&base, "mixed-bbbb", &gone, "vk 1");
+        std::fs::write(mixed.join(crate::names::RECIPE), "{}").unwrap();
+
+        let rows = scan(&base, &[], false);
+        let by = |name: &str| rows.iter().find(|r| r.name == name).unwrap();
+        assert!(by("alone-aaaa").deletable);
+        assert!(!by("mixed-bbbb").deletable);
+        assert_eq!(by("mixed-bbbb").status, Status::Stopped);
+        assert!(owned(&mixed).is_err());
     }
 
     #[test]
@@ -987,7 +1031,7 @@ mod tests {
             find(&rows, "app-aaaa-bbbb", resolver(&base)).unwrap().dir,
             b
         );
-        let own = select_dir(rows.clone(), &b).unwrap();
+        let own = select_dirs(rows.clone(), std::slice::from_ref(&b)).unwrap();
         assert_eq!(own.iter().map(|r| &r.dir).collect::<Vec<_>>(), [&b]);
         // A run takes over the name: the word is still two VMs', and a run is no dev row.
         idx.release(&b).unwrap();

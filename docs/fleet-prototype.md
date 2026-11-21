@@ -2551,17 +2551,22 @@ their terminal escape sequences dropped whole. A VM whose state dir the list can
 is — a byte that is not UTF-8, a control character — is neither read nor acted on by its path:
 `vk workloads` derives the ID from the path's bytes, and the path shown no longer hashes to it.
 
-An operator's session acts by running `vk` as a shell would. A pinned run is stopped (`vk
-stop`) or rebooted (`vk reboot`), named by the pid of its `vk run` — `vk stop <dir>` would take
-the VMs of every directory below too — or by its state dir when the list has no pid; a dev
-environment is stopped with `vk dev stop`. `/dev` lists every environment `vk dev list` knows,
-stopped ones included, read as the page loads and reused for five seconds: a stopped one is
-started again in its recorded workspace (`vk dev up --workspace … --environment …`), and a
-stale one — its workspace gone, or no identity recorded — removed (`vk dev gc --yes --
-<name>`). A CI job is the executor's and has no action.
+The hub runs `vk stop` or `vk reboot` for a pinned run, using its `vk run` pid or, if the
+listing has no pid, its state directory. `vk dev stop --state-dir` needs no workspace. It
+stops only the VM using that state directory and succeeds if the VM is already down. The
+executor controls CI jobs.
+
+`/dev` reads `vk dev list` on page load and caches the result for five seconds, including
+stopped environments. Start runs `vk dev up --workspace … --environment …` in the recorded
+workspace. Stop and Remove use the confirmed state directory so reassigning a name cannot
+redirect either action. For a stopped environment whose workspace is gone, Remove runs
+`vk delete --yes -- <state dir>` only if the listing confirms directory ownership. A run
+recipe or missing boot record prevents removal. For an environment that never booted, the
+page points to `vk dev gc --all-stale`.
 
 Stops, reboots and removals require confirmation from the same session, once and within ten
-minutes. The target must still match: the run's pid and start, or the environment's last boot.
+minutes. The target must still match the run's pid and start, or the environment's last boot
+and state directory.
 
 Actions run in the background, one at a time per target, with a 5-minute limit (one hour for
 `vk dev up`). On timeout, the process group receives SIGTERM, then SIGKILL 2 minutes later.

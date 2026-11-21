@@ -548,11 +548,12 @@ inside state, configured managed directories and managed editor data. Their cont
 are lost. `--images --storage` and `--all` select both categories.
 
 ```sh
-vk dev prune NAME --all             # prune another environment by its `vk dev list` name
+vk dev prune NAME --all             # prune another environment of this workspace, by name
 ```
 
 For `NAME`, use the environment name from `vk list` or `vk dev list`, or its state
-directory's name. Either works host-wide without a workspace config. Prune uses the storage
+directory's name. `vk dev prune NAME` takes an environment of this workspace only; `vk reset
+NAME` takes one of any workspace, without a workspace config. Prune uses the storage
 recorded at the last boot, even if the workspace has moved or changed. `vk reset NAME`
 accepts the same options and requires a readable dev identity with no run recipe beside it.
 An environment booted by a `vk` from before
@@ -589,10 +590,12 @@ vk dev gc ENVIRONMENT_NAME --yes
 vk dev gc
 ```
 
-`list`, `gc NAME` and `gc --all-stale` work from anywhere without a project
-config. A bare `gc`, like `stop`, reads the config and takes only this
-workspace's environment, not its task leftovers; if that environment has no
-state, it reports nothing to remove. At first boot, an environment gets a stable name
+`list` and `gc --all-stale` work from anywhere without a project config;
+`--all-stale` takes no name. `gc NAME`, like `stop NAME` and `prune NAME`, reads the config
+and rejects a VM outside this workspace (exit 2). `vk delete NAME` can remove a stopped
+recorded dev environment from any workspace, even if the workspace directory is gone. A
+bare `gc` takes only this workspace's environment, not its task leftovers; if that
+environment has no state, it reports nothing to remove. At first boot, an environment gets a stable name
 from its workspace directory, with `-ENV` appended for environments other than `dev`.
 Collisions add `-2`, `-3`, and so on. A listing or name lookup assigns names to older
 environments. Use `vk rename` to change an environment's name. Use that name with `vk start`, `vk stop`, `vk delete`
@@ -600,7 +603,8 @@ and other VM commands. `vk list` shows the
 environment's active and previously started compose services under `NAME/SERVICE`. The state
 directory's name also works, including any leading `.` or `-`
 (e.g. `app-3f9c0d1e2a4b5c6d`, shown as `dir_name` in `vk dev list --json`). A task's leftover
-state uses only its directory name. Use `vk dev gc NAME` to remove its stopped state.
+state uses only its directory name, and records no workspace: `vk dev gc --all-stale`
+removes it once stopped.
 For a stopped environment, `vk delete NAME` removes the directory only if it holds a
 valid recorded identity and no run recipe. If `NAME` identifies two different directories,
 use the other name of the environment you want. The `MEM` column
@@ -922,7 +926,7 @@ shape for inspection, not a complete script to execute.
 
 | Symptom | Next step |
 | --- | --- |
-| No config found | Run `init` at the checkout root or pass `--workspace DIR`. |
+| Workspace search found no config (exit 5) | Run `init` at the checkout root, `cd` into the project, pass `--workspace DIR` or set `VIRTKIT_WORKSPACE=DIR`. |
 | Unknown key or invalid source combination | Check the error's file location, local overrides and schema; select one source. |
 | Missing `${localEnv:NAME}` | Export it, add it to `local.env`, or declare an intentional default. |
 | Wrong files or permissions in the guest | Inspect `workspace`, mount paths, the image's user and UID/GID build arguments. |
@@ -943,8 +947,10 @@ Logs remain readable after exit. Filter with `--kernel`, `--agent`, `--guest` or
 
 All project commands accept `--workspace DIR`, `--dev-config FILE`,
 `--environment NAME`, `--freshness POLICY`, `--cache-registry REF|DIR|none` and
-`--cache-insecure` as global `vk dev` options. Use `vk dev COMMAND --help` for
-individual options.
+`--cache-insecure` as global `vk dev` options. `--workspace` overrides `$VIRTKIT_WORKSPACE`.
+With neither, `--dev-config` locates the workspace if supplied. Otherwise, a command that
+needs a workspace searches from the current directory and exits 5 if it finds no config.
+Use `vk dev COMMAND --help` for individual options.
 
 | Command | Purpose |
 | --- | --- |
@@ -965,9 +971,9 @@ individual options.
 | `logs` | Read or follow primary/service console output. |
 | `doctor` | Check the host and resolved requirements. |
 | `plan` | Inspect the resolved config; `--explain`, `--diff`, `--format`, `--show-secrets`. |
-| `stop` | Stop the environment and publishers; `--timeout SECONDS`. |
+| `stop [NAME]` | Stop the environment and publishers, or another environment of this workspace; `--timeout SECONDS`. |
 | `storage list`, `storage reset NAME` | Inspect storage or destroy a durable item's data. |
-| `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. Select a stopped environment by name from any directory. |
+| `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. `NAME` selects a stopped environment in this workspace. Use `vk reset NAME` for a stopped dev environment with a valid identity and no run recipe in any workspace. |
 | `list` | Host-wide environment inventory (on-disk sizes by default); `--no-sizes`, `--json`. |
-| `gc [NAME…]` | Remove stopped state. With no names, remove this workspace's environment. Supports `--all-stale` and `--yes`. For a stopped environment with a valid recorded identity and no run recipe, [`vk delete NAME`](../README.md#manage-vms) also removes its state. |
+| `gc [NAME…]` | Remove stopped state of this workspace's environments. With no names, remove this workspace's environment. `--all-stale` (host-wide, no names) and `--yes`. For a stopped environment with a valid recorded identity and no run recipe, [`vk delete NAME`](../README.md#manage-vms) also removes its state, from any workspace. |
 | `schema` | Print the configuration JSON Schema. |

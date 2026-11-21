@@ -1012,7 +1012,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk check` | Validate KVM, VMM, embedded assets, configured host features, and an optional minimum `vk` version. |
 | `vk gc` | Reclaim unused image bases, CI checkouts, image-cache chunks, the local build cache past its retention and size cap, the images of long-unused dev environments and run state dirs, and scratch left by killed builds and runs, then summarize what went and what stayed; `--dry-run` only reports. `vk run` (not of a UEFI bundle), `vk build`, `vk export`, `vk registry pull` and a booting `vk dev` start a pass in the background once a day, and sooner when the disk runs low. |
 | `vk update` | Check for or install a digest-verified GitHub release. |
-| `vk dev ...` | Boot, enter, refresh and stop a project's development environment from `.virtkit/config.toml`; its services, endpoints, storage, tasks and editor. `vk dev list\|gc` covers every environment on the host. |
+| `vk dev ...` | Boot, enter, refresh and stop a project's development environment from `.virtkit/config.toml`; its services, endpoints, storage, tasks and editor. `vk dev list` lists every environment on the host. `vk dev gc --all-stale` removes stopped environments whose workspace is gone or that never recorded a boot. |
 | `vk toolchain lock\|install\|export\|status` | Pin a project's virtkit release and install its artifacts from the lock. |
 | `vk-agent service up\|down\|reboot\|status` | Control compose services from the primary guest; a full `vk` there has `vk service`. |
 | `vk registry ...` | Publish, fetch, inspect, report on, or sweep OCI stores. |

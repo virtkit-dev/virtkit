@@ -113,8 +113,7 @@ impl Target {
     }
 }
 
-/// Prune inputs from the current plan (`vk dev prune`) or recorded `dev.json`
-/// (`vk dev prune NAME`, host-wide without a config).
+/// Bare `vk dev prune` uses the current plan. Named prune and `vk reset` use `dev.json`.
 struct Env {
     state_dir: PathBuf,
     /// only labels the preview
@@ -428,17 +427,8 @@ pub(super) fn run(plan: &Plan, opts: &Options) -> Result<String> {
     run_env(&env_of_plan(plan)?, opts, default_confirm)
 }
 
-/// `vk dev prune NAME`: prune host-wide without a config, using the state-directory
-/// name shared by `vk dev list` and `vk dev gc`.
-pub(super) fn run_by_name(name: &str, opts: &Options) -> Result<String> {
-    // Resolve against the same host-wide listing `vk dev list` shows, so an unknown name
-    // fails here the way it does there.
-    let rows = super::list::state(false)?;
-    let row = super::list::find(&rows, name, crate::names::resolve)?;
-    run_env(&env_of_state(&row.dir), opts, default_confirm)
-}
-
-/// Prune the state directory already resolved and checked by `vk reset`.
+/// Prune the state directory already resolved and checked, by `vk reset` or by
+/// `vk dev prune NAME`, from what it recorded at its last boot.
 pub(crate) fn run_in(dir: &Path, opts: &Options) -> Result<String> {
     run_env(&env_of_state(dir), opts, default_confirm)
 }
@@ -1323,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_by_name_resolves_host_wide_state_and_reports_an_unknown_name() {
+    fn prune_in_a_state_dir_goes_by_what_it_recorded() {
         const CHILD: &str = "VK_TEST_PRUNE_BY_NAME";
         if std::env::var_os(CHILD).is_some() {
             let dir = super::super::plan::dev_state_base()
@@ -1348,8 +1338,8 @@ mod tests {
                 readied_by_its_boot: true,
             };
             std::fs::write(dir.join("dev.json"), serde_json::to_vec(&identity).unwrap()).unwrap();
-            run_by_name(
-                "proj-1a2b",
+            run_in(
+                &dir,
                 &Options {
                     all: true,
                     yes: true,
@@ -1361,13 +1351,6 @@ mod tests {
             assert!(!dir.join("root.qcow2").exists()); // images
             assert!(!dir.join("roots").exists()); // fixed storage
             assert!(dir.join("id_ed25519").exists()); // identity, kept
-            let err = run_by_name("absent", &Options::default())
-                .unwrap_err()
-                .to_string();
-            assert!(
-                err.contains("no dev environment state named absent"),
-                "{err}"
-            );
             return;
         }
         let _guard = super::super::testutil::env_guard();
@@ -1375,7 +1358,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "dev::prune::tests::prune_by_name_resolves_host_wide_state_and_reports_an_unknown_name",
+                "dev::prune::tests::prune_in_a_state_dir_goes_by_what_it_recorded",
                 "--nocapture",
             ])
             .env(CHILD, "1")

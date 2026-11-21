@@ -1277,9 +1277,40 @@ pub fn worktree_root(dir: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// The caller is in no workspace and named none: nothing says which project `vk dev` is to
+/// work on. Its own error, so `vk dev` can tell it from a workspace whose config is wrong
+/// and say how one is chosen.
+#[derive(Debug)]
+pub struct NoWorkspace {
+    /// where a config was looked for
+    pub looked: String,
+}
+
+impl std::fmt::Display for NoWorkspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no {CONFIG_FILE} in {} — `vk dev init` writes one, --workspace names the project, \
+             --dev-config names the file",
+            self.looked
+        )
+    }
+}
+
+impl std::error::Error for NoWorkspace {}
+
+/// The environment variable that names the workspace when `--workspace` does not.
+pub const WORKSPACE_ENV: &str = "VIRTKIT_WORKSPACE";
+
+/// `--workspace` overrides a nonempty [`WORKSPACE_ENV`]. With neither, [`discover`] uses
+/// `--dev-config` if supplied or searches from the current directory.
+pub fn chosen_workspace(flag: Option<PathBuf>, env: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    flag.or_else(|| env.filter(|v| !v.is_empty()).map(PathBuf::from))
+}
+
 /// Find the config for a caller in `from`, failing when the project has none. `--workspace`
-/// names the root outright and `--dev-config` names the file, whose own directory's parent
-/// is then the workspace unless `--workspace` says otherwise.
+/// sets the workspace root. With only `--dev-config`, use the file's directory as the
+/// workspace, or its parent when the directory is `.virtkit`.
 pub fn discover(from: &Path, workspace: Option<&Path>, config: Option<&Path>) -> Result<Files> {
     let (workspace, config) = match (workspace, config) {
         (Some(w), Some(c)) => (absolute(w)?, absolute(c)?),
@@ -1307,10 +1338,7 @@ pub fn discover(from: &Path, workspace: Option<&Path>, config: Option<&Path>) ->
                     }
                     _ => from.display().to_string(),
                 };
-                bail!(
-                    "no {CONFIG_FILE} in {looked} — `vk dev init` writes one, --workspace names \
-                     the project, --dev-config names the file"
-                );
+                return Err(anyhow::Error::new(NoWorkspace { looked }));
             };
             return Ok(files);
         }

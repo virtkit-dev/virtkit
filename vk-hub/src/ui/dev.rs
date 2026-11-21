@@ -49,6 +49,9 @@ pub(super) fn dev_name(w: &Workload) -> Option<String> {
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct DevRow {
     pub name: String,
+    /// state directory, when present in the listing
+    #[serde(default)]
+    pub dir: Option<String>,
     pub workspace: Option<String>,
     pub environment: Option<String>,
     pub status: String,
@@ -56,6 +59,9 @@ pub(super) struct DevRow {
     pub booted_secs: Option<u64>,
     #[serde(default)]
     pub flags: Vec<String>,
+    /// whether `vk delete` removes its directory whole; absent from an older `vk`
+    #[serde(default)]
+    pub deletable: Option<bool>,
 }
 
 impl DevRow {
@@ -71,6 +77,20 @@ impl DevRow {
     /// identity recorded.
     pub(super) fn stale(&self) -> bool {
         !self.running() && (self.has("workspace-missing") || self.has("ephemeral"))
+    }
+
+    /// Stale, and removed whole by `vk delete`, as `vk dev list` says. That keeps the
+    /// directory of one that recorded no boot, or that also holds a run's recipe; a never
+    /// booted one is left to `vk dev gc --all-stale`. An older `vk` does not say, and its
+    /// rows are not offered for removal.
+    pub(super) fn removable(&self) -> bool {
+        self.stale() && self.deletable == Some(true) && self.dir().is_some()
+    }
+
+    /// Stop and Remove require an absolute state directory so name reuse cannot redirect
+    /// them. Start uses the recorded workspace and environment.
+    pub(super) fn dir(&self) -> Option<&str> {
+        self.dir.as_deref().filter(|d| d.starts_with('/'))
     }
 }
 
@@ -211,6 +231,9 @@ fn table(h: &mut Html, rows: &[DevRow], local: &Local, steer: Option<&Auth>) {
                 let path = format!("/dev/{}/action", r.name);
                 super::actions::op_form(h, auth, &path, op, label);
             }
+            if r.stale() && r.has("ephemeral") && !r.removable() {
+                h.raw("<span class=\"sub\">Never booted: <code>vk dev gc --all-stale</code> removes it.</span>");
+            }
             h.raw("</td>");
         }
         h.raw("</tr>");
@@ -228,9 +251,11 @@ pub(super) mod tests {
             name: "app-1234".into(),
             workspace: Some("/src/app".into()),
             environment: Some("dev".into()),
+            dir: Some("/s/app-1234".into()),
             status: status.into(),
             booted_secs: None,
             flags: flags.iter().map(|f| f.to_string()).collect(),
+            deletable: None,
         }
     }
 
@@ -243,6 +268,25 @@ pub(super) mod tests {
         assert!(!row("running", &["workspace-missing"]).stale());
         // A flag a newer `vk` adds is not taken for staleness.
         assert!(!row("stopped", &["pinned"]).stale());
+        // Removable only where `vk` says `vk delete` removes it whole, by its state dir.
+        let mut gone = row("stopped", &["workspace-missing"]);
+        assert!(!gone.removable(), "an older `vk` does not say");
+        gone.deletable = Some(true);
+        assert!(gone.removable());
+        gone.dir = None;
+        assert!(!gone.removable(), "no state dir to give `vk delete`");
+        gone.dir = Some("app-1234".into());
+        assert!(
+            !gone.removable(),
+            "a relative dir, which `vk` would read as a name"
+        );
+        // Not one that also holds a run's recipe, nor one running.
+        let mut mixed = row("stopped", &["workspace-missing"]);
+        mixed.deletable = Some(false);
+        assert!(!mixed.removable());
+        mixed.deletable = Some(true);
+        mixed.status = "running".into();
+        assert!(!mixed.removable());
     }
 
     /// The ID `vk workloads` derives from a state dir.

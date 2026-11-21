@@ -277,7 +277,7 @@ fn dev_images(cfg: &Config, req: &Request, base: &Path, sum: &mut Summary) {
                 }
             }
             Ok(crate::dev::prune::Reclaimed::Unrecorded) => sum.keep(format!(
-                "dev images: {}: its storage was never recorded — `vk dev prune {}` previews \
+                "dev images: {}: its storage was never recorded — `vk reset {} --dry-run` previews \
                  what it would take",
                 row.name, row.name
             )),
@@ -295,13 +295,13 @@ fn dev_images(cfg: &Config, req: &Request, base: &Path, sum: &mut Summary) {
     );
     for name in hooked {
         sum.keep(format!(
-            "dev images: {name} has hooks.create; reclaim with `vk dev prune {name}`"
+            "dev images: {name} has hooks.create; reclaim with `vk reset {name}`"
         ));
     }
     if !undated.is_empty() {
         sum.keep(format!(
             "dev images: last run by an older vk, so not known to be idle: {} — \
-             `vk dev prune NAME` reclaims their images",
+             `vk reset NAME` reclaims their images",
             undated.join(", ")
         ));
     }

@@ -313,14 +313,14 @@ pub fn plan_delete(
     Ok((stop, removal))
 }
 
-/// A dev directory must be directly under the dev base and pass [`owned_dev`]. A run directory
+/// A dev directory must be directly under the dev base and pass [`crate::dev::list::owned`]. A run directory
 /// must be directly under the run base and contain a regular [`crate::names::MADE`] file.
 /// Other directories may contain user files.
 fn made(t: &Target) -> bool {
     let (base, owned) = match t.kind {
         Kind::Dev => (
             crate::dev::plan::dev_state_base(),
-            owned_dev(&t.dir).is_ok(),
+            crate::dev::list::owned(&t.dir).is_ok(),
         ),
         _ => (
             crate::names::run_base(),
@@ -330,19 +330,6 @@ fn made(t: &Target) -> bool {
     let parent = vms::canonical(&t.dir).parent().map(Path::to_path_buf);
     let base = base.ok().map(|b| vms::canonical(&b));
     parent.is_some() && parent == base && owned
-}
-
-/// A recorded dev identity and the absence of a run recipe distinguish dev state here.
-/// Forgetting a run recipe still leaves a directory with an unreadable identity ineligible.
-fn owned_dev(dir: &Path) -> Result<()> {
-    if exists(&dir.join(crate::names::RECIPE))? {
-        bail!(
-            "{} also holds a run's {}: it is not known to be only a dev environment's",
-            dir.display(),
-            crate::names::RECIPE
-        );
-    }
-    recorded_identity(dir).map(drop)
 }
 
 /// Whether `path` exists; an error, not `false`, when that cannot be told.
@@ -1110,7 +1097,7 @@ pub fn reset(r: &OsStr, options: &crate::dev::prune::Options) -> Result<String> 
             t.name
         );
     }
-    owned_dev(&t.dir).with_context(|| format!("{} is not reset", t.name))?;
+    crate::dev::list::owned(&t.dir).with_context(|| format!("{} is not reset", t.name))?;
     crate::dev::prune::run_in(&t.dir, options)
 }
 

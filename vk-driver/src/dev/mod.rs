@@ -33,6 +33,7 @@ pub mod sshsetup;
 mod status;
 pub mod storage;
 mod table;
+pub mod targets;
 pub mod task;
 pub mod wsl;
 
@@ -258,8 +259,8 @@ pub(crate) mod testutil {
     }
 
     /// Like [`register_vm`], with `pid` as the managing process that stop signals. Since this
-    /// process holds the lock, `vk stop` and [`crate::dev::stop`] signal `pid`, while
-    /// [`crate::vms::stop_entry`] reads the entry as replaced and signals nothing.
+    /// process holds the lock, `vk stop DIR` signals `pid`, while [`crate::vms::stop_entry`]
+    /// and [`crate::dev::stop`] read the entry as replaced and signal nothing.
     pub(super) fn register_vm_as(
         plan: &Plan,
         pid: u32,

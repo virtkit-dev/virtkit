@@ -8,8 +8,8 @@ All notable changes to virtkit will be documented in this file.
 
 - `vk dev list` shows stable workspace-based names. `vk run --name` sets an explicit
   name. Runs with `--state-dir` or `--detach` get a name from what they boot.
-  Services-only compose runs stay unnamed. `vk stop`, `vk dev stop`, `gc`, `prune` and the
-  other VM commands take a name.
+  Services-only compose runs stay unnamed. `vk stop` and the other VM commands take a
+  name.
 - `vk start NAME` and `vk restart NAME` boot a dev environment from its workspace or
   replay a saved run in the background. Use `NAME/SERVICE` to start, stop or restart one
   compose service. `vk dev service down` accepts `--timeout`.
@@ -18,6 +18,10 @@ All notable changes to virtkit will be documented in this file.
   Use `--dry-run` to preview or `-y` or `-f` to confirm without a terminal.
 - `vk rename` changes a VM's name, and `vk ls` lists VMs.
 - `vk reset` removes a stopped dev environment's boot images or persistent data by name.
+- `$VIRTKIT_WORKSPACE` names the `vk dev` workspace. A `vk dev` command that needs a
+  workspace and has none exits 5.
+- In `vk dev list --json`, `deletable` tells whether `vk delete` recognizes the state
+  directory as belonging to the environment.
 
 ### Changed
 
@@ -31,6 +35,14 @@ All notable changes to virtkit will be documented in this file.
 - **A directory names exactly one project's VMs.** `vk list`, `stop`, `reboot`, `pause` and
   `resume` take the VMs of the directories below it only with `--recursive` (`-r`). A bare
   word is a VM name: write `./dir` for a directory.
+- `vk dev stop NAME`, `vk dev gc NAME` and `vk dev prune NAME` refuse VMs outside the
+  selected workspace (exit 2). Across workspaces, use `vk stop` to stop a VM, `vk delete`
+  to remove a stopped VM or `vk reset` to prune a stopped dev environment.
+  `vk dev gc --all-stale` searches the whole host and takes no names.
+- The hub can remove a stopped environment whose workspace is gone when `vk delete`
+  recognizes its state directory. Stop and Remove still target the confirmed environment
+  if its name changes. Stop leaves runs started inside that directory alone. Use
+  `vk dev gc --all-stale` for environments that never booted.
 
 ### Fixed
 

@@ -1,7 +1,10 @@
-//! Operator actions on this machine's VMs use the same `vk` commands as a shell: stop or
-//! reboot a pinned run (`vk stop`, `vk reboot`), stop a dev environment (`vk dev stop`),
-//! restart it in its workspace (`vk dev up`), or remove it once stale (`vk dev gc`).
-//! CI jobs remain under their runner's control.
+//! Operators stop or reboot pinned runs with `vk stop` or `vk reboot`. Dev environments
+//! start in their recorded workspace (`vk dev up`). Stop (`vk dev stop --state-dir`) and
+//! Remove (`vk delete`) use the confirmed state directory, so name reuse cannot redirect
+//! either action. Stop affects only that VM and succeeds if it is already down. Remove
+//! requires a stale environment whose listing confirms directory ownership. A missing identity
+//! or a run recipe prevents removal. Use `vk dev gc
+//! --all-stale` for environments that never booted. The runner controls CI jobs.
 //!
 //! Every action is a `POST` the UI's checks pass ([`super::check_post`]), done as the
 //! session's principal and recorded in the audit log before it runs and as it ends. One that
@@ -67,9 +70,7 @@ pub(super) fn vm_ops(w: &Workload) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-/// The `vk` arguments for `op` on `w`. A run is named by the pid of its `vk run` where the
-/// list has it — `vk stop <dir>` also stops the VMs of every directory below that one — and
-/// otherwise by its state dir, if the list shows that as it is.
+/// Prefer the `vk run` pid. Fall back to its exact state directory when the list has no pid.
 fn vm_command(w: &Workload, op: &str) -> Option<Vec<OsString>> {
     let target = || match w.pid {
         Some(pid) => Some(OsString::from(pid.to_string())),
@@ -78,12 +79,13 @@ fn vm_command(w: &Workload, op: &str) -> Option<Vec<OsString>> {
     match (w.kind, op) {
         (WorkloadKind::Run, "stop") => Some(vec!["stop".into(), "--".into(), target()?]),
         (WorkloadKind::Run, "reboot") => Some(vec!["reboot".into(), "--".into(), target()?]),
-        (WorkloadKind::Dev, "stop") => Some(vec![
-            "dev".into(),
-            "stop".into(),
-            "--".into(),
-            dev_name(w)?.into(),
-        ]),
+        // By its state dir, once the list shows it is a dev environment's.
+        (WorkloadKind::Dev, "stop") => {
+            dev_name(w)?;
+            let mut dir = OsString::from("--state-dir=");
+            dir.push(super::local::exact_state_dir(w)?);
+            Some(vec!["dev".into(), "stop".into(), dir])
+        }
         _ => None,
     }
 }
@@ -150,12 +152,15 @@ pub(super) async fn vm_action(
 pub(super) fn dev_ops(row: &DevRow) -> Vec<(&'static str, &'static str)> {
     let mut ops = Vec::new();
     if row.running() {
-        ops.push(("stop", "Stop"));
+        // Stop requires an absolute state directory.
+        if row.dir().is_some() {
+            ops.push(("stop", "Stop"));
+        }
     } else if row.workspace.is_some() && row.environment.is_some() && !row.has("workspace-missing")
     {
         ops.push(("start", "Start"));
     }
-    if row.stale() {
+    if row.removable() {
         ops.push(("gc", "Remove"));
     }
     ops
@@ -171,8 +176,7 @@ fn dev_command(row: &DevRow, op: &str) -> Option<(Vec<OsString>, Duration)> {
             vec![
                 "dev".into(),
                 "stop".into(),
-                "--".into(),
-                row.name.clone().into(),
+                format!("--state-dir={}", row.dir()?).into(),
             ],
             STOP_TIMEOUT,
         ),
@@ -188,11 +192,10 @@ fn dev_command(row: &DevRow, op: &str) -> Option<(Vec<OsString>, Duration)> {
         ),
         "gc" => (
             vec![
-                "dev".into(),
-                "gc".into(),
+                "delete".into(),
                 "--yes".into(),
                 "--".into(),
-                row.name.clone().into(),
+                row.dir()?.into(),
             ],
             STOP_TIMEOUT,
         ),
@@ -214,7 +217,7 @@ pub(super) async fn dev_action(
     };
     let op = super::field(&form, "op").unwrap_or("").to_string();
     // Read again, so a start goes to its recorded workspace and a removal only to one that is
-    // still stale.
+    // still stale. The state dir asked about is the one acted on.
     let rows = site
         .dev_list
         .get(&site.local, &ui.hub, Duration::ZERO)
@@ -260,8 +263,11 @@ pub(super) async fn dev_action(
             },
             op,
             detail: Html::new(),
-            // The boot it was asked about.
-            asked: vec![("booted", or_dash(row.booted_secs))],
+            // The boot it was asked about, and the state dir it is on.
+            asked: vec![
+                ("booted", or_dash(row.booted_secs)),
+                ("dir", or_dash(row.dir())),
+            ],
         };
         if let Some(asked) = ask_first(&site.questions, local::layout, htmx, &auth, &form, &ask)? {
             return Ok(asked);
@@ -719,12 +725,18 @@ mod tests {
         assert_eq!(ops(&row("running", &[])), ["stop"]);
         assert_eq!(ops(&row("running", &["workspace-missing"])), ["stop"]);
         assert_eq!(ops(&row("stopped", &[])), ["start"]);
-        // Its workspace gone: nothing to start it in.
-        assert_eq!(ops(&row("stopped", &["workspace-missing"])), ["gc"]);
+        // Its workspace gone: nothing to start it in, and removed only where `vk` says
+        // `vk delete` removes it whole.
+        let mut gone = row("stopped", &["workspace-missing"]);
+        assert!(ops(&gone).is_empty());
+        gone.deletable = Some(true);
+        assert_eq!(ops(&gone), ["gc"]);
         assert!(ops(&row("stopped", &["pinned"])) == ["start"]);
+        // Never booted: `vk delete` would keep its directory, so it is not offered.
         let mut bare = row("never-booted", &["ephemeral"]);
         bare.workspace = None;
-        assert_eq!(ops(&bare), ["gc"]);
+        assert!(ops(&bare).is_empty());
+        assert!(dev_command(&bare, "gc").is_none());
         let (args, _) = dev_command(&row("stopped", &[]), "start").unwrap();
         assert_eq!(
             args,
@@ -741,6 +753,22 @@ mod tests {
         );
         assert!(dev_command(&row("stopped", &[]), "gc").is_none());
         assert!(dev_command(&row("running", &[]), "start").is_none());
+        // Stop and Remove use the listed state directory. A missing directory disables both.
+        let mut running = row("running", &[]);
+        let (args, _) = dev_command(&running, "stop").unwrap();
+        assert_eq!(
+            args,
+            ["dev", "stop", "--state-dir=/s/app-1234"].map(OsString::from)
+        );
+        let (args, _) = dev_command(&gone, "gc").unwrap();
+        assert_eq!(
+            args,
+            ["delete", "--yes", "--", "/s/app-1234"].map(OsString::from)
+        );
+        running.dir = None;
+        gone.dir = None;
+        assert!(dev_ops(&running).is_empty() && dev_command(&running, "stop").is_none());
+        assert!(dev_ops(&gone).is_empty() && dev_command(&gone, "gc").is_none());
     }
 
     #[test]
@@ -750,10 +778,10 @@ mod tests {
         assert_eq!(vm_ops(&w), [("stop", "Stop")]);
         assert_eq!(
             vm_command(&w, "stop").unwrap(),
-            ["dev", "stop", "--", "app-1234"].map(OsString::from)
+            ["dev", "stop", "--state-dir=/s/app-1234"].map(OsString::from)
         );
         assert!(vm_command(&w, "reboot").is_none());
-        // A dev environment whose state dir the list shows altered: no name to stop it by,
+        // A dev environment whose state dir the list shows altered: nothing to stop it by,
         // and keyed by its ID.
         w.state_dir = "/s/app-12\u{fffd}34".into();
         assert!(vm_ops(&w).is_empty() && vm_command(&w, "stop").is_none());
