@@ -2674,32 +2674,35 @@ enum Cmd {
         #[arg(long)]
         stale: bool,
     },
-    /// Stop running VMs or a compose service
+    /// Stop running VMs or compose services
     ///
     /// For a running VM, send SIGTERM to its `vk run` process and wait for it to exit. This
     /// also stops its compose siblings. Use `NAME/SERVICE` to stop one service through its
     /// manager. The current project is the default. Use `--all` to stop every running VM.
+    /// Every REF is resolved first, then every VM is told to stop before any is waited for.
     #[command(display_order = 8)]
     Stop {
-        /// VM or service to stop (default: the current project)
+        /// VMs or services to stop (default: the current project)
         ///
         /// Select a VM by name or pid, or a service by `NAME/SERVICE` or `PID/SERVICE`. A path
         /// (absolute or starting with `./`, `../` or `~`) selects a project or state directory.
         /// Directories match exactly unless `--recursive`. Stopping a named VM also stops its
         /// published endpoints. An explicit reference to a stopped VM exits 1.
         #[arg(value_name = "REF")]
-        target: Option<std::ffi::OsString>,
+        targets: Vec<std::ffi::OsString>,
         /// with a directory (default: the current one), also every VM whose project is below it
         #[arg(short = 'r', long, conflicts_with = "all")]
         recursive: bool,
         /// stop every running vk VM
-        #[arg(long, conflicts_with = "target")]
+        #[arg(long, conflicts_with = "targets")]
         all: bool,
-        /// seconds to wait for VM shutdown or for each socket operation during a service stop
+        /// give up after this many seconds in all; 0 waits as long as it takes
         ///
-        /// A run allows a Linux guest one minute to power off and a Windows guest three, then 10
-        /// seconds to save its disks; the default leaves time for either run to exit without
-        /// reporting an orderly shutdown as stuck.
+        /// All VMs and services share this deadline. If a stop is unconfirmed when time
+        /// runs out, vk reports it and exits 1. Shutdowns already in progress continue.
+        /// Linux guests get up to one minute to power off. Windows guests get three
+        /// minutes, then up to 10 seconds to flush their disks. A shorter timeout can
+        /// expire while a guest is still shutting down.
         #[arg(long, default_value_t = 210, value_name = "SECS")]
         timeout: u64,
     },
@@ -4046,11 +4049,18 @@ async fn cli_main(cli: Cli) -> ExitCode {
             };
         }
         Cmd::Stop {
-            target,
+            targets,
             recursive,
             all,
             timeout,
-        } => return stop_ref(target.as_deref(), *recursive, *all, opts(*timeout)),
+        } => {
+            let deadline = match *timeout {
+                0 => vms::Deadline::NEVER,
+                secs => vms::Deadline::in_secs(secs),
+            };
+            let config = cli.config.as_deref();
+            return stop_refs(targets, *recursive, *all, config, deadline);
+        }
         _ => {}
     }
     if let Cmd::Reboot {
@@ -6284,29 +6294,32 @@ fn act_on_vms(
     report_vms(run(selector))
 }
 
-/// `vk stop [REF]`. The REF is read once: a name — a VM's or a service's — stops through
-/// its kind, and anything else as [`vms::stop_cmd`] selects it. An explicit REF that names
-/// nothing running exits 1, however it is spelled.
-fn stop_ref(
-    target: Option<&std::ffi::OsStr>,
+/// `vk stop [REF…]`. Each REF is read once, all of them before anything is stopped (a REF
+/// that cannot be read exits 2), then stopped together by [`lifecycle::stop`]. With none,
+/// the current directory's VMs, or `--all`, stop as [`vms::stop_cmd`] selects them.
+/// `deadline` bounds the whole of it.
+fn stop_refs(
+    targets: &[std::ffi::OsString],
     recursive: bool,
     all: bool,
-    opts: lifecycle::Opts,
+    config: Option<&Path>,
+    deadline: vms::Deadline,
 ) -> ExitCode {
-    let read =
-        target.map(|t| vms::Ref::parse(t).and_then(|r| vms::Selector::from_ref(r, recursive)));
-    let selector = match read.transpose() {
-        Ok(Some((sel @ vms::Selector::Named { .. }, service)))
-        | Ok(Some((sel, service @ Some(_)))) => return lifecycle::stop(sel, service, opts),
-        Ok(Some((sel, None))) => Some(sel),
-        Ok(None) if recursive => Some(vms::Selector::Here { below: true }),
-        Ok(None) => None,
+    if targets.is_empty() {
+        let selector = recursive.then_some(vms::Selector::Here { below: true });
+        return report_vms(vms::stop_cmd(selector, all, deadline));
+    }
+    let read: anyhow::Result<Vec<_>> = targets
+        .iter()
+        .map(|t| vms::Ref::parse(t).and_then(|r| vms::Selector::from_ref(r, recursive)))
+        .collect();
+    match read {
+        Ok(refs) => lifecycle::stop(refs, config, deadline),
         Err(e) => {
             eprintln!("vk: {e:#}");
-            return exit_code(2);
+            exit_code(2)
         }
-    };
-    report_vms(vms::stop_cmd(selector, all, opts.timeout))
+    }
 }
 
 /// Print what [`act_on_vms`]'s action reports; exit 1 unless it did it to every VM.
@@ -8618,13 +8631,15 @@ mod tests {
         let dir = homes.dir().join("state");
         std::fs::create_dir_all(&dir).unwrap();
         homes.name(&dir, "app");
-        let opts = lifecycle::Opts {
-            config: None,
-            timeout: 1,
-            build: false,
-        };
         for r in [std::ffi::OsStr::new("app"), dir.as_os_str()] {
-            assert_eq!(stop_ref(Some(r), false, false, opts), exit_code(1), "{r:?}");
+            let code = stop_refs(
+                &[r.to_owned()],
+                false,
+                false,
+                None,
+                vms::Deadline::in_secs(1),
+            );
+            assert_eq!(code, exit_code(1), "{r:?}");
         }
     }
 
@@ -8633,7 +8648,8 @@ mod tests {
     #[test]
     fn recursive_without_a_ref_is_the_current_directory_and_below() {
         let _homes = crate::dev::testutil::Homes::new("recursive");
-        let stop = |sel: Option<vms::Selector>| vms::stop_cmd(sel, false, 1);
+        let stop =
+            |sel: Option<vms::Selector>| vms::stop_cmd(sel, false, vms::Deadline::in_secs(1));
         // Nothing running: `-r` alone is done already, as plain `vk stop` is; `-r .` names
         // a directory and says nothing was there.
         assert_eq!(act_on_vms(None, true, stop), ExitCode::SUCCESS);

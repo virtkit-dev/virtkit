@@ -91,6 +91,8 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::vms::Deadline;
+
 /// VM probe interval and tolerated consecutive misses. Multiple misses prevent a busy
 /// agent from taking down a working publisher.
 const VM_PROBE_EVERY: Duration = Duration::from_secs(5);
@@ -213,23 +215,40 @@ fn lock_file(path: &Path) -> Result<std::fs::File> {
 
 /// Serialize managed commands. A racing `ensure` waits and observes its predecessor.
 fn op_lock(state_dir: &Path) -> Result<std::fs::File> {
-    let path = dir_of(state_dir).join(".op.lock");
-    let f = lock_file(&path)?;
-    // SAFETY: as `try_flock`; blocking, and only ever held for the length of a command.
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("locking {}", path.display()));
-    }
-    Ok(f)
+    op_lock_by(state_dir, Deadline::NEVER)
 }
 
-/// Open the operation lock without creating state. `Ok(None)` means this state directory
-/// has never published; read-only commands must not leave directories behind.
-fn op_lock_existing(state_dir: &Path) -> Result<Option<std::fs::File>> {
+/// [`op_lock`], waiting for it no longer than `deadline`.
+fn op_lock_by(state_dir: &Path, deadline: Deadline) -> Result<std::fs::File> {
+    let path = dir_of(state_dir).join(".op.lock");
+    let f = lock_file(&path)?;
+    let how = match deadline.left() {
+        None => libc::LOCK_EX,
+        Some(_) => libc::LOCK_EX | libc::LOCK_NB,
+    };
+    loop {
+        // SAFETY: as `try_flock`; only ever held for the length of a command.
+        if unsafe { libc::flock(f.as_raw_fd(), how) } == 0 {
+            return Ok(f);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(err).with_context(|| format!("locking {}", path.display()));
+        }
+        if deadline.passed() {
+            bail!("locking {}: out of time", path.display());
+        }
+        std::thread::sleep(deadline.cap(Duration::from_millis(50)));
+    }
+}
+
+/// Return `None` if there is no publisher directory. Read-only commands must leave
+/// that directory absent. Otherwise wait for the operation lock until `deadline`.
+fn op_lock_existing(state_dir: &Path, deadline: Deadline) -> Result<Option<std::fs::File>> {
     if !dir_of(state_dir).is_dir() {
         return Ok(None);
     }
-    op_lock(state_dir).map(Some)
+    op_lock_by(state_dir, deadline).map(Some)
 }
 
 /// Claim a publisher's lifetime lock. `Some` transfers or releases the claim; `None`
@@ -689,7 +708,7 @@ async fn vm_gone(agent_addr: &SocketAddr) {
 /// created for it. Blocks behind a `vk publish ensure|stop` in flight on the same state
 /// dir: roughly `stop`'s timeout per publisher it waits on.
 pub fn live(state_dir: &Path) -> Result<Vec<(Entry, Liveness)>> {
-    Ok(match op_lock_existing(state_dir)? {
+    Ok(match op_lock_existing(state_dir, Deadline::NEVER)? {
         Some(_op) => live_entries(state_dir),
         None => Vec::new(),
     })
@@ -773,9 +792,25 @@ fn age(secs: u64) -> String {
 /// Stop selected publishers and wait for their lifetime locks. Retain records for
 /// publishers that do not stop because their addresses may remain bound.
 pub fn stop(state_dir: &Path, name: Option<&str>, timeout: Duration) -> Result<(String, bool)> {
-    let Some(_op) = op_lock_existing(state_dir)? else {
+    stop_by(state_dir, name, timeout, Deadline::NEVER, &|| true)
+}
+
+/// [`stop`], giving each publisher `timeout` and the whole of it no longer than `deadline`,
+/// and stopping none unless `still` holds once the operation lock is taken: no publisher is
+/// added while it is held.
+fn stop_by(
+    state_dir: &Path,
+    name: Option<&str>,
+    timeout: Duration,
+    deadline: Deadline,
+    still: &dyn Fn() -> bool,
+) -> Result<(String, bool)> {
+    let Some(_op) = op_lock_existing(state_dir, deadline)? else {
         return Ok((format!("no publishers for {}\n", state_dir.display()), true));
     };
+    if !still() {
+        return Ok((String::new(), true));
+    }
     let selected: Vec<(Entry, Liveness)> = live_entries(state_dir)
         .into_iter()
         .filter(|(e, _)| name.is_none_or(|n| n == e.name))
@@ -815,6 +850,7 @@ pub fn stop(state_dir: &Path, name: Option<&str>, timeout: Duration) -> Result<(
         };
         // SAFETY: kill only delivers a signal; an already-exited pid fails harmlessly.
         unsafe { libc::kill(pid, libc::SIGTERM) };
+        let timeout = deadline.cap(timeout);
         if wait_gone(state_dir, &e.name, timeout) {
             forget_entry(state_dir, &e.name);
             out.push_str(&format!("stopped {} ({} -> {})\n", e.name, e.listen, e.to));
@@ -834,6 +870,28 @@ pub fn stop(state_dir: &Path, name: Option<&str>, timeout: Duration) -> Result<(
 /// Stop all publishers during VM teardown without reporting a secondary result.
 pub fn stop_all_quietly(state_dir: &Path, timeout: Duration) {
     let _ = stop(state_dir, None, timeout);
+}
+
+/// [`stop_all_quietly`], five seconds per publisher, the whole of it within `deadline`, and
+/// only while `still` holds under the operation lock.
+pub fn stop_all_within(state_dir: &Path, deadline: Deadline, still: &dyn Fn() -> bool) {
+    let _ = stop_by(state_dir, None, Duration::from_secs(5), deadline, still);
+}
+
+/// [`stop`] of publisher `name`, five seconds for it, only while `still` holds under the
+/// operation lock.
+pub fn stop_while(
+    state_dir: &Path,
+    name: &str,
+    still: &dyn Fn() -> bool,
+) -> Result<(String, bool)> {
+    stop_by(
+        state_dir,
+        Some(name),
+        Duration::from_secs(5),
+        Deadline::NEVER,
+        still,
+    )
 }
 
 /// Whether `fd` is a regular file — the shape of the lifetime lock.
@@ -936,6 +994,13 @@ fn wait_gone(state_dir: &Path, name: &str, timeout: Duration) -> bool {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Hold `state_dir`'s publisher operation lock, as a `vk publish` in flight there does.
+#[cfg(test)]
+pub(crate) fn hold_op_lock(state_dir: &Path) -> std::fs::File {
+    make_dir(state_dir).unwrap();
+    op_lock(state_dir).unwrap()
 }
 
 /// Model a live publisher by holding its lifetime lock beside its record, for tests here and

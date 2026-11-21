@@ -154,6 +154,16 @@ pub fn resolve_selected(
     among: Among,
     unnamed: bool,
 ) -> Result<Target> {
+    resolve_running(sel, service, among, unnamed).map(|(t, _)| t)
+}
+
+/// [`resolve_selected`], with the record of the running VM it went by, if it went by one.
+fn resolve_running(
+    sel: Selector,
+    service: Option<String>,
+    among: Among,
+    unnamed: bool,
+) -> Result<(Target, Option<VmEntry>)> {
     let idx = crate::names::Index::open()?;
     let known = match &sel {
         Selector::Named { name, dir } => Some(Candidate {
@@ -172,8 +182,8 @@ pub fn resolve_selected(
         }
         Selector::Pid(_) => None,
     };
-    let (name, dir, kind) = match known {
-        Some(c) => (c.name, c.dir, c.kind),
+    let (name, dir, kind, found) = match known {
+        Some(c) => (c.name, c.dir, c.kind, None),
         // Nothing named there: a running VM still answers to its pid or its directory.
         None => {
             let entry = vms::one_running(Some(sel))?;
@@ -193,15 +203,16 @@ pub fn resolve_selected(
                     entry.pid
                 ),
             };
-            (name, entry.state_dir, kind)
+            (name, entry.state_dir.clone(), kind, Some(entry))
         }
     };
-    Ok(Target {
+    let t = Target {
         name,
         dir,
         kind,
         service,
-    })
+    };
+    Ok((t, found))
 }
 
 /// The running VM on `dir`, if any.
@@ -532,8 +543,7 @@ fn succeeds(mut cmd: std::process::Command, what: &str, cached: bool) -> Result<
 
 /// Return the service manager's reply, or its error with the service name. A `cached`
 /// start boots only an image already built: one that is not fails with a
-/// [`crate::build::NotBuilt`]. For stops, `timeout` bounds each socket read and write in
-/// seconds.
+/// [`crate::build::NotBuilt`]. For stops, `timeout` bounds each connect, read and write in seconds.
 fn control_unit(
     ctl: &Path,
     shown: &str,
@@ -550,7 +560,21 @@ fn control_unit(
         (false, _) => Request::Stop { unit },
     };
     let timeout = (!up).then(|| Duration::from_secs(timeout));
-    let reply = vms::control(ctl, &req, timeout, |line| eprintln!("{line}"))
+    ask(
+        vms::Control::open(ctl, vms::Deadline::NEVER, timeout, None),
+        shown,
+        &req,
+    )
+}
+
+/// Send `req` over `conn` to a service manager: [`control_unit`]'s reply, or its error.
+fn ask(
+    conn: Result<vms::Control>,
+    shown: &str,
+    req: &vk_core::fleetctl::Request,
+) -> Result<String> {
+    let reply = conn
+        .and_then(|c| c.request(req, |line| eprintln!("{line}")))
         .with_context(|| format!("{shown}: asking its VM's service manager"))?;
     if reply.not_built {
         return Err(crate::build::NotBuilt(format!("{shown}: {}", reply.message)).into());
@@ -650,19 +674,159 @@ pub fn start(refs: &[OsString], o: Opts) -> ExitCode {
     worst(codes)
 }
 
-/// `vk stop` of a REF already read that names a VM or a compose service: through its kind.
-/// A running VM without a name goes by its pid. One that is not running exits 1.
-pub fn stop(sel: Selector, service: Option<String>, o: Opts) -> ExitCode {
-    let result = resolve_selected(sel, service, Among::ProjectVm, true).and_then(|t| {
-        let up = running_on(&t.dir).is_some();
-        if !up && t.kind == Kind::Dev && t.service.is_none() {
-            // What an environment published can outlive it on record: cleared, as
-            // `vk dev stop` does for one already down.
-            crate::publish::stop_all_quietly(&t.dir, Duration::from_secs(5));
+/// A compose service `vk stop` stops through its VM's service manager, and the run of that
+/// VM it was selected on: its record, and the run itself, held.
+struct ServiceStop {
+    t: Target,
+    entry: VmEntry,
+    run: vms::Held,
+}
+
+/// What one REF given to `vk stop` comes to.
+enum Stopping {
+    Service(Box<ServiceStop>),
+    /// running VMs, stopped together with every other REF's
+    Vms(Vec<VmEntry>),
+}
+
+/// Resolve one REF of `vk stop`, already read. A name or a service goes through its kind,
+/// a running VM without a name by its pid; one that is not running is an error. A pid or a
+/// directory takes every running VM it matches, and none is an error. A dev environment
+/// already down is added to `stale`, for what it published to be cleared.
+fn stopping(sel: Selector, service: Option<String>, stale: &mut Vec<PathBuf>) -> Result<Stopping> {
+    if !matches!(sel, Selector::Named { .. }) && service.is_none() {
+        let (matched, none) = vms::running_selected(sel)?;
+        if matched.is_empty() {
+            bail!("{}", none.trim_end());
         }
-        execute(&t, &plan(Verb::Stop, &t, up)?, o)
+        return Ok(Stopping::Vms(matched));
+    }
+    let (t, found) = resolve_running(sel, service, Among::ProjectVm, true)?;
+    let entry = found.or_else(|| running_on(&t.dir));
+    if entry.is_none() && t.kind == Kind::Dev && t.service.is_none() {
+        // What an environment published can outlive it on record: cleared, as
+        // `vk dev stop` does for one already down.
+        stale.push(t.dir.clone());
+    }
+    plan(Verb::Stop, &t, entry.is_some())?;
+    match (&t.service, entry) {
+        (Some(_), Some(entry)) => match vms::held_run(&entry) {
+            Ok(Some(run)) => Ok(Stopping::Service(Box::new(ServiceStop { t, entry, run }))),
+            Ok(None) => bail!("{} is not running: its VM {} is down", t.shown(), t.name),
+            Err(why) => bail!(
+                "{}: not stopped: its VM {} (pid {}): {why}",
+                t.shown(),
+                t.name,
+                entry.pid
+            ),
+        },
+        // That VM alone: a directory selector would also take one whose project this
+        // state dir is.
+        (None, Some(entry)) if vms::held_by_another(&entry) => {
+            bail!("{} is held by another run", t.name)
+        }
+        (None, Some(entry)) => Ok(Stopping::Vms(vec![entry])),
+        (_, None) => bail!("{} is not running", t.shown()),
+    }
+}
+
+/// Stop the compose service `s` stands for, only on the run it was selected on and within
+/// `deadline`. A run's manager is asked over a connection that run is checked to serve; a
+/// dev environment's `vk dev service down` is told which run that is.
+fn stop_service(s: &ServiceStop, config: Option<&Path>, deadline: vms::Deadline) -> Result<String> {
+    let shown = s.t.shown();
+    if deadline.passed() {
+        bail!("{shown}: not stopped: the time ran out first");
+    }
+    let unit = s.t.service.clone().unwrap_or_default();
+    if s.t.kind != Kind::Dev {
+        let ctl = vms::control_socket(&s.entry)
+            .with_context(|| format!("{} runs no compose services", s.t.name))?;
+        let conn = vms::Control::open(&ctl, deadline, None, Some(&s.run));
+        let said = ask(conn, &shown, &vk_core::fleetctl::Request::Stop { unit })?;
+        return Ok(format!("{said}\n"));
+    }
+    let o = Opts {
+        config,
+        timeout: 0,
+        build: false,
+    };
+    let mut args = dev_args(&s.t.dir, o)?;
+    // Each of its socket operations bounded by what is left, rounded up to whole seconds: it
+    // is held to the deadline itself here. 0 is no bound.
+    let secs = deadline.left().map_or(0, |left| {
+        let part = u64::from(left.subsec_nanos() > 0);
+        left.as_secs().saturating_add(part).max(1)
     });
-    exit(report(result))
+    args.extend(["service".into(), "down".into(), unit.into()]);
+    args.extend(["--timeout".into(), secs.to_string().into()]);
+    let exe = std::env::current_exe().context("resolving the running vk")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args).env(vms::STOP_RUN_ENV, vms::run_id(&s.entry));
+    succeeds_by(cmd, &format!("stopping {shown}"), deadline)?;
+    Ok(String::new())
+}
+
+/// [`succeeds`] for a child not waited for past `deadline`: one still running then is left
+/// to finish, and fails the operation.
+fn succeeds_by(mut cmd: std::process::Command, what: &str, deadline: vms::Deadline) -> Result<()> {
+    let mut child = cmd.spawn().with_context(|| format!("{what}: running vk"))?;
+    let status = loop {
+        let waited = match deadline.left() {
+            None => child.wait().map(Some),
+            Some(_) => child.try_wait(),
+        };
+        match waited.with_context(|| format!("{what}: waiting for vk"))? {
+            Some(status) => break status,
+            None if deadline.passed() => bail!("{what}: not done when the time ran out"),
+            None => std::thread::sleep(deadline.cap(Duration::from_millis(100))),
+        }
+    };
+    if !status.success() {
+        bail!("{what}: vk {status}");
+    }
+    Ok(())
+}
+
+/// `vk stop REF…`, each REF already read. Every REF is resolved first. Every VM is then told
+/// to stop, compose services stop through their managers one after the other, and only
+/// then is any VM waited for. A service whose VM is stopped too goes down with it.
+/// `deadline` bounds the whole command. Exits 1 when a REF selects nothing running or
+/// something is not confirmed stopped.
+pub fn stop(
+    refs: Vec<(Selector, Option<String>)>,
+    config: Option<&Path>,
+    deadline: vms::Deadline,
+) -> ExitCode {
+    let mut ok = true;
+    let mut entries: Vec<VmEntry> = Vec::new();
+    let mut services = Vec::new();
+    let mut stale = Vec::new();
+    for (sel, service) in refs {
+        match stopping(sel, service, &mut stale) {
+            Ok(Stopping::Service(s)) => services.push(s),
+            Ok(Stopping::Vms(found)) => {
+                for e in found {
+                    if !entries.iter().any(|known| known.state_dir == e.state_dir) {
+                        entries.push(e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("vk: {e:#}");
+                ok = false;
+            }
+        }
+    }
+    services.retain(|s| !entries.iter().any(|e| e.state_dir == s.entry.state_dir));
+    // VMs first: a service slow to stop holds none of them back.
+    let vms = vms::Stops::begin(entries, stale, deadline);
+    for s in &services {
+        ok &= report(stop_service(s, config, deadline));
+    }
+    let (out, down) = vms.finish();
+    ok &= report(Ok(out)) && down;
+    exit(ok)
 }
 
 /// Print what a verb did, or why it failed; whether it succeeded.
@@ -1405,6 +1569,51 @@ mod tests {
         assert_eq!(Step::Control { up: false }.describe(&svc), "stop app/db");
     }
 
+    /// A queued service is stopped only through the run its VM was selected on, and only
+    /// before the deadline: a manager another process listens with by then, as a run that
+    /// replaced it would, is never asked.
+    #[test]
+    fn a_queued_service_stop_goes_only_to_its_run() {
+        use std::io::Read;
+        let _env = crate::dev::testutil::env_guard();
+        let tmp = crate::dev::testutil::scratch("stop-svc");
+        let stand_in = crate::dev::testutil::StandIn::spawn();
+        let vsock = tmp.0.join("vsock.sock");
+        let mut entry = run_of(&tmp.0, &stand_in, &["db"]);
+        entry.exec_addr = format!("vsock-auto://{}:4444", vsock.display());
+        let ctl = crate::manager::host_control_socket(&vsock);
+        let listener = vk_core::unixpath::bind(&ctl).unwrap();
+        let s = ServiceStop {
+            t: target(Kind::Run, Some("db")),
+            run: vms::held_run(&entry).unwrap().unwrap(),
+            entry,
+        };
+        let err = stop_service(&s, None, vms::Deadline::NEVER).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no longer served by the run selected"),
+            "{err:#}"
+        );
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut asked = Vec::new();
+        conn.read_to_end(&mut asked).unwrap();
+        assert!(asked.is_empty(), "{asked:?}");
+        let err = stop_service(&s, None, vms::Deadline::in_secs(0)).unwrap_err();
+        assert!(format!("{err:#}").contains("time ran out"), "{err:#}");
+    }
+
+    /// A child still running at the deadline fails the operation rather than holding it.
+    #[test]
+    fn a_child_past_the_deadline_is_not_waited_for() {
+        let _env = crate::dev::testutil::env_guard();
+        // Left to end by itself, shortly after.
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("3");
+        let began = std::time::Instant::now();
+        let err = succeeds_by(cmd, "stopping app/db", vms::Deadline::in_secs(1)).unwrap_err();
+        assert!(began.elapsed() < Duration::from_secs(5));
+        assert!(format!("{err:#}").contains("stopping app/db"), "{err:#}");
+    }
+
     /// A child that fails is reported by what it was for and how it ended, never by its
     /// arguments, which for a replayed run hold whatever its command line held.
     #[test]
@@ -1668,6 +1877,13 @@ mod tests {
             "services": services,
         }))
         .unwrap()
+    }
+
+    /// [`entry`] of the run `stand_in` stands for, with its start time as `vk run` records it.
+    fn run_of(dir: &Path, stand_in: &crate::dev::testutil::StandIn, services: &[&str]) -> VmEntry {
+        let mut e = entry(dir, stand_in.id(), services);
+        e.pid_start_ticks = crate::usage::proc_starttime(i32::try_from(e.pid).unwrap());
+        e
     }
 
     fn os(s: &str) -> OsString {
@@ -1938,7 +2154,7 @@ mod tests {
         };
         recipe(&["run", "alpine"]);
         let stand_in = crate::dev::testutil::StandIn::locking(&dir, false);
-        let _registered = vms::register(entry(&dir, stand_in.id(), &[]));
+        let _registered = vms::register(run_of(&dir, &stand_in, &[]));
         let t = resolve(&os(&stand_in.id().to_string()), Among::ProjectVm).unwrap();
         assert_eq!((t.name.as_str(), t.dir.as_path()), ("app", dir.as_path()));
         for _ in 0..2 {
@@ -1955,7 +2171,7 @@ mod tests {
         ] {
             recipe(args);
             let mut stand_in = crate::dev::testutil::StandIn::locking(&dir, false);
-            let _registered = vms::register(entry(&dir, stand_in.id(), &[]));
+            let _registered = vms::register(run_of(&dir, &stand_in, &[]));
             let err = format!("{:#}", restart_one(&t, O).unwrap_err());
             assert!(err.contains(said), "{err}");
             assert!(stand_in.alive() && running_on(&dir).is_some());

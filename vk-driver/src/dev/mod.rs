@@ -285,18 +285,26 @@ pub(crate) mod testutil {
     ) -> (crate::vms::Registration, StandIn) {
         std::fs::create_dir_all(&plan.state_dir).unwrap();
         let stand_in = StandIn::locking(&plan.state_dir, ignores_term);
-        (register_entry(plan, stand_in.id()), stand_in)
+        // With its start time, as `vk run` records it.
+        let ticks = crate::usage::proc_starttime(i32::try_from(stand_in.id()).unwrap());
+        (register_entry_at(plan, stand_in.id(), ticks), stand_in)
     }
 
     /// Record `plan`'s VM as managed by `pid`, taking no lock: alive only while something
     /// else holds the state dir's.
     pub(super) fn register_entry(plan: &Plan, pid: u32) -> crate::vms::Registration {
+        register_entry_at(plan, pid, None)
+    }
+
+    /// [`register_entry`], recording `ticks` as the start time of `pid`.
+    fn register_entry_at(plan: &Plan, pid: u32, ticks: Option<u64>) -> crate::vms::Registration {
         let entry = serde_json::from_value(serde_json::json!({
             "state_dir": crate::vms::canonical(&plan.state_dir),
             "pid": pid,
             "label": "devcontainer",
             "exec_addr": "unused",
-            "created_secs": 7
+            "created_secs": 7,
+            "pid_start_ticks": ticks,
         }))
         .unwrap();
         crate::vms::register(entry)

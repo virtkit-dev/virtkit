@@ -37,7 +37,7 @@ use super::{Auth, Body, Ui};
 use crate::local::{Action, NotStarted};
 use crate::store::Role;
 
-/// How long a stop or a reboot may take: `vk stop` waits up to 90 seconds itself.
+/// How long a stop or a reboot may take: `vk stop` waits up to 210 seconds itself.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// How long `vk dev up` may take: it may build the environment's images first.

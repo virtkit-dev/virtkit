@@ -17,6 +17,7 @@ All notable changes to virtkit will be documented in this file.
   `vk` recognizes as its own. It preserves other files in user-supplied run directories.
   Use `--dry-run` to preview or `-y` or `-f` to confirm without a terminal.
 - `vk rename` changes a VM's name, and `vk ls` lists VMs.
+- `vk stop` takes several REFs and signals every VM before waiting for any.
 - `vk reset` removes a stopped dev environment's boot images or persistent data by name.
 - `vk dev start` boots a stopped environment without building images or reuses a running one.
   If a build is needed, it exits 3 unless another target failed for a different reason.
@@ -41,6 +42,8 @@ All notable changes to virtkit will be documented in this file.
 - **A directory names exactly one project's VMs.** `vk list`, `stop`, `reboot`, `pause` and
   `resume` take the VMs of the directories below it only with `--recursive` (`-r`). A bare
   word is a VM name: write `./dir` for a directory.
+- **`vk stop --timeout` bounds the whole command, not each VM.** It stays 210 seconds by
+  default; `--timeout 0` waits as long as it takes.
 - `vk start` and `vk restart` build missing images only with `--build`. They exit 3
   when at least one target needs a build and no target failed for another reason.
 - `vk dev stop NAME`, `vk dev gc NAME` and `vk dev prune NAME` refuse VMs outside the

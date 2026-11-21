@@ -99,6 +99,43 @@ pub fn connect(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
     std::os::unix::net::UnixStream::connect(SocketPath::new(path)?.as_path())
 }
 
+/// Like [`connect`], with a send timeout that bounds the wait for backlog space
+/// and remains set on the returned stream.
+pub fn connect_within(
+    path: &Path,
+    timeout: Option<std::time::Duration>,
+) -> io::Result<std::os::unix::net::UnixStream> {
+    let short = SocketPath::new(path)?;
+    let name = short.as_path().as_os_str().as_bytes();
+    // SAFETY: an all-zero sockaddr_un is valid.
+    let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if name.len() >= sa.sun_path.len() || name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{path:?} cannot be a unix socket"),
+        ));
+    }
+    sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (to, from) in sa.sun_path.iter_mut().zip(name) {
+        *to = *from as libc::c_char;
+    }
+    // SAFETY: socket(2) has no memory preconditions; the descriptor is owned below.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh socket owned by nothing else.
+    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    stream.set_write_timeout(timeout)?;
+    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + name.len() + 1;
+    // Not retried when interrupted: a retry would start the timeout over.
+    // SAFETY: `sa` is a valid sockaddr_un and `len` covers its path and terminating NUL.
+    if unsafe { libc::connect(fd, (&raw const sa).cast(), len as libc::socklen_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stream)
+}
+
 /// [`tokio::net::UnixListener::bind`] for a path of any length.
 pub fn bind_tokio(path: &Path) -> io::Result<tokio::net::UnixListener> {
     tokio::net::UnixListener::bind(SocketPath::new(path)?.as_path())

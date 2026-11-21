@@ -644,6 +644,7 @@ vk start app                  # a stopped run again, from its run.json
 vk start shop/redis           # a compose service, starting its VM first if needed
 vk stop shop                  # that VM alone, and what it publishes
 vk stop shop/redis            # one compose service
+vk stop app shop --timeout 60 # both at once, 60 s in all
 vk restart app
 vk delete scratch             # prompts on a terminal before deleting
 vk delete -n scratch shop/db  # only list what would go
@@ -661,6 +662,9 @@ build is needed and no target failed for another reason.
 `vk start NAME/SERVICE` boots the primary VM if needed, then prints its service manager's
 reply. `vk stop NAME/SERVICE` stops one service. `vk stop NAME` stops the named VM and its
 published endpoints. An explicit reference to a stopped VM exits 1 with `vk stop`.
+`vk stop REF…` resolves all references and signals every selected VM before waiting.
+The targets share one timeout (210 seconds by default, unlimited with `--timeout 0`).
+If time runs out, vk reports unconfirmed stops and exits 1. Shutdowns in progress continue.
 `vk restart` resolves each reference once. Before stopping a primary, it checks the dev
 workspace and recorded config, or the run recipe, working directory and any recorded
 `--config`. If the primary is already down, `vk restart` starts it.
@@ -1005,7 +1009,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk, or a Windows Dockerfile into a bundle. |
 | `vk exec` | Run a command in an existing guest and return the command's exit status. |
 | `vk list` | List known VMs by project, including stopped VMs and compose services that have started. Select by name, pid or directory (`-r` includes subdirectories). Filter by status (`--running`, `--stopped`) or `--kind`. Use `-w` for the wide table or `--json` and `--field` for scripts. |
-| `vk start`, `vk stop`, `vk restart`, `vk delete` | Select a VM by name, pid or directory. Only `stop` accepts an unnamed primary or `--all`. Select a service by `NAME/SERVICE`, or by `PID/SERVICE` for start, stop and restart. Deleting a service requires a stopped parent VM. `start`, `restart` and `delete` accept multiple references. |
+| `vk start`, `vk stop`, `vk restart`, `vk delete` | Select a VM by name, pid or directory. Only `stop` accepts an unnamed primary or `--all`. Select a service by `NAME/SERVICE`, or by `PID/SERVICE` for start, stop and restart. Deleting a service requires a stopped parent VM. `start`, `stop`, `restart` and `delete` accept multiple references. |
 | `vk rename` | Give a VM another name. |
 | `vk reset` | Remove a stopped dev environment's boot images or persistent data. |
 | `vk reboot` | Reboot a running VM in place through its guest, or power-cycle it with `--force`. |

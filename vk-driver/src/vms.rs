@@ -22,7 +22,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -378,7 +378,7 @@ pub(crate) fn running_in(dir: &Path) -> Vec<VmEntry> {
         if alive(&entry) {
             out.push(entry);
         } else {
-            remove_in(dir, &entry.state_dir);
+            prune_gone(dir, &entry);
         }
     }
     out.sort_by_key(|e| e.created_secs);
@@ -674,32 +674,117 @@ pub fn control_socket(entry: &VmEntry) -> Option<PathBuf> {
 /// One request to a run's service manager over `ctl`, from the host: the same protocol
 /// `vk-agent service` speaks from inside the guest. Progress lines (an on-demand build a `Start`
 /// streams) go to `on_progress`; the terminal reply is returned as is, refusals included.
-/// `timeout` bounds each read and write — `None` for an op that builds.
+/// `timeout` bounds each connect, read and write. Operations that build pass `None`.
 pub fn control(
     ctl: &Path,
     req: &Request,
     timeout: Option<Duration>,
-    mut on_progress: impl FnMut(&str),
+    on_progress: impl FnMut(&str),
 ) -> Result<Reply> {
-    use std::io::{BufRead, BufReader};
-    let mut stream = vk_core::unixpath::connect(ctl)
-        .with_context(|| format!("control: connect {}", ctl.display()))?;
-    stream.set_read_timeout(timeout)?;
-    stream.set_write_timeout(timeout)?;
-    let mut text = serde_json::to_string(req).context("encoding the control request")?;
-    text.push('\n');
-    stream.write_all(text.as_bytes())?;
-    let mut rd = BufReader::new(stream);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if rd.read_line(&mut line)? == 0 {
-            bail!("control peer closed before Done");
+    control_by(ctl, req, Deadline::NEVER, timeout, on_progress)
+}
+
+/// [`control`], with no connect, read or write going past `deadline`.
+pub fn control_by(
+    ctl: &Path,
+    req: &Request,
+    deadline: Deadline,
+    timeout: Option<Duration>,
+    on_progress: impl FnMut(&str),
+) -> Result<Reply> {
+    Control::open(ctl, deadline, timeout, None)?.request(req, on_progress)
+}
+
+/// A connection to a run's service manager. Every read and write on it, as its connect,
+/// waits no longer than its timeout, nor past its deadline.
+pub(crate) struct Control {
+    stream: std::os::unix::net::UnixStream,
+    deadline: Deadline,
+    timeout: Option<Duration>,
+}
+
+impl Control {
+    /// Connect to the manager on `ctl`. With `run`, only one that run serves is kept.
+    pub(crate) fn open(
+        ctl: &Path,
+        deadline: Deadline,
+        timeout: Option<Duration>,
+        run: Option<&Held>,
+    ) -> Result<Self> {
+        let bound = bound(deadline, timeout).context("control")?;
+        let stream = vk_core::unixpath::connect_within(ctl, bound)
+            .with_context(|| format!("control: connect {}", ctl.display()))?;
+        if let Some(run) = run
+            && !run.serves(&stream).context("control: reading its peer")?
+        {
+            bail!(
+                "control: {} is no longer served by the run selected (pid {})",
+                ctl.display(),
+                run.pid
+            );
         }
-        match serde_json::from_str::<Frame>(line.trim_end()).context("decoding control frame")? {
-            Frame::Progress(p) => on_progress(&p),
-            Frame::Done(reply) => return Ok(reply),
+        Ok(Control {
+            stream,
+            deadline,
+            timeout,
+        })
+    }
+
+    /// Send `req`, then read its reply. Progress lines (an on-demand build a `Start`
+    /// streams) go to `on_progress`.
+    pub(crate) fn request(self, req: &Request, mut on_progress: impl FnMut(&str)) -> Result<Reply> {
+        use std::io::{BufRead, BufReader};
+        let mut text = serde_json::to_string(req).context("encoding the control request")?;
+        text.push('\n');
+        let mut rd = BufReader::new(self);
+        rd.get_mut().write_all(text.as_bytes())?;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if rd.read_line(&mut line)? == 0 {
+                bail!("control peer closed before Done");
+            }
+            match serde_json::from_str::<Frame>(line.trim_end())
+                .context("decoding control frame")?
+            {
+                Frame::Progress(p) => on_progress(&p),
+                Frame::Done(reply) => return Ok(reply),
+            }
         }
+    }
+}
+
+/// What a socket operation may wait: `timeout`, or what is left before `deadline` when that
+/// is less; an error once it has passed.
+fn bound(deadline: Deadline, timeout: Option<Duration>) -> std::io::Result<Option<Duration>> {
+    match deadline.left() {
+        None => Ok(timeout),
+        Some(left) if left.is_zero() => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "out of time",
+        )),
+        Some(left) => Ok(Some(timeout.map_or(left, |t| t.min(left)))),
+    }
+}
+
+// Bounded call by call, so a peer trickling a reply cannot hold a read past the deadline.
+impl std::io::Read for Control {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.stream
+            .set_read_timeout(bound(self.deadline, self.timeout)?)?;
+        std::io::Read::read(&mut self.stream, buf)
+    }
+}
+
+impl std::io::Write for Control {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.stream
+            .set_write_timeout(bound(self.deadline, self.timeout)?)?;
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
     }
 }
 
@@ -1295,42 +1380,377 @@ fn block(lines: &[String]) -> String {
     }
 }
 
-/// SIGTERM the run managing `entry` and wait up to `timeout` seconds for it to exit (the
-/// state-dir lock frees). Prunes the entry once it is down. Returns whether it went down.
-/// A no-op success if already dead. Stop managed publishers first on a separate short
-/// budget.
-fn stop_one(entry: &VmEntry, timeout: u64) -> bool {
-    if !alive(entry) {
-        // Publishers detect an already-gone VM on their next probe. Do not signal here
-        // because the entry may only be stale.
-        if let Ok(dir) = registry_dir() {
-            remove_in(&dir, &entry.state_dir);
-        }
-        return true;
+/// When a command's time is up: one instant on the monotonic clock, or never.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deadline(Option<Instant>);
+
+impl Deadline {
+    /// No bound.
+    pub const NEVER: Self = Self(None);
+
+    /// `secs` seconds from now; never when that is past what the clock can hold.
+    pub fn in_secs(secs: u64) -> Self {
+        Self(Instant::now().checked_add(Duration::from_secs(secs)))
     }
-    // Stop publishers before their target disappears and they retain unusable bound
-    // addresses until the next probe. Give them at most five seconds each instead of the
-    // per-VM `--timeout`; publishers normally exit immediately on SIGTERM.
-    crate::publish::stop_all_quietly(
-        &entry.state_dir,
-        std::time::Duration::from_secs(timeout.min(5)),
-    );
-    // The result is dropped because neither failure changes what to do: ESRCH means it went
-    // down between the check above and here, and EPERM means the pid is no longer the run we
-    // recorded — the wait below then reports it as still standing, which is the truth either
-    // way. The state-dir lock was just held, so that window is a handful of instructions.
-    // SAFETY: kill with a signal number is always safe.
-    unsafe { libc::kill(entry.pid as i32, libc::SIGTERM) };
-    for _ in 0..timeout.saturating_mul(2) {
-        if !alive(entry) {
-            if let Ok(dir) = registry_dir() {
-                remove_in(&dir, &entry.state_dir);
+
+    /// What is left of it, zero once it has passed; `None` without a bound.
+    pub fn left(self) -> Option<Duration> {
+        self.0
+            .map(|end| end.saturating_duration_since(Instant::now()))
+    }
+
+    /// Whether it has passed.
+    pub fn passed(self) -> bool {
+        self.left().is_some_and(|left| left.is_zero())
+    }
+
+    /// `d`, or what is left of it when that is less.
+    pub fn cap(self, d: Duration) -> Duration {
+        self.left().map_or(d, |left| left.min(d))
+    }
+}
+
+/// How often a stop looks whether its runs are gone.
+const STOP_POLL: Duration = Duration::from_millis(100);
+
+/// A process held by its pidfd: a signal sent through it reaches the process it was opened
+/// on or nothing, whatever its pid has come to name since, and it reads as exited once that
+/// process has, reaped or not.
+pub(crate) struct Held {
+    fd: std::os::fd::OwnedFd,
+    pid: i32,
+}
+
+impl Held {
+    /// Process `pid`, or `None` when it is gone. Any other failure — no pidfds before Linux
+    /// 5.3, or a filter denying them — is the caller's to report.
+    fn open(pid: i32) -> std::io::Result<Option<Self>> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: `pidfd_open` takes a pid and flags and returns a new descriptor or -1.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::ESRCH) => Ok(None),
+                _ => Err(e),
+            };
+        }
+        let fd = i32::try_from(fd).map_err(|_| std::io::Error::other("pidfd out of range"))?;
+        // SAFETY: a fresh descriptor nothing else owns.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        Ok(Some(Held { fd, pid }))
+    }
+
+    /// Another handle on the same process.
+    fn try_clone(&self) -> std::io::Result<Self> {
+        let fd = self.fd.try_clone()?;
+        Ok(Held { fd, pid: self.pid })
+    }
+
+    /// Send it `signal`: `Ok(false)` when it is gone already.
+    fn signal(&self, signal: libc::c_int) -> std::io::Result<bool> {
+        // SAFETY: `pidfd_send_signal` on a pidfd this value owns, with no siginfo.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.fd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            _ => Err(e),
+        }
+    }
+
+    /// Whether it has exited: its pidfd reads as ready.
+    pub(crate) fn exited(&self) -> bool {
+        let mut fd = libc::pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one pollfd this frame owns, and a zero timeout: it never blocks.
+        unsafe { libc::poll(&raw mut fd, 1, 0) > 0 }
+    }
+
+    /// Whether `stream` is connected to a listener this process opened, and the process is
+    /// still running: a listener's credentials are those of whoever called `listen`, and a
+    /// pid is not reused while its process lives.
+    fn serves(&self, stream: &std::os::unix::net::UnixStream) -> std::io::Result<bool> {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: SO_PEERCRED writes one `ucred` through a pointer to a local of that size,
+        // and the descriptor is `stream`'s, live for the call.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(cred.pid == self.pid && !self.exited())
+    }
+}
+
+/// What a pid is to the run a [`VmEntry`] records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Identity {
+    Run,
+    Other,
+    /// the entry recorded no start time and procfs names no holder of its state-dir lock
+    Unknown,
+}
+
+/// Whether `pid` is the run `entry` records: started at the recorded time, or, for an entry
+/// that recorded none, the holder of its state-dir lock.
+fn identity(entry: &VmEntry, pid: i32) -> Identity {
+    let of = |same: bool| if same { Identity::Run } else { Identity::Other };
+    if let Some(ticks) = entry.pid_start_ticks {
+        return of(crate::usage::proc_starttime(pid) == Some(ticks));
+    }
+    std::fs::File::open(&entry.state_dir)
+        .ok()
+        .and_then(|f| crate::run::flock_holder_pid(&f))
+        .map_or(Identity::Unknown, |holder| of(holder == pid))
+}
+
+/// The run `entry` records, held by its pidfd once identified, so neither a signal nor the
+/// wait for its exit can reach another process: `Ok(None)` when it is gone, or an error
+/// saying why it is not signalled. A run whose identity cannot be told is never signalled.
+pub(crate) fn held_run(entry: &VmEntry) -> std::result::Result<Option<Held>, String> {
+    let pid = i32::try_from(entry.pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| "its record has an unusable pid".to_string())?;
+    let Some(held) = Held::open(pid).map_err(|e| format!("cannot hold pid {pid}: {e}"))? else {
+        return Ok(None);
+    };
+    match identity(entry, pid) {
+        Identity::Run => Ok(Some(held)),
+        // A run holds its state-dir lock as long as it lives: with the lock free, it is gone.
+        _ if !alive(entry) => Ok(None),
+        Identity::Other => {
+            Err("another process holds its state dir now, so nothing was signalled".to_string())
+        }
+        Identity::Unknown => Err(format!(
+            "cannot confirm pid {pid} is its run (no start time recorded, no lock holder \
+             named), so it was not signalled"
+        )),
+    }
+}
+
+/// Whether both entries have the same [`run_id`].
+pub(crate) fn same_run(a: &VmEntry, b: &VmEntry) -> bool {
+    run_id(a) == run_id(b)
+}
+
+/// Identify a registration by pid, optional process start time and registration time.
+pub(crate) fn run_id(entry: &VmEntry) -> String {
+    let ticks = entry
+        .pid_start_ticks
+        .map_or("-".to_string(), |t| t.to_string());
+    format!("{}:{ticks}:{}", entry.pid, entry.created_secs)
+}
+
+/// Set on the `vk dev service down` that `vk stop` runs, to the [`run_id`] of the run it
+/// selected: the service is stopped only while its environment is still that run.
+pub const STOP_RUN_ENV: &str = "VIRTKIT_STOP_RUN";
+
+/// Remove the registry record, in `dir`, of the run `entry` records, once that run is gone:
+/// under its state-dir lock, so a run that took the directory over keeps its own record, and
+/// only while the record is still that run's.
+/// A record whose state dir cannot be locked, or is gone, is left: a run may be creating it
+/// again.
+fn prune_gone(dir: &Path, entry: &VmEntry) {
+    let Ok(lock) = std::fs::File::open(&entry.state_dir) else {
+        return;
+    };
+    // SAFETY: the fd is owned by `lock`, which outlives the call; LOCK_NB never blocks. The
+    // lock is released when `lock` drops.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return;
+    }
+    let path = dir.join(format!("{}.json", slug(&entry.state_dir)));
+    let recorded = std::fs::read(&path)
+        .ok()
+        .and_then(|json| serde_json::from_slice::<VmEntry>(&json).ok());
+    if recorded.is_some_and(|r| same_run(&r, entry)) {
+        remove_in(dir, &entry.state_dir);
+    }
+}
+
+/// Where the stop of one run stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Fate {
+    /// told to stop, not gone yet
+    Stopping,
+    Down,
+    /// not stopped, and why
+    Failed(String),
+}
+
+/// One run [`Stops`] is stopping.
+struct RunStop {
+    entry: VmEntry,
+    /// the run, held from the moment it is identified
+    run: Option<Held>,
+    fate: Fate,
+}
+
+impl RunStop {
+    fn of(entry: VmEntry) -> Self {
+        let (run, fate) = match held_run(&entry) {
+            Ok(Some(run)) => (Some(run), Fate::Stopping),
+            Ok(None) => (None, Fate::Down),
+            Err(why) => (None, Fate::Failed(why)),
+        };
+        RunStop { entry, run, fate }
+    }
+
+    /// Send the run `signal`, if it is still being stopped.
+    fn signal(&mut self, signal: libc::c_int) {
+        let (Fate::Stopping, Some(run)) = (&self.fate, &self.run) else {
+            return;
+        };
+        match run.signal(signal) {
+            Ok(true) => {}
+            Ok(false) => self.fate = Fate::Down,
+            Err(e) => {
+                self.fate = Fate::Failed(format!("cannot signal pid {}: {e}", self.entry.pid))
             }
-            return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    false
+
+    /// Mark it down once its run has exited.
+    fn check(&mut self) {
+        if self.fate == Fate::Stopping && self.run.as_ref().is_some_and(Held::exited) {
+            self.fate = Fate::Down;
+        }
+    }
+
+    /// What to say of it, after `waited` seconds of stopping.
+    fn line(&self, waited: u64) -> String {
+        let RunStop { entry, .. } = self;
+        match &self.fate {
+            Fate::Down => format!("stopped {} (pid {})\n", entry.label, entry.pid),
+            Fate::Stopping => format!(
+                "{} (pid {}) did not stop after {waited}s\n",
+                entry.label, entry.pid
+            ),
+            Fate::Failed(why) => format!("{} (pid {}): {why}\n", entry.label, entry.pid),
+        }
+    }
+}
+
+/// Stop the managed publishers of `runs`, and those left on record in each of `stale`, a
+/// state dir no run holds, on a thread of their own: a publisher's lock held elsewhere delays
+/// no signal and no wait. They go while their targets shut down, rather than hold unusable
+/// bound addresses until their next probe; they normally exit at once on SIGTERM, so each is
+/// given at most five seconds, within `deadline`.
+fn unpublish(
+    runs: &[RunStop],
+    stale: Vec<PathBuf>,
+    deadline: Deadline,
+) -> std::thread::JoinHandle<()> {
+    let mut dirs: Vec<(PathBuf, Option<Held>)> = (runs.iter())
+        .filter(|r| !matches!(r.fate, Fate::Failed(_)))
+        .map(|r| {
+            let run = r.run.as_ref().and_then(|h| h.try_clone().ok());
+            (r.entry.state_dir.clone(), run)
+        })
+        .collect();
+    dirs.extend(stale.into_iter().map(|dir| (dir, None)));
+    std::thread::spawn(move || {
+        for (dir, run) in dirs {
+            // Under the publisher lock, clean up only while the selected run is alive or
+            // the state directory is unlocked. A replacement may already hold that directory.
+            let still = || run.as_ref().is_some_and(|h| !h.exited()) || !dir_locked(&dir);
+            crate::publish::stop_all_within(&dir, deadline, &still);
+        }
+    })
+}
+
+/// Runs stopped together: every one is told to stop ([`Stops::begin`]) before any is waited
+/// for ([`Stops::finish`]), and one deadline bounds both.
+pub(crate) struct Stops {
+    runs: Vec<RunStop>,
+    deadline: Deadline,
+    /// where their records are pruned once they are gone
+    registry: Option<PathBuf>,
+    began: Instant,
+    /// the stop of their publishers, under way beside the wait
+    unpublishing: std::thread::JoinHandle<()>,
+}
+
+impl Stops {
+    /// Send every run in `entries` SIGTERM, then stop the managed publishers of each, and
+    /// those left on record in each of `stale`, a state dir no run holds.
+    pub(crate) fn begin(entries: Vec<VmEntry>, stale: Vec<PathBuf>, deadline: Deadline) -> Self {
+        Self::begin_in(registry_dir().ok(), entries, stale, deadline)
+    }
+
+    /// [`Stops::begin`], against the registry at `registry`.
+    fn begin_in(
+        registry: Option<PathBuf>,
+        entries: Vec<VmEntry>,
+        stale: Vec<PathBuf>,
+        deadline: Deadline,
+    ) -> Self {
+        let began = Instant::now();
+        let mut runs: Vec<RunStop> = entries.into_iter().map(RunStop::of).collect();
+        for r in &mut runs {
+            r.signal(libc::SIGTERM);
+        }
+        let unpublishing = unpublish(&runs, stale, deadline);
+        Stops {
+            runs,
+            deadline,
+            registry,
+            began,
+            unpublishing,
+        }
+    }
+
+    /// Wait for every run to exit, or the deadline to pass; prune the records of those gone.
+    /// Returns one report line per run, and whether every one went down. A run still
+    /// stopping when the deadline passes is reported and left to finish its shutdown.
+    pub(crate) fn finish(mut self) -> (String, bool) {
+        loop {
+            self.runs.iter_mut().for_each(RunStop::check);
+            if self.runs.iter().all(|r| r.fate != Fate::Stopping) || self.deadline.passed() {
+                break;
+            }
+            std::thread::sleep(self.deadline.cap(STOP_POLL));
+        }
+        // It ends by the deadline too; a panic there is not the stop's to report.
+        let _ = self.unpublishing.join();
+        let waited = self.began.elapsed().as_secs();
+        let mut out = String::new();
+        for r in &self.runs {
+            if let (Fate::Down, Some(registry)) = (&r.fate, &self.registry) {
+                prune_gone(registry, &r.entry);
+            }
+            out.push_str(&r.line(waited));
+        }
+        let down = self.runs.iter().all(|r| r.fate == Fate::Down);
+        (out, down)
+    }
 }
 
 /// Whether an empty selection succeeds. An explicit `vk stop TARGET` returns not-found (exit 1)
@@ -1691,55 +2111,39 @@ fn select_vms(target: Option<Selector>, all: bool) -> Result<Selection> {
 }
 
 /// Stop VMs selected by `--all`, a pid or project directory, or the current directory by
-/// default. Returns the summary and whether every selected VM went down.
-pub fn stop_cmd(target: Option<Selector>, all: bool, timeout: u64) -> Result<(String, bool)> {
+/// default, all at once, with `deadline` bounding the whole of it. Returns the summary and
+/// whether every selected VM went down.
+pub fn stop_cmd(target: Option<Selector>, all: bool, deadline: Deadline) -> Result<(String, bool)> {
     let selected = match select_vms(target, all)? {
         Selection::Matched(v) => v,
         Selection::Empty(out, ok) => return Ok((out, ok)),
     };
-    let mut out = String::new();
-    let mut ok = true;
-    for e in &selected {
-        let (line, down) = stop_line(e, timeout);
-        out.push_str(&line);
-        ok &= down;
-    }
-    Ok((out, ok))
+    Ok(Stops::begin(selected, Vec::new(), deadline).finish())
 }
 
-/// Stop the VM `entry` records, as [`stop_cmd`] stops each one it selects: the report line,
-/// and whether it went down.
-fn stop_line(entry: &VmEntry, timeout: u64) -> (String, bool) {
-    if stop_one(entry, timeout) {
-        (
-            format!("stopped {} (pid {})\n", entry.label, entry.pid),
-            true,
-        )
-    } else {
-        (
-            format!(
-                "{} (pid {}) did not stop after {timeout}s\n",
-                entry.label, entry.pid
-            ),
-            false,
-        )
-    }
-}
-
-/// [`stop_line`] for `entry` only: `None`, with nothing stopped or signalled, when its
-/// state-dir lock is held by a process other than its `vk run` — a run that replaced it
-/// there. [`alive`] reads any holder of the lock as this VM, which is right for `vk stop`,
-/// asked about a directory, but not for a caller that means this one VM. A holder procfs
-/// cannot name (see [`crate::run::flock_holder`]) is taken to be its own run, as `alive`
-/// takes it.
-pub(crate) fn stop_entry(entry: &VmEntry, timeout: u64) -> Option<(String, bool)> {
-    let holder = std::fs::File::open(&entry.state_dir)
+/// Whether procfs identifies a different pid holding the state-directory lock. An unknown
+/// holder passes this check. [`held_run`] still verifies identity before signalling.
+pub(crate) fn held_by_another(entry: &VmEntry) -> bool {
+    std::fs::File::open(&entry.state_dir)
         .ok()
-        .and_then(|f| crate::run::flock_holder_pid(&f));
-    if holder.is_some_and(|pid| u32::try_from(pid) != Ok(entry.pid)) {
+        .and_then(|f| crate::run::flock_holder_pid(&f))
+        .is_some_and(|pid| u32::try_from(pid) != Ok(entry.pid))
+}
+
+/// Stop the VM `entry` records, and only it: `None`, with nothing stopped or signalled,
+/// when [`held_by_another`]. Otherwise the report line, and whether it went down.
+pub(crate) fn stop_entry(entry: &VmEntry, timeout: u64) -> Option<(String, bool)> {
+    if held_by_another(entry) {
         return None;
     }
-    Some(stop_line(entry, timeout))
+    let deadline = Deadline::in_secs(timeout);
+    Some(Stops::begin(vec![entry.clone()], Vec::new(), deadline).finish())
+}
+
+/// The running VMs `sel` selects, and what to say when it selects none.
+pub(crate) fn running_selected(sel: Selector) -> Result<(Vec<VmEntry>, String)> {
+    let (sel, matched) = select_running(Some(sel))?;
+    Ok((matched, sel.not_found()))
 }
 
 /// How a VM was rebooted, or why it was not.
@@ -2218,12 +2622,7 @@ pub(crate) mod tests {
         let dead = entry(tmpdir("state-dead"), None);
         record_in(&reg, &dead).unwrap();
         assert_eq!(load_all_in(&reg).len(), 1);
-        // running() uses the real registry dir, so exercise the prune logic directly:
-        for e in load_all_in(&reg) {
-            if !alive(&e) {
-                remove_in(&reg, &e.state_dir);
-            }
-        }
+        assert!(running_in(&reg).is_empty());
         assert_eq!(load_all_in(&reg).len(), 0);
         std::fs::remove_dir_all(&reg).ok();
     }
@@ -2962,6 +3361,227 @@ PUBLISHED     -
         // on the rounded figure, as `usage::fmt_bytes` does.
         assert_eq!(compact_bytes(1024 * 1024 * 1024 - 1), "1.0G");
         assert_eq!(compact_bytes(1024 * 1024 - 1), "1M");
+    }
+
+    #[test]
+    fn a_deadline_past_what_the_clock_holds_is_never() {
+        assert_eq!(Deadline::in_secs(u64::MAX), Deadline::NEVER);
+        assert_eq!(Deadline::NEVER.left(), None);
+        assert!(!Deadline::NEVER.passed());
+        let second = Duration::from_secs(1);
+        assert_eq!(Deadline::NEVER.cap(second), second);
+        assert!(Deadline::in_secs(0).passed());
+        assert_eq!(Deadline::in_secs(0).cap(second), Duration::ZERO);
+        assert!(Deadline::in_secs(60).cap(second) == second);
+    }
+
+    /// The registry record of `stand_in`, run on `dir`, as `vk run` writes it: with its start
+    /// time.
+    fn run_entry(dir: &Path, stand_in: &crate::dev::testutil::StandIn) -> VmEntry {
+        let mut e = entry(dir.to_path_buf(), None);
+        e.pid = stand_in.id();
+        e.pid_start_ticks = crate::usage::proc_starttime(i32::try_from(e.pid).unwrap());
+        assert!(e.pid_start_ticks.is_some());
+        e
+    }
+
+    /// Whether `reg` holds a record of `e`'s run.
+    fn recorded(reg: &Path, e: &VmEntry) -> bool {
+        load_all_in(reg).iter().any(|r| same_run(r, e))
+    }
+
+    /// One run that ignores its stop holds none of the others back, and the deadline bounds
+    /// the whole stop: each is signalled before any is waited for.
+    #[test]
+    fn a_stop_signals_every_run_before_waiting_for_any() {
+        use crate::dev::testutil::StandIn;
+        let _env = crate::dev::testutil::env_guard();
+
+        let reg = tmpdir("stops-reg");
+        let (stuck_dir, quick_dir) = (tmpdir("stops-stuck"), tmpdir("stops-quick"));
+        let mut stuck = StandIn::locking(&stuck_dir, true);
+        let mut quick = StandIn::locking(&quick_dir, false);
+        let entries = vec![run_entry(&stuck_dir, &stuck), run_entry(&quick_dir, &quick)];
+        for e in &entries {
+            record_in(&reg, e).unwrap();
+        }
+        let began = Instant::now();
+        let deadline = Deadline::in_secs(2);
+        let stops = Stops::begin_in(Some(reg.clone()), entries.clone(), Vec::new(), deadline);
+        let (out, down) = stops.finish();
+        assert!(began.elapsed() < Duration::from_secs(4), "{out}");
+        assert!(!down, "{out}");
+        assert!(
+            out.contains(&format!("(pid {}) did not stop after", stuck.id())),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("stopped devcontainer (pid {})", quick.id())),
+            "{out}"
+        );
+        assert!(stuck.alive());
+        assert!(!quick.alive());
+        // Only the record of the run that went is pruned.
+        assert!(recorded(&reg, &entries[0]));
+        assert!(!recorded(&reg, &entries[1]));
+        for d in [reg, stuck_dir, quick_dir] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A stop waits for the run it signalled, not for whatever holds its state dir after: a
+    /// run that takes the directory over is neither waited for nor stripped of its record or
+    /// its publishers.
+    #[test]
+    fn a_stop_ends_with_its_run_not_with_a_replacement() {
+        use crate::dev::testutil::StandIn;
+        let _env = crate::dev::testutil::env_guard();
+
+        let reg = tmpdir("stops-replaced-reg");
+        let dir = tmpdir("stops-replaced");
+        let mut first = StandIn::locking(&dir, false);
+        let gone = run_entry(&dir, &first);
+        record_in(&reg, &gone).unwrap();
+        // Publishers are stopped once their operation lock is free, by then the replacement's.
+        let op = crate::publish::hold_op_lock(&dir);
+        let deadline = Deadline::in_secs(30);
+        let stops = Stops::begin_in(Some(reg.clone()), vec![gone.clone()], Vec::new(), deadline);
+        while first.alive() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut second = StandIn::locking(&dir, true);
+        let replacement = run_entry(&dir, &second);
+        record_in(&reg, &replacement).unwrap();
+        let mut relay = StandIn::spawn();
+        let addr = "tcp://127.0.0.1:8601";
+        let _relay =
+            crate::publish::fake_publisher(&dir, "web", addr, "vsock://80", relay.id(), None);
+        drop(op);
+        let began = Instant::now();
+        let (out, down) = stops.finish();
+        assert!(down, "{out}");
+        assert!(began.elapsed() < Duration::from_secs(5), "{out}");
+        assert!(second.alive());
+        assert!(relay.alive(), "the replacement's publisher was stopped");
+        assert!(recorded(&reg, &replacement));
+        drop(second);
+        std::fs::remove_dir_all(&reg).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pid that names another process than the recorded run is never signalled, nor
+    /// reported stopped while something else holds the run's state dir.
+    #[test]
+    fn a_pid_that_is_no_longer_its_run_is_never_signalled() {
+        use crate::dev::testutil::StandIn;
+        let _env = crate::dev::testutil::env_guard();
+
+        let dir = tmpdir("stops-other");
+        let _holder = StandIn::locking(&dir, false);
+        let mut other = StandIn::spawn();
+        let mut e = run_entry(&dir, &other);
+        e.pid_start_ticks = e.pid_start_ticks.map(|t| t + 1);
+        let (out, down) = Stops::begin_in(None, vec![e], Vec::new(), Deadline::in_secs(1)).finish();
+        assert!(!down, "{out}");
+        assert!(out.contains("nothing was signalled"), "{out}");
+        assert!(other.alive());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A publisher's operation lock held elsewhere holds back no run's signal, whether a run's
+    /// or a stopped one's.
+    #[test]
+    fn a_contended_publisher_lock_delays_no_signal() {
+        use crate::dev::testutil::StandIn;
+        let _env = crate::dev::testutil::env_guard();
+
+        let (a_dir, b_dir) = (tmpdir("stops-contended-a"), tmpdir("stops-contended-b"));
+        let stale = tmpdir("stops-contended-stale");
+        let mut a = StandIn::locking(&a_dir, false);
+        let mut b = StandIn::locking(&b_dir, false);
+        let entries = vec![run_entry(&a_dir, &a), run_entry(&b_dir, &b)];
+        let ops = [&stale, &a_dir].map(|d| crate::publish::hold_op_lock(d));
+        let stale_dirs = vec![stale.clone()];
+        let stops = std::thread::spawn(move || {
+            Stops::begin_in(None, entries, stale_dirs, Deadline::in_secs(30)).finish()
+        });
+        let began = Instant::now();
+        while a.alive() || b.alive() {
+            assert!(began.elapsed() < Duration::from_secs(10), "not signalled");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !stops.is_finished(),
+            "a's publishers went without their lock"
+        );
+        drop(ops);
+        let (out, down) = stops.join().unwrap();
+        assert!(down, "{out}");
+        for d in [a_dir, b_dir, stale] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A connect waits for room in a full backlog no longer than the deadline, and a reply
+    /// trickled in holds no read past it either.
+    #[test]
+    fn a_control_request_ends_at_its_deadline() {
+        let dir = tmpdir("control-deadline");
+        let req = Request::Stop { unit: "db".into() };
+        let full = dir.join("full.sock");
+        let listener = vk_core::unixpath::bind(&full).unwrap();
+        // SAFETY: listen(2) on a socket `listener` owns; a backlog of 0 holds one connection.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let mut queued = Vec::new();
+        while let Ok(s) = vk_core::unixpath::connect_within(&full, Some(Duration::from_millis(50)))
+        {
+            queued.push(s);
+            assert!(queued.len() < 64, "the backlog never filled");
+        }
+        let began = Instant::now();
+        let err = control_by(&full, &req, Deadline::in_secs(1), None, |_| {}).unwrap_err();
+        assert!(began.elapsed() < Duration::from_secs(3), "{err:#}");
+
+        let slow = dir.join("slow.sock");
+        let listener = vk_core::unixpath::bind(&slow).unwrap();
+        let serve = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            // Never a whole frame, until the client goes.
+            while conn.write_all(b"x").is_ok() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let began = Instant::now();
+        let err = control_by(&slow, &req, Deadline::in_secs(1), None, |_| {}).unwrap_err();
+        assert!(began.elapsed() < Duration::from_secs(3), "{err:#}");
+        serve.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A manager the run held serves is sent the request.
+    #[test]
+    fn a_control_request_goes_to_the_run_held() {
+        use std::io::BufRead;
+        let dir = tmpdir("control-held");
+        let ctl = dir.join("ctl.sock");
+        let listener = vk_core::unixpath::bind(&ctl).unwrap();
+        let serve = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&conn).read_line(&mut line).unwrap();
+            let done = Frame::Done(Reply::ok("db stopped"));
+            let text = serde_json::to_string(&done).unwrap() + "\n";
+            conn.write_all(text.as_bytes()).unwrap();
+            line
+        });
+        let this = Held::open(i32::try_from(std::process::id()).unwrap())
+            .unwrap()
+            .unwrap();
+        let req = Request::Stop { unit: "db".into() };
+        let conn = Control::open(&ctl, Deadline::in_secs(30), None, Some(&this)).unwrap();
+        assert_eq!(conn.request(&req, |_| {}).unwrap().message, "db stopped");
+        assert!(serve.join().unwrap().contains("db"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A state-dir lock held by a process other than the entry's `vk run` reads as a run that

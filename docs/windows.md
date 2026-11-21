@@ -100,9 +100,9 @@ A stop presses the ACPI power button and, if Windows is still up 10 seconds late
 qemu-ga to shut it down. Three minutes after the button (ten for a build step's guest), vk asks
 the VMM to quit, which flushes the disks (a kill would leave a qcow2 overlay's cached metadata
 unwritten, and the next run of a kept disk would corrupt it), and kills it only if it is still
-running 10 seconds later. `vk stop` waits 210 seconds by default before it reports a run as
-stuck; a VM left behind by a vk that crashed ends itself the same way 11 minutes after the
-button.
+running 10 seconds later. All targets of `vk stop` share one timeout (210 seconds by
+default). If vk crashes, a surviving VM requests a VMM quit 11 minutes after the power
+button. A backup alarm ends the VM if the shutdown thread stalls.
 
 ## Sharing builds between hosts
 

@@ -137,7 +137,7 @@ enum DevAction {
     Restart {
         #[command(flatten)]
         targets: Targets,
-        /// seconds to wait per environment stop, or per service-stop socket read or write
+        /// seconds to wait per environment stop or per socket operation when stopping a service
         #[arg(long, default_value_t = super::boot::STOP_TIMEOUT_SECS)]
         timeout: u64,
     },
@@ -414,7 +414,7 @@ enum DevAction {
             conflicts_with_all = ["names", "services", "vms"]
         )]
         state_dir: Option<PathBuf>,
-        /// seconds to wait per environment stop, or per service-stop socket read or write
+        /// seconds to wait per environment stop or per socket operation when stopping a service
         #[arg(long, default_value_t = super::boot::STOP_TIMEOUT_SECS)]
         timeout: u64,
     },
@@ -632,7 +632,9 @@ enum DevServiceAction {
     Down {
         /// the service
         name: String,
-        /// seconds to wait for each socket read or write while stopping the service
+        /// seconds to wait for each socket connect, read or write while stopping the service
+        ///
+        /// 0 waits indefinitely.
         #[arg(long, default_value_t = 120, value_name = "SECS")]
         timeout: u64,
     },
@@ -974,7 +976,8 @@ async fn dev_action(
             dev::service_within(
                 &plan,
                 &vk_core::fleetctl::Request::Stop { unit: name },
-                Some(std::time::Duration::from_secs(timeout)),
+                (timeout > 0).then(|| std::time::Duration::from_secs(timeout)),
+                std::env::var(crate::vms::STOP_RUN_ENV).ok().as_deref(),
             )
             .await,
         ),
@@ -1840,7 +1843,7 @@ fn env_verb(
 }
 
 /// `verb` on the compose service `service` of `env`: a start brings the environment up
-/// first, a stop leaves it up. `timeout` bounds each read and write of a stop's request.
+/// first, a stop leaves it up. Each stop socket operation has its own `timeout`.
 async fn service_verb(
     verb: Verb,
     env: &super::targets::Env,
@@ -1874,7 +1877,7 @@ async fn service_verb(
         let reply = match req {
             Request::Stop { .. } => {
                 let within = Some(std::time::Duration::from_secs(timeout));
-                dev::service_within(&plan, req, within).await?
+                dev::service_within(&plan, req, within, None).await?
             }
             _ => dev::service(&plan, req).await?,
         };

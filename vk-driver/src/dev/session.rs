@@ -577,8 +577,9 @@ async fn publish_for(
     Ok(failed)
 }
 
-/// Stop the publishers of `service`'s endpoints — its relays only, not the environment's.
-fn unpublish_for(plan: &Plan, service: &str) {
+/// Stop the publishers of `service`'s endpoints — its relays only, not the environment's —
+/// while `run` is up: they are then that run's.
+fn unpublish_for(plan: &Plan, service: &str, run: &crate::vms::Held) {
     for ep in plan
         .endpoints
         .iter()
@@ -586,11 +587,7 @@ fn unpublish_for(plan: &Plan, service: &str) {
     {
         // Best effort: a relay that will not stop is reported by the next `ensure`, which
         // refuses to replace a publisher running a different spec.
-        let _ = crate::publish::stop(
-            &plan.state_dir,
-            Some(&ep.name),
-            std::time::Duration::from_secs(5),
-        );
+        let _ = crate::publish::stop_while(&plan.state_dir, &ep.name, &|| !run.exited());
     }
 }
 
@@ -788,22 +785,33 @@ pub async fn service(
     plan: &Plan,
     req: &vk_core::fleetctl::Request,
 ) -> Result<vk_core::fleetctl::Reply> {
-    // Both forms of start have no socket timeout. Other requests get 120 seconds for guest shutdown.
+    // Starts may build indefinitely. Other requests get 120 seconds per socket operation.
     let timeout = match req {
         vk_core::fleetctl::Request::Start { .. }
         | vk_core::fleetctl::Request::StartCached { .. } => None,
         _ => Some(std::time::Duration::from_secs(120)),
     };
-    service_within(plan, req, timeout).await
+    service_within(plan, req, timeout, None).await
 }
 
-/// [`service`], bounding each read and write of the request by `timeout` (`None`: none).
+/// Bound each socket connect, read and write by `timeout` (`None` waits indefinitely).
+/// A stop verifies that the current run serves the connection and matches any `selected`
+/// run ID. After a successful stop, try to remove its relays while that run is alive.
 pub async fn service_within(
     plan: &Plan,
     req: &vk_core::fleetctl::Request,
     timeout: Option<std::time::Duration>,
+    selected: Option<&str>,
 ) -> Result<vk_core::fleetctl::Reply> {
     let entry = running_entry(plan)?;
+    if let Some(selected) = selected
+        && crate::vms::run_id(&entry) != selected
+    {
+        bail!(
+            "the dev environment is no longer the run selected (now pid {})",
+            entry.pid
+        );
+    }
     let ctl = crate::vms::control_socket(&entry).ok_or_else(|| {
         anyhow::anyhow!(
             "the environment has no compose services (source: {})",
@@ -814,19 +822,21 @@ pub async fn service_within(
             }
         )
     })?;
-    // A service's relays go with it: down before the stop, up once the start is confirmed.
-    if let vk_core::fleetctl::Request::Stop { unit } = req {
-        unpublish_for(plan, unit);
-    }
-    let result = crate::vms::control(&ctl, req, timeout, |line| eprintln!("{line}"));
-    // Restore relays if the manager refuses the stop or the request fails, so a service
-    // that remains running stays reachable without waiting for the next attach to republish.
-    if let vk_core::fleetctl::Request::Stop { unit } = req
-        && !result.as_ref().is_ok_and(|r| r.ok)
+    let run = match req {
+        vk_core::fleetctl::Request::Stop { .. } => match crate::vms::held_run(&entry) {
+            Ok(Some(run)) => Some(run),
+            Ok(None) => bail!("the dev environment is not running"),
+            Err(why) => bail!("the dev environment (pid {}): {why}", entry.pid),
+        },
+        _ => None,
+    };
+    let reply = crate::vms::Control::open(&ctl, crate::vms::Deadline::NEVER, timeout, run.as_ref())
+        .and_then(|c| c.request(req, |line| eprintln!("{line}")))?;
+    if let (vk_core::fleetctl::Request::Stop { unit }, Some(run)) = (req, &run)
+        && reply.ok
     {
-        let _ = publish_for(plan, &entry, Some(unit)).await;
+        unpublish_for(plan, unit, run);
     }
-    let reply = result?;
     if let vk_core::fleetctl::Request::Start { unit }
     | vk_core::fleetctl::Request::StartCached { unit } = req
         && reply.ok

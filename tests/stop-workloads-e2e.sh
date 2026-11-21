@@ -10,7 +10,7 @@
 # 3. `vk stop` lets a daemon left in the primary by `vk exec` handle SIGTERM rather than
 #    meet the power cut, and the command the run booted with handle it too.
 # 4. The stop powers `db` off alongside the primary: `db` stops while the primary's command
-#    is still in its TERM trap, and the whole stop stays well within `vk stop`'s 210 s.
+#    is still in its TERM trap, and the command returns in under 45 seconds.
 #
 # Run:  VK=./dist/vk tests/stop-workloads-e2e.sh
 # Needs: a `vk` with an embedded kernel/agent, KVM, and a registry to pull alpine.
@@ -106,7 +106,7 @@ echo "== leave a daemon in the primary, then stop the run =="
 wait_for 10 file_is "$OUT/daemon.up" up || fail "the daemon in the primary did not start"
 rm -f "$OUT/stop-order"
 started=$(date +%s)
-"$VK" stop "$WORK"
+"$VK" stop --timeout 45 "$WORK" || fail "vk stop did not report the run stopped"
 took=$(($(date +%s) - started))
 echo "the stop took ${took}s"
 file_is "$OUT/daemon" term \
