@@ -106,6 +106,8 @@ All notable changes to virtkit will be documented in this file.
   reply timeout.
 - GitLab relays receive the hub's reason for refusing a session and a clean close when
   the hub hands over.
+- Released grants and grants past their claim deadline no longer count toward the hub's
+  active queue limits for capacity requests.
 
 ## [0.114.0] - 2026-11-20
 

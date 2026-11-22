@@ -55,6 +55,8 @@ vk-selfupdate = { path = "../vk-selfupdate" }
 vk-oidc = { path = "../vk-oidc", features = ["fake-idp"] }
 # The tests' relay, on its one HTTP/2 connection.
 hyper = { workspace = true, features = ["client", "http2"] }
+# Advance lease deadlines in tests without waiting.
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(target_env = "musl")'.dependencies]
 jemallocator.workspace = true

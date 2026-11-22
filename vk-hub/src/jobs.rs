@@ -1563,18 +1563,44 @@ pub fn last_refusal(hub: &Hub, node: &str) -> Option<String> {
 async fn on_lease(hub: &Hub, node: &str, id: &str, lease: LeaseState) -> Result<Vec<HubJobMsg>> {
     let ended = {
         let mut state = hub.dispatch.lock();
-        let Some(r) = state.reservations.get_mut(id).filter(|r| r.node == node) else {
+        let Some(r) = state.reservations.get(id).filter(|r| r.node == node) else {
             return Ok(Vec::new());
         };
+        let ticket = r.ticket.clone();
         match lease {
             LeaseState::Held { remaining_secs } => {
+                // Admission can reuse the slot at the claim deadline, before the scheduler
+                // retires the ticket. A late renewal must not revive the old grant.
+                let deadline = ticket
+                    .as_ref()
+                    .and_then(|t| match &state.tickets.get(t)?.phase {
+                        TicketPhase::Granted {
+                            reservation,
+                            accepted,
+                        } if reservation == id => grant_deadline(&state, id, *accepted),
+                        _ => None,
+                    });
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    if let Some(ticket) = ticket.and_then(|t| state.tickets.get_mut(&t)) {
+                        ticket.phase = TicketPhase::Finished(AdmissionOutcome::Released);
+                        ticket.probe = false;
+                    }
+                    // The node still holds the reservation. Reply with a release, as for a
+                    // late acceptance.
+                    state.reservations.remove(id);
+                    return Ok(vec![HubJobMsg::Release {
+                        reservation: id.to_owned(),
+                    }]);
+                }
+                let Some(r) = state.reservations.get_mut(id) else {
+                    return Ok(Vec::new());
+                };
                 if matches!(r.phase, ResvPhase::Held { .. }) {
                     r.phase = ResvPhase::Held {
                         lease_secs: remaining_secs.min(MAX_LEASE_SECS),
                     };
                 }
                 r.leases = r.leases.wrapping_add(1);
-                let ticket = r.ticket.clone();
                 if let Some(ticket) = ticket.and_then(|t| state.tickets.get_mut(&t))
                     && let TicketPhase::Granted {
                         reservation,
@@ -2595,6 +2621,16 @@ pub fn queue_reservation(
             ))
         };
     }
+    // An unclaimable grant frees its slot before the scheduler marks the ticket finished.
+    let now = Instant::now();
+    let holds = |t: &Ticket| match &t.phase {
+        TicketPhase::Granted {
+            reservation,
+            accepted,
+        } => grant_deadline(&state, reservation, *accepted).is_some_and(|deadline| now < deadline),
+        TicketPhase::Finished(_) => false,
+        _ => true,
+    };
     let waiting = state
         .tickets
         .values()
@@ -2607,12 +2643,10 @@ pub fn queue_reservation(
                         | TicketPhase::Offering { .. }
                         | TicketPhase::Granted { .. }
                 )
+                && holds(t)
         })
         .count();
-    let active = state
-        .tickets
-        .values()
-        .filter(|t| !matches!(t.phase, TicketPhase::Finished(_)));
+    let active = state.tickets.values().filter(|t| holds(t));
     let principal_active = active.clone().filter(|t| t.key == principal.id).count();
     let runner_limit = usize::try_from(identity.request_concurrency)
         .unwrap_or(usize::MAX)
@@ -2629,7 +2663,6 @@ pub fn queue_reservation(
         )
         .retry_after(1));
     }
-    let now = Instant::now();
     state.tickets.insert(
         id.clone(),
         Ticket {
@@ -2657,6 +2690,15 @@ pub fn queue_reservation(
     drop(state);
     hub.dispatch.bump();
     Ok(id)
+}
+
+/// Exclusive claim deadline, one second before lease expiry. A lease of one second or
+/// less has no claim window. Returns `None` unless the reservation is held.
+fn grant_deadline(state: &State, reservation: &str, accepted: Instant) -> Option<Instant> {
+    let ResvPhase::Held { lease_secs } = state.reservations.get(reservation)?.phase else {
+        return None;
+    };
+    Some(accepted + Duration::from_secs(u64::from(lease_secs.saturating_sub(1))))
 }
 
 pub fn poll_ticket(
@@ -2882,11 +2924,7 @@ fn claim_blocking(hub: &Hub, principal: &ApiPrincipal, reservation: &str) -> Res
         if r != reservation {
             return None;
         }
-        let held = state.reservations.get(r)?;
-        let ResvPhase::Held { lease_secs } = held.phase else {
-            return None;
-        };
-        Some(*accepted + Duration::from_secs(u64::from(lease_secs.saturating_sub(1))))
+        grant_deadline(&state, r, *accepted)
     });
     if !live || lease_deadline.is_none_or(|deadline| Instant::now() >= deadline) {
         return Err(gone(reservation));
@@ -2934,15 +2972,24 @@ fn claim_blocking(hub: &Hub, principal: &ApiPrincipal, reservation: &str) -> Res
         return Err(error.into());
     }
     let current = current();
+    // Admission uses the current deadline. A renewal may have changed it during the write.
     let valid = current
-        && lease_deadline.is_some_and(|deadline| Instant::now() < deadline)
         && state
             .reservations
             .get(reservation)
             .is_some_and(|r| r.key == principal.id && matches!(r.phase, ResvPhase::Held { .. }))
         && state.tickets.get(&id).is_some_and(|t| {
+            let TicketPhase::Granted {
+                reservation: r,
+                accepted,
+            } = &t.phase
+            else {
+                return false;
+            };
             ours(t)
-                && matches!(&t.phase, TicketPhase::Granted { reservation: r, .. } if r == reservation)
+                && r == reservation
+                && grant_deadline(&state, r, *accepted)
+                    .is_some_and(|deadline| Instant::now() < deadline)
         });
     if !valid {
         let probe = state.tickets.get_mut(&id).and_then(|ticket| {
@@ -5378,12 +5425,16 @@ mod tests {
         assert!(db.admission("c").unwrap().is_some());
     }
 
-    #[tokio::test]
-    async fn claim_does_not_hold_dispatch_lock_during_durable_write() {
-        let hub = Arc::new(Hub::new(
-            Arc::new(crate::store::Db::open_memory().unwrap()),
-            None,
-        ));
+    /// Blocks the durable claim write for `relay`'s `ticket` in session 1 (`reservation`
+    /// on `node`, 60 s lease). Returns the claim task, the sender that unblocks the write,
+    /// and the thread holding the writer.
+    async fn claim_held_at_write(
+        hub: &Arc<Hub>,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), ApiError>>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
         let principal = ApiPrincipal {
             id: "relay".into(),
             name: "relay".into(),
@@ -5459,6 +5510,16 @@ mod tests {
         })
         .await
         .unwrap();
+        (claim, release_tx, writer)
+    }
+
+    #[tokio::test]
+    async fn claim_does_not_hold_dispatch_lock_during_durable_write() {
+        let hub = Arc::new(Hub::new(
+            Arc::new(crate::store::Db::open_memory().unwrap()),
+            None,
+        ));
+        let (claim, release_tx, writer) = claim_held_at_write(&hub).await;
         // Disconnect changes the grant while the write is blocked. The worker must be able
         // to observe it, retire the ticket and remove the durable claim before replying.
         relay_disconnected(&hub, "relay", 1);
@@ -5470,6 +5531,159 @@ mod tests {
             hub.dispatch.lock().tickets["ticket"].phase,
             TicketPhase::Finished(_)
         ));
+    }
+
+    /// A renewal during the durable write can shorten the claim window to zero.
+    #[tokio::test]
+    async fn a_claim_is_checked_against_a_renewal_during_its_write() {
+        let hub = Arc::new(Hub::new(
+            Arc::new(crate::store::Db::open_memory().unwrap()),
+            None,
+        ));
+        let (claim, release_tx, writer) = claim_held_at_write(&hub).await;
+        // A 1 s lease leaves no time to claim under the one-second margin.
+        let renewed = LeaseState::Held { remaining_secs: 1 };
+        on_lease(&hub, "node", "reservation", renewed)
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let error = claim.await.unwrap().unwrap_err();
+        assert_eq!(error.status, StatusCode::GONE, "{error:?}");
+        assert!(hub.db.admission("ticket").unwrap().is_none());
+    }
+
+    /// Checks runner, relay and hub limits without a scheduler pass. The paused clock lets
+    /// the test admit a replacement at the claim deadline and deliver a late renewal.
+    #[tokio::test(start_paused = true)]
+    async fn an_ended_grant_frees_its_place_before_the_next_pass() {
+        let dir =
+            std::env::temp_dir().join(format!("vk-hub-jobs-ended-grant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = Hub::new(Arc::new(crate::store::Db::open_memory().unwrap()), None)
+            .with_jobs(dir.clone(), DEFAULT_LOST_AFTER, None)
+            .unwrap();
+        hub.open_session("relay");
+        let principal = ApiPrincipal {
+            id: "relay".into(),
+            name: "relay".into(),
+            instance: None,
+            kind: crate::store::PrincipalKind::Relay { session: None },
+        };
+        let identity = |runner: &str, request_concurrency| ResolvedIdentity {
+            lane: crate::policy::LaneId::Default,
+            class: crate::policy::Class::Normal,
+            gitlab: Some("gl".into()),
+            runner_id: Some(1),
+            runner: Some(runner.into()),
+            concurrent: 1,
+            limit: None,
+            request_concurrency,
+        };
+        // The ticket and its 60 s reservation share an ID.
+        let grant = |id: &str, runner: &str, accepted: Instant| {
+            let mut state = hub.dispatch.lock();
+            let mut t = ticket(
+                TicketPhase::Granted {
+                    reservation: id.into(),
+                    accepted,
+                },
+                accepted,
+            );
+            t.key = principal.id.clone();
+            t.request_id = id.into();
+            t.identity = identity(runner, 1);
+            t.reservation = Some(id.into());
+            state.tickets.insert(id.into(), t);
+            state.reservations.insert(
+                id.into(),
+                Resv {
+                    key: principal.id.clone(),
+                    instance: None,
+                    node: "node".into(),
+                    envelope: Envelope::default(),
+                    phase: ResvPhase::Held { lease_secs: 60 },
+                    accepted_at: 0,
+                    leases: 0,
+                    ticket: Some(id.into()),
+                },
+            );
+        };
+        let queue = |request_id: &str, runner: &str, request_concurrency| {
+            queue_reservation(
+                &hub,
+                &principal,
+                QueueRequest {
+                    request_id,
+                    digest: "",
+                    identity: identity(runner, request_concurrency),
+                    placement: Placement::default(),
+                    lease_secs: 60,
+                    queued: true,
+                },
+            )
+        };
+        let full = |result: Result<String, ApiError>| {
+            let error = result.unwrap_err();
+            assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE, "{error:?}");
+        };
+
+        // A live grant fills the runner's only slot. Release it and retry the refused request.
+        grant("released", "a", Instant::now());
+        full(queue("next", "a", 1));
+        release(&hub, &principal, "released").unwrap();
+        let next = queue("next", "a", 1).unwrap();
+
+        // The reservation stays held, but its queue slot frees exactly 59 s into the 60 s lease.
+        hub.dispatch.lock().tickets.remove(&next);
+        grant("expired", "b", Instant::now());
+        tokio::time::advance(Duration::from_secs(59) - Duration::from_millis(1)).await;
+        full(queue("after-expired", "b", 1));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        queue("after-expired", "b", 1).unwrap();
+        // A renewal arriving after the replacement was admitted must release the old grant.
+        let renewed = LeaseState::Held { remaining_secs: 60 };
+        let reply = on_lease(&hub, "node", "expired", renewed).await.unwrap();
+        assert!(
+            matches!(&reply[..], [HubJobMsg::Release { reservation }] if reservation == "expired"),
+            "{reply:?}"
+        );
+        let error = claim_blocking(&hub, &principal, "expired").unwrap_err();
+        assert_eq!(error.status, StatusCode::GONE, "{error:?}");
+        full(queue("after-renewal", "b", 1));
+
+        // Fill the relay's last slot with a grant, then release it. Its other tickets stay queued.
+        {
+            let mut state = hub.dispatch.lock();
+            state.tickets.clear();
+            for n in 0..MAX_PRINCIPAL_TICKETS - 1 {
+                let mut t = ticket(TicketPhase::Waiting, Instant::now());
+                t.key = principal.id.clone();
+                t.request_id = format!("waiting-{n}");
+                state.tickets.insert(format!("waiting-{n}"), t);
+            }
+        }
+        grant("last", "c", Instant::now());
+        full(queue("over", "d", 1));
+        release(&hub, &principal, "last").unwrap();
+        queue("over", "d", 1).unwrap();
+
+        // Another client owns the waiting tickets. Releasing this grant frees the last hub slot.
+        {
+            let mut state = hub.dispatch.lock();
+            state.tickets.clear();
+            for n in 0..MAX_TICKETS - 1 {
+                let mut t = ticket(TicketPhase::Waiting, Instant::now());
+                t.key = "other".into();
+                t.request_id = format!("other-{n}");
+                state.tickets.insert(format!("other-{n}"), t);
+            }
+        }
+        grant("hub-last", "e", Instant::now());
+        full(queue("beyond", "f", 1));
+        release(&hub, &principal, "hub-last").unwrap();
+        queue("beyond", "f", 1).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The lines still open show as the terminal would: continued, then overwritten.
