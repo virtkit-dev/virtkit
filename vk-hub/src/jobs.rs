@@ -213,6 +213,9 @@ pub struct Dispatch {
     pub egress_write_every: Duration,
     /// How long a node has to answer an offer; defaults to [`OFFER_TIMEOUT`].
     pub offer_timeout: Duration,
+    /// Set by [`testing::end_request_waits`] for current and future reservation waits.
+    #[cfg(test)]
+    requests_ended: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -820,6 +823,8 @@ impl Dispatch {
             affinity: Affinity::default(),
             egress_write_every: DEFAULT_EGRESS_WRITE_EVERY,
             offer_timeout: OFFER_TIMEOUT,
+            #[cfg(test)]
+            requests_ended: std::sync::atomic::AtomicBool::new(false),
             state: Mutex::new(State {
                 capacity_revision: crate::now_secs().saturating_mul(1000),
                 ..State::default()
@@ -842,6 +847,19 @@ impl Dispatch {
     /// Wake on the next change.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changes.subscribe()
+    }
+
+    /// Reservation waits end early only in tests.
+    #[cfg(not(test))]
+    pub fn requests_ended(&self) -> bool {
+        false
+    }
+
+    /// Whether [`testing::end_request_waits`] ended reservation waits.
+    #[cfg(test)]
+    pub fn requests_ended(&self) -> bool {
+        self.requests_ended
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Counts of queued jobs and unanswered starts whose specs remain only in memory because
@@ -6484,6 +6502,18 @@ pub(crate) mod testing {
             ticket.polled = Instant::now() - TICKET_IDLE - Duration::from_secs(1);
         }
         super::step(hub).await.unwrap();
+    }
+
+    /// Expire job `id`'s placement window and run a dispatch pass.
+    pub async fn end_window_and_step(hub: &Hub, id: &str) {
+        hub.dispatch.lock().jobs.get_mut(id).unwrap().deadline = Instant::now();
+        super::step(hub).await.unwrap();
+    }
+
+    /// Treat current and future reservation waits as expired.
+    pub fn end_request_waits(hub: &Hub) {
+        (hub.dispatch.requests_ended).store(true, std::sync::atomic::Ordering::Relaxed);
+        hub.dispatch.bump();
     }
 
     /// Have every ticket go unpolled past [`TICKET_IDLE`], then run a pass.

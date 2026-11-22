@@ -2074,4 +2074,28 @@ mod tests {
             ByteRange::Unsatisfiable
         );
     }
+
+    /// A request reaching a draining relay connection gets HTTP 503 so the relay can reconnect.
+    #[tokio::test]
+    async fn an_ended_relay_connection_serves_nothing_new() {
+        let hub = Arc::new(Hub::new(Arc::new(Db::open_memory().unwrap()), None));
+        let relay = RelayConn::new(Arc::new(Mutex::new(None)));
+        relay.end();
+        let peer = SocketAddr::from(([127, 0, 0, 1], 1));
+        let service = service_fn(move |req| {
+            let (hub, relay) = (hub.clone(), relay.clone());
+            async move { Ok::<_, Infallible>(relay_request(req, &hub, peer, None, &relay).await) }
+        });
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(http1::Builder::new().serve_connection(TokioIo::new(server), service));
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let req = Request::post("/v1/capacity")
+            .body(http_body_util::Empty::<Bytes>::new())
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }

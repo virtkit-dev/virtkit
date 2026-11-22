@@ -124,7 +124,7 @@ async fn a_job_whose_project_is_delisted_is_held_saying_why() {
     let key = jobs_key(&hub);
     ready_relay(&hub, &key);
     // Submitted while listed, with no node to take it yet; then its lane drops the project.
-    let job = submit(addr, &key, job_body(1, None, 2), None).await;
+    let job = submit(addr, &key, job_body(1, None, HELD_WINDOW), None).await;
     list_project(&hub, false);
     let mut node = ready_node(addr, &hub, 16384).await;
     crate::jobs::testing::step(&hub).await;
@@ -132,7 +132,10 @@ async fn a_job_whose_project_is_delisted_is_held_saying_why() {
         crate::jobs::testing::job_blocked(&hub, &job),
         Some("no longer allowed by its lane")
     );
-    let ended = view_until(addr, &key, &job, |v| v.state == JobState::Finished).await;
+    crate::jobs::testing::end_window_and_step(&hub, &job).await;
+    // Check the result without polling for another dispatch pass.
+    let ended = job_view(addr, &key, &job).await;
+    assert_eq!(ended.state, JobState::Finished, "{ended:?}");
     assert_eq!(
         ended.result.unwrap().message.as_deref(),
         Some("no node took it within its placement window (no longer allowed by its lane)")

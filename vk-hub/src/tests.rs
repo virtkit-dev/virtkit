@@ -1569,6 +1569,8 @@ async fn a_tls_download_is_bound_to_its_connection() {
     };
     ops::update(&hub, "uid 0", &node_id, &sha, false).unwrap();
     let path = format!("{}{sha}", vk_hub_proto::RELEASE_PATH);
+    // Use each TLS connection immediately so the hub's pre-authentication timeout cannot
+    // expire while requests on other connections run.
     let (stream, exported) = tls_stream(addr).await;
     let headers = download_headers(
         &key,
@@ -1577,8 +1579,14 @@ async fn a_tls_download_is_bound_to_its_connection() {
         now_secs(),
         vk_hub_proto::Channel::Tls(&exported),
     );
+    let (status, body) = get_on(stream, &path, &headers).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, bin);
+    let unbound = |(status, body): (u16, Vec<u8>)| {
+        status == 403 && String::from_utf8_lossy(&body).contains("binding to the connection")
+    };
     let (other, _) = tls_stream(addr).await;
-    assert_eq!(get_on(other, &path, &headers).await.0, 403);
+    assert!(unbound(get_on(other, &path, &headers).await));
     let plain = download_headers(
         &key,
         &node_id,
@@ -1587,10 +1595,7 @@ async fn a_tls_download_is_bound_to_its_connection() {
         vk_hub_proto::Channel::Plaintext,
     );
     let (third, _) = tls_stream(addr).await;
-    assert_eq!(get_on(third, &path, &plain).await.0, 403);
-    let (status, body) = get_on(stream, &path, &headers).await;
-    assert_eq!(status, 200);
-    assert_eq!(body, bin);
+    assert!(unbound(get_on(third, &path, &plain).await));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

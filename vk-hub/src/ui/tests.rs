@@ -839,11 +839,15 @@ impl Events {
 
     /// Read more; `false` at the end of the connection.
     async fn fill(&mut self) -> bool {
-        let mut chunk = [0u8; 4096];
-        let n = tokio::time::timeout(Duration::from_secs(10), self.stream.read(&mut chunk))
+        tokio::time::timeout(Duration::from_secs(10), self.read_more())
             .await
             .expect("the stream went quiet")
-            .unwrap();
+    }
+
+    /// Read without a timeout. Return `false` at EOF.
+    async fn read_more(&mut self) -> bool {
+        let mut chunk = [0u8; 4096];
+        let n = self.stream.read(&mut chunk).await.unwrap();
         self.buf.extend_from_slice(&chunk[..n]);
         n > 0
     }
@@ -851,6 +855,11 @@ impl Events {
     /// The next event, comments and `version` events skipped; `None` once the stream has
     /// ended.
     async fn next(&mut self) -> Option<String> {
+        self.next_event(true).await
+    }
+
+    /// Like [`Events::next`], with an optional timeout per read.
+    async fn next_event(&mut self, bounded: bool) -> Option<String> {
         loop {
             // Whole chunks into `body`.
             while let Some(line_end) = self.buf.windows(2).position(|w| w == b"\r\n") {
@@ -876,7 +885,15 @@ impl Events {
                     return Some(event);
                 }
             }
-            if self.ended || !self.fill().await {
+            if self.ended {
+                return None;
+            }
+            let more = if bounded {
+                self.fill().await
+            } else {
+                self.read_more().await
+            };
+            if !more {
                 return None;
             }
         }
@@ -898,6 +915,25 @@ async fn events_until(events: &mut Events, want: &str) -> Vec<String> {
         }
     }
     panic!("no event with {want:?}: {seen:?}");
+}
+
+/// Return the latest event of each name concatenated once they contain all of `wants`.
+/// One 30-second deadline covers all reads.
+async fn latest_with(events: &mut Events, wants: &[&str]) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut latest: Vec<(String, String)> = Vec::new();
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next_event(false)).await {
+        let name = event.lines().next().unwrap_or_default().to_string();
+        match latest.iter_mut().find(|(n, _)| *n == name) {
+            Some(last) => last.1 = event,
+            None => latest.push((name, event)),
+        }
+        let all: String = latest.iter().map(|(_, e)| e.as_str()).collect();
+        if wants.iter().all(|w| all.contains(w)) {
+            return all;
+        }
+    }
+    panic!("no events with all of {wants:?}: {latest:?}");
 }
 
 /// The stream's next event containing `want`, within 30s.
@@ -4339,9 +4375,11 @@ async fn the_job_history_is_shown_filtered_and_paged() {
          rel=\"noopener noreferrer\">↗</a></td>",
         "<span class=\"badge bad\">script failure, exit 2</span>",
         "<span class=\"badge busy\">running: step_script</span>",
-        // Running for 90 seconds by the hub's clock; the browser advances the duration.
-        "<td class=\"num\"><span data-since=\"",
-        "\">1m3",
+        // The browser advances the timer from this timestamp. The row test checks its text.
+        &format!(
+            "<td class=\"num\"><span data-since=\"{}\">",
+            crate::utc(now - 90)
+        ),
         "<span class=\"badge\">queued</span>",
     ] {
         assert!(page.contains(want), "{want}: {page}");
@@ -9955,10 +9993,9 @@ async fn relays_and_their_runners_follow_their_server() {
         hub.db.record_relay(&relay, write, now).unwrap();
     }
     hub.clients_changed();
-    // The stream's periodic heartbeat can render between writes. Wait for the relay's
-    // heartbeat, written last, so the event includes its inventory and report too.
-    let event = events_until(&mut live, " · HTTP 204</td>").await.concat();
-    for want in [
+    // Each event reads state separately and may render between writes. Wait until the
+    // latest events include all the updates.
+    let wants = [
         "<strong>relay-1</strong> <code class=\"sub\">",
         "<span class=\"badge bad\">unreachable</span>",
         "https://gitlab.example.com <span class=\"badge warn\">pending</span>",
@@ -9983,19 +10020,21 @@ async fn relays_and_their_runners_follow_their_server() {
         "<span class=\"badge bad\">token not verified</span> \
          <span class=\"badge bad\">token refused</span>",
         "&lt;script&gt;x&lt;/script&gt;",
-    ] {
-        assert!(event.contains(want), "{want}: {event}");
-    }
+    ];
+    let event = latest_with(&mut live, &wants).await;
     assert!(!event.contains("<script>"), "{event}");
     assert!(!event.contains("<form"), "{event}");
     hub.db
         .add_gitlab("gl", "https://gitlab.example.com", "uid 0", now)
         .unwrap();
     hub.clients_changed();
-    next_with(&mut live, "<td><strong>gl</strong></td>").await;
-    // Its runners no longer wait for their server.
-    let waiting = next_with(&mut live, "event: gitlab-waiting\n").await;
-    assert!(!waiting.contains("Runners waiting"), "{waiting}");
+    // The server listing and the empty waiting fragment can arrive in either order.
+    // Only the navigation counts remain in the waiting event.
+    let wants = [
+        "<td><strong>gl</strong></td>",
+        "event: gitlab-waiting\ndata: <span id=\"nav-count-",
+    ];
+    latest_with(&mut live, &wants).await;
     let mut live_server = Events::open(addr, "/events/gitlab/gl", &viewer).await;
     let event = next_with(&mut live_server, "GitLab ID 42").await;
     // Its server approved: no lane, and no link adding one for a viewer.

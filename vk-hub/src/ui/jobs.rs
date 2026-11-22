@@ -1714,6 +1714,34 @@ mod tests {
         assert!(!h.into_string().contains("<th>Event</th>"));
     }
 
+    /// The hub renders elapsed time and supplies the start time for the browser's timer.
+    #[test]
+    fn a_running_job_s_row_shows_its_run_so_far() {
+        let mut j = super::super::tests::history_job(1, "acme/web");
+        j.state = JobState::Running;
+        j.started_at = Some(1000);
+        let row = |now| {
+            let mut h = Html::new();
+            job_row(
+                &mut h,
+                &JobFilter::default(),
+                "ab",
+                &j,
+                &HashMap::new(),
+                now,
+            );
+            h.into_string()
+        };
+        for (now, shown) in [(1090, "1m30s"), (4600, "1h00m")] {
+            let row = row(now);
+            let want = format!(
+                "<td class=\"num\"><span data-since=\"{}\">{shown}</span></td>",
+                crate::utc(1000)
+            );
+            assert!(row.contains(&want), "{want}: {row}");
+        }
+    }
+
     /// Show preparation activity and a browser timer; link the awaited job only through
     /// a plain web link.
     #[test]

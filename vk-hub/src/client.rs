@@ -924,7 +924,7 @@ async fn reserve(
         if let Some(grant) = jobs::poll_ticket(hub, principal, &ticket)? {
             break grant;
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || hub.dispatch.requests_ended() {
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::NoCapacity,

@@ -20,6 +20,8 @@ type Session = vk_peer::session::Ws;
 pub(in crate::tests) struct H2 {
     sender: hyper::client::conn::http2::SendRequest<H2Body>,
     authority: String,
+    /// True once the connection future completes.
+    ended: tokio::sync::watch::Receiver<bool>,
 }
 
 impl H2 {
@@ -114,10 +116,15 @@ pub(in crate::tests) async fn dial_h2(
         hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io))
             .await
             .unwrap();
-    tokio::spawn(conn);
+    let (ended_tx, ended) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let _ = conn.await;
+        ended_tx.send_replace(true);
+    });
     let h2 = H2 {
         sender,
         authority: format!("localhost:{}", addr.port()),
+        ended,
     };
     (h2, exported)
 }
@@ -380,8 +387,7 @@ async fn a_plain_listener_serves_a_relay_over_http2_with_prior_knowledge() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Once its session ends, a relay's connection serves no new request and closes; the tickets
-/// queued on it end with the session.
+/// Ending the session closes its connection and cancels its queued tickets.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_relay_s_connection_and_tickets_end_with_its_session() {
     let (dir, addr, _hub, key) = hub_and_relay("relay-conn-end", true).await;
@@ -409,39 +415,16 @@ async fn a_relay_s_connection_and_tickets_end_with_its_session() {
             ..
         }
     ));
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match h2.capacity_or_closed().await {
-                None | Some(503) => break,
-                Some(_) => tokio::time::sleep(Duration::from_millis(10)).await,
-            }
-        }
-    })
-    .await
-    .expect("the ended session's connection served on");
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !h2.sender.is_closed() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the ended session's connection stayed open");
+    let mut ended = h2.ended.clone();
+    tokio::time::timeout(Duration::from_secs(10), ended.wait_for(|ended| *ended))
+        .await
+        .expect("the ended session's connection stayed open")
+        .unwrap();
 
     let path = format!("/v1/reservations/tickets/{ticket}");
     let (status, _) = newer.send("GET", &path, &[], None).await.unwrap();
     assert_eq!(status, 410);
     std::fs::remove_dir_all(&dir).unwrap();
-}
-
-impl H2 {
-    /// A capacity request's status, or `None` once the connection takes no new request.
-    async fn capacity_or_closed(&self) -> Option<u16> {
-        let body = json!({"runner": "test", "placement": placement()});
-        self.send("POST", "/v1/capacity", &[], Some(body))
-            .await
-            .ok()
-            .map(|(status, _)| status)
-    }
 }
 
 /// A hand-over closes every relay session, so their connections drain rather than hold it.

@@ -517,6 +517,10 @@ fn spec(gitlab_id: u64) -> JobSpec {
     JobSpec::GitlabCi(ci)
 }
 
+/// A day-long placement window for tests that expire it with
+/// [`crate::jobs::testing::end_window_and_step`].
+const HELD_WINDOW: u32 = 86_400;
+
 fn job_body(n: u8, reservation: Option<&str>, place_within_secs: u32) -> Value {
     let mut body = json!({
         "runner": "test",
@@ -546,13 +550,15 @@ impl FakeNode {
 
     /// The next job message from the hub.
     async fn job(&mut self) -> HubJobMsg {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        tokio::time::timeout(Duration::from_secs(10), self.next_job())
+            .await
+            .expect("no job message came")
+    }
+
+    /// Wait for the next job message without a timeout.
+    async fn next_job(&mut self) -> HubJobMsg {
         loop {
-            let msg = tokio::time::timeout_at(deadline, self.inbox.recv())
-                .await
-                .expect("no job message came")
-                .expect("the session ended");
-            if let HubMsg::Job(job) = msg {
+            if let HubMsg::Job(job) = self.inbox.recv().await.expect("the session ended") {
                 return job;
             }
         }
@@ -785,6 +791,12 @@ fn job_audit(hub: &Hub, id: &str) -> Vec<String> {
         .map(|r| r.event)
         .filter(|e| e.contains(id))
         .collect()
+}
+
+async fn job_view(addr: SocketAddr, key: &str, id: &str) -> JobView {
+    let resp = api(addr, "GET", &format!("/v1/jobs/{id}"), Some(key), None).await;
+    assert_eq!(resp.status, 200, "{resp:?}");
+    resp.json()
 }
 
 /// Job `id`'s view, once it satisfies `cond`.
@@ -2101,7 +2113,12 @@ async fn simultaneous_reservations_account_for_an_offer_before_selecting_again()
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_expires() {
     let dir = scratch("reserve");
-    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    // Keep the offer timeout longer than the test watchdogs.
+    let db = Arc::new(Db::open_memory().unwrap());
+    let (addr, hub) = serve_hub_with(db, &dir, Duration::from_secs(60), |hub| {
+        hub.answering_offers_within(Duration::from_secs(120))
+    })
+    .await;
     let key = jobs_key(&hub);
     // The roomier node is offered first; it refuses, the other accepts.
     let mut big = ready_node(addr, &hub, 32768).await;
@@ -2295,7 +2312,8 @@ async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_e
     .await;
     assert_eq!(resp.status, 204);
 
-    // Nobody accepts within the wait: `no_capacity`, to retry later.
+    // Keep the request deadline past the watchdog. End the wait after both refusals so
+    // the caller gets a retryable `no_capacity`.
     let ask = {
         let key = key.clone();
         tokio::spawn(async move {
@@ -2304,24 +2322,48 @@ async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_e
                 "POST",
                 "/v1/reservations",
                 Some(&key),
-                Some(relay_reservation_body(3, 1)),
+                Some(relay_reservation_body(3, 60)),
             )
             .await
         })
     };
-    for node in [&mut big, &mut small] {
-        let HubJobMsg::Offer { reservation, .. } = node.job().await else {
-            panic!("expected an offer");
+    let resp = tokio::time::timeout(Duration::from_secs(30), async {
+        let refuse = |node: &FakeNode, msg| {
+            let HubJobMsg::Offer { reservation, .. } = msg else {
+                panic!("expected an offer to {}: {msg:?}", node.id);
+            };
+            node.send(NodeJobMsg::OfferReply {
+                reservation,
+                reply: OfferReply::Refused {
+                    reason: Refusal::NotReady,
+                    message: None,
+                },
+            });
         };
-        node.send(NodeJobMsg::OfferReply {
-            reservation,
-            reply: OfferReply::Refused {
-                reason: Refusal::NotReady,
-                message: None,
-            },
-        });
-    }
-    let resp = ask.await.unwrap();
+        let mut changes = hub.dispatch.subscribe();
+        // Either node can receive the first offer.
+        let second = tokio::select! {
+            msg = big.next_job() => {
+                refuse(&big, msg);
+                &mut small
+            }
+            msg = small.next_job() => {
+                refuse(&small, msg);
+                &mut big
+            }
+        };
+        let msg = second.next_job().await;
+        refuse(second, msg);
+        let not_ready =
+            |id: &str| crate::jobs::last_refusal(&hub, id).as_deref() == Some("not ready");
+        while !(not_ready(&big.id) && not_ready(&small.id)) {
+            changes.changed().await.unwrap();
+        }
+        crate::jobs::testing::end_request_waits(&hub);
+        ask.await.unwrap()
+    })
+    .await
+    .expect("the reservation request was not refused");
     assert_eq!((resp.status, resp.code()), (503, ErrorCode::NoCapacity));
     assert_eq!(
         resp.json::<vk_hub_proto::client::ClientError>()

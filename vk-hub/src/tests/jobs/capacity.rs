@@ -1124,7 +1124,7 @@ async fn a_job_kept_from_headroom_ends_saying_why() {
         "POST",
         "/v1/jobs",
         Some(&key),
-        Some(job_body(1, None, 1)),
+        Some(job_body(1, None, HELD_WINDOW)),
     )
     .await;
     assert_eq!(reply.status, 201, "{reply:?}");
@@ -1134,7 +1134,10 @@ async fn a_job_kept_from_headroom_ends_saying_why() {
         crate::jobs::testing::job_blocked(&hub, &id),
         Some("production headroom")
     );
-    let view = view_until(addr, &key, &id, |v| v.state == JobState::Finished).await;
+    crate::jobs::testing::end_window_and_step(&hub, &id).await;
+    // Check the result without polling for another dispatch pass.
+    let view = job_view(addr, &key, &id).await;
+    assert_eq!(view.state, JobState::Finished, "{view:?}");
     let result = view.result.unwrap();
     assert_eq!(result.failure, Some(FailureClass::NoCapacity));
     assert_eq!(
@@ -1158,7 +1161,7 @@ async fn a_job_whose_reservation_cannot_take_it_is_kept_from_headroom() {
     // Its node takes no work now; the other's room is all kept.
     crate::jobs::testing::unhold(&hub, &reserved.id);
     headroom(&hub, vec![(placement(), 2)]);
-    let mut body = job_body(2, Some(&grant.reservation), 1);
+    let mut body = job_body(2, Some(&grant.reservation), HELD_WINDOW);
     body["admission"] = json!(ticket);
     let reply = api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await;
     assert_eq!(reply.status, 201, "{reply:?}");
@@ -1168,7 +1171,10 @@ async fn a_job_whose_reservation_cannot_take_it_is_kept_from_headroom() {
         crate::jobs::testing::job_blocked(&hub, &id),
         Some("production headroom")
     );
-    let view = view_until(addr, &key, &id, |v| v.state == JobState::Finished).await;
+    crate::jobs::testing::end_window_and_step(&hub, &id).await;
+    // Check the result without polling for another dispatch pass.
+    let view = job_view(addr, &key, &id).await;
+    assert_eq!(view.state, JobState::Finished, "{view:?}");
     assert_eq!(
         view.result.unwrap().message.as_deref(),
         Some("no node took it within its placement window (production headroom)")
