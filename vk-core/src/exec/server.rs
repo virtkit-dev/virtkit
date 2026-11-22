@@ -532,23 +532,23 @@ async fn do_handle_conn(
         .await
         .map_err(|_| anyhow!("no request within {first_message_timeout:?}"))?
         .ok_or(anyhow!("no data"))??;
-    // A command or a connect takes a permit, held until it ends; a status probe does not, so
-    // a full channel still answers the watchdog's.
-    let permit = match (&client_request, limit) {
-        (Message::CmdExec(_) | Message::CmdConnect { .. }, Some(limit)) => {
-            match limit.try_acquire() {
-                Some(permit) => Some(permit),
-                None => {
-                    let msg = limit.refusal();
-                    // The refusal is the session's only reply; a client already gone has
-                    // nothing left to tell.
-                    let _ = send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await;
-                    return Err(anyhow!(msg));
-                }
+    // Commands and connects take a permit. Status probes bypass the cap so the watchdog
+    // still gets a reply. Release acquired permits before sending a refusal.
+    let mut permits = Vec::new();
+    if let (Message::CmdExec(_) | Message::CmdConnect { .. }, Some(limit)) =
+        (&client_request, limit)
+    {
+        match limit.try_acquire() {
+            Some(permit) => permits.push(permit),
+            None => {
+                let msg = limit.refusal();
+                // The refusal is the session's only reply; a client already gone has
+                // nothing left to tell.
+                let _ = send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await;
+                return Err(anyhow!(msg));
             }
         }
-        _ => None,
-    };
+    }
 
     match client_request {
         Message::CmdExec(cmd) => {
@@ -561,37 +561,37 @@ async fn do_handle_conn(
                 && cmd.mode == RunMode::Background
             {
                 let msg = refused.to_string();
+                drop(permits);
                 // The refusal is the session's only reply; a client already gone has nothing
                 // left to tell.
                 let _ = send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await;
                 return Err(anyhow!(msg));
             }
-            // A route with a cap of its own runs only in the foreground, so its permit is held
-            // here, until the command ends.
-            let _route_permit = match route_limit {
-                Some(limit) => match limit.try_acquire() {
-                    Some(permit) => Some(permit),
+            // Capped routes run only in the foreground and release both permits together.
+            if let Some(limit) = route_limit {
+                match limit.try_acquire() {
+                    Some(permit) => permits.push(permit),
                     None => {
                         let msg = limit.refusal();
+                        drop(permits);
                         // As above: a client already gone has nothing left to tell.
                         let _ =
                             send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await;
                         return Err(anyhow!(msg));
                     }
-                },
-                None => None,
-            };
+                }
+            }
             let cmd = match exec_wrapper {
                 Some(w) => wrap_cmd(cmd, w),
                 None => cmd,
             };
             let req_id = REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if cmd.tty.is_some() {
-                srv_run_cmd_tty(req_id, stream, sink, cmd)
+                srv_run_cmd_tty(req_id, stream, sink, cmd, permits)
                     .await
                     .and(Ok(false))
             } else {
-                srv_run_cmd(req_id, stream, sink, cmd, permit)
+                srv_run_cmd(req_id, stream, sink, cmd, permits)
                     .await
                     .and(Ok(false))
             }
@@ -612,6 +612,7 @@ async fn do_handle_conn(
             // (the guest's own control port, as `vk exec`/`vk ping` already use).
             if wrappers.is_some() {
                 let msg = "connect is refused on a wrapped (host-exec) channel".to_string();
+                drop(permits);
                 let _ = send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await;
                 return Err(anyhow!(msg));
             }
@@ -620,11 +621,12 @@ async fn do_handle_conn(
                 Ok(a) => a,
                 Err(e) => {
                     let msg = format!("invalid connect target {target:?}: {e:#}");
+                    drop(permits);
                     let _ = send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await;
                     return Err(anyhow!("connect [{req_id}] {msg}"));
                 }
             };
-            srv_run_connect(req_id, stream, sink, &addrs)
+            srv_run_connect(req_id, stream, sink, &addrs, permits)
                 .await
                 .and(Ok(false))
         }
@@ -1033,11 +1035,13 @@ async fn srv_run_cmd_tty(
     + 'static,
     mut sink: impl Sink<Message, Error = std::io::Error> + Unpin + Send + 'static,
     cmd: CmdExec,
+    permits: Permits,
 ) -> Result<(), anyhow::Error> {
     info!("command [{}] {} (tty)", req_id, cmd);
     let Some(tty) = &cmd.tty else { unreachable!() };
     if cmd.mode == RunMode::Background {
         let msg = "--tty is incompatible with --background".to_string();
+        drop(permits);
         send_last(stream, sink, Message::StartErr { msg: msg.clone() }).await?;
         return Err(anyhow!("command [{req_id}] {msg}"));
     }
@@ -1046,6 +1050,7 @@ async fn srv_run_cmd_tty(
         Ok(pair) => pair,
         Err(e) => {
             let msg = format!("openpty: {e}");
+            drop(permits);
             send_last(stream, sink, Message::StartErr { msg }).await?;
             return Err(anyhow!("command [{req_id}] openpty: {e}"));
         }
@@ -1091,6 +1096,7 @@ async fn srv_run_cmd_tty(
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
+            drop(permits);
             send_last(stream, sink, Message::StartErr { msg: e.to_string() }).await?;
             return Err(anyhow!("command [{req_id}] error starting process: {e}"));
         }
@@ -1187,17 +1193,7 @@ async fn srv_run_cmd_tty(
     }
     // both halves of the master are dropped by now, so the pty is closed and whatever
     // still holds a slave sees its terminal go away
-    let _ = tx
-        .send(Message::ExecDone(CmdResult {
-            code: status.code(),
-            signal: status.signal(),
-        }))
-        .await;
-    drop(tx);
-    let sink = writer.await?;
-    if let Some(stream) = stream {
-        linger(stream, sink).await;
-    }
+    end_session(req_id, tx, writer, permits, status, stream).await?;
     info!("command [{req_id}] done ({status})");
 
     Ok(())
@@ -1211,7 +1207,7 @@ async fn srv_run_cmd(
     + 'static,
     mut sink: impl Sink<Message, Error = std::io::Error> + Unpin + Send + 'static,
     cmd: CmdExec,
-    permit: Option<OwnedSemaphorePermit>,
+    permits: Permits,
 ) -> Result<(), anyhow::Error> {
     info!("command [{}] {}", req_id, cmd);
     let mut command = build_command(&cmd, session_user(&cmd));
@@ -1238,6 +1234,7 @@ async fn srv_run_cmd(
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
+            drop(permits);
             send_last(stream, sink, Message::StartErr { msg: e.to_string() }).await?;
             return Err(anyhow!("command [{req_id}] error starting process: {e}",));
         }
@@ -1247,10 +1244,10 @@ async fn srv_run_cmd(
         info!("command [{req_id}] background task started");
         // A background command counts against the cap until it exits, not just until it
         // starts. Its exit status has no one to go to.
-        if let Some(permit) = permit {
+        if !permits.is_empty() {
             tokio::spawn(async move {
                 let _ = child.wait().await;
-                drop(permit);
+                drop(permits);
             });
         }
         send_last(stream, sink, Message::StartOK).await?;
@@ -1391,20 +1388,41 @@ async fn srv_run_cmd(
             info!("command [{req_id}] stdio still held after exit, ending the session anyway");
         }
     }
-    let _ = tx
-        .send(Message::ExecDone(CmdResult {
-            code: status.code(),
-            signal: status.signal(),
-        }))
-        .await;
-    debug!("command [{req_id}] execDone sent");
+    end_session(req_id, tx, writer, permits, status, stream).await?;
+    info!("command [{req_id}] done ({status})");
+
+    Ok(())
+}
+
+/// Permits acquired from the channel and route limits that apply to this request.
+type Permits = Vec<OwnedSemaphorePermit>;
+
+/// Finish sending queued output before releasing the command's permits. A client that
+/// blocks the output writer keeps its slot until the writer can finish. Release the slot
+/// before `ExecDone` so the client can use it as soon as it receives the exit status,
+/// even while this session waits in [`linger`].
+async fn end_session<S: Sink<Message, Error = std::io::Error> + Unpin>(
+    req_id: usize,
+    tx: mpsc::Sender<Message>,
+    writer: task::JoinHandle<S>,
+    permits: Permits,
+    status: std::process::ExitStatus,
+    stream: Option<impl Stream<Item = Result<Message, std::io::Error>> + Unpin>,
+) -> Result<(), task::JoinError> {
     drop(tx);
-    let sink = writer.await?;
+    let mut sink = writer.await?;
+    drop(permits);
+    let done = Message::ExecDone(CmdResult {
+        code: status.code(),
+        signal: status.signal(),
+    });
+    match sink.send(done).await {
+        Ok(()) => debug!("command [{req_id}] execDone sent"),
+        Err(e) => debug!("command [{req_id}] execDone not sent: {e}"),
+    }
     if let Some(stream) = stream {
         linger(stream, sink).await;
     }
-    info!("command [{req_id}] done ({status})");
-
     Ok(())
 }
 
@@ -1422,6 +1440,7 @@ async fn srv_run_connect(
     + 'static,
     mut sink: impl Sink<Message, Error = std::io::Error> + Unpin + Send + 'static,
     targets: &[SocketAddr],
+    permits: Permits,
 ) -> Result<(), anyhow::Error> {
     let conn = match raw_connect_any(targets).await {
         Ok((conn, target)) => {
@@ -1429,6 +1448,7 @@ async fn srv_run_connect(
             conn
         }
         Err(e) => {
+            drop(permits);
             send_last(stream, sink, Message::StartErr { msg: e.to_string() }).await?;
             return Err(anyhow!("connect [{req_id}] {e:#}"));
         }
@@ -1475,6 +1495,7 @@ async fn srv_run_connect(
     client_stream_reader.abort();
     drop(client_stream_reader);
     writer.await?;
+    drop(permits);
     debug!("connect [{req_id}] done");
 
     Ok(())
