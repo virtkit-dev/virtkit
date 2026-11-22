@@ -104,6 +104,8 @@ All notable changes to virtkit will be documented in this file.
   drops oversized replies even when the final fragment crosses the 32 MiB limit.
 - Time spent sending a request to a UEFI guest's QEMU guest agent now counts toward its
   reply timeout.
+- GitLab relays receive the hub's reason for refusing a session and a clean close when
+  the hub hands over.
 
 ## [0.114.0] - 2026-11-20
 

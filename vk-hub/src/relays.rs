@@ -77,18 +77,22 @@ pub(crate) async fn run(
     permit: OwnedSemaphorePermit,
     conn: Option<RelayConn>,
 ) {
-    session(&mut ws, hub, peer, exported, permit, conn).await;
-    crate::session::finish(ws).await;
+    session(&mut ws, hub, peer, exported, permit, conn.as_ref()).await;
+    // Start GOAWAY while the session's final frames drain.
+    if let Some(conn) = &conn {
+        conn.end();
+    }
+    crate::session::finish(ws, conn.is_some()).await;
 }
 
-/// [`run`]'s session, up to its stream's end.
+/// Handle the session until [`run`] takes over stream shutdown.
 async fn session(
     ws: &mut Ws,
     hub: Arc<Hub>,
     peer: SocketAddr,
     exported: Exported,
     permit: OwnedSemaphorePermit,
-    conn: Option<RelayConn>,
+    conn: Option<&RelayConn>,
 ) {
     let versions = if conn.is_some() {
         RELAY_HTTP2
@@ -101,7 +105,7 @@ async fn session(
         Err(r) => return turn_away(ws, peer, r).await,
     };
     let (session, ending) = hub.open_session(&relay.id);
-    let welcomed = welcome(ws, &hub, &relay, session, conn.as_ref()).await;
+    let welcomed = welcome(ws, &hub, &relay, session, conn).await;
     drop(permit);
     if let Err(r) = welcomed {
         hub.close_session(&relay.id, session);
@@ -236,7 +240,11 @@ async fn serve(
                 let text = match frame {
                     None => return Ok("connection closed"),
                     Some(Err(e)) => bail!("reading: {e}"),
-                    Some(Ok(Message::Close(_))) => return Ok("closed by the relay"),
+                    Some(Ok(Message::Close(_))) => {
+                        // Tungstenite queued the close reply. Give it one handshake step to flush.
+                        let _ = tokio::time::timeout(HANDSHAKE_STEP, ws.flush()).await;
+                        return Ok("closed by the relay");
+                    }
                     Some(Ok(Message::Text(text))) => text,
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
                         deadline = tokio::time::Instant::now() + quiet;

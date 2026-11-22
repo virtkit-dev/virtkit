@@ -138,13 +138,20 @@ pub(crate) async fn turn_away(ws: &mut Ws, peer: SocketAddr, r: Refusal) {
     refuse(ws, r.code, &r.reason).await;
 }
 
-/// End the stream of a session over once what was sent on it is on its way. On a relay's
-/// HTTP/2 connection a stream dropped while still open is reset, which discards the data it
-/// still buffers — a refusal, or the close after it — so the peer would read an error instead.
-/// Ending it first sends that data, then the end. Best effort, bounded as a step.
-pub(crate) async fn finish(mut ws: Ws) {
-    use tokio::io::AsyncWriteExt;
-    let _ = tokio::time::timeout(HANDSHAKE_STEP, ws.get_mut().shutdown()).await;
+/// Shut down the write side. On HTTP/2 this only queues the end of the stream. Dropping it
+/// now can reset the stream and discard a buffered refusal or close frame. After a successful
+/// shutdown, read the HTTP/2 stream until peer EOF or a read error. One handshake timeout
+/// bounds both operations.
+pub(crate) async fn finish(mut ws: Ws, http2: bool) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _ = tokio::time::timeout(HANDSHAKE_STEP, async {
+        let io = ws.get_mut();
+        if io.shutdown().await.is_ok() && http2 {
+            let mut buf = [0u8; 4096];
+            while io.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+        }
+    })
+    .await;
 }
 
 /// Tell the peer why and close. Best effort: the peer is being turned away, and a failure to

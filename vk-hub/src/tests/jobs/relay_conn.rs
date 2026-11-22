@@ -455,11 +455,47 @@ async fn a_hand_over_closes_relay_sessions() {
     let closed = tokio::time::timeout(Duration::from_secs(5), session.recv())
         .await
         .expect("the session was not closed");
-    assert!(
-        matches!(closed, None | Some(Message::Close(_))),
-        "{closed:?}"
-    );
+    assert!(matches!(closed, Some(Message::Close(_))), "{closed:?}");
     assert!(hub.handover.gate.drained(Duration::from_secs(5)).await);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The hub echoes the relay's close code and reason before ending the stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_s_close_is_answered_before_its_stream_ends() {
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let (dir, addr, _hub, key) = hub_and_relay("relay-conn-close", true).await;
+    let (h2, exported) = dial_h2(addr, true).await;
+    let ours = VersionRange {
+        min: 2,
+        max: gl::CONNECTION,
+    };
+    let (welcome, mut ws) = open_session(&h2, &key, ours, exported.as_ref()).await;
+    assert!(matches!(welcome, HubMsg::Welcome { .. }), "{welcome:?}");
+    let frame = CloseFrame {
+        code: CloseCode::Away,
+        reason: "relay stopping".into(),
+    };
+    ws.close(Some(frame.clone())).await.unwrap();
+    // Frames already in flight may precede the close reply.
+    let replied = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(f))) => return f,
+                Some(Ok(_)) => {}
+                other => panic!("the stream ended before the hub's reply: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the hub did not answer the close");
+    assert_eq!(replied, Some(frame));
+    let end = tokio::time::timeout(Duration::from_secs(10), ws.next())
+        .await
+        .expect("the stream did not end");
+    assert!(end.is_none(), "{end:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
