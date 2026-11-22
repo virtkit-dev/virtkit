@@ -512,6 +512,199 @@ pub fn write_new(path: &Path, contents: &[u8], mode: u32) -> Result<(), anyhow::
     )
 }
 
+/// Create or truncate `path` and write `contents` with the requested `mode` regardless of
+/// umask. Refuse a symlink at `path`.
+///
+/// Only the writer child opens the target, so concurrent forks in the parent cannot inherit
+/// its write descriptor and prevent execution (`ETXTBSY`). Truncation preserves the inode,
+/// so a write descriptor left open by an earlier writer can still prevent execution.
+pub fn write_executable(path: &Path, contents: &[u8], mode: u32) -> Result<(), anyhow::Error> {
+    write_in_child(path, contents, mode, libc::O_TRUNC, false)
+}
+
+/// Like [`write_executable`], but require a new file and fsync it before returning success.
+/// An existing `path` yields [`std::io::ErrorKind::AlreadyExists`] in the error chain.
+/// A write failure can leave a partial file under its final name, so a retry also fails.
+pub fn write_executable_new(path: &Path, contents: &[u8], mode: u32) -> Result<(), anyhow::Error> {
+    write_in_child(path, contents, mode, libc::O_EXCL, true)
+}
+
+fn write_in_child(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+    how: libc::c_int,
+    sync: bool,
+) -> Result<(), anyhow::Error> {
+    spawn_writer(path, contents, mode, how, sync)?.wait(path)
+}
+
+// The error report contains a step byte followed by a native-endian errno.
+const WRITER_OPEN: u8 = 1;
+const WRITER_WRITE: u8 = 2;
+
+/// The writer child and its error-report pipe.
+struct Writer {
+    pid: libc::pid_t,
+    report_r: OwnedFd,
+    report_w: OwnedFd,
+}
+
+/// Fork the child that writes `contents` to `path`, opened with `O_CREAT` and `how`.
+fn spawn_writer(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+    how: libc::c_int,
+    sync: bool,
+) -> Result<Writer, anyhow::Error> {
+    let cpath = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("{} holds a NUL byte", path.display()))?;
+    let mut fds = [0 as libc::c_int; 2];
+    // A forked sibling may keep the write end open after the writer exits. A nonblocking
+    // read avoids waiting for EOF. The writer's single error record fits in the empty pipe.
+    // SAFETY: pipe2 writes two descriptors into a local of the right size.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("creating a pipe to write {}", path.display()));
+    }
+    // SAFETY: both descriptors are fresh and owned by nothing else.
+    let (report_r, report_w) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // SAFETY: the child calls only async-signal-safe functions (close_range, getrlimit, open,
+    // write, fchmod, fsync, close, _exit) on memory prepared before the fork, so a lock another
+    // thread held at the fork cannot be waited on in it.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("forking to write {}", path.display()));
+    }
+    if pid == 0 {
+        // SAFETY: see above; every pointer and length stays within `cpath`, `contents` and
+        // the locals below.
+        unsafe {
+            let fail = |step: u8| -> ! {
+                let errno = *libc::__errno_location();
+                let mut msg = [0u8; 5];
+                msg[0] = step;
+                msg[1..].copy_from_slice(&errno.to_ne_bytes());
+                libc::write(report_w.as_raw_fd(), msg.as_ptr().cast(), msg.len());
+                libc::_exit(1);
+            };
+            // Close inherited descriptors above stdio before a slow fsync can prolong a
+            // job's flock. Any descriptor the cleanup misses stays open until the writer exits.
+            close_all_but(report_w.as_raw_fd());
+            let fd = libc::open(
+                cpath.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | how | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                mode as libc::c_uint,
+            );
+            if fd < 0 {
+                fail(WRITER_OPEN);
+            }
+            let mut left = contents;
+            while !left.is_empty() {
+                let n = libc::write(fd, left.as_ptr().cast(), left.len());
+                if n < 0 && *libc::__errno_location() == libc::EINTR {
+                    continue;
+                }
+                if n <= 0 {
+                    fail(WRITER_WRITE);
+                }
+                left = left.get(n as usize..).unwrap_or_default();
+            }
+            // Writing can clear set-user-ID and set-group-ID bits. Apply the mode last.
+            if libc::fchmod(fd, mode as libc::mode_t) != 0 {
+                fail(WRITER_WRITE);
+            }
+            if (sync && libc::fsync(fd) != 0) || libc::close(fd) != 0 {
+                fail(WRITER_WRITE);
+            }
+            libc::_exit(0);
+        }
+    }
+    Ok(Writer {
+        pid,
+        report_r,
+        report_w,
+    })
+}
+
+/// Best-effort, async-signal-safe cleanup of descriptors above stdio, except `keep`.
+fn close_all_but(keep: libc::c_int) {
+    let close = |from: libc::c_int, to: libc::c_int| {
+        if from > to {
+            return;
+        }
+        // SAFETY: close_range only closes descriptors of this process; the bounds are
+        // non-negative, so the casts keep their values.
+        if unsafe { libc::syscall(libc::SYS_close_range, from as u32, to as u32, 0u32) } == 0 {
+            return;
+        }
+        // If close_range fails (including on kernels before Linux 5.9), scan through the
+        // soft fd limit, capped at 2^20. Fall back to 1024 if the limit is unavailable.
+        // SAFETY: getrlimit writes into a local; close acts on this process's descriptors.
+        unsafe {
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            let top = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+                libc::c_int::try_from(limit.rlim_cur.min(1 << 20)).unwrap_or(1 << 20)
+            } else {
+                1024
+            };
+            for fd in from..=to.min(top) {
+                libc::close(fd);
+            }
+        }
+    };
+    if keep < 3 {
+        close(3, libc::c_int::MAX);
+    } else {
+        close(3, keep - 1);
+        close(keep + 1, libc::c_int::MAX);
+    }
+}
+
+impl Writer {
+    /// Reap the writer. On failure, return its reported error or fall back to its exit status.
+    fn wait(self, path: &Path) -> Result<(), anyhow::Error> {
+        let Writer {
+            pid,
+            report_r,
+            report_w,
+        } = self;
+        drop(report_w);
+        let mut status = 0;
+        loop {
+            // SAFETY: reaping the child forked above, into a local.
+            if unsafe { libc::waitpid(pid, &mut status, 0) } == pid {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e)
+                    .with_context(|| format!("waiting for the writer of {}", path.display()));
+            }
+        }
+        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+            return Ok(());
+        }
+        let mut msg = [0u8; 5];
+        // Only a complete error record takes precedence over the exit status.
+        let got = std::io::Read::read(&mut std::fs::File::from(report_r), &mut msg);
+        if got.is_ok_and(|n| n == msg.len()) {
+            let errno = i32::from_ne_bytes([msg[1], msg[2], msg[3], msg[4]]);
+            let what = if msg[0] == WRITER_OPEN {
+                "creating"
+            } else {
+                "writing"
+            };
+            return Err(std::io::Error::from_raw_os_error(errno))
+                .with_context(|| format!("{what} {}", path.display()));
+        }
+        bail!("the writer of {} died (status {status:#x})", path.display())
+    }
+}
+
 /// [`write_atomic`], or with `replace` false [`write_new`], of what `fill` writes into the
 /// staged file — for contents streamed rather than held in memory. The file is fsynced
 /// before it is published either way. `fill`'s error fails the write and nothing is
@@ -1450,6 +1643,260 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn an_executable_is_written_to_be_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("executable");
+        let exe = dir.join("tool");
+        let run = || {
+            let out = std::process::Command::new(&exe).output().unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        write_executable(&exe, b"#!/bin/sh\necho one; echo more\n", 0o755).unwrap();
+        assert_eq!(run(), "one\nmore\n");
+        write_executable(&exe, b"#!/bin/sh\necho two\n", 0o700).unwrap();
+        assert_eq!(run(), "two\n");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"#!/bin/sh\necho two\n");
+        let mode = std::fs::metadata(&exe).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o700);
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+        assert!(write_executable(&link, b"x", 0o755).is_err());
+        assert_eq!(run(), "two\n");
+        let err = write_executable_new(&exe, b"x", 0o755).unwrap_err();
+        assert!(
+            err.chain().any(|e| e
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)),
+            "{err:#}"
+        );
+        assert_eq!(run(), "two\n");
+        let fresh = dir.join("fresh");
+        write_executable_new(&fresh, b"#!/bin/sh\necho three\n", 0o750).unwrap();
+        let out = std::process::Command::new(&fresh).output().unwrap();
+        assert_eq!(out.stdout, b"three\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_executable_keeps_its_special_mode_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("executable-setuid");
+        let exe = dir.join("tool");
+        write_executable(&exe, b"#!/bin/sh\necho one\n", 0o4755).unwrap();
+        let mode = std::fs::metadata(&exe).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o4755);
+        let fresh = dir.join("fresh");
+        write_executable_new(&fresh, b"#!/bin/sh\necho two\n", 0o4750).unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o4750);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Model a concurrent fork that keeps inherited descriptors open. Signal each child
+    /// with a byte because children from parallel tests can inherit each other's write ends.
+    struct Sibling {
+        pid: libc::pid_t,
+        gate_w: OwnedFd,
+        reaped: bool,
+    }
+
+    impl Sibling {
+        fn fork() -> Sibling {
+            let mut gate = [0 as libc::c_int; 2];
+            // SAFETY: pipe2 writes two descriptors into a local of the right size.
+            assert_eq!(
+                unsafe { libc::pipe2(gate.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            // SAFETY: both descriptors are fresh and owned by nothing else.
+            let (gate_r, gate_w) =
+                unsafe { (OwnedFd::from_raw_fd(gate[0]), OwnedFd::from_raw_fd(gate[1])) };
+            // SAFETY: the child only closes, reads and exits, all async-signal-safe.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "{}", std::io::Error::last_os_error());
+            if pid == 0 {
+                // SAFETY: the read stays within the local byte; nothing else owns the closed
+                // fd in this process, which exits without dropping it.
+                unsafe {
+                    libc::close(gate_w.as_raw_fd());
+                    let mut b = 0u8;
+                    while libc::read(gate_r.as_raw_fd(), (&raw mut b).cast(), 1) < 0
+                        && *libc::__errno_location() == libc::EINTR
+                    {}
+                    libc::_exit(0);
+                }
+            }
+            Sibling {
+                pid,
+                gate_w,
+                reaped: false,
+            }
+        }
+
+        /// Open the gate and return the child's wait status.
+        fn reap(&self) -> std::io::Result<libc::c_int> {
+            // SAFETY: the write stays within the one-byte literal.
+            if unsafe { libc::write(self.gate_w.as_raw_fd(), b"x".as_ptr().cast(), 1) } != 1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut status = 0;
+            // SAFETY: reaping the child forked by `fork`, into a local.
+            while unsafe { libc::waitpid(self.pid, &mut status, 0) } != self.pid {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
+            Ok(status)
+        }
+
+        /// Release the child, asserting it exited cleanly.
+        fn release(mut self) {
+            let status = self.reap();
+            self.reaped = true;
+            drop(self);
+            let status = status.unwrap();
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "sibling status {status:#x}"
+            );
+        }
+    }
+
+    /// Release a waiting child even if the test panics.
+    impl Drop for Sibling {
+        fn drop(&mut self) {
+            if !self.reaped {
+                // Best effort during cleanup.
+                let _ = self.reap();
+            }
+        }
+    }
+
+    /// A sibling holding the report pipe open cannot delay a successful write.
+    #[test]
+    fn an_executable_write_does_not_wait_on_a_forked_sibling() {
+        let dir = scratch("executable-sibling");
+        let exe = dir.join("tool");
+        let writer =
+            spawn_writer(&exe, b"#!/bin/sh\necho one\n", 0o755, libc::O_TRUNC, false).unwrap();
+        let sibling = Sibling::fork();
+        let written = writer.wait(&exe);
+        let contents = std::fs::read(&exe);
+        sibling.release();
+        written.unwrap();
+        assert_eq!(contents.unwrap(), b"#!/bin/sh\necho one\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Report the writer's death even when a sibling keeps the report pipe open.
+    #[test]
+    fn a_writer_dying_silently_does_not_wait_on_a_forked_sibling() {
+        let dir = scratch("executable-silent");
+        // A FIFO no one reads: the writer blocks opening it until killed, never reporting.
+        let fifo = dir.join("fifo");
+        let cfifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(cfifo.as_ptr(), 0o600) }, 0);
+        let writer = spawn_writer(&fifo, b"x", 0o600, libc::O_TRUNC, false).unwrap();
+        let sibling = Sibling::fork();
+        // SAFETY: F_GETFL on a descriptor `writer` owns.
+        let flags = unsafe { libc::fcntl(writer.report_r.as_raw_fd(), libc::F_GETFL) };
+        // SAFETY: signalling the writer forked above, not yet reaped.
+        let killed = unsafe { libc::kill(writer.pid, libc::SIGKILL) };
+        let nonblocking = flags >= 0 && flags & libc::O_NONBLOCK != 0;
+        // Skip the wait on a blocking pipe so a regression fails the test without hanging.
+        let written = (killed == 0 && nonblocking).then(|| writer.wait(&fifo));
+        sibling.release();
+        assert_eq!(killed, 0);
+        assert!(nonblocking, "report pipe flags {flags:#x}");
+        let err = written.unwrap().unwrap_err();
+        assert!(format!("{err:#}").contains("died"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Above stdio, the blocked writer holds only its report pipe and the output FIFO.
+    /// An inherited job lock here could outlive the child it was intended for.
+    #[test]
+    fn a_writer_keeps_no_inherited_descriptor() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let dir = scratch("executable-inherited");
+        let held = std::fs::File::create(dir.join("lock")).unwrap();
+        let held_id = (
+            held.metadata().unwrap().dev(),
+            held.metadata().unwrap().ino(),
+        );
+        // Fill the FIFO to hold the writer open for descriptor inspection.
+        let fifo = dir.join("fifo");
+        let cfifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(cfifo.as_ptr(), 0o600) }, 0);
+        let mut reader = std::fs::File::options()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        let contents = vec![b'x'; 1 << 20];
+        let writer = spawn_writer(&fifo, &contents, 0o600, libc::O_TRUNC, false).unwrap();
+        // SAFETY: pidfd_open of the child forked above, not yet reaped.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, writer.pid, 0) };
+        assert!(pidfd >= 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: a fresh descriptor owned by nothing else.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as libc::c_int) };
+        // Data means the writer has finished descriptor cleanup. Poll its pidfd too so an
+        // early exit fails the test without hanging.
+        let mut fds = [
+            libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        loop {
+            // SAFETY: poll reads and writes the local array, of the length passed.
+            if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } >= 0 {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            assert_eq!(e.kind(), std::io::ErrorKind::Interrupted, "{e}");
+        }
+        assert_eq!(fds[1].revents, 0, "the writer exited early");
+        let mut kept = Vec::new();
+        for entry in std::fs::read_dir(format!("/proc/{}/fd", writer.pid)).unwrap() {
+            let entry = entry.unwrap();
+            let fd: libc::c_int = entry.file_name().to_str().unwrap().parse().unwrap();
+            if fd > 2 {
+                let st = std::fs::metadata(entry.path()).unwrap();
+                kept.push((fd, (st.dev(), st.ino())));
+            }
+        }
+        assert!(kept.iter().all(|(_, id)| *id != held_id), "{kept:?}");
+        // Its report pipe and the FIFO it writes.
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(
+            kept.iter()
+                .any(|(fd, _)| *fd == writer.report_w.as_raw_fd()),
+            "{kept:?}"
+        );
+        // SAFETY: F_SETFL on a descriptor `reader` owns.
+        assert_eq!(
+            unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, 0) },
+            0
+        );
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut got).unwrap();
+        writer.wait(&fifo).unwrap();
+        assert_eq!(got.len(), contents.len());
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The tree goes with its links, and nothing a link names; the space counted is the
