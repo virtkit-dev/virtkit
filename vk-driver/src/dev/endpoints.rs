@@ -10,16 +10,15 @@
 //! all environments share, starts at a block derived from the state directory so worktrees
 //! usually miss each other without coordination, and confirms a candidate two ways: no other
 //! environment has written that block down, and every auto endpoint of the service binds on
-//! it. The second test alone is not enough — a bind proves the block is free only until the
-//! probe's listener is dropped, and the publisher takes the address later — so the recorded
-//! blocks are what keeps two environments choosing at once apart. A wildcard listener
+//! it. The probe checks availability only at bind time. The publisher binds later, so the
+//! allocator records the block under the lock to keep concurrent allocations distinct. A wildcard listener
 //! (`0.0.0.0:<port>`, or `[::]:<port>` with `IPV6_V6ONLY=0`) takes the port on every block,
 //! and shows up here as every block failing. A remembered block is kept while anything is
 //! published from the environment, moved only when it is taken by something else and nothing
 //! of ours is live: an address never moves under a running relay.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -202,11 +201,31 @@ fn blocks_taken_elsewhere(plan: &Plan) -> Result<BTreeSet<u8>> {
         .collect())
 }
 
-/// Whether every `port` can be bound on `addr` right now.
-fn bindable(addr: Ipv4Addr, ports: &[u16]) -> bool {
-    ports
-        .iter()
-        .all(|&p| TcpListener::bind(SocketAddrV4::new(addr, p)).is_ok())
+/// Check each port on `addr` with the relay's `SO_REUSEADDR` setting. Only `EADDRINUSE`
+/// returns `Ok(false)`. Other errors include the address that failed.
+fn bindable(addr: Ipv4Addr, ports: &[u16]) -> Result<bool> {
+    for &p in ports {
+        let at = SocketAddrV4::new(addr, p);
+        match probe_bind(at.into()) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return Ok(false),
+            Err(e) => return Err(e).with_context(|| format!("probing {at}")),
+        }
+    }
+    Ok(true)
+}
+
+/// Return a socket bound to `at` with `SO_REUSEADDR`, without listening. A relay can bind
+/// the address even if a forked child keeps the probe open until exec. An existing listener
+/// or a socket bound there without `SO_REUSEADDR` still causes `EADDRINUSE`.
+pub(crate) fn probe_bind(at: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpSocket> {
+    let sock = match at {
+        std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    sock.set_reuseaddr(true)?;
+    sock.bind(at)?;
+    Ok(sock)
 }
 
 /// The block the scan starts at, derived from the state directory.
@@ -245,10 +264,10 @@ pub(crate) fn allocate(plan: &Plan, service: Option<&str>, live: bool) -> Result
     if let Some(a) = &alloc
         && let Some(addr) = a.address(service)
     {
-        if bindable(addr, &ports) {
+        if bindable(addr, &ports)? {
             return Ok(addr);
         }
-        // Another listener took a port on our address. Active relays pin the block,
+        // A port on our address is in use. Active relays pin the block,
         // so the caller must resolve the conflict.
         if live {
             bail!(
@@ -271,18 +290,22 @@ pub(crate) fn allocate(plan: &Plan, service: Option<&str>, live: bool) -> Result
             let elsewhere = blocks_taken_elsewhere(plan)?;
             let span = u32::from(BLOCK_LAST - BLOCK_FIRST) + 1;
             let start = u32::from(preferred_block(&plan.state_dir) - BLOCK_FIRST);
-            let block = (0..span)
-                .map(|i| BLOCK_FIRST + ((start + i) % span) as u8)
-                .find(|b| !elsewhere.contains(b) && bindable(Ipv4Addr::new(127, 0, *b, 1), &ports))
-                .with_context(|| {
-                    format!(
-                        "every 127.0.<{BLOCK_FIRST}-{BLOCK_LAST}>.x block is another \
-                         environment's or already has a listener on one of the ports {ports:?}; \
+            let mut free = None;
+            for b in (0..span).map(|i| BLOCK_FIRST + ((start + i) % span) as u8) {
+                if !elsewhere.contains(&b) && bindable(Ipv4Addr::new(127, 0, b, 1), &ports)? {
+                    free = Some(b);
+                    break;
+                }
+            }
+            let block = free.with_context(|| {
+                format!(
+                    "every 127.0.<{BLOCK_FIRST}-{BLOCK_LAST}>.x block is another \
+                         environment's or has one of the ports {ports:?} in use; \
                          a wildcard listener (0.0.0.0:<port>, or [::]:<port> with \
                          IPV6_V6ONLY=0) takes every block at once, so look for one of those \
                          first — and `vk dev list --all` names the environments"
-                    )
-                })?;
+                )
+            })?;
             Allocation {
                 block,
                 octets: BTreeMap::new(),
@@ -291,7 +314,7 @@ pub(crate) fn allocate(plan: &Plan, service: Option<&str>, live: bool) -> Result
     };
     let octet = alloc.next_octet()?;
     let addr = Ipv4Addr::new(127, 0, alloc.block, octet);
-    if !bindable(addr, &ports) {
+    if !bindable(addr, &ports)? {
         bail!(
             "{addr} cannot bind {ports:?}, though the block was free a moment ago — retry, \
              or look for a listener that came up on it"
@@ -300,8 +323,7 @@ pub(crate) fn allocate(plan: &Plan, service: Option<&str>, live: bool) -> Result
     alloc
         .octets
         .insert(service.unwrap_or("").to_string(), octet);
-    // Recorded before the lock goes: the next environment to choose reads this file, and a
-    // block confirmed only by a probe's listener is free again the moment that drops.
+    // Record the block under the lock so the next allocator sees the reservation.
     save(plan, &alloc)?;
     Ok(addr)
 }
@@ -463,6 +485,7 @@ mod tests {
 
     use super::*;
     use crate::dev::plan::Source;
+    use std::net::TcpListener;
 
     fn plan_in(dir: &Path, endpoints: Vec<EndpointPlan>) -> Plan {
         Plan {
@@ -563,11 +586,8 @@ mod tests {
             .expect("a free port below the ephemeral range")
     }
 
-    /// `allocate`, retried while one of its own probes is still bound: a child another test
-    /// forked keeps the probe's socket until it execs (see `crate::testutil::released`). A
-    /// re-ask passes `live`, so a port held that way fails the call instead of moving the block.
     fn allocated(plan: &Plan, service: Option<&str>, live: bool) -> Ipv4Addr {
-        crate::testutil::once_released("cannot bind", || allocate(plan, service, live)).unwrap()
+        allocate(plan, service, live).unwrap()
     }
 
     #[test]
@@ -617,9 +637,8 @@ mod tests {
 
     #[test]
     fn a_block_another_environment_wrote_down_is_not_offered_again() {
-        // Two environments in one base, with the same ports and nothing published: the
-        // second must miss the first's block on the strength of its `endpoints.json` alone,
-        // since the probe that confirmed it dropped its listener on the way out.
+        // Both environments use the same base and ports. With nothing published, only
+        // the first environment's endpoints.json reserves its block.
         let t = scratch("neighbours");
         let (_held, port) = free_port();
         let mut first = plan_in(t.path(), vec![ep("web", None, port, None)]);
@@ -686,6 +705,18 @@ mod tests {
 
     #[test]
     fn a_taken_block_moves_unless_something_of_ours_is_live() {
+        // Isolate the listeners so a child forked by another test cannot keep a port
+        // occupied after this test drops its listener.
+        const CHILD: &str = "VK_TEST_ENDPOINTS_TAKEN";
+        if std::env::var_os(CHILD).is_none() {
+            let t = scratch("taken-parent");
+            crate::dev::testutil::in_child(
+                "dev::endpoints::tests::a_taken_block_moves_unless_something_of_ours_is_live",
+                CHILD,
+                t.path(),
+            );
+            return;
+        }
         let t = scratch("taken");
         let (_held, port) = free_port();
         let plan = plan_in(t.path(), vec![ep("web", None, port, None)]);
@@ -704,8 +735,6 @@ mod tests {
             "{e:#}"
         );
         drop(squatter2);
-        // A child another test forked while the squatter was open holds its socket until it
-        // execs: see `crate::testutil::released`.
         assert_eq!(allocated(&plan, None, true), moved);
         drop(squatter);
         // Forgetting drops the octet, not the block: the next allocation is in the block
@@ -713,6 +742,56 @@ mod tests {
         assert!(forget(&plan, None));
         assert_eq!(load(&plan).unwrap().unwrap().octets, BTreeMap::new());
         assert_eq!(allocated(&plan, None, false), moved);
+    }
+
+    /// An open probe stands in for a descriptor inherited by a forked child.
+    #[tokio::test]
+    async fn a_live_probe_does_not_keep_a_relay_off_its_address() {
+        let probe = probe_bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let at = probe.local_addr().unwrap();
+        let endpoint = format!("tcp://{at}").parse().unwrap();
+        let relay = vk_core::net::raw_listen(&endpoint).await.unwrap();
+        let err = probe_bind(at).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+        drop((relay, probe));
+    }
+
+    /// Descriptor exhaustion must surface as an error naming the address.
+    #[test]
+    fn a_probe_that_cannot_run_is_an_error() {
+        // Isolate the process-wide descriptor limit from the other tests.
+        const CHILD: &str = "VK_TEST_ENDPOINTS_EMFILE";
+        if std::env::var_os(CHILD).is_none() {
+            let t = scratch("emfile-parent");
+            crate::dev::testutil::in_child(
+                "dev::endpoints::tests::a_probe_that_cannot_run_is_an_error",
+                CHILD,
+                t.path(),
+            );
+            return;
+        }
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is writable for the duration of getrlimit.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let lowered = libc::rlimit {
+            rlim_cur: 0,
+            ..limit
+        };
+        // SAFETY: `lowered` is initialized and readable for the duration of setrlimit.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+        let probed = bindable(Ipv4Addr::LOCALHOST, &[1]);
+        // SAFETY: `limit` holds the original limits returned by getrlimit.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let err = probed.unwrap_err();
+        assert!(format!("{err:#}").contains("127.0.0.1:1"), "{err:#}");
+        let io = err.downcast_ref::<std::io::Error>().unwrap();
+        assert_eq!(io.raw_os_error(), Some(libc::EMFILE), "{err:#}");
     }
 
     #[test]

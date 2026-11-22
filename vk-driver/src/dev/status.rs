@@ -506,7 +506,12 @@ pub fn doctor(plan: &Plan, cfg: &crate::config::Config) -> (String, bool) {
             );
             continue;
         }
-        match std::net::TcpListener::bind(&*addr) {
+        // Listening here could make a concurrent `vk dev up` move the environment's block.
+        let probed = addr
+            .parse()
+            .map_err(std::io::Error::other)
+            .and_then(crate::dev::endpoints::probe_bind);
+        match probed {
             Ok(_) => line(true, "endpoint", format!("{}: {addr} is free", ep.name)),
             Err(e) => line(
                 !ep.required,

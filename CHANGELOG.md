@@ -93,6 +93,9 @@ All notable changes to virtkit will be documented in this file.
   finished while a child process held the upload file open.
 - `vk node`, `vk tune` and `vk-gitlab` can reuse their state directory as soon as the
   previous holder releases it.
+- `vk dev` keeps its `auto` endpoint address when a child inherits a port check or
+  `vk dev doctor` checks the port concurrently. If the check itself fails, `vk dev`
+  reports the error.
 
 ## [0.114.0] - 2026-11-20
 
