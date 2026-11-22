@@ -338,12 +338,7 @@ async fn setup(tag: &str, notify: Option<&std::path::Path>) -> Setup {
     // The installed binary, and the release: the same program, other bytes.
     let built = std::fs::read(env!("CARGO_BIN_EXE_vk-registry")).unwrap();
     let installed = dir.join("vk-registry");
-    std::fs::write(&installed, &built).unwrap();
-    std::fs::set_permissions(
-        &installed,
-        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-    )
-    .unwrap();
+    vk_fs::write_executable(&installed, &built, 0o755).unwrap();
     let mut release = built;
     release.extend_from_slice(b"\0an update's release");
     let sha = sha256(&release);

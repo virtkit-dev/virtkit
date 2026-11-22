@@ -1666,8 +1666,7 @@ mod tests {
         let new = new.as_bytes();
         std::fs::write(dir.join("new"), new).unwrap();
         let held = releases_dir(&dir.join("node")).join(sha(new));
-        std::fs::write(&held, new).unwrap();
-        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o700)).unwrap();
+        vk_fs::write_executable(&held, new, 0o700).unwrap();
         let ack = core
             .command(update_to("u", &dir, &version, None), 1)
             .unwrap();

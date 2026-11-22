@@ -494,7 +494,7 @@ pub fn smoke_test(name: &str, path: &Path, version: &str) -> Result<()> {
         name,
         path,
         version,
-        run_version(|| std::process::Command::new(path)),
+        run_version(|| std::process::Command::new(path), std::thread::sleep),
     )
 }
 
@@ -522,7 +522,7 @@ pub fn smoke_test_file(name: &str, file: &fs::File, path: &Path, version: &str) 
         }
         cmd
     };
-    check_version_output(name, path, version, run_version(run))
+    check_version_output(name, path, version, run_version(run, std::thread::sleep))
 }
 
 /// Check `path`'s `--version` output, `out`, against [`smoke_test`]'s requirements.
@@ -1016,15 +1016,12 @@ pub const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum `--version` output read; a version line is a few dozen bytes.
 const MAX_VERSION_OUTPUT: u64 = 64 * 1024;
 
-/// Run `--version` on what `command` makes, waiting out a busy file rather than reporting it.
-/// Closing the download's write fd is not enough on its own: a `fork` anywhere else in the
-/// process inherits that open file, and the kernel counts the file open for writing — so
-/// `execve` answers ETXTBSY — until that child reaches its own `exec`. Nothing here can stop
-/// the fork, and the window it leaves is microseconds wide, so looking again beats failing a
-/// download that is fine. A file held open for real still ends in ETXTBSY, once the looking
-/// is done.
+/// Run `--version`, retrying ETXTBSY because a concurrent fork can keep the download's
+/// write descriptor open until exec. Call `wait` with the delay between attempts and
+/// return the last error if the file stays busy.
 fn run_version(
     command: impl Fn() -> std::process::Command,
+    mut wait: impl FnMut(Duration),
 ) -> std::io::Result<std::process::Output> {
     // Ten looks 20ms apart — 180ms of waiting before a busy file is reported as busy.
     const ATTEMPTS: u32 = 10;
@@ -1036,7 +1033,7 @@ fn run_version(
     };
     for _ in 1..ATTEMPTS {
         match run() {
-            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => std::thread::sleep(WAIT),
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => wait(WAIT),
             r => return r,
         }
     }
@@ -1048,12 +1045,23 @@ fn run_version(
 /// stdout; past `timeout`, the group is killed and the run fails as `TimedOut`. Its output
 /// counts as ended when the process has exited and nothing it started still holds stdout.
 fn output_within(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
+    let deadline = std::time::Instant::now() + timeout;
+    spawn_grouped(cmd)?.finish(deadline, timeout)
+}
+
+/// A process group leader and the stdout collected by its reader thread.
+struct Grouped {
+    child: std::process::Child,
+    stdout: std::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+/// Start `cmd` in its own process group and collect its stdout on a reader thread.
+fn spawn_grouped(mut cmd: std::process::Command) -> std::io::Result<Grouped> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
-    let deadline = std::time::Instant::now() + timeout;
     let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1070,47 +1078,62 @@ fn output_within(
         }
         let _ = tx.send(out);
     });
-    // Until the final `wait` the leader is left unreaped, a zombie once it exits, so the
-    // group's id stays its own for `kill`.
-    let exited = |child: &std::process::Child| -> std::io::Result<bool> {
-        // SAFETY: `siginfo_t` is plain data, for `waitid` to fill.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
-        // SAFETY: `info` outlives the call; WNOWAIT leaves the child to be reaped by `wait`.
-        if unsafe { libc::waitid(libc::P_PID, child.id(), &mut info, flags) } != 0 {
-            return Err(std::io::Error::last_os_error());
+    Ok(Grouped { child, stdout: rx })
+}
+
+impl Grouped {
+    /// Wait for the child and its stdout until `deadline`. Report `timeout` in the error.
+    fn finish(
+        self,
+        deadline: std::time::Instant,
+        timeout: Duration,
+    ) -> std::io::Result<std::process::Output> {
+        let Grouped {
+            mut child,
+            stdout: rx,
+        } = self;
+        // Leave the leader unreaped until the final wait so its group ID cannot be reused
+        // before a timeout kills the group.
+        let exited = |child: &std::process::Child| -> std::io::Result<bool> {
+            // SAFETY: `siginfo_t` is plain data, for `waitid` to fill.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+            // SAFETY: `info` outlives the call; WNOWAIT leaves the child to be reaped by `wait`.
+            if unsafe { libc::waitid(libc::P_PID, child.id(), &mut info, flags) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `waitid` filled `info`, or left it zeroed when the child has not exited.
+            Ok(unsafe { info.si_pid() } != 0)
+        };
+        let give_up = |child: &mut std::process::Child| {
+            if let Ok(pgid) = i32::try_from(child.id()) {
+                // SAFETY: a kill of the process group `process_group(0)` made, its leader not
+                // yet reaped.
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            }
+            let _ = child.wait();
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("did not finish within {}s", timeout.as_secs()),
+            )
+        };
+        while !exited(&child)? {
+            if std::time::Instant::now() >= deadline {
+                return Err(give_up(&mut child));
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        // SAFETY: `waitid` filled `info`, or left it zeroed when the child has not exited.
-        Ok(unsafe { info.si_pid() } != 0)
-    };
-    let give_up = |child: &mut std::process::Child| {
-        if let Ok(pgid) = i32::try_from(child.id()) {
-            // SAFETY: a kill of the process group `process_group(0)` made, its leader not
-            // yet reaped.
-            unsafe { libc::kill(-pgid, libc::SIGKILL) };
-        }
-        let _ = child.wait();
-        std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("did not finish within {}s", timeout.as_secs()),
-        )
-    };
-    while !exited(&child)? {
-        if std::time::Instant::now() >= deadline {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let Ok(stdout) = rx.recv_timeout(left) else {
             return Err(give_up(&mut child));
-        }
-        std::thread::sleep(Duration::from_millis(10));
+        };
+        let status = child.wait()?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr: Vec::new(),
+        })
     }
-    let left = deadline.saturating_duration_since(std::time::Instant::now());
-    let Ok(stdout) = rx.recv_timeout(left) else {
-        return Err(give_up(&mut child));
-    };
-    let status = child.wait()?;
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr: Vec::new(),
-    })
 }
 
 /// A download bar on stderr, or a silent one when stderr is not a terminal (so a
@@ -1622,8 +1645,8 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             let exe = dir.join(tool.name);
-            fs::write(&exe, b"the binary being replaced").unwrap();
-            fs::set_permissions(&exe, fs::Permissions::from_mode(mode)).unwrap();
+            // A test may run this inode later. Keep its write descriptor out of concurrent forks.
+            vk_fs::write_executable(&exe, b"the binary being replaced", mode).unwrap();
             Scratch { dir, exe }
         }
     }
@@ -1651,84 +1674,128 @@ mod tests {
             .collect()
     }
 
-    /// The smoke test execs a file this process just wrote, so it races every `fork` the
-    /// process makes: one landing while the download is still open inherits the write fd and
-    /// holds the file busy past the close, until that child execs. A write fd of our own
-    /// stands in for that inherited one — released while the smoke test is already looking
-    /// again, and the download is good, so the verdict must be that it passes.
+    /// Model a fork that inherited the download's write descriptor. A separate holder
+    /// keeps the file busy through the first attempt without passing the descriptor to
+    /// children of parallel tests. Releasing it during the retry wait must allow exec.
     #[test]
     fn the_smoke_test_waits_out_a_binary_something_still_holds_open() {
+        use std::io::{BufRead, Write};
         let s = Scratch::new(&VK, "busy", 0o755);
-        fs::write(&s.exe, FAKE_VK).unwrap();
+        vk_fs::write_executable(&s.exe, FAKE_VK.as_bytes(), 0o755).unwrap();
 
-        let held = OpenOptions::new().write(true).open(&s.exe).unwrap();
-        // Released a long way inside the 180ms budget, and late enough that the first look
-        // is the one that finds the file busy.
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            drop(held);
-        });
-        let looking = std::time::Instant::now();
-        smoke_test(VK.name, &s.exe, "0.30.0").unwrap();
-        assert!(
-            looking.elapsed() >= Duration::from_millis(20),
-            "the first look succeeded: nothing waited"
+        // The shell signals when the file is open. Send a newline so `read` succeeds and
+        // the shell's exit status confirms it reached the release point.
+        let mut holder = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec 3>>\"$0\"; echo held; read _"])
+            .arg(&s.exe)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut said = String::new();
+        std::io::BufReader::new(holder.stdout.take().unwrap())
+            .read_line(&mut said)
+            .unwrap();
+        assert_eq!(said, "held\n");
+        let mut holder = Some(holder);
+        let mut waits = Vec::new();
+        // Reap the holder on the first ETXTBSY so the next attempt can run the file.
+        let wait = |delay| {
+            waits.push(delay);
+            if let Some(mut holder) = holder.take() {
+                holder.stdin.take().unwrap().write_all(b"\n").unwrap();
+                assert!(holder.wait().unwrap().success());
+            }
+        };
+        let out = run_version(|| std::process::Command::new(&s.exe), wait);
+        check_version_output(VK.name, &s.exe, "0.30.0", out).unwrap();
+        assert_eq!(
+            waits,
+            [Duration::from_millis(20)],
+            "one wait, after a busy look"
         );
 
-        // Held for good: the wait is a budget, not a spin, so a file that never frees up
-        // still reports the errno it failed on.
+        // A permanently busy file must report ETXTBSY after ten attempts and nine waits.
         let _held = OpenOptions::new().write(true).open(&s.exe).unwrap();
-        let err = smoke_test(VK.name, &s.exe, "0.30.0").unwrap_err();
+        let mut waits = Vec::new();
+        let out = run_version(
+            || std::process::Command::new(&s.exe),
+            |delay| waits.push(delay),
+        );
+        let err = check_version_output(VK.name, &s.exe, "0.30.0", out).unwrap_err();
         assert_eq!(
             err.downcast_ref::<std::io::Error>()
                 .and_then(|e| e.raw_os_error()),
             Some(libc::ETXTBSY),
             "{err:#}"
         );
+        assert_eq!(waits, [Duration::from_millis(20); 9]);
     }
 
     /// A `--version` that hangs, or leaves something holding its output open, is killed
     /// with all it started and fails rather than holding the caller.
     #[test]
     fn a_version_that_hangs_is_killed_with_what_it_started() {
+        use std::io::BufRead;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
         let s = Scratch::new(&VK, "hangs", 0o755);
-        let pid_file = s.dir.join("sleeper");
+        // Each script reports the sleeper's PID on fd 3. The second leaves stdout open
+        // in a background child after the shell exits.
         for script in [
-            format!(
-                "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
-                pid_file.display()
-            ),
-            format!(
-                "#!/bin/sh\necho vk 0.30.0\nsleep 30 &\necho $! > {}\n",
-                pid_file.display()
-            ),
+            "#!/bin/sh\necho $$ >&3\nexec sleep 30 3>&-\n",
+            "#!/bin/sh\necho vk 0.30.0\nsleep 30 3>&- &\necho $! >&3\n",
         ] {
-            let _ = fs::remove_file(&pid_file);
-            fs::write(&s.exe, script).unwrap();
-            let started = std::time::Instant::now();
+            vk_fs::write_executable(&s.exe, script.as_bytes(), 0o755).unwrap();
+            let (ready_r, ready_w) = std::io::pipe().unwrap();
+            let fd = ready_w.as_raw_fd();
             let mut cmd = std::process::Command::new(&s.exe);
             cmd.arg("--version");
-            let err = output_within(cmd, Duration::from_millis(500)).unwrap_err();
+            // SAFETY: dup2 and fcntl are async-signal-safe; they give the child the pipe as
+            // fd 3, without close-on-exec — which a dup2 onto itself would leave set.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let moved = if fd == 3 {
+                        libc::fcntl(fd, libc::F_SETFD, 0) == 0
+                    } else {
+                        libc::dup2(fd, 3) == 3
+                    };
+                    if moved {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+            let running = spawn_grouped(cmd).unwrap();
+            drop(ready_w);
+            let mut said = String::new();
+            std::io::BufReader::new(ready_r)
+                .read_line(&mut said)
+                .unwrap();
+            let pid: i32 = said.trim().parse().unwrap();
+            // A pidfd keeps identifying this sleeper after it exits and its PID can be reused.
+            // SAFETY: pidfd_open of a pid, into a fresh descriptor.
+            let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            assert!(pidfd >= 0, "{}", std::io::Error::last_os_error());
+            // SAFETY: a fresh descriptor owned by nothing else.
+            let pidfd = unsafe { OwnedFd::from_raw_fd(i32::try_from(pidfd).unwrap()) };
+            // Start the timeout after the sleeper reports its PID.
+            let started = std::time::Instant::now();
+            let timeout = Duration::from_millis(500);
+            let err = running.finish(started + timeout, timeout).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
             assert!(started.elapsed() < Duration::from_secs(10));
-            let pid: i32 = fs::read_to_string(&pid_file)
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
-            // Killed, and reaped by whoever inherited it: gone, or a zombie for a moment.
-            let gone = || {
-                fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |st| {
-                    st.rsplit(')').next().unwrap().trim().starts_with('Z')
-                })
+            // Wait for the sleeper's pidfd to signal exit.
+            let mut poll = libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
             };
-            let looking = std::time::Instant::now();
-            while !gone() {
-                assert!(
-                    looking.elapsed() < Duration::from_secs(5),
-                    "{pid} still runs"
-                );
-                std::thread::sleep(Duration::from_millis(20));
+            // SAFETY: poll reads and writes the one local pollfd.
+            while unsafe { libc::poll(&mut poll, 1, -1) } < 0 {
+                let e = std::io::Error::last_os_error();
+                assert_eq!(e.kind(), std::io::ErrorKind::Interrupted, "{e}");
             }
         }
     }
@@ -1737,12 +1804,11 @@ mod tests {
     #[test]
     fn the_smoke_test_of_an_open_file_runs_that_file() {
         let s = Scratch::new(&VK, "open", 0o755);
-        fs::write(&s.exe, FAKE_VK).unwrap();
+        vk_fs::write_executable(&s.exe, FAKE_VK.as_bytes(), 0o755).unwrap();
         let file = fs::File::open(&s.exe).unwrap();
         let moved = s.dir.join("moved");
         fs::rename(&s.exe, &moved).unwrap();
-        fs::write(&s.exe, WRONG_VK).unwrap();
-        fs::set_permissions(&s.exe, fs::Permissions::from_mode(0o755)).unwrap();
+        vk_fs::write_executable(&s.exe, WRONG_VK.as_bytes(), 0o755).unwrap();
         smoke_test_file(VK.name, &file, &s.exe, "0.30.0").unwrap();
         assert!(smoke_test(VK.name, &s.exe, "0.30.0").is_err());
     }

@@ -445,17 +445,16 @@ mod tests {
     // Stand in for ssh-keygen so the test does not depend on the host's OpenSSH install.
     fn fake_ssh_keygen(dir: &Path) -> PathBuf {
         let p = dir.join("ssh-keygen");
-        std::fs::write(
+        vk_fs::write_executable(
             &p,
-            "#!/bin/sh\n\
+            b"#!/bin/sh\n\
              while [ $# -gt 0 ]; do case \"$1\" in -f) f=$2; shift ;; esac; shift; done\n\
              [ -n \"$f\" ] || exit 2\n\
              (umask 077; printf 'PRIVATE\\n' > \"$f\")\n\
              printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAtest fake\\n' > \"$f.pub\"\n",
+            0o755,
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p
     }
 

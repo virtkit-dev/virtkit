@@ -4337,6 +4337,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "vk-fs",
 ]
 
 [[package]]

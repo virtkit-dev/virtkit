@@ -1231,27 +1231,10 @@ mod tests {
         }
     }
 
-    /// `script`, as the `vk` a driver of `f` runs. Written by `cp`, not here: a file this
-    /// process holds open for writing, as a child another test forks meanwhile inherits it,
-    /// cannot be run (ETXTBSY).
+    /// Install `script` as the fixture's `vk` executable.
     fn fake_vk(f: &Fixture, script: &str) -> PathBuf {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
         let exe = f.dir.join("vk");
-        let source = exe.with_extension("sh");
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o755)
-            .open(&source)
-            .unwrap()
-            .write_all(script.as_bytes())
-            .unwrap();
-        let copied = std::process::Command::new("cp")
-            .arg(&source)
-            .arg(&exe)
-            .status();
-        assert!(copied.unwrap().success());
+        vk_fs::write_executable(&exe, script.as_bytes(), 0o755).unwrap();
         exe
     }
 

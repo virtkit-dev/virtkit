@@ -332,22 +332,22 @@ fn describe(status: std::io::Result<std::process::ExitStatus>) -> String {
 /// `<dir>/go` exists ([`finish`]), so a test sees it quitting for as long as it needs to.
 #[cfg(test)]
 pub fn stub(tag: &str) -> Spec {
-    use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("vk-node-runner-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("gitlab-runner");
-    std::fs::write(
+    vk_fs::write_executable(
         &script,
         format!(
             "#!/bin/sh\ntrap 'until [ -e {go} ]; do sleep 0.05; done; exit 0' QUIT\n\
              echo \"$$ $*\" >> {starts}\nwhile true; do sleep 0.05; done\n",
             starts = dir.join("starts").display(),
             go = dir.join("go").display(),
-        ),
+        )
+        .as_bytes(),
+        0o755,
     )
     .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     Spec {
         binary: script,
         config: "/cfg.toml".into(),

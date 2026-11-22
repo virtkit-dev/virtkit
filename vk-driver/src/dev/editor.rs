@@ -996,7 +996,6 @@ mod tests {
     #[test]
     fn the_extension_probes_check_every_id_over_a_real_shell() {
         let _env = env_guard();
-        use std::os::unix::fs::OpenOptionsExt;
         // The probes run in the guest as `sh -c <script> <cli> <ext…>`, so `$0` is the server
         // CLI and `$1..` the extension ids. Run the real scripts through the host `/bin/sh`
         // against a stub `code` to guard that argument layout — a stray `shift` here once
@@ -1006,15 +1005,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let code = dir.join("code");
         // Lists ext2 and ext3, but not the first requested id, ext1.
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o755)
-            .open(&code)
-            .unwrap();
-        std::io::Write::write_all(&mut f, b"#!/bin/sh\nprintf 'ext2\\next3\\n'\n").unwrap();
-        drop(f);
+        vk_fs::write_executable(&code, b"#!/bin/sh\nprintf 'ext2\\next3\\n'\n", 0o755).unwrap();
         let cli = code.to_str().unwrap();
 
         let all_present = |exts: &[&str]| -> bool {
@@ -1187,16 +1178,8 @@ mod tests {
     /// `--list-extensions` prints `extensions` (newline-separated, `""` for none), so a test can
     /// drive the Remote-SSH check [`select`] runs either way.
     fn fake_editor(dir: &Path, name: &str, extensions: &str) -> PathBuf {
-        use std::os::unix::fs::OpenOptionsExt;
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join(name);
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o755)
-            .open(&path)
-            .unwrap();
         let script = format!(
             "#!/bin/sh\n\
              case \"$1\" in\n\
@@ -1204,14 +1187,13 @@ mod tests {
              --list-extensions) printf '{extensions}' ;;\n\
              esac\n"
         );
-        std::io::Write::write_all(&mut f, script.as_bytes()).unwrap();
+        vk_fs::write_executable(&path, script.as_bytes(), 0o755).unwrap();
         path
     }
 
     #[test]
     fn resetting_the_server_stops_it_and_empties_its_directory() {
         let _env = env_guard();
-        use std::os::unix::fs::PermissionsExt;
         use std::os::unix::process::ExitStatusExt;
         let dir = std::env::temp_dir().join(format!("vk-deveditor-reset-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1226,8 +1208,7 @@ mod tests {
         // ends on its own: a bounded sleep could run out while a loaded host's reset is still
         // scanning `/proc`, and its exit would read as the reset having missed it.
         let node = data.join("bin/abc/node");
-        std::fs::write(&node, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
-        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        vk_fs::write_executable(&node, b"#!/bin/sh\nwhile :; do sleep 1; done\n", 0o755).unwrap();
         let mut server = std::process::Command::new(&node).spawn().unwrap();
 
         let reset = |data: &Path| {

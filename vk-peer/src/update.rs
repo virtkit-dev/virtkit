@@ -1143,7 +1143,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sh = dir.join("sh");
-        std::fs::copy("/bin/sh", &sh).unwrap();
+        vk_fs::write_executable(&sh, &std::fs::read("/bin/sh").unwrap(), 0o755).unwrap();
         let binary = Binary::open(&sh, None).unwrap();
         // Another file at the path: the child still runs the one opened.
         std::fs::remove_file(&sh).unwrap();

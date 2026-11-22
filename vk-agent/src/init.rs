@@ -5052,13 +5052,12 @@ mod tests {
 
     #[test]
     fn a_setpriv_that_cannot_make_the_drop_is_not_one() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("vk-setpriv-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fake = |name: &str, code: u8| {
             let p = dir.join(name);
-            std::fs::write(&p, format!("#!/bin/sh\nexit {code}\n")).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            vk_fs::write_executable(&p, format!("#!/bin/sh\nexit {code}\n").as_bytes(), 0o755)
+                .unwrap();
             p.to_string_lossy().into_owned()
         };
         // util-linux: takes the flags and makes the drop.

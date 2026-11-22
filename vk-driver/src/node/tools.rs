@@ -1788,16 +1788,17 @@ mod tests {
             .map(|d| d.join("sleep"))
             .find(|p| p.is_file())
             .expect("no sleep on PATH");
-        std::fs::write(
+        vk_fs::write_executable(
             &path,
             format!(
                 "#!/bin/sh\n{} 30 >/dev/null 2>&1 &\necho $! > {}\necho 'git version 2'\n",
                 sleep.display(),
                 pid.display()
-            ),
+            )
+            .as_bytes(),
+            0o755,
         )
         .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let found = probe_versions(&dir).await;
         assert_eq!(found.get("git").map(String::as_str), Some("git version 2"));
         let pid: i32 = std::fs::read_to_string(&pid)
@@ -2051,8 +2052,8 @@ mod tests {
         let dir = scratch("probe");
         let script = |name: &str, body: &str| {
             let path = dir.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            vk_fs::write_executable(&path, format!("#!/bin/sh\n{body}\n").as_bytes(), 0o755)
+                .unwrap();
         };
         script("git", "echo 'git version 2.49.0'; echo more");
         script("git-lfs", "exit 1");
