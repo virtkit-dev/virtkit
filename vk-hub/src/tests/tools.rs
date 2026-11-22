@@ -209,33 +209,29 @@ async fn a_tools_build_goes_only_to_a_node_speaking_version_4() {
             ..vk_hub_proto::Report::default()
         })
     };
-    send(&mut ws, &progress(vk_hub_proto::ToolsPhase::Building, None)).await;
-    eventually(|| {
-        hub.db
-            .node(&node_id)
-            .unwrap()
-            .unwrap()
-            .report
-            .and_then(|r| r.tools)
-            .is_some()
+    // Subscribe before sending so a fast report write cannot race the subscription.
+    let mut changes = hub.subscribe_node(&node_id);
+    let stored_phase = || {
+        let row = hub.db.node(&node_id).unwrap().unwrap();
+        row.report.and_then(|r| r.tools).map(|t| t.phase)
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        send(&mut ws, &progress(vk_hub_proto::ToolsPhase::Building, None)).await;
+        while stored_phase() != Some(vk_hub_proto::ToolsPhase::Building) {
+            changes.changed().await.unwrap();
+        }
+        // If pacing holds the second report, the next ping flushes it.
+        send(
+            &mut ws,
+            &progress(vk_hub_proto::ToolsPhase::Failed, Some("no stage tools")),
+        )
+        .await;
+        while stored_phase() != Some(vk_hub_proto::ToolsPhase::Failed) {
+            changes.changed().await.unwrap();
+        }
     })
-    .await;
-    tokio::time::sleep(crate::server::HEARTBEAT).await;
-    send(
-        &mut ws,
-        &progress(vk_hub_proto::ToolsPhase::Failed, Some("no stage tools")),
-    )
-    .await;
-    eventually(|| {
-        hub.db
-            .node(&node_id)
-            .unwrap()
-            .unwrap()
-            .report
-            .and_then(|r| r.tools)
-            .is_some_and(|t| t.phase == vk_hub_proto::ToolsPhase::Failed)
-    })
-    .await;
+    .await
+    .expect("the node's progress was not stored");
     let stored = hub.db.node(&node_id).unwrap().unwrap().report.unwrap();
     assert_eq!(stored.tools.unwrap().log, ["step 3/4[2J"]);
     let events: Vec<String> = hub

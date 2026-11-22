@@ -18,7 +18,7 @@ use vk_hub_proto::registry::{
 };
 use vk_hub_proto::{HubMsg, RefusalCode};
 
-use crate::server::{Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub, MISSED_HEARTBEATS, Reach};
+use crate::server::{Ending, Exported, HEARTBEAT, Hub, MISSED_HEARTBEATS, Reach};
 use crate::session::{HANDSHAKE_STEP, Peer, PeerKind, Refusal, Ws, turn_away};
 use crate::store::{
     NotEnrolled, Program, RegistryChange, RegistryCommandRow, RegistryRow, RegistryWrite, Release,
@@ -118,7 +118,7 @@ async fn welcome(
         Err(e) => return Err(e.into()),
     }
     let text = serde_json::to_string(&HubMsg::Welcome {
-        heartbeat_secs: HEARTBEAT_SECS,
+        heartbeat_secs: hub.heartbeat_secs(),
     })
     .map_err(anyhow::Error::from)?;
     send_text(ws, text).await.map_err(Refusal::gone)
@@ -133,8 +133,8 @@ async fn serve(
     session: u64,
     ending: &Ending,
 ) -> Result<&'static str> {
-    let quiet = HEARTBEAT * MISSED_HEARTBEATS;
-    let mut ping = tokio::time::interval(HEARTBEAT);
+    let quiet = hub.heartbeat * MISSED_HEARTBEATS;
+    let mut ping = tokio::time::interval(hub.heartbeat);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut deadline = tokio::time::Instant::now() + quiet;
     let mut steer = Steer::default();
@@ -155,7 +155,7 @@ async fn serve(
             }
             () = ending.kick.notified() => steer.sync(ws, hub, registry).await?,
             _ = ping.tick() => {
-                tokio::time::timeout(HEARTBEAT, ws.send(Message::Ping(Default::default())))
+                tokio::time::timeout(hub.heartbeat, ws.send(Message::Ping(Default::default())))
                     .await
                     .map_err(|_| anyhow!("the registry is not reading"))?
                     .map_err(|e| anyhow!("pinging: {e}"))?;

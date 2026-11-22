@@ -46,9 +46,19 @@ fn tls_acceptor() -> tokio_rustls::TlsAcceptor {
 }
 
 async fn serve_on(tls: Option<tokio_rustls::TlsAcceptor>) -> (SocketAddr, Arc<Hub>) {
+    serve_configured(tls, |hub| hub).await
+}
+
+async fn serve_configured(
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    configure: impl FnOnce(Hub) -> Hub,
+) -> (SocketAddr, Arc<Hub>) {
     let listener = server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
-    let hub = Arc::new(Hub::new(Arc::new(Db::open_memory().unwrap()), None));
+    let hub = Arc::new(configure(Hub::new(
+        Arc::new(Db::open_memory().unwrap()),
+        None,
+    )));
     tokio::spawn(server::serve(listener, tls, hub.clone()));
     (addr, hub)
 }
@@ -447,25 +457,41 @@ async fn a_removed_node_is_revoked_mid_session_and_refused_after() {
     assert!(code.is_permanent());
 }
 
+/// A peer that never sends its hello exhausts the handshake read timeout.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_silent_peer_is_dropped_in_the_handshake_and_in_the_session() {
-    let (addr, hub) = start().await;
-    let key = keypair();
-    let node_id = enrolled(addr, &hub, &key).await;
-    // Connected and saying nothing: refused after one handshake step.
+async fn a_silent_peer_is_refused_in_the_handshake() {
+    let (addr, _hub) =
+        serve_configured(None, |hub| hub.with_handshake_step(Duration::from_secs(1))).await;
     let mut ws = dial(addr).await;
-    let HubMsg::Refused { code, .. } = receive(&mut ws).await else {
-        panic!("expected a refusal");
+    let refused = tokio::time::timeout(Duration::from_secs(10), receive(&mut ws))
+        .await
+        .expect("the silent peer was not refused");
+    let HubMsg::Refused { code, .. } = refused else {
+        panic!("expected a refusal, got {refused:?}");
     };
     assert_eq!(code, RefusalCode::Protocol);
-    // Authenticated, then not reading — so not even answering pings: dropped once
-    // `MISSED_HEARTBEATS` heartbeats pass.
+}
+
+/// Stop reading after authentication so even pings go unanswered. The hub drops the
+/// session after `MISSED_HEARTBEATS` intervals.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_peer_is_dropped_in_the_session() {
+    let (addr, hub) = serve_configured(None, |hub| hub.with_heartbeat(1)).await;
+    let key = keypair();
+    let node_id = enrolled(addr, &hub, &key).await;
+    let mut changed = hub.subscribe_node(&node_id);
     let mut ws = dial(addr).await;
     assert!(matches!(
         open(&mut ws, &node_id, &"0b".repeat(16), &key).await,
-        HubMsg::Welcome { .. }
+        HubMsg::Welcome { heartbeat_secs: 1 }
     ));
-    tokio::time::sleep(server::HEARTBEAT * (server::MISSED_HEARTBEATS + 1)).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while hub.current_session(&node_id).is_some() {
+            changed.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the silent session was not dropped");
     assert_eq!(hub.reach(&node_id), Reach::Unreachable);
     closed(&mut ws, Duration::from_secs(5)).await;
 }

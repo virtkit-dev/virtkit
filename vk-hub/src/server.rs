@@ -43,12 +43,8 @@ pub(crate) fn full(bytes: impl Into<Bytes>) -> Body {
         .boxed()
 }
 
-/// How often a node heartbeats, in seconds, told to it at the start of each session. Short
-/// under test, so a quiet session is dropped within a test's patience.
-#[cfg(not(test))]
+/// Default heartbeat interval, in seconds, advertised to peers at session start.
 pub const HEARTBEAT_SECS: u32 = 5;
-#[cfg(test)]
-pub const HEARTBEAT_SECS: u32 = 1;
 // The protocol promises a node at least 1.
 const _: () = assert!(HEARTBEAT_SECS >= 1);
 
@@ -193,6 +189,10 @@ pub struct Hub {
     /// How long a node may go unheard before its session is dropped and it shows unreachable:
     /// [`MISSED_HEARTBEATS`] heartbeats.
     pub(crate) quiet: Duration,
+    /// Peer heartbeat and ping interval. Defaults to [`HEARTBEAT`].
+    pub(crate) heartbeat: Duration,
+    /// Time to receive each peer handshake message. Defaults to [`crate::session::HANDSHAKE_STEP`].
+    pub(crate) handshake_step: Duration,
     /// What lets the hub hand over to a release without refusing a connection.
     pub(crate) handover: crate::update::Handover,
     /// The hub's own update, when it serves as `vk-hub serve`.
@@ -285,6 +285,8 @@ impl Hub {
                 crate::tokens::DEFAULT_MAX_JOB_TOKEN,
             )),
             quiet: HEARTBEAT * MISSED_HEARTBEATS,
+            heartbeat: HEARTBEAT,
+            handshake_step: crate::session::HANDSHAKE_STEP,
             handover: crate::update::Handover::default(),
             self_update: std::sync::OnceLock::new(),
             runner_tokens: crate::relays::RunnerTokens::default(),
@@ -298,6 +300,28 @@ impl Hub {
     #[cfg(test)]
     pub fn with_quiet(mut self, quiet: Duration) -> Self {
         self.quiet = quiet;
+        self
+    }
+
+    /// Set the heartbeat and ping interval in whole seconds, as advertised in the welcome.
+    /// A silent node's session expires after [`MISSED_HEARTBEATS`] intervals.
+    #[cfg(test)]
+    pub fn with_heartbeat(mut self, secs: u32) -> Self {
+        assert!(secs >= 1, "the protocol promises at least 1s");
+        self.heartbeat = Duration::from_secs(secs.into());
+        self.quiet = self.heartbeat * MISSED_HEARTBEATS;
+        self
+    }
+
+    /// The heartbeat interval told to a peer, in seconds.
+    pub(crate) fn heartbeat_secs(&self) -> u32 {
+        u32::try_from(self.heartbeat.as_secs()).unwrap_or(u32::MAX)
+    }
+
+    /// Allow `step` for each handshake message the hub receives.
+    #[cfg(test)]
+    pub fn with_handshake_step(mut self, step: Duration) -> Self {
+        self.handshake_step = step;
         self
     }
 

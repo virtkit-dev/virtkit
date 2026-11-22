@@ -44,9 +44,7 @@ use vk_hub_proto::gitlab::{
 use vk_hub_proto::{CommandAck, HubMsg, Outcome, RefusalCode};
 
 use crate::jobs::TicketNotice;
-use crate::server::{
-    Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub, MISSED_HEARTBEATS, Reach, RelayConn,
-};
+use crate::server::{Ending, Exported, HEARTBEAT, Hub, MISSED_HEARTBEATS, Reach, RelayConn};
 use crate::session::{
     HANDSHAKE_STEP, Peer, PeerKind, RELAY_HTTP1, RELAY_HTTP2, Refusal, Ws, turn_away,
 };
@@ -163,7 +161,7 @@ async fn welcome(
         conn.bind(&relay.id, &relay.hostname, session);
     }
     let text = serde_json::to_string(&HubMsg::Welcome {
-        heartbeat_secs: HEARTBEAT_SECS,
+        heartbeat_secs: hub.heartbeat_secs(),
     })
     .map_err(anyhow::Error::from)?;
     send_text(ws, text).await.map_err(Refusal::gone)
@@ -179,8 +177,8 @@ async fn serve(
     session: u64,
     ending: &Ending,
 ) -> Result<&'static str> {
-    let quiet = HEARTBEAT * MISSED_HEARTBEATS;
-    let mut ping = tokio::time::interval(HEARTBEAT);
+    let quiet = hub.heartbeat * MISSED_HEARTBEATS;
+    let mut ping = tokio::time::interval(hub.heartbeat);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut deadline = tokio::time::Instant::now() + quiet;
     let mut told: Option<ServerStatus> = None;
@@ -228,7 +226,7 @@ async fn serve(
                 steer.sync(ws, hub, relay).await?;
             }
             _ = ping.tick() => {
-                tokio::time::timeout(HEARTBEAT, ws.send(Message::Ping(Default::default())))
+                tokio::time::timeout(hub.heartbeat, ws.send(Message::Ping(Default::default())))
                     .await
                     .map_err(|_| anyhow!("the relay is not reading"))?
                     .map_err(|e| anyhow!("pinging: {e}"))?;

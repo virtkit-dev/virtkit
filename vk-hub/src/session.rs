@@ -27,18 +27,14 @@ use vk_hub_proto::{
     from_hex_lower,
 };
 
-use crate::server::{Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub};
+use crate::server::{Ending, Exported, HEARTBEAT, Hub};
 use crate::store::NotEnrolled;
 
 pub(crate) type Ws = WebSocketStream<TokioIo<Upgraded>>;
 
-/// How long a node has for each handshake step. Signing a nonce takes microseconds; a peer
-/// this slow is not a node doing its job, and holding the socket for it costs a descriptor.
-/// Short under test, so the timeout itself can be tested.
-#[cfg(not(test))]
+/// Default timeout for receiving a peer's hello or signed challenge response. A stalled
+/// handshake holds a socket descriptor. This also bounds close and refusal operations.
 pub(crate) const HANDSHAKE_STEP: Duration = crate::server::PRE_AUTH_TIMEOUT;
-#[cfg(test)]
-pub(crate) const HANDSHAKE_STEP: Duration = Duration::from_secs(1);
 
 /// The protocol versions this hub speaks: [`vk_hub_proto::PROTOCOL`]'s, [`JOBS`],
 /// [`vk_hub_proto::TOOLS`], [`vk_hub_proto::RUNNER_NONE`], [`LIVE_EGRESS`] and
@@ -262,7 +258,7 @@ pub(crate) async fn handshake(
         node_id,
         incarnation,
         vk_version,
-    } = receive(ws, HANDSHAKE_STEP).await.map_err(protocol)?
+    } = receive(ws, hub.handshake_step).await.map_err(protocol)?
     else {
         return Err(Refusal::new(
             RefusalCode::Protocol,
@@ -321,7 +317,8 @@ pub(crate) async fn handshake(
     )
     .await
     .map_err(Refusal::gone)?;
-    let NodeMsg::Auth { signature } = receive(ws, HANDSHAKE_STEP).await.map_err(protocol)? else {
+    let NodeMsg::Auth { signature } = receive(ws, hub.handshake_step).await.map_err(protocol)?
+    else {
         return Err(Refusal::new(
             RefusalCode::Protocol,
             "a challenge is answered with an auth",
@@ -402,7 +399,7 @@ async fn welcome(
     send(
         ws,
         &HubMsg::Welcome {
-            heartbeat_secs: HEARTBEAT_SECS,
+            heartbeat_secs: hub.heartbeat_secs(),
         },
     )
     .await
@@ -421,10 +418,10 @@ async fn serve(
     mut jobs: Option<tokio::sync::mpsc::Receiver<vk_hub_proto::dispatch::HubJobMsg>>,
 ) -> Result<&'static str> {
     let quiet = hub.quiet;
-    let mut ping = tokio::time::interval(HEARTBEAT);
+    let mut ping = tokio::time::interval(hub.heartbeat);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut deadline = tokio::time::Instant::now() + quiet;
-    let mut pace = Pace::default();
+    let mut pace = Pace::new(hub.heartbeat);
     let mut steer = Steer::default();
     let mut access = Access::new(node.version);
     let mut access_changed = hub.token_keys.subscribe_node_access();
@@ -456,7 +453,7 @@ async fn serve(
             Ok(()) = access_changed.changed() => access.sync(ws, hub, node).await?,
             Some(msg) = next_job(&mut jobs) => send(ws, &HubMsg::Job(msg)).await?,
             _ = ping.tick() => {
-                tokio::time::timeout(HEARTBEAT, ws.send(Message::Ping(Default::default())))
+                tokio::time::timeout(hub.heartbeat, ws.send(Message::Ping(Default::default())))
                     .await
                     .map_err(|_| anyhow!("the node is not reading"))?
                     .map_err(|e| anyhow!("pinging: {e}"))?;
@@ -837,14 +834,14 @@ async fn acknowledge(
     send(ws, &HubMsg::Recorded(recorded)).await
 }
 
-/// How much of what its node reports a session writes. A node heartbeats every
-/// [`HEARTBEAT`], and sends an inventory or a report when something changed; one doing any
-/// of it faster only costs writes. Heartbeats and reports are each stored at most one per
-/// half heartbeat, the latest of those held back stored at the next ping, so the stored one
-/// is never staler than that. An inventory is durable at most once a heartbeat; one sooner
-/// is stored all the same, and made durable by the next durable write.
-#[derive(Default)]
+/// Pace writes for a node that heartbeats every [`Hub::heartbeat`] and reports changes
+/// to its inventory and workloads. Hold back heartbeats and reports received within half
+/// an interval of the previous write of that kind. The next ping flushes the latest held
+/// value of each kind. Store every inventory, requesting a durable write at most once per
+/// interval. The next durable write also covers earlier inventories.
 struct Pace {
+    /// [`Hub::heartbeat`].
+    every: Duration,
     heartbeat: Paced<Heartbeat>,
     report: Paced<Report>,
     durable_inventory_at: Option<Instant>,
@@ -868,10 +865,10 @@ impl<T> Default for Paced<T> {
 
 impl<T> Paced<T> {
     /// `msg` arrived at `now`: it, to store now, or `None` with it held back.
-    fn offer(&mut self, msg: T, now: Instant) -> Option<T> {
+    fn offer(&mut self, msg: T, now: Instant, heartbeat: Duration) -> Option<T> {
         if self
             .stored_at
-            .is_some_and(|t| now.duration_since(t) < HEARTBEAT / 2)
+            .is_some_and(|t| now.duration_since(t) < heartbeat / 2)
         {
             self.held = Some((msg, now));
             return None;
@@ -890,9 +887,18 @@ impl<T> Paced<T> {
 }
 
 impl Pace {
+    fn new(heartbeat: Duration) -> Self {
+        Pace {
+            every: heartbeat,
+            heartbeat: Paced::default(),
+            report: Paced::default(),
+            durable_inventory_at: None,
+        }
+    }
+
     /// `heartbeat` arrived at `now`: it, to store now, or `None` with it held back.
     fn heartbeat(&mut self, heartbeat: Heartbeat, now: Instant) -> Option<Heartbeat> {
-        self.heartbeat.offer(heartbeat, now)
+        self.heartbeat.offer(heartbeat, now, self.every)
     }
 
     /// The heartbeat held back, to store at `now`, and when it arrived.
@@ -902,7 +908,7 @@ impl Pace {
 
     /// `report` arrived at `now`: it, to store now, or `None` with it held back.
     fn report(&mut self, report: Report, now: Instant) -> Option<Report> {
-        self.report.offer(report, now)
+        self.report.offer(report, now, self.every)
     }
 
     /// The report held back, to store at `now`.
@@ -914,7 +920,7 @@ impl Pace {
     fn inventory_durable(&mut self, now: Instant) -> bool {
         let durable = self
             .durable_inventory_at
-            .is_none_or(|t| now.duration_since(t) >= HEARTBEAT);
+            .is_none_or(|t| now.duration_since(t) >= self.every);
         if durable {
             self.durable_inventory_at = Some(now);
         }
@@ -1018,7 +1024,7 @@ mod tests {
 
     #[test]
     fn a_heartbeat_too_soon_is_held_and_the_latest_stored_at_the_next_ping() {
-        let mut pace = Pace::default();
+        let mut pace = Pace::new(HEARTBEAT);
         let t = Instant::now();
         assert_eq!(pace.heartbeat(beat(1), t), Some(beat(1)));
         assert_eq!(pace.heartbeat(beat(2), t + HEARTBEAT / 4), None);
@@ -1035,7 +1041,7 @@ mod tests {
     /// Admission age includes storage delays, including time held back by pacing.
     #[test]
     fn a_heartbeat_stored_late_ages_its_admission() {
-        let mut pace = Pace::default();
+        let mut pace = Pace::new(HEARTBEAT);
         let t = Instant::now();
         let read = |age_ms| Heartbeat {
             admission: Some(vk_hub_proto::Admission::default()),
@@ -1056,7 +1062,7 @@ mod tests {
 
     #[test]
     fn reports_are_paced_apart_from_heartbeats() {
-        let mut pace = Pace::default();
+        let mut pace = Pace::new(HEARTBEAT);
         let t = Instant::now();
         let report = |n| Report {
             workloads_omitted: n,
@@ -1119,7 +1125,7 @@ mod tests {
 
     #[test]
     fn an_inventory_is_durable_at_most_once_a_heartbeat() {
-        let mut pace = Pace::default();
+        let mut pace = Pace::new(HEARTBEAT);
         let t = Instant::now();
         assert!(pace.inventory_durable(t));
         assert!(!pace.inventory_durable(t + HEARTBEAT / 2));
