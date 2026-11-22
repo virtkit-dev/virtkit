@@ -89,6 +89,8 @@ All notable changes to virtkit will be documented in this file.
 
 - `vk dev up` can finish setting up a running environment after the process that started it
   exits.
+- `vk-registry` no longer reports a blob upload as busy just because the previous chunk
+  finished while a child process held the upload file open.
 
 ## [0.114.0] - 2026-11-20
 

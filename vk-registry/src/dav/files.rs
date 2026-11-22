@@ -658,8 +658,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vk-reg-files-ns-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::new(dir.clone()).unwrap();
+        // Release the probe's lock on return even if another test's child inherited the descriptor.
         let try_lock = || {
-            let file = std::fs::File::open(dir.join(".files.lock")).unwrap();
+            let file = vk_fs::LockFile::new(std::fs::File::open(dir.join(".files.lock")).unwrap());
             // SAFETY: flock on a descriptor `file` owns.
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
         };

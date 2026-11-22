@@ -1760,7 +1760,7 @@ impl Store {
                 .with_context(|| format!("locking {}", path.display()));
         }
         Ok(LockGuard {
-            _file: f,
+            _file: vk_fs::LockFile::new(f),
             root: self.root.clone(),
         })
     }
@@ -1814,7 +1814,7 @@ impl Store {
             return Err(e).with_context(|| format!("locking {}", path.display()));
         }
         Ok(Lease {
-            file,
+            file: vk_fs::LockFile::new(file),
             path,
             root: self.root.clone(),
         })
@@ -1861,6 +1861,9 @@ impl Store {
             };
             // SAFETY: the fd is owned by `file`, open for the call; LOCK_NB never waits.
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+                // A dry run leaves the stale lease file in place. Release the probe's lock
+                // even if a child inherited the descriptor.
+                let _probe = vk_fs::LockFile::new(file);
                 // Nobody holds it: its reader is gone. One this user may not remove (another's,
                 // in a store shared by a group) is left for its owner's gc.
                 if !dry_run && let Err(e) = remove_if_present(&path) {
@@ -3453,7 +3456,7 @@ const MAX_LEASE_BYTES: u64 = 64 << 20;
 /// [`Store::gc`] reads, so a reader killed without a destructor releases its lease with its
 /// last descriptor, and the next pass removes the file. Dropping it unlinks the file.
 pub struct Lease {
-    file: std::fs::File,
+    file: vk_fs::LockFile,
     path: PathBuf,
     /// The store it leases from.
     root: PathBuf,
@@ -3487,8 +3490,8 @@ impl Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        // Unlinked while still locked, so a gc never reads it as dead first. Best-effort: a
-        // file left behind is unlocked once this closes, and the next gc removes it.
+        // Unlink while locked so gc cannot see the lease as dead first. If unlink fails,
+        // dropping the lock lets a later gc retry.
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -3760,10 +3763,10 @@ fn dir_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// A held store lock (see [`Store::lock_shared`]); released when dropped (flock
-/// releases on the last close of the fd).
+/// A held store lock (see [`Store::lock_shared`]). Dropping the guard releases the lock
+/// even if a child inherited the descriptor (see [`vk_fs::LockFile`]).
 pub struct LockGuard {
-    _file: std::fs::File,
+    _file: vk_fs::LockFile,
     /// The store it locks, for a [`Lease`] to check it is added to under its own store's lock.
     root: PathBuf,
 }
@@ -5036,7 +5039,7 @@ fn upload_is_for(store: &Store, id: &str, name: &str) -> bool {
 enum UploadSession {
     /// The session's file, opened for appending and held under an exclusive `flock` until
     /// it is dropped.
-    Held(std::fs::File),
+    Held(vk_fs::LockFile),
     /// Another request holds it: a PATCH appending, or a finalization verifying and
     /// promoting it.
     Busy,
@@ -5078,6 +5081,7 @@ fn lock_upload(store: &Store, id: &str) -> Result<UploadSession> {
         }
         return Err(e).with_context(|| format!("locking {}", path.display()));
     }
+    let file = vk_fs::LockFile::new(file);
     let held = file.metadata().context("reading the locked upload")?;
     let live = match std::fs::metadata(&path) {
         Ok(m) => m.dev() == held.dev() && m.ino() == held.ino(),
@@ -8073,6 +8077,8 @@ mod tests {
             }
             assert_eq!(std::fs::metadata(&upload).unwrap().len(), len);
             assert!(!store.has_blob(&digest[7..]));
+            // Model a forked child that keeps the descriptor after the holder releases the session.
+            let inherited = holder.try_clone().unwrap();
             drop(holder);
 
             // A PATCH that opened the session, then a finalization of it, then the PATCH's
@@ -8081,6 +8087,8 @@ mod tests {
             let (go, until) = std::sync::mpsc::channel();
             upload_hooks::on_opened(id, opened, until);
             std::thread::scope(|scope| {
+                // Drop the sender before joining the racer if an assertion panics.
+                let go = go;
                 let racer = scope.spawn(|| {
                     patch_upload(&store, "img", id, b"appended late")
                         .unwrap()
@@ -8092,6 +8100,7 @@ mod tests {
                 go.send(()).unwrap();
                 assert_eq!(racer.join().unwrap(), StatusCode::NOT_FOUND);
             });
+            drop(inherited);
             let hex = &digest[7..];
             assert_eq!(store.get_blob(hex).unwrap().unwrap(), raw);
             if zstd {
@@ -9737,10 +9746,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vk-regserve-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::new(dir.clone()).unwrap();
-        // non-blocking probe with its own open file description; `f` drops on
-        // return, releasing any lock the probe took.
+        // Probe with a separate open file description and release the lock on return,
+        // even if another test's child inherited the descriptor.
         let try_lock = |op: libc::c_int| -> bool {
-            let f = std::fs::File::create(dir.join(".lock")).unwrap();
+            let f = vk_fs::LockFile::new(std::fs::File::create(dir.join(".lock")).unwrap());
             // SAFETY: fd valid for f's lifetime; LOCK_NB makes a denial return -1.
             unsafe { libc::flock(f.as_raw_fd(), op | libc::LOCK_NB) == 0 }
         };
@@ -9752,10 +9761,13 @@ mod tests {
             !try_lock(libc::LOCK_EX),
             "exclusive (gc) must be denied while shared holders live"
         );
+        // Model a forked child that keeps s1's descriptor after the guard drops.
+        let s1_copy = s1._file.try_clone().unwrap();
         drop(s1);
         assert!(!try_lock(libc::LOCK_EX), "one shared holder still lives");
         drop(s2);
         assert!(try_lock(libc::LOCK_EX), "exclusive acquires once all drop");
+        drop(s1_copy);
 
         let gc = store.lock_exclusive().unwrap();
         assert!(
