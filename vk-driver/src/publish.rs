@@ -181,8 +181,8 @@ pub fn validate_name(name: &str) -> Result<()> {
 }
 
 /// Take an exclusive flock on `path`, creating it. `Ok(None)` means someone else holds it.
-fn try_flock(path: &Path) -> Result<Option<std::fs::File>> {
-    let f = lock_file(path)?;
+fn try_flock(path: &Path) -> Result<Option<vk_fs::LockFile>> {
+    let f = vk_fs::LockFile::new(lock_file(path)?);
     // SAFETY: the fd is owned by `f` and outlives the call; LOCK_NB never blocks.
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         return Ok(Some(f));
@@ -214,14 +214,14 @@ fn lock_file(path: &Path) -> Result<std::fs::File> {
 }
 
 /// Serialize managed commands. A racing `ensure` waits and observes its predecessor.
-fn op_lock(state_dir: &Path) -> Result<std::fs::File> {
+fn op_lock(state_dir: &Path) -> Result<vk_fs::LockFile> {
     op_lock_by(state_dir, Deadline::NEVER)
 }
 
 /// [`op_lock`], waiting for it no longer than `deadline`.
-fn op_lock_by(state_dir: &Path, deadline: Deadline) -> Result<std::fs::File> {
+fn op_lock_by(state_dir: &Path, deadline: Deadline) -> Result<vk_fs::LockFile> {
     let path = dir_of(state_dir).join(".op.lock");
-    let f = lock_file(&path)?;
+    let f = vk_fs::LockFile::new(lock_file(&path)?);
     let how = match deadline.left() {
         None => libc::LOCK_EX,
         Some(_) => libc::LOCK_EX | libc::LOCK_NB,
@@ -244,7 +244,7 @@ fn op_lock_by(state_dir: &Path, deadline: Deadline) -> Result<std::fs::File> {
 
 /// Return `None` if there is no publisher directory. Read-only commands must leave
 /// that directory absent. Otherwise wait for the operation lock until `deadline`.
-fn op_lock_existing(state_dir: &Path, deadline: Deadline) -> Result<Option<std::fs::File>> {
+fn op_lock_existing(state_dir: &Path, deadline: Deadline) -> Result<Option<vk_fs::LockFile>> {
     if !dir_of(state_dir).is_dir() {
         return Ok(None);
     }
@@ -253,7 +253,7 @@ fn op_lock_existing(state_dir: &Path, deadline: Deadline) -> Result<Option<std::
 
 /// Claim a publisher's lifetime lock. `Some` transfers or releases the claim; `None`
 /// means a live publisher holds it.
-fn claim(state_dir: &Path, name: &str) -> Result<Option<std::fs::File>> {
+fn claim(state_dir: &Path, name: &str) -> Result<Option<vk_fs::LockFile>> {
     try_flock(&dir_of(state_dir).join(format!("{name}.lock")))
 }
 
@@ -510,8 +510,9 @@ pub async fn ensure(
         }
     })?;
     let pid = spawn_publisher(state_dir, name, listen, to, service, &listener, &lock)?;
-    // Write the pid after spawning but before transferring the lock, so every observable
-    // claim has a record.
+    // The child inherited the claim. Closing the parent's copy must preserve it.
+    let lock = lock.into_file();
+    // Record the child's PID before releasing the parent's copy of the claim.
     let entry = Entry {
         pid,
         created_secs: crate::vms::unix_now(),
@@ -732,7 +733,7 @@ pub fn live(state_dir: &Path) -> Result<Vec<(Entry, Liveness)>> {
 /// Read publishers without pruning records or creating files. Like [`live`], wait for any
 /// `ensure` or `stop` holding the operation lock.
 pub fn snapshot(state_dir: &Path) -> Result<Vec<(Entry, Liveness)>> {
-    let _op = match open_existing(&dir_of(state_dir).join(".op.lock"))? {
+    let _op = match open_existing(&dir_of(state_dir).join(".op.lock"))?.map(vk_fs::LockFile::new) {
         Some(op) => {
             // SAFETY: as `op_lock_by`; released when `op` drops.
             if unsafe { libc::flock(op.as_raw_fd(), libc::LOCK_EX) } != 0 {
@@ -760,7 +761,7 @@ fn open_existing(path: &Path) -> Result<Option<std::fs::File>> {
 
 /// Probe the lock without creating it. A missing lock is unheld.
 fn held_lock(path: &Path) -> Result<bool> {
-    let Some(f) = open_existing(path)? else {
+    let Some(f) = open_existing(path)?.map(vk_fs::LockFile::new) else {
         return Ok(false);
     };
     // SAFETY: as `try_flock`; released when `f` drops.
@@ -1058,7 +1059,7 @@ fn wait_gone(state_dir: &Path, name: &str, timeout: Duration) -> bool {
 
 /// Hold `state_dir`'s publisher operation lock, as a `vk publish` in flight there does.
 #[cfg(test)]
-pub(crate) fn hold_op_lock(state_dir: &Path) -> std::fs::File {
+pub(crate) fn hold_op_lock(state_dir: &Path) -> vk_fs::LockFile {
     make_dir(state_dir).unwrap();
     op_lock(state_dir).unwrap()
 }
@@ -1073,7 +1074,7 @@ pub(crate) fn fake_publisher(
     to: &str,
     pid: u32,
     service: Option<&str>,
-) -> std::fs::File {
+) -> vk_fs::LockFile {
     let lock = claim(state_dir, name).unwrap().expect("nothing held it");
     write_entry(
         state_dir,
@@ -1462,7 +1463,7 @@ mod tests {
 
         // Kernel lock release makes even an abruptly killed publisher read as dead.
         drop(lock);
-        assert!(crate::testutil::released(|| live_entries(&t.0).is_empty()));
+        assert!(live_entries(&t.0).is_empty());
     }
 
     #[tokio::test]

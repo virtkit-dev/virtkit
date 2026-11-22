@@ -153,11 +153,10 @@ pub(crate) fn digest_hex(digest: &str) -> Result<&str> {
         .with_context(|| format!("digest {digest:?} is not sha256:<64 lowercase hex>"))
 }
 
-/// Pull-serialization lock: an abstract unix socket derived from the image
-/// directory. Binding the name IS the lock — the kernel releases it when the
-/// holding process dies, and unlike a lock file it cannot be unlinked by a
-/// cache cleanup (an `rm -rf images/` mid-pull would let two prepares race
-/// again). A hash collision only serializes two unrelated pulls.
+/// Binding an abstract Unix socket derived from the image directory serializes pulls.
+/// The name stays bound until the last listener descriptor closes, including inherited
+/// copies. Removing `images/` during a pull cannot unlink the lock and let another prepare
+/// race it. A hash collision only serializes two unrelated pulls.
 ///
 /// The name is predictable and the abstract namespace has no permissions, so another local
 /// user can bind it first. A waiter refuses such a holder (see [`judge`]), which turns that
@@ -307,10 +306,9 @@ pub(crate) fn fnv64(parts: &[&[u8]]) -> u64 {
         })
 }
 
-/// A held pull lock. The bound abstract socket IS the lock (the kernel frees it when this
-/// process dies); `_sock` keeps it bound for the whole hold — independent of the responder —
-/// so the lock is never released early even if that thread exits. The responder answers
-/// waiters with this job's identity; dropping the guard stops it and frees the socket.
+/// Holds the abstract socket independently of the responder, which reports this job's
+/// identity to waiters. Dropping the guard stops the responder and closes its listener.
+/// An inherited descriptor can keep the socket bound.
 pub(crate) struct PullLock {
     _sock: Arc<UnixListener>,
     stop: Arc<AtomicBool>,
@@ -336,7 +334,7 @@ impl Drop for PullLock {
         if let Some(h) = self.responder.take() {
             let _ = h.join();
         }
-        // `_sock` drops after this, releasing the abstract socket.
+        // `_sock` drops after the responder exits.
     }
 }
 
@@ -403,6 +401,60 @@ impl WaitBeat {
         self.last = waited;
         true
     }
+}
+
+/// Probes `dir`'s pull lock by connecting. Binding to probe could block a pull until a
+/// forked child closes the inherited descriptor at exec. Only a refused connection to a
+/// name with no matching stream socket counts as free.
+fn pull_lock_held(dir: &Path) -> bool {
+    let Ok(addr) = pull_lock_addr(pull_lock_hash(dir)) else {
+        return true;
+    };
+    let Some((sa, len)) = abstract_sockaddr(&addr) else {
+        return true;
+    };
+    // SAFETY: socket(2) has no memory preconditions; the descriptor is owned below.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return true;
+    }
+    // SAFETY: `fd` is a fresh socket owned by nothing else.
+    let _sock = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    // SAFETY: `sa` is a valid sockaddr_un and `len` covers exactly what was filled in.
+    let rc = unsafe { libc::connect(fd, (&raw const sa).cast(), len as libc::socklen_t) };
+    if rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ECONNREFUSED) {
+        return true;
+    }
+    // A bound stream socket also refuses connections before it starts listening.
+    addr.as_abstract_name().is_none_or(abstract_name_bound)
+}
+
+/// Looks up `@<name>` in this network namespace's Unix socket table. Only stream sockets
+/// conflict with a stream bind. An accepted connection can retain the name in the table,
+/// so a match can overreport contention. An unreadable table also counts as bound.
+fn abstract_name_bound(name: &[u8]) -> bool {
+    let Ok(table) = std::fs::read("/proc/net/unix") else {
+        return true;
+    };
+    // Columns: Num RefCount Protocol Flags Type St Inode Path. The type is `SOCK_STREAM` as
+    // `%04X`; the path is the last column, absent for an unbound socket.
+    table.split(|&b| b == b'\n').skip(1).any(|line| {
+        let fields: Vec<&[u8]> = line
+            .split(|&b| b == b' ')
+            .filter(|f| !f.is_empty())
+            .collect();
+        matches!(
+            fields.as_slice(),
+            [_, _, _, _, ty, _, _, path]
+                if *ty == b"0001" && path.strip_prefix(b"@") == Some(name)
+        )
+    })
 }
 
 /// [`acquire_pull_lock`] without waiting: `None` when another process holds it. Held, it
@@ -1096,7 +1148,7 @@ fn base_dirs(root: &Path) -> Vec<PathBuf> {
 pub(crate) struct TmpGuard<'a> {
     path: &'a Path,
     /// `None` on a filesystem that cannot take the `flock`, where the pull lock alone holds.
-    claim: Option<std::fs::File>,
+    claim: Option<vk_fs::LockFile>,
     _on_signal: crate::termclean::Registration,
     keep: bool,
 }
@@ -1131,7 +1183,7 @@ impl<'a> TmpGuard<'a> {
             Err(_) => false,
         };
         let on_signal = crate::termclean::remove_on_signal(path, std::os::fd::AsFd::as_fd(&dir));
-        let claim = claimed.then_some(dir);
+        let claim = claimed.then(|| vk_fs::LockFile::new(dir));
         Ok(TmpGuard {
             path,
             claim,
@@ -1146,7 +1198,7 @@ impl<'a> TmpGuard<'a> {
     /// removal disabled by `keep`, without `mem::forget` or `ManuallyDrop`. That destructor
     /// also unregisters the dir from removal on a signal, before the caller promotes it.
     #[must_use = "the claim is to be held until the dir is renamed away"]
-    pub(crate) fn keep(mut self) -> Option<std::fs::File> {
+    pub(crate) fn keep(mut self) -> Option<vk_fs::LockFile> {
         self.keep = true;
         self.claim.take()
     }
@@ -1355,12 +1407,23 @@ impl TmpSweep {
         let Ok(dir) = vk_fs::open_dir_in(parent.as_fd(), name) else {
             return; // gone, not a directory, or a symlink
         };
-        // Held answering, so a build of the same stage waits the removal out.
-        let Some(_pull) = try_acquire_pull_lock(&at.with_extension("")) else {
-            return; // a build or pull of this entry is in flight
+        // Hold the lock and answer waiters throughout removal. A dry run only probes it.
+        let entry = at.with_extension("");
+        let _pull = if self.dry_run {
+            if pull_lock_held(&entry) {
+                return; // a build or pull of this entry is in flight
+            }
+            None
+        } else {
+            let Some(pull) = try_acquire_pull_lock(&entry) else {
+                return; // a build or pull of this entry is in flight
+            };
+            Some(pull)
         };
         // Reopened from the descriptor, the same inode, for a lock `flock` can take.
-        let Ok(claim) = vk_fs::reopen_dir(dir.as_fd()).map(std::fs::File::from) else {
+        let Ok(claim) =
+            vk_fs::reopen_dir(dir.as_fd()).map(|fd| vk_fs::LockFile::new(std::fs::File::from(fd)))
+        else {
             return;
         };
         let Ok(meta) = claim.metadata() else {
@@ -1636,32 +1699,25 @@ mod tests {
 
     #[test]
     fn pull_lock_excludes_and_releases() {
-        // A per-process dir keys a per-process abstract socket name: cargo runs test binaries
-        // in parallel, so a fixed name would collide with a concurrent vk-driver test process.
-        let dir =
-            std::env::temp_dir().join(format!("virtkit-test-pull-lock-{}", std::process::id()));
+        // In a process of its own: a child another test forks keeps a copy of the lock's
+        // socket until it execs, and nothing unbinds a socket before then.
+        const CHILD: &str = "VK_TEST_PULL_LOCK_DIR";
+        let Some(dir) = std::env::var_os(CHILD).map(PathBuf::from) else {
+            let dir =
+                std::env::temp_dir().join(format!("virtkit-test-pull-lock-{}", std::process::id()));
+            crate::dev::testutil::in_child(
+                "image::tests::pull_lock_excludes_and_releases",
+                CHILD,
+                &dir,
+            );
+            return;
+        };
         let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
         let held = UnixListener::bind_addr(&addr).unwrap();
         let err = UnixListener::bind_addr(&addr).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
         drop(held);
-        // A concurrent test that spawns a subprocess can briefly inherit this listener fd across
-        // `fork()`, keeping the abstract name bound past our drop until the child execs; retry
-        // the rebind until it frees rather than failing on that transient contention.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            match UnixListener::bind_addr(&addr) {
-                Ok(_) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "the lock addr stayed bound after release"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                Err(e) => panic!("rebinding the released lock addr failed: {e}"),
-            }
-        }
+        UnixListener::bind_addr(&addr).expect("the released lock addr binds again");
     }
 
     /// A squatter that never accepts, its backlog full, cannot hang a waiter: the query gives
@@ -1725,6 +1781,16 @@ mod tests {
         drop((held, squatter));
     }
 
+    // Asking leaves the lock as it found it.
+    #[test]
+    fn a_pull_lock_is_asked_after_without_taking_it() {
+        let dir =
+            std::env::temp_dir().join(format!("virtkit-test-pull-held-{}", std::process::id()));
+        assert!(!pull_lock_held(&dir));
+        let _held = try_acquire_pull_lock(&dir).expect("asking took nothing");
+        assert!(pull_lock_held(&dir));
+    }
+
     // The sweeper's lock, taken without waiting, answers like a build's: a waiter waits it out
     // rather than give up on an unanswering holder, and gets the lock once it goes.
     #[test]
@@ -1736,7 +1802,14 @@ mod tests {
         let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
         // SAFETY: geteuid(2) has no preconditions and cannot fail.
         let me = unsafe { libc::geteuid() };
-        assert_eq!(query_holder(&addr).unwrap().unwrap().uid, Some(me));
+        // Check the responder's job identity as well as the kernel's peer UID.
+        let answered = || {
+            let holder = query_holder(&addr).unwrap().unwrap();
+            assert_eq!(holder.uid, Some(me));
+            assert_eq!(holder.who, Some(crate::jobctx::job_identity()));
+        };
+        answered();
+        let (heard, said) = std::sync::mpsc::channel();
         let waiter = {
             let dir = dir.clone();
             std::thread::spawn(move || {
@@ -1747,14 +1820,20 @@ mod tests {
                     "sha256:x",
                     std::time::Duration::from_millis(1),
                     Some(std::time::Duration::ZERO),
-                    crate::activity::Sink::new(None),
+                    crate::activity::Sink::heard(heard),
                 )
                 .map(drop)
             })
         };
-        // Past a few queries' worth of polls.
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(!waiter.is_finished(), "the waiter keeps waiting");
+        // Wait for the first contention report before querying the holder again.
+        assert!(matches!(
+            said.recv().unwrap(),
+            Activity::Waiting { building: true, .. }
+        ));
+        // The responder must keep answering while the waiter is blocked.
+        for _ in 0..3 {
+            answered();
+        }
         drop(held);
         waiter.join().unwrap().unwrap();
     }
@@ -1770,7 +1849,8 @@ mod tests {
             std::env::temp_dir().join(format!("virtkit-test-wait-said-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let sink = crate::activity::Sink::new(Some(root.join(ACTIVITY)));
+        let (heard, said) = std::sync::mpsc::channel();
+        let sink = crate::activity::Sink::heard_at(Some(root.join(ACTIVITY)), heard);
         let acquire = |name: &str, verb: &str| {
             acquire_pull_lock_with(
                 &root.join(name),
@@ -1803,25 +1883,28 @@ mod tests {
                 }
             })
         };
+        /// Stop the holder on panic so the scoped waiter can finish.
+        struct Stop(Arc<AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
         let waiter = std::thread::scope(|scope| {
+            let stopping = Stop(stop);
             let waiter = scope.spawn(|| acquire("img", "build"));
-            let waiting = |holder: Option<&str>| {
-                Some(Activity::Waiting {
-                    image: "img".into(),
-                    building: true,
-                    holder: holder.map(str::to_string),
-                })
+            let waiting = |holder: Option<&str>| Activity::Waiting {
+                image: "img".into(),
+                building: true,
+                holder: holder.map(str::to_string),
             };
-            let until = |want: Option<Activity>| {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                while read_activity(&root) != want {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "{want:?} is never said: {:?} is",
-                        read_activity(&root)
-                    );
-                    std::thread::sleep(ms(5));
-                }
+            let until = |want: Activity| {
+                while said
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap_or_else(|e| panic!("{want:?} is never said: {e}"))
+                    != want
+                {}
+                assert_eq!(read_activity(&root), Some(want));
             };
             until(waiting(Some("job 1")));
             *answer.lock().unwrap() = "job 2".into();
@@ -1829,7 +1912,7 @@ mod tests {
             // A holder that answers without saying who it is.
             answer.lock().unwrap().clear();
             until(waiting(None));
-            stop.store(true, Ordering::Relaxed);
+            drop(stopping);
             holder.join().unwrap();
             waiter.join().unwrap()
         });
@@ -1921,7 +2004,18 @@ mod tests {
 
     #[test]
     fn pull_lock_answers_holder_identity_then_releases() {
-        let dir = std::env::temp_dir().join(format!("virtkit-test-holder-{}", std::process::id()));
+        // In a process of its own, for the reason `pull_lock_excludes_and_releases` gives.
+        const CHILD: &str = "VK_TEST_PULL_HOLDER_DIR";
+        let Some(dir) = std::env::var_os(CHILD).map(PathBuf::from) else {
+            let dir =
+                std::env::temp_dir().join(format!("virtkit-test-holder-{}", std::process::id()));
+            crate::dev::testutil::in_child(
+                "image::tests::pull_lock_answers_holder_identity_then_releases",
+                CHILD,
+                &dir,
+            );
+            return;
+        };
         let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
         let lock = acquire_pull_lock(&dir, "build", "myimg", "sha256:x").unwrap();
         // a waiter reads the holder's identity over the lock socket (pid fallback, no CI env)
@@ -1935,22 +2029,9 @@ mod tests {
             Some(unsafe { libc::geteuid() }),
             "the kernel names the binder"
         );
-        // released on drop: the addr binds again (retry for fork-inherited fd races)
+        // released on drop: the addr binds again
         drop(lock);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            match UnixListener::bind_addr(&addr) {
-                Ok(_) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "the lock addr stayed bound after release"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                Err(e) => panic!("rebinding the released lock addr failed: {e}"),
-            }
-        }
+        UnixListener::bind_addr(&addr).expect("the released lock addr binds again");
     }
 
     /// `len` bytes no filesystem compresses below `len`, for a test that counts space freed.
@@ -1979,9 +2060,22 @@ mod tests {
     // lock, or one just made, is a live build's.
     #[test]
     fn sweep_orphaned_build_tmp_reclaims_only_dead_staging_dirs() {
+        // Isolate the immediate post-release sweep from forks that could inherit the socket.
+        // The variable selects the child branch. The child creates its own sweep root.
+        const CHILD: &str = "VK_TEST_SWEEP_TMP_ROOT";
+        if std::env::var_os(CHILD).is_none() {
+            let t = crate::dev::testutil::scratch("sweep-tmp-parent");
+            crate::dev::testutil::in_child(
+                "image::tests::sweep_orphaned_build_tmp_reclaims_only_dead_staging_dirs",
+                CHILD,
+                &t.0,
+            );
+            return;
+        }
         let root =
             std::env::temp_dir().join(format!("virtkit-test-sweep-tmp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
         let dead = root.join("dead.tmp");
         std::fs::create_dir_all(dead.join(".build-1-0-x")).unwrap();
         std::fs::write(dead.join(".build-1-0-x/stage.ext4"), noise(64 * 1024)).unwrap();
@@ -2028,6 +2122,51 @@ mod tests {
         sweep_dead_tmp(&root, DEAD_TMP_GRACE, false);
         assert!(!pulling.exists(), "released, the dir is dead");
         assert!(!claimed.exists(), "a dropped guard removes its own dir");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A dry run spares a dir whose pull lock is bound but not listening, as a real sweep's
+    /// bind would: the connection it asks with is refused all the same.
+    #[test]
+    fn a_dry_run_spares_a_dir_whose_pull_lock_is_bound_without_listening() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let root =
+            std::env::temp_dir().join(format!("virtkit-test-sweep-bound-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["bound.tmp", "free.tmp", "dgram.tmp"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let bind = |dir: &str, ty: libc::c_int| {
+            let (sa, len) =
+                abstract_sockaddr(&pull_lock_addr(pull_lock_hash(&root.join(dir))).unwrap())
+                    .unwrap();
+            // SAFETY: plain socket calls on a fresh descriptor, owned by the result; `sa` and
+            // `len` describe exactly the address filled in.
+            unsafe {
+                let fd = libc::socket(libc::AF_UNIX, ty | libc::SOCK_CLOEXEC, 0);
+                assert!(fd >= 0);
+                let bound = OwnedFd::from_raw_fd(fd);
+                assert_eq!(
+                    libc::bind(fd, (&raw const sa).cast(), len as libc::socklen_t),
+                    0
+                );
+                bound
+            }
+        };
+        let bound = bind("bound", libc::SOCK_STREAM);
+        // A datagram socket on the lock's name does not hold it: a stream socket binds it.
+        let dgram = bind("dgram", libc::SOCK_DGRAM);
+        assert!(pull_lock_held(&root.join("bound")));
+        assert!(!pull_lock_held(&root.join("free")));
+        assert!(!pull_lock_held(&root.join("dgram")));
+        let swept = sweep_dead_tmp(&root, std::time::Duration::ZERO, true);
+        assert_eq!(swept.dirs, 2, "only the free and datagram dirs count");
+        for dir in ["bound.tmp", "free.tmp", "dgram.tmp"] {
+            assert!(root.join(dir).exists(), "{dir}");
+        }
+        // Last: a child another test forks may keep this lock past its drop.
+        let _taken = try_acquire_pull_lock(&root.join("dgram")).expect("a datagram name is free");
+        drop((bound, dgram));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2117,7 +2256,7 @@ mod tests {
 
     /// Whether another open of `dir` can take the claim.
     fn claimable(dir: &Path) -> bool {
-        flock_nb(&std::fs::File::open(dir).unwrap()).is_ok()
+        flock_nb(&vk_fs::LockFile::new(std::fs::File::open(dir).unwrap())).is_ok()
     }
 
     // The claim `keep` hands over still holds the dir once it is renamed to its final name, and
@@ -2137,16 +2276,7 @@ mod tests {
         std::fs::rename(&tmp, &promoted).unwrap();
         assert!(!claimable(&promoted), "the claim holds through the rename");
         drop(claim);
-        // A child another test forks meanwhile shares the claim's open file description until
-        // it execs, so the dropped claim can briefly stay held: wait for it.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !claimable(&promoted) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "dropping the claim releases the dir"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        assert!(claimable(&promoted), "dropping the claim releases the dir");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2206,17 +2336,10 @@ mod tests {
         }
     }
 
-    /// Run `gc_idle` until `base` is evicted — retried for the reason
-    /// [`crate::cachelock::reclaimed_eventually`] documents.
-    fn evict_eventually(root: &Path, base: &Path) {
-        assert!(
-            crate::cachelock::reclaimed_eventually(|| {
-                gc_idle(root, std::time::Duration::ZERO);
-                !base.exists()
-            }),
-            "base {} was not reclaimed within the timeout",
-            base.display()
-        );
+    /// Run `gc_idle`, which must evict `base`.
+    fn evicted(root: &Path, base: &Path) {
+        gc_idle(root, std::time::Duration::ZERO);
+        assert!(!base.exists(), "base {} was not reclaimed", base.display());
     }
 
     #[test]
@@ -2237,7 +2360,7 @@ mod tests {
         // Idle (marked used, no live overlay): a zero timeout evicts it.
         let idle = base("idle");
         mark_used(&idle);
-        evict_eventually(&root, &idle);
+        evicted(&root, &idle);
 
         // Referenced: a held use-lock survives a zero timeout, and is reclaimed once dropped.
         let live = base("live");
@@ -2253,7 +2376,7 @@ mod tests {
             "a base under a live overlay must never be evicted"
         );
         drop(guard);
-        evict_eventually(&root, &live);
+        evicted(&root, &live);
 
         // No `.used` marker (mid-materialize): never evicted, even at a zero timeout.
         let fresh = base("fresh");
@@ -2317,20 +2440,11 @@ mod tests {
         let outside = base(tmp.join("outside").join("fp"), hour);
         std::os::unix::fs::symlink(tmp.join("outside"), state.join("build").join("link")).unwrap();
 
-        // Retried for the reason `cachelock::reclaimed_eventually` documents.
-        let mut build = Evicted::default();
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            let once = gc_idle(&state.join("build"), Duration::from_secs(1800));
-            build.bases += once.bases;
-            build.bytes += once.bytes;
-            !idle_build.exists()
-        }));
+        let build = gc_idle(&state.join("build"), Duration::from_secs(1800));
+        assert!(!idle_build.exists());
         assert_eq!(build.bases, 1);
         assert!(build.bytes >= 64 * 1024, "{}", build.bytes);
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            evict_idle_images(&state, Duration::from_secs(1800));
-            !idle_docker.exists()
-        }));
+        evict_idle_images(&state, Duration::from_secs(1800));
         assert!(!idle_build.exists());
         assert!(!idle_docker.exists());
         assert!(recent.exists(), "a base used within the window must stay");
@@ -2423,20 +2537,16 @@ mod tests {
 
         // Then the least recently used base nobody holds, and no more than the target needs —
         // passing over the one the asking job last booted, as its note gives it, reached here
-        // through a symlink. Retried for the reason `cachelock::reclaimed_eventually` documents.
+        // through a symlink.
         let link = tmp.join("state-link");
         std::os::unix::fs::symlink(&state, &link).unwrap();
         let notes = tmp.join("job-images");
         let key = Path::new("42-proj/build");
         remember_bases(&notes, key, &[link.join("docker").join("img").join("d1")]);
         let keep = remembered_bases(&notes, key);
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            let once = evict_for_room(&state, idle, &jobs, 1, &keep, EVICT_WAIT).evicted;
-            if !older.exists() {
-                assert_eq!(once.bases, 1, "{once:?}");
-            }
-            !older.exists()
-        }));
+        let once = evict_for_room(&state, idle, &jobs, 1, &keep, EVICT_WAIT).evicted;
+        assert!(!older.exists());
+        assert_eq!(once.bases, 1, "{once:?}");
         assert!(oldest.exists(), "the asking job's own base must stay");
         assert!(stays());
 
@@ -2457,14 +2567,8 @@ mod tests {
             }
         );
         assert!(oldest.exists() && newest.exists() && stays());
-        let mut rest = Evicted::default();
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            let once = evict_for_room(&state, idle, &jobs, reach, &[], EVICT_WAIT).evicted;
-            rest.bases += once.bases;
-            rest.chunks += once.chunks;
-            rest.bytes += once.bytes;
-            !oldest.exists() && !newest.exists()
-        }));
+        let rest = evict_for_room(&state, idle, &jobs, reach, &[], EVICT_WAIT).evicted;
+        assert!(!oldest.exists() && !newest.exists());
         assert_eq!((rest.bases, rest.chunks), (2, 1), "{rest:?}");
         assert!(rest.bytes >= reach, "{rest:?}");
         assert!(!chunks.join("live").exists());
@@ -2496,12 +2600,12 @@ mod tests {
         std::fs::write(&lock, "").unwrap();
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
         let idle = Duration::from_secs(4 * 3600);
-        assert!(crate::cachelock::reclaimed_eventually(|| {
+        assert_eq!(
             evict_for_room(&tmp, idle, &tmp, 1, &[], EVICT_WAIT)
                 .evicted
-                .bases
-                == 1
-        }));
+                .bases,
+            1
+        );
         assert!(!base.exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2633,13 +2737,8 @@ mod tests {
         std::fs::write(tmp.join("outside"), noise(64 * 1024)).unwrap();
         std::fs::hard_link(tmp.join("outside"), idle.join("linked")).unwrap();
 
-        // Retried, as the real passes below are, for the reason `reclaimed_eventually`
-        // documents: a held lock reads as a base in use.
-        let mut dry = Evicted::default();
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            dry = collect_idle(&root, Duration::ZERO, true);
-            dry.bases == 1
-        }));
+        let dry = collect_idle(&root, Duration::ZERO, true);
+        assert_eq!(dry.bases, 1);
         assert!(
             dry.bytes >= 64 * 1024 && dry.bytes < 128 * 1024,
             "{}",
@@ -2650,21 +2749,13 @@ mod tests {
             idle.join("runner.ext4").is_file(),
             "a dry run removes nothing"
         );
-        let mut dry_tmp = Swept::default();
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            dry_tmp = collect_orphaned_staging(&state, true);
-            dry_tmp.dirs == 1
-        }));
+        let dry_tmp = collect_orphaned_staging(&state, true);
+        assert_eq!(dry_tmp.dirs, 1);
         assert!(dry_tmp.bytes >= 32 * 1024, "{}", dry_tmp.bytes);
         assert!(dead.is_dir(), "a dry run removes nothing");
 
-        let mut real = Evicted::default();
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            let once = collect_idle(&root, Duration::ZERO, false);
-            real.bases += once.bases;
-            real.bytes += once.bytes;
-            !idle.exists()
-        }));
+        let real = collect_idle(&root, Duration::ZERO, false);
+        assert!(!idle.exists());
         assert_eq!(real.bases, dry.bases);
         assert!(
             real.bytes.abs_diff(dry.bytes) <= 8192,
@@ -2711,7 +2802,7 @@ mod tests {
         );
 
         let evict = base("evict");
-        evict_eventually(&root, &evict);
+        evicted(&root, &evict);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2743,19 +2834,14 @@ mod tests {
             std::fs::write(chunks.join(c), noise(8192)).unwrap();
         }
 
-        let mut dry = Evicted::default();
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            dry = collect_idle(&root, Duration::ZERO, true);
-            dry.bases == 1
-        }));
+        let dry = collect_idle(&root, Duration::ZERO, true);
+        assert_eq!(dry.bases, 1);
         let (dry_chunks, _) = collect_chunks(&root, true, &dry.would_evict);
         assert_eq!(dry_chunks, 1, "only the chunk no other base references");
         assert!(chunks.join("aaa").exists());
 
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            collect_idle(&root, Duration::ZERO, false);
-            !idle.exists()
-        }));
+        collect_idle(&root, Duration::ZERO, false);
+        assert!(!idle.exists());
         let (real_chunks, _) = collect_chunks(&root, false, &[]);
         assert_eq!(real_chunks, dry_chunks);
         assert!(!chunks.join("aaa").exists() && chunks.join("bbb").exists());

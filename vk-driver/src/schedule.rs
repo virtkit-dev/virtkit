@@ -364,10 +364,8 @@ fn set_runner_concurrent_checked(
         Ok((file, meta, text))
     };
 
-    // An attempt that starts over on the same file keeps the lock it took. Retaken through a
-    // new descriptor, it could find itself still held: a fork elsewhere in this process
-    // copies the old descriptor into its child, which holds it until it execs.
-    let mut locked: Option<(std::fs::File, u64, u64)> = None;
+    // Keep the lock across retries on the same inode so another edit cannot intervene.
+    let mut locked: Option<(vk_fs::LockFile, u64, u64)> = None;
     for _ in 0..EDIT_ATTEMPTS {
         let (file, meta, text) = read_config()?;
         // SAFETY: geteuid takes no arguments and cannot fail.
@@ -393,7 +391,7 @@ fn set_runner_concurrent_checked(
                 }
                 return Ok(false);
             }
-            locked = Some((file, meta.dev(), meta.ino()));
+            locked = Some((vk_fs::LockFile::new(file), meta.dev(), meta.ino()));
         }
         if text.is_empty() {
             // Most likely mid-rewrite: give the writer a moment to finish.

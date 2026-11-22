@@ -1838,7 +1838,7 @@ pub const STOP_RUN_ENV: &str = "VIRTKIT_STOP_RUN";
 /// again.
 fn prune_gone(dir: &Path, entry: &VmEntry) -> Pruned {
     let lock = match std::fs::File::open(&entry.state_dir) {
-        Ok(lock) => lock,
+        Ok(lock) => vk_fs::LockFile::new(lock),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Pruned::DirGone,
         Err(e) => return Pruned::Failed(format!("{}: {e}", entry.state_dir.display())),
     };
@@ -4592,7 +4592,7 @@ PUBLISHED     -
         use std::ffi::OsString;
 
         /// Register a running primary, hold its state directory lock and give each service a console log.
-        fn up(dir: &Path, project: &Path, services: &[&str]) -> (Registration, std::fs::File) {
+        fn up(dir: &Path, project: &Path, services: &[&str]) -> (Registration, vk_fs::LockFile) {
             std::fs::create_dir_all(dir).unwrap();
             let dir = canonical(dir);
             let mut e = entry(dir.clone(), Some(canonical(project)));

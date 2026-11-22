@@ -272,7 +272,7 @@ fn ensure_dir(plan: &Plan) -> Result<PathBuf> {
 
 /// The operation's lock, held for as long as the returned file lives. `None` when another
 /// reconciliation holds it.
-fn try_lock(plan: &Plan) -> Result<Option<std::fs::File>> {
+fn try_lock(plan: &Plan) -> Result<Option<vk_fs::LockFile>> {
     use std::os::fd::AsRawFd;
     ensure_dir(plan)?;
     let f = std::fs::OpenOptions::new()
@@ -285,7 +285,7 @@ fn try_lock(plan: &Plan) -> Result<Option<std::fs::File>> {
         .with_context(|| format!("opening {}", lock_path(plan).display()))?;
     // SAFETY: the fd is owned by `f`; LOCK_NB does not block.
     match unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } {
-        0 => Ok(Some(f)),
+        0 => Ok(Some(vk_fs::LockFile::new(f))),
         _ => Ok(None),
     }
 }
@@ -1144,8 +1144,6 @@ mod tests {
 
     #[test]
     fn the_operation_has_a_lock_a_log_and_a_stamp_under_the_state_dir() {
-        // Holds a lock across the release check below; a concurrent fork must not inherit it.
-        let _env = env_guard();
         let dir = std::env::temp_dir().join(format!("vk-deveditor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let plan = plan_in(&dir);
@@ -1159,11 +1157,7 @@ mod tests {
         assert!(lock_holder(&plan).is_some());
         assert!(status(&plan).contains("running"), "{}", status(&plan));
         drop(held);
-        assert!(
-            crate::testutil::released(|| lock_holder(&plan).is_none()),
-            "lock still held after drop: {:?}",
-            lock_holder(&plan)
-        );
+        assert_eq!(lock_holder(&plan), None, "lock still held after drop");
 
         // The files are named for the server they concern, beside the lock, all private.
         assert_eq!(

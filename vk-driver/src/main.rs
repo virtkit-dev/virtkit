@@ -102,8 +102,6 @@ mod switch;
 mod task;
 mod term;
 mod termclean;
-#[cfg(test)]
-mod testutil;
 mod tidy;
 mod timing;
 mod toolchain;

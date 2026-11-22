@@ -3043,9 +3043,7 @@ mod tests {
         };
         let plan = plan_in(&tmp);
         std::fs::create_dir_all(&plan.state_dir).unwrap();
-        let _lock =
-            crate::testutil::acquired(|| crate::dev::list::try_lock_state_dir(&plan.state_dir))
-                .expect("lock it");
+        let _lock = crate::dev::list::try_lock_state_dir(&plan.state_dir).expect("lock it");
         // Register this test process as the VM's `vk run`, including its start time.
         let me = std::process::id();
         let ticks = crate::vms::own_start_ticks().unwrap();
@@ -3232,9 +3230,7 @@ mod tests {
         };
         let plan = plan_in(&tmp);
         std::fs::create_dir_all(&plan.state_dir).unwrap();
-        let _lock =
-            crate::testutil::acquired(|| crate::dev::list::try_lock_state_dir(&plan.state_dir))
-                .expect("lock it");
+        let _lock = crate::dev::list::try_lock_state_dir(&plan.state_dir).expect("lock it");
         let me = std::process::id();
         let ticks = crate::vms::own_start_ticks().unwrap();
         let _vm = crate::vms::register(
@@ -3360,9 +3356,7 @@ mod tests {
         // Prevent `after_boot` from contacting a guest to deliver the session environment.
         plan.unresolved = vec!["${localEnv:TOKEN} is not set".into()];
         std::fs::create_dir_all(&plan.state_dir).unwrap();
-        let _lock =
-            crate::testutil::acquired(|| crate::dev::list::try_lock_state_dir(&plan.state_dir))
-                .expect("lock it");
+        let _lock = crate::dev::list::try_lock_state_dir(&plan.state_dir).expect("lock it");
         // This process is both the VM's `vk run` and, under another start time, its parent.
         let me = std::process::id();
         let ticks = crate::vms::own_start_ticks().unwrap();

@@ -520,7 +520,7 @@ mod tests {
     use super::*;
     use crate::dev::config::Freshness;
     use crate::dev::plan::VsCodePlan;
-    use crate::dev::testutil::{env_guard, mount};
+    use crate::dev::testutil::mount;
 
     struct TmpDir(PathBuf);
     impl Drop for TmpDir {
@@ -782,30 +782,20 @@ mod tests {
         assert!(disk.is_symlink(), "the link survived");
         assert_eq!(std::fs::read(&elsewhere).unwrap(), b"precious");
 
-        // A regular backing goes, and the state directory's lock is free again after. A child
-        // another test forks while reset holds the lock keeps a copy of the descriptor until
-        // it execs (close-on-exec only acts at exec), hence the retries.
+        // A regular backing goes, and the state directory's lock is free again after.
         std::fs::remove_file(&disk).unwrap();
         std::fs::write(&disk, b"data").unwrap();
-        // The symlinked reset above took the lock too, so a forked copy of it can refuse this
-        // one.
-        let report = crate::testutil::once_released("being booted", || {
-            rt.block_on(reset(&plan, "runner:/var/wab", true))
-        })
-        .unwrap();
+        let report = rt.block_on(reset(&plan, "runner:/var/wab", true)).unwrap();
         assert!(report.contains("removed"), "{report}");
         assert!(!disk.exists(), "the backing survived the reset");
-        let freed = crate::testutil::released(|| {
-            crate::dev::list::try_lock_state_dir(&plan.state_dir).is_some()
-        });
-        assert!(freed, "the lock was not handed back");
+        assert!(
+            crate::dev::list::try_lock_state_dir(&plan.state_dir).is_some(),
+            "the lock was not handed back"
+        );
     }
 
     #[test]
     fn a_reset_refuses_while_the_environment_is_being_booted() {
-        // Holds the state-dir lock, then asserts a reset succeeds once it drops; a lock
-        // inherited by a concurrent fork outlives that drop, hence `once_released`.
-        let _env = env_guard();
         let (t, plan) = fixture("locked");
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -822,9 +812,7 @@ mod tests {
         assert!(format!("{e:#}").contains("being booted"), "{e:#}");
         assert!(disk.is_file(), "nothing was removed under the boot");
         drop(held);
-        let retried = crate::testutil::once_released("being booted", || {
-            rt.block_on(reset(&plan, "runner:/var/wab", true))
-        });
+        let retried = rt.block_on(reset(&plan, "runner:/var/wab", true));
         assert!(retried.is_ok(), "{retried:?}");
     }
 

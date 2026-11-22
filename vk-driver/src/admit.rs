@@ -43,6 +43,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+use vk_fs::LockFile;
+
 /// The directory lock, taken for every ledger read and write.
 const LOCK: &str = ".lock";
 /// How often a waiting job re-checks the ledger.
@@ -60,7 +62,7 @@ const RECLAIM_AGAIN: Duration = Duration::from_secs(60);
 /// through the locked descriptor without resolving the entry's path again.
 #[derive(Debug)]
 pub struct Reservation {
-    file: File,
+    file: LockFile,
     job_id: String,
 }
 
@@ -759,7 +761,7 @@ impl Reservation {
     /// The locked entry, for a process that hands the reservation on by descriptor: the
     /// reservation counts for as long as any copy of it stays open.
     pub fn into_file(self) -> File {
-        self.file
+        self.file.into_file()
     }
 
     /// Choose the memory node this job's VM boots on, and record it in the ledger so the jobs
@@ -1965,7 +1967,7 @@ impl Entry {
 
 /// Open (creating) `path` and take a shared lock on it — the mark of a live reservation.
 /// Shared, so `prepare` and the supervisor can hold the same one across the handoff.
-fn open_shared(path: &Path) -> Result<File> {
+fn open_shared(path: &Path) -> Result<LockFile> {
     let file = File::options()
         .read(true)
         .write(true)
@@ -1975,16 +1977,16 @@ fn open_shared(path: &Path) -> Result<File> {
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
     lock_shared(&file).with_context(|| format!("locking {}", path.display()))?;
-    Ok(file)
+    Ok(LockFile::new(file))
 }
 
 /// Open an existing `path` writable and take a shared lock, without creating it.
 /// [`Reservation::place`] needs write access to record the job's NUMA placement. Return the
 /// original `io::Error` so callers can distinguish a missing entry from a lock failure.
-fn open_locked_shared(path: &Path) -> std::io::Result<File> {
+fn open_locked_shared(path: &Path) -> std::io::Result<LockFile> {
     let file = File::options().read(true).write(true).open(path)?;
     lock_shared(&file)?;
-    Ok(file)
+    Ok(LockFile::new(file))
 }
 
 fn lock_shared(file: &File) -> std::io::Result<()> {
@@ -1996,11 +1998,6 @@ fn lock_shared(file: &File) -> std::io::Result<()> {
 }
 
 /// Whether anyone holds `file`'s reservation, probed by trying to take it exclusively.
-///
-/// A lock lives until the last copy of the descriptor holding it closes, so a process that
-/// forks while a reservation is being released keeps it alive for the instant before the
-/// child execs. Erring that way is the right way round — a reservation read as live for one
-/// poll costs a job two seconds, where reclaiming a live one would overcommit the host.
 fn locked(file: &File) -> bool {
     // SAFETY: same as open_shared; LOCK_NB never blocks.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -2012,7 +2009,7 @@ fn locked(file: &File) -> bool {
 
 /// Take the directory's exclusive lock, held until the returned file drops. Blocking: the
 /// critical section is a directory scan, and a waiter is better than a spuriously refused job.
-pub(crate) fn lock_dir(dir: &Path) -> Result<File> {
+pub(crate) fn lock_dir(dir: &Path) -> Result<LockFile> {
     match lock_dir_with(dir, libc::LOCK_EX)? {
         Some(file) => Ok(file),
         // A blocking flock waits rather than answer EWOULDBLOCK.
@@ -2021,11 +2018,11 @@ pub(crate) fn lock_dir(dir: &Path) -> Result<File> {
 }
 
 /// [`lock_dir`], or `None` at once where another holds the lock.
-fn try_lock_dir(dir: &Path) -> Result<Option<File>> {
+fn try_lock_dir(dir: &Path) -> Result<Option<LockFile>> {
     lock_dir_with(dir, libc::LOCK_EX | libc::LOCK_NB)
 }
 
-fn lock_dir_with(dir: &Path, op: libc::c_int) -> Result<Option<File>> {
+fn lock_dir_with(dir: &Path, op: libc::c_int) -> Result<Option<LockFile>> {
     let path = dir.join(LOCK);
     let file = File::options()
         .write(true)
@@ -2042,7 +2039,7 @@ fn lock_dir_with(dir: &Path, op: libc::c_int) -> Result<Option<File>> {
         }
         return Err(e).with_context(|| format!("locking {}", path.display()));
     }
-    Ok(Some(file))
+    Ok(Some(LockFile::new(file)))
 }
 
 /// Wall-clock seconds, for ageing a job's history: what makes a run old is calendar time,
@@ -2079,7 +2076,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn tmpdir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("vk-admit-{name}-{}", std::process::id()));
@@ -2106,21 +2103,6 @@ mod tests {
             .unwrap()
             .granted_mib;
         (used, anomalies.len())
-    }
-
-    /// Wait for the live ledger to fall to `mib`. Releasing is not instant when something
-    /// else in the process forks at the wrong moment (see [`locked`]), and the rest of this
-    /// binary's tests spawn children constantly.
-    fn until_ledger_is(dir: &Path, mib: u64) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while live_mib(dir) != mib {
-            assert!(
-                Instant::now() < deadline,
-                "ledger stuck at {} MiB, expected {mib}",
-                live_mib(dir)
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
     }
 
     /// One run of a job at `ceiling_mib`, for the tests that are not about disk. The history
@@ -2199,7 +2181,7 @@ mod tests {
     }
 
     /// A reservation held by this test, as another job's would be.
-    fn held(dir: &Path, job: &str, want_mib: u64, asked: u128, granted: bool) -> File {
+    fn held(dir: &Path, job: &str, want_mib: u64, asked: u128, granted: bool) -> LockFile {
         held_on(dir, job, want_mib, asked, granted, None)
     }
 
@@ -2211,7 +2193,7 @@ mod tests {
         asked: u128,
         granted: bool,
         node: Option<Place>,
-    ) -> File {
+    ) -> LockFile {
         let file = open_shared(&dir.join(job)).unwrap();
         Entry {
             want_mib,
@@ -2247,7 +2229,7 @@ mod tests {
         crate::admit::release(&dir, "mine");
         drop(held_by_others);
         crate::admit::release(&dir, "other");
-        until_ledger_is(&dir, 0);
+        assert_eq!(live_mib(&dir), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2277,7 +2259,7 @@ mod tests {
         let granted = try_acquire(&dir, "resv", &ask(1024)).unwrap().unwrap();
         assert_eq!(live_mib(&dir), 1024);
         drop(granted);
-        until_ledger_is(&dir, 0);
+        assert_eq!(live_mib(&dir), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2342,7 +2324,7 @@ mod tests {
         assert_eq!(renamed.name(), "job");
         assert!(!dir.join("resv2").exists());
         drop(renamed);
-        until_ledger_is(&dir, 0);
+        assert_eq!(live_mib(&dir), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2382,7 +2364,7 @@ mod tests {
         drop(dead);
 
         // It neither counts against the budget nor survives the scan that found it.
-        until_ledger_is(&dir, 0);
+        assert_eq!(live_mib(&dir), 0);
         assert!(!dir.join("dead").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2417,7 +2399,7 @@ mod tests {
 
         drop(res);
         release(&dir, "waiter");
-        until_ledger_is(&dir, 0);
+        assert_eq!(live_mib(&dir), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2429,44 +2411,77 @@ mod tests {
         const WANT: u64 = 3072; // two of these do not fit together
         let dir = tmpdir("contended");
 
-        let watching = Arc::new(AtomicBool::new(true));
+        /// Tracks scan requests and completions while racers hold their grants.
+        #[derive(Default)]
+        struct Scans {
+            asked: u64,
+            done: u64,
+            stopped: bool,
+        }
+        type Shared = Arc<(std::sync::Mutex<Scans>, std::sync::Condvar)>;
+        let scans: Shared = Arc::default();
+        // Wake the watcher if a racer panics, and wake waiting racers if the watcher panics.
+        struct Stop(Shared);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                let (lock, cv) = &*self.0;
+                lock.lock().unwrap_or_else(|e| e.into_inner()).stopped = true;
+                cv.notify_all();
+            }
+        }
         let over = Arc::new(AtomicU64::new(0));
         let unparseable = Arc::new(AtomicU64::new(0));
         let watcher = std::thread::spawn({
-            let (dir, watching, over, unparseable) = (
+            let (dir, scans, over, unparseable) = (
                 dir.clone(),
-                Arc::clone(&watching),
+                Arc::clone(&scans),
                 Arc::clone(&over),
                 Arc::clone(&unparseable),
             );
             move || {
-                while watching.load(Ordering::Relaxed) {
+                let stop = Stop(scans);
+                let (lock, cv) = &*stop.0;
+                loop {
+                    let asked = {
+                        let state = cv
+                            .wait_while(lock.lock().unwrap(), |s| s.asked == s.done && !s.stopped)
+                            .unwrap();
+                        if state.stopped {
+                            return;
+                        }
+                        state.asked
+                    };
                     let (used, odd) = live(&dir);
                     over.fetch_max(used, Ordering::Relaxed);
                     unparseable.fetch_add(odd as u64, Ordering::Relaxed);
-                    std::thread::sleep(Duration::from_millis(5));
+                    lock.lock().unwrap().done = asked;
+                    cv.notify_all();
                 }
             }
         });
-
-        // Stops the watcher however this test ends: a racer that panics unwinds past the
-        // explicit stop below, and the watcher's poll loop has no deadline of its own.
-        struct StopOnDrop(Arc<AtomicBool>);
-        impl Drop for StopOnDrop {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Relaxed);
-            }
-        }
-        let _stop = StopOnDrop(Arc::clone(&watching));
+        let stop = Stop(Arc::clone(&scans));
 
         let racers: Vec<_> = (0..4)
             .map(|i| {
-                let dir = dir.clone();
+                let (dir, scans) = (dir.clone(), Arc::clone(&scans));
                 std::thread::spawn(move || {
                     let job = format!("job{i}");
                     let res = acquire_mem(&dir, &job, WANT, BUDGET, Duration::from_secs(120))
                         .unwrap_or_else(|e| panic!("{job} was never admitted: {e}"));
-                    std::thread::sleep(Duration::from_millis(50));
+                    // Held until a scan that began after the grant is done.
+                    let (lock, cv) = &*scans;
+                    let mut state = lock.lock().unwrap();
+                    state.asked += 1;
+                    let ticket = state.asked;
+                    cv.notify_all();
+                    let state = cv
+                        .wait_while(state, |s| s.done < ticket && !s.stopped)
+                        .unwrap();
+                    assert!(
+                        state.done >= ticket,
+                        "the watcher stopped before {job}'s scan"
+                    );
+                    drop(state);
                     drop(res);
                     release(&dir, &job);
                 })
@@ -2475,9 +2490,10 @@ mod tests {
         for r in racers {
             r.join().unwrap();
         }
-        watching.store(false, Ordering::Relaxed);
+        drop(stop);
         watcher.join().unwrap();
 
+        assert!(over.load(Ordering::Relaxed) >= WANT, "no scan saw a grant");
         assert!(
             over.load(Ordering::Relaxed) <= BUDGET,
             "the ledger held {} MiB of a {BUDGET} MiB budget",
@@ -2488,7 +2504,7 @@ mod tests {
             0,
             "a scan caught an entry between its creation and its first write"
         );
-        until_ledger_is(&dir, 0);
+        assert_eq!(live_mib(&dir), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3206,7 +3222,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
         // The reservation still counts, held by the supervisor alone.
         assert_eq!(live_mib(&dir), 2048);
         drop(supervised);
-        until_ledger_is(&dir, 0);
+        assert_eq!(live_mib(&dir), 0);
 
         // A job with no reservation (admission off) has nothing to hold.
         assert!(hold(&dir, "unknown").is_none());
@@ -3235,39 +3251,38 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
     /// report a ledger anomaly against a job that is merely starting up, and leave that job's
     /// request out of the queue order for the pass.
     ///
-    /// The probe scans as fast as it can take the lock, against churn from admissions that
-    /// never wait, so the window is sampled thousands of times rather than a handful.
+    /// The watcher scans in every round of nonblocking admissions.
     #[test]
     fn a_scan_never_observes_a_half_written_entry() {
+        const ROUNDS: usize = 200;
+        const SCANS: usize = 4;
         let dir = tmpdir("half-written");
-        let watching = Arc::new(AtomicBool::new(true));
-        let odd = Arc::new(AtomicU64::new(0));
-        let scans = Arc::new(AtomicU64::new(0));
+        // Start each round together and wait for its scans before starting the next.
+        // If either side panics, its channels disconnect.
+        let (start, started) = std::sync::mpsc::sync_channel::<()>(0);
+        let (done, finished) = std::sync::mpsc::sync_channel::<()>(0);
         let watcher = std::thread::spawn({
-            let (dir, watching, odd, scans) = (
-                dir.clone(),
-                Arc::clone(&watching),
-                Arc::clone(&odd),
-                Arc::clone(&scans),
-            );
+            let dir = dir.clone();
             move || {
-                while watching.load(Ordering::Relaxed) {
-                    odd.fetch_add(live(&dir).1 as u64, Ordering::Relaxed);
-                    scans.fetch_add(1, Ordering::Relaxed);
+                let mut odd = 0;
+                while started.recv().is_ok() {
+                    for _ in 0..SCANS {
+                        odd += live(&dir).1 as u64;
+                    }
+                    if done.send(()).is_err() {
+                        break;
+                    }
                 }
+                odd
             }
         });
-        struct StopOnDrop(Arc<AtomicBool>);
-        impl Drop for StopOnDrop {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Relaxed);
-            }
-        }
-        let _stop = StopOnDrop(Arc::clone(&watching));
 
         // Four jobs that all fit together, so every acquire is granted on its first pass and
         // the churn is pure create-and-release.
-        for _ in 0..50 {
+        for _ in 0..ROUNDS {
+            if start.send(()).is_err() {
+                break; // the watcher failed: its join below says how
+            }
             let held: Vec<_> = (0..4)
                 .map(|i| {
                     let job = format!("job{i}");
@@ -3281,14 +3296,15 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
                 drop(res);
                 release(&dir, &job);
             }
+            if finished.recv().is_err() {
+                break;
+            }
         }
-        watching.store(false, Ordering::Relaxed);
-        watcher.join().unwrap();
+        drop(start);
+        let odd = watcher.join().unwrap();
 
-        assert!(scans.load(Ordering::Relaxed) > 100, "the probe barely ran");
         assert_eq!(
-            odd.load(Ordering::Relaxed),
-            0,
+            odd, 0,
             "a scan could not parse an entry — it is not written where it is created"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3382,7 +3398,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
         // Three fields: every entry this ledger held before placement, and every entry on a
         // host that places nothing.
         let old = open_shared(&dir.join("old")).unwrap();
-        (&old).write_all(b"512 7 granted\n").unwrap();
+        (&*old).write_all(b"512 7 granted\n").unwrap();
         let entry = Entry::read(&old).unwrap();
         assert_eq!((entry.want_mib, entry.asked, entry.granted), (512, 7, true));
         assert_eq!(entry.node, None);
@@ -3810,13 +3826,10 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
         let teasers = std::cell::Cell::new(0);
         let reclaim = |need: u64| {
             asked.borrow_mut().push(need);
-            // The directory lock is free while it runs. A child another test forks shares the
-            // lock's open file until it execs, so it can look held for a moment after release.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while try_lock_dir(&dir).unwrap().is_none() {
-                assert!(Instant::now() < deadline, "reclaim runs outside the lock");
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            assert!(
+                try_lock_dir(&dir).unwrap().is_some(),
+                "reclaim runs outside the lock"
+            );
             let freed = |freed| Reclaimed {
                 freed,
                 reach: Some(freed),
@@ -3957,14 +3970,14 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
 
         // A field a later version adds is passed over without costing the node.
         let later = open_shared(&dir.join("later")).unwrap();
-        (&later)
+        (&*later)
             .write_all(b"0 1 granted node=2 disk=7 extra=1\n")
             .unwrap();
         let back = Entry::read(&later).unwrap();
         assert_eq!((back.node, back.disk), (Some(Place::Node(2)), Some(7)));
 
         let garbled = open_shared(&dir.join("garbled")).unwrap();
-        (&garbled).write_all(b"0 1 granted disk=12x\n").unwrap();
+        (&*garbled).write_all(b"0 1 granted disk=12x\n").unwrap();
         assert!(Entry::read(&garbled).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3991,7 +4004,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
         assert_eq!(committed(&dir).unwrap().granted_cpus, 6);
 
         let garbled = open_shared(&dir.join("garbled")).unwrap();
-        (&garbled).write_all(b"0 1 granted cpus=x\n").unwrap();
+        (&*garbled).write_all(b"0 1 granted cpus=x\n").unwrap();
         assert!(Entry::read(&garbled).is_none());
         drop((placed, older, garbled));
         let _ = std::fs::remove_dir_all(&dir);

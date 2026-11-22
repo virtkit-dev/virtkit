@@ -251,7 +251,7 @@ fn collect_in(
         {
             continue;
         }
-        let Ok(held) = open_dir(dir) else {
+        let Ok(held) = open_dir(dir).map(vk_fs::LockFile::new) else {
             continue;
         };
         let same = held

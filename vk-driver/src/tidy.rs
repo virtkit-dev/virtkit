@@ -299,9 +299,15 @@ mod tests {
                 // SAFETY: a signal to the stand-in this test spawned.
                 unsafe { libc::kill(pid, libc::SIGKILL) };
                 let ticks = o.record.pid_start_ticks.unwrap();
-                assert!(crate::testutil::released(|| crate::usage::proc_exited(
-                    pid, ticks
-                )));
+                // `kill` can return before the child exits. Leave reaping to `StandIn`.
+                // SAFETY: an all-zero siginfo_t is valid; waitid writes into it.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                // SAFETY: waits on this test's own child, without reaping it.
+                let waited = unsafe {
+                    libc::waitid(libc::P_PID, a_pid, &mut info, libc::WEXITED | libc::WNOWAIT)
+                };
+                assert_eq!(waited, 0, "{}", std::io::Error::last_os_error());
+                assert!(crate::usage::proc_exited(pid, ticks));
             }
             Decision::End
         });

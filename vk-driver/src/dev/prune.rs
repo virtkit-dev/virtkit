@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 
 use super::plan::Plan;
+use vk_fs::LockFile;
 
 #[derive(Args, Default)]
 pub(crate) struct Options {
@@ -132,13 +133,14 @@ struct Selection {
     /// was left alone
     warn_incomplete: bool,
     // Keep the root and service directory locks through preview, confirmation and removal.
-    _locks: Vec<File>,
+    _locks: Vec<LockFile>,
 }
 
 impl Selection {
     /// The state dir itself, which the selection locks last.
     fn root_dir(&self) -> Result<&File> {
-        self._locks.last().context("no state directory selected")
+        let root = self._locks.last().context("no state directory selected")?;
+        Ok(root)
     }
 }
 
@@ -213,7 +215,7 @@ fn select_target(root: &File, relative: &Path, category: &'static str) -> Result
 
 fn select(env: &Env, opts: &Options) -> Result<Selection> {
     let root = match open_dir(&env.state_dir) {
-        Ok(dir) => dir,
+        Ok(dir) => LockFile::new(dir),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Selection {
                 targets: Vec::new(),
@@ -288,6 +290,7 @@ fn select(env: &Env, opts: &Options) -> Result<Selection> {
             continue;
         }
         let dir = open_dir(&fd_path(&root).join(&name))
+            .map(LockFile::new)
             .with_context(|| format!("opening service directory {}", name.display()))?;
         lock(&dir)?;
         for file in MEDIA {
@@ -651,7 +654,6 @@ fn run_env(env: &Env, opts: &Options, confirm: impl FnOnce() -> Result<bool>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::once_released;
     use std::os::unix::fs::symlink;
 
     /// What a prune says when it finds a state directory's lock held.
@@ -764,8 +766,8 @@ mod tests {
         ] {
             assert!(f.plan.state_dir.join(name).exists(), "{name}");
         }
-        // Again right after the run above released its locks: see `once_released`.
-        let again = once_released(IN_USE, || run(&f.plan, &opts)).unwrap();
+        // Again right after the run above released its locks.
+        let again = run(&f.plan, &opts).unwrap();
         assert!(again.contains("nothing to remove"));
     }
 
@@ -902,10 +904,7 @@ mod tests {
             yes: true,
             ..Default::default()
         };
-        once_released(IN_USE, || {
-            run_env(&legacy, &opts, || panic!("--yes must not ask"))
-        })
-        .unwrap();
+        run_env(&legacy, &opts, || panic!("--yes must not ask")).unwrap();
         assert!(f.plan.state_dir.join("data.qcow2").exists()); // loose disk unidentified, kept
         assert!(!f.plan.state_dir.join("root.qcow2").exists()); // images gone
         assert!(!f.plan.state_dir.join("roots").exists()); // fixed storage gone
@@ -929,7 +928,7 @@ mod tests {
         for name in ["root.qcow2", "data.qcow2", "lifecycle/create", "dev.json"] {
             assert!(f.plan.state_dir.join(name).exists(), "{name}");
         }
-        once_released(IN_USE, || run_env(&e, &Options::default(), || Ok(true))).unwrap();
+        run_env(&e, &Options::default(), || Ok(true)).unwrap();
         assert!(!f.plan.state_dir.join("root.qcow2").exists());
     }
 
@@ -999,7 +998,7 @@ mod tests {
     fn held_environment_and_service_locks_refuse_removal() {
         let f = fixture("locks");
         for dir in [&f.plan.state_dir, &f.plan.state_dir.join("svc-db")] {
-            let held = open_dir(dir).unwrap();
+            let held = LockFile::new(open_dir(dir).unwrap());
             lock(&held).unwrap();
             assert!(
                 run(
@@ -1019,19 +1018,15 @@ mod tests {
     #[test]
     fn symlinked_selected_paths_are_refused_but_links_inside_storage_are_not_followed() {
         let mut f = fixture("symlinks");
-        // Previous runs' dropped locks can remain held: see `once_released`.
-        // Wait for release so contention cannot masquerade as a refusal.
         let prune = |plan: &Plan, storage| {
-            once_released(IN_USE, || {
-                run(
-                    plan,
-                    &Options {
-                        storage,
-                        yes: true,
-                        ..Default::default()
-                    },
-                )
-            })
+            run(
+                plan,
+                &Options {
+                    storage,
+                    yes: true,
+                    ..Default::default()
+                },
+            )
         };
         let link = f.plan.state_dir.join("root.qcow2");
         std::fs::remove_file(&link).unwrap();
@@ -1227,7 +1222,7 @@ mod tests {
             );
         }
         record(serde_json::json!({ "environment": "dev", "hooks": { "create": null } }));
-        let held = open_dir(dir).unwrap();
+        let held = LockFile::new(open_dir(dir).unwrap());
         lock(&held).unwrap();
         let busy = reclaim_images(dir, hour, false, false)
             .unwrap_err()
@@ -1238,7 +1233,7 @@ mod tests {
         // Used again since the caller looked: the stamp read under the locks keeps it.
         stamp(std::time::Duration::ZERO);
         assert_eq!(
-            once_released(IN_USE, || reclaim_images(dir, hour, false, false)).unwrap(),
+            reclaim_images(dir, hour, false, false).unwrap(),
             Reclaimed::Recent
         );
         stamp(hour * 48);
@@ -1247,8 +1242,7 @@ mod tests {
         std::fs::write(dir.join(format!("{TRASH}1-root.qcow2")), b"old").unwrap();
         std::fs::write(dir.join(format!("{TRASH}x-notes.txt")), b"mine").unwrap();
 
-        let Reclaimed::Images { files, bytes } =
-            once_released(IN_USE, || reclaim_images(dir, hour, false, true)).unwrap()
+        let Reclaimed::Images { files, bytes } = reclaim_images(dir, hour, false, true).unwrap()
         else {
             panic!("a recorded environment is reclaimed");
         };
@@ -1256,7 +1250,7 @@ mod tests {
         assert!(dir.join("root.qcow2").exists(), "a dry run removes nothing");
         assert!(!dir.join(RECLAIMED).exists());
 
-        let real = once_released(IN_USE, || reclaim_images(dir, hour, false, false)).unwrap();
+        let real = reclaim_images(dir, hour, false, false).unwrap();
         assert_eq!(real, Reclaimed::Images { files, bytes });
         for name in ["root.qcow2", "svc-db/db-overlay.qcow2", "lifecycle/create"] {
             assert!(!dir.join(name).exists(), "{name}");

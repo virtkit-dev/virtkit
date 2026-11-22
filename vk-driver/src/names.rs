@@ -190,7 +190,7 @@ fn marker(name: &str) -> String {
 }
 
 /// The index lock, held for as long as this lives.
-pub struct Locked(#[allow(dead_code)] std::fs::File);
+pub struct Locked(#[allow(dead_code)] vk_fs::LockFile);
 
 /// Read the symlink target. Tests can inject an I/O error for [`tests::UNREADABLE`].
 fn read_link(path: &Path) -> std::io::Result<PathBuf> {
@@ -261,7 +261,7 @@ impl Index {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("locking {}", path.display()));
         }
-        Ok(Locked(f))
+        Ok(Locked(vk_fs::LockFile::new(f)))
     }
 
     /// The state dir `name` names, whether or not it still exists.

@@ -563,11 +563,8 @@ mod tests {
             toml::from_str(&format!("state_dir = {:?}\n", state.display().to_string())).unwrap();
         clear(&cfg, false, &ours()).unwrap();
         assert!(idle.exists());
-        // Retried: a test forking meanwhile can hold the image's lock for an instant.
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            clear(&cfg, true, &ours()).unwrap();
-            !idle.exists()
-        }));
+        clear(&cfg, true, &ours()).unwrap();
+        assert!(!idle.exists());
         assert!(busy.join("runner.ext4").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }

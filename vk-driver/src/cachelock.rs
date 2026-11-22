@@ -19,6 +19,8 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 
+use vk_fs::LockFile;
+
 /// A held reference to a cache entry: the shared lock lives exactly as long as this guard, so
 /// a reclaim can never remove the entry underneath its user. Released on drop, which re-dates
 /// the entry — every reference here is held for a whole job (a checkout, a base under a live
@@ -27,7 +29,7 @@ use anyhow::{Context, Result};
 // `Debug` so a `Result` carrying a guard stays `unwrap_err`-able in tests.
 #[derive(Debug)]
 pub(crate) struct Guard {
-    _file: std::fs::File,
+    _file: LockFile,
     used: PathBuf,
 }
 
@@ -60,7 +62,7 @@ pub(crate) fn is_not_found(e: &anyhow::Error) -> bool {
 /// the next acquisition stamps it again.
 pub(crate) fn acquire_shared(lock: &Path, used: &Path) -> Result<Guard> {
     for _ in 0..ACQUIRE_ATTEMPTS {
-        let file = open_lock(lock)?;
+        let file = LockFile::new(open_lock(lock)?);
         // SAFETY: `file` owns this fd and the returned guard keeps it open.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
             return Err(std::io::Error::last_os_error())
@@ -124,7 +126,7 @@ pub(crate) fn try_reclaim(
     let Ok(file) = open_lock(lock) else {
         return false;
     };
-    reclaim_opened(&file, lock, used, idle, now, remove)
+    reclaim_opened(&LockFile::new(file), lock, used, idle, now, remove)
 }
 
 /// [`try_reclaim`] with `lock` already open as `file`.
@@ -174,13 +176,13 @@ fn lock_exclusive(file: &std::fs::File, lock: &Path) -> bool {
 /// waits behind it in [`acquire_shared`], then finds the entry as the sweep left it.
 #[derive(Debug)]
 pub(crate) struct Exclusive {
-    _file: std::fs::File,
+    _file: LockFile,
 }
 
 /// Lock the entry whose sidecar is `lock` exclusively, without waiting. Returns `None` if held,
 /// unopenable or replaced. Unlike [`try_reclaim`], keeps new references blocked across steps.
 pub(crate) fn try_exclusive(lock: &Path) -> Option<Exclusive> {
-    let file = open_lock(lock).ok()?;
+    let file = LockFile::new(open_lock(lock).ok()?);
     lock_exclusive(&file, lock).then_some(Exclusive { _file: file })
 }
 
@@ -188,7 +190,7 @@ pub(crate) fn try_exclusive(lock: &Path) -> Option<Exclusive> {
 /// process on the host takes at a time. `None` once `wait` is out. Polled rather than blocked
 /// on, so the wait has an end. Created 0600 as every sidecar here is.
 pub(crate) fn lock_exclusive_within(lock: &Path, wait: Duration) -> Result<Option<Exclusive>> {
-    let file = open_lock(lock)?;
+    let file = LockFile::new(open_lock(lock)?);
     let deadline = std::time::Instant::now() + wait;
     loop {
         // SAFETY: the fd is owned by `file`, which outlives the call.
@@ -217,26 +219,6 @@ fn open_lock(lock: &Path) -> Result<std::fs::File> {
         .mode(0o600)
         .open(lock)
         .with_context(|| format!("opening {}", lock.display()))
-}
-
-/// Run a cache's own sweep until it reports the entry reclaimed, for tests. The liveness probe
-/// is a non-blocking exclusive `flock`, and a *concurrent* test that spawns a subprocess (the
-/// qcow2 tests run `qemu-img`) briefly leaks this test's `.inuse` fd into the forked child
-/// across `fork()`, keeping the shared lock alive until the child `exec`s. That makes a
-/// single-shot eviction check racy under parallel load, so retry — exactly as the periodic
-/// production sweep would. Converges once the transient inheriting child is gone.
-#[cfg(test)]
-pub(crate) fn reclaimed_eventually(mut sweep: impl FnMut() -> bool) -> bool {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if sweep() {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 #[cfg(test)]
@@ -293,13 +275,13 @@ mod tests {
         ));
         assert!(!removed, "a live reference must block the reclaim");
         drop(guard);
-        assert!(reclaimed_eventually(|| try_reclaim(
+        assert!(try_reclaim(
             &lock,
             &used,
             Duration::ZERO,
             SystemTime::now(),
             || removed = true
-        )));
+        ));
         assert!(removed, "a released entry is reclaimable");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -393,13 +375,9 @@ mod tests {
             || { panic!("zero elapsed is inside a non-zero idle window") }
         ));
         let mut removed = false;
-        assert!(reclaimed_eventually(|| try_reclaim(
-            &lock,
-            &used,
-            Duration::ZERO,
-            earlier,
-            || removed = true
-        )));
+        assert!(try_reclaim(&lock, &used, Duration::ZERO, earlier, || {
+            removed = true
+        }));
         assert!(removed, "a zero idle window reclaims despite the skew");
         let _ = std::fs::remove_dir_all(&dir);
     }

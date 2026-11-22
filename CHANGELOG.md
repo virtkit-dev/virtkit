@@ -96,6 +96,8 @@ All notable changes to virtkit will be documented in this file.
 - `vk dev` keeps its `auto` endpoint address when a child inherits a port check or
   `vk dev doctor` checks the port concurrently. If the check itself fails, `vk dev`
   reports the error.
+- `vk dev` no longer reports an environment as booting after the previous command finishes.
+- `vk gc --dry-run` checks for active image pulls without taking the pull lock.
 
 ## [0.114.0] - 2026-11-20
 

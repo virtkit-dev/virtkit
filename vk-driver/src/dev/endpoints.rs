@@ -155,7 +155,7 @@ pub(crate) fn forget(plan: &Plan, service: Option<&str>) -> bool {
 
 /// Serialize allocations so two environments cannot reserve the same block between
 /// the bind probe and publication.
-fn global_lock(plan: &Plan) -> Result<std::fs::File> {
+fn global_lock(plan: &Plan) -> Result<vk_fs::LockFile> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let base = state_base(plan)?;
@@ -174,6 +174,7 @@ fn global_lock(plan: &Plan) -> Result<std::fs::File> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
+        .map(vk_fs::LockFile::new)
         .with_context(|| format!("opening {}", path.display()))?;
     // SAFETY: flock on an fd this process owns; blocks until the lock is ours.
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {

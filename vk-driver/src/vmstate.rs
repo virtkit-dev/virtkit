@@ -339,6 +339,7 @@ fn locked<T>(
     use anyhow::Context as _;
     let d = Dir(vk_fs::open_dir(dir)?);
     let lock = (d.file(LOCK, libc::O_WRONLY | libc::O_CREAT))
+        .map(vk_fs::LockFile::new)
         .with_context(|| format!("opening {}", dir.join(LOCK).display()))?;
     let op = match wait {
         Wait::Block => libc::LOCK_EX,
@@ -462,7 +463,7 @@ mod tests {
     fn a_stop_skips_a_record_it_would_wait_for() {
         let t = crate::dev::testutil::scratch("vmstate-held");
         let dir = &t.0;
-        let held = std::fs::File::create(dir.join(LOCK)).unwrap();
+        let held = vk_fs::LockFile::new(std::fs::File::create(dir.join(LOCK)).unwrap());
         // SAFETY: a lock on a file this test opened, released when `held` drops.
         assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
         let began = std::time::Instant::now();
@@ -473,7 +474,7 @@ mod tests {
         let (me, ticks) = (std::process::id(), crate::vms::own_start_ticks());
         stopping(dir, me, ticks, None);
         assert_eq!(read(dir).map(|r| r.state), Some(State::Stopping));
-        let held = std::fs::File::create(dir.join(LOCK)).unwrap();
+        let held = vk_fs::LockFile::new(std::fs::File::create(dir.join(LOCK)).unwrap());
         // SAFETY: as above.
         assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
         let began = std::time::Instant::now();
@@ -491,7 +492,7 @@ mod tests {
             ..record(State::Starting, None)
         };
         std::fs::write(dir.join(FILE), serde_json::to_vec(&stale).unwrap()).unwrap();
-        let held = std::fs::File::create(dir.join(LOCK)).unwrap();
+        let held = vk_fs::LockFile::new(std::fs::File::create(dir.join(LOCK)).unwrap());
         // SAFETY: as above.
         assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
         let began = std::time::Instant::now();

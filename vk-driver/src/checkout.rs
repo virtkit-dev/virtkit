@@ -1176,15 +1176,12 @@ mod tests {
         root
     }
 
-    /// Sweep with a zero window until `dest` is gone — retried for the reason
-    /// [`crate::cachelock::reclaimed_eventually`] documents.
-    fn evict_eventually(root: &Path, dest: &Path) {
+    /// Sweep with a zero window, which must take `dest`.
+    fn evicted(root: &Path, dest: &Path) {
+        gc_idle(root, Duration::ZERO);
         assert!(
-            crate::cachelock::reclaimed_eventually(|| {
-                gc_idle(root, Duration::ZERO);
-                !dest.exists()
-            }),
-            "checkout {} was not reclaimed within the timeout",
+            !dest.exists(),
+            "checkout {} was not reclaimed",
             dest.display()
         );
     }
@@ -1213,7 +1210,7 @@ mod tests {
         drop(guard);
         gc_idle(&root, Duration::from_secs(3600));
         assert!(ours.exists(), "a just-released checkout stays cached");
-        evict_eventually(&root, &ours);
+        evicted(&root, &ours);
         assert!(
             unmarked.exists(),
             "a tree virtkit never made is not a candidate"
@@ -1234,21 +1231,12 @@ mod tests {
         drop(acquire_use_lock(&dest).unwrap());
         claim(&dest).unwrap();
 
-        // Retried, as the real pass below is, for the reason `reclaimed_eventually` documents.
-        let mut dry = Reclaimed::default();
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            dry = collect_idle(&root, Duration::ZERO, true);
-            dry.trees == 1
-        }));
+        let dry = collect_idle(&root, Duration::ZERO, true);
+        assert_eq!(dry.trees, 1);
         assert!(dry.bytes >= 16 * 1024, "{}", dry.bytes);
         assert!(dest.join("file").is_file(), "a dry run removes nothing");
-        let mut real = Reclaimed::default();
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            let once = collect_idle(&root, Duration::ZERO, false);
-            real.trees += once.trees;
-            real.bytes += once.bytes;
-            !dest.exists()
-        }));
+        let real = collect_idle(&root, Duration::ZERO, false);
+        assert!(!dest.exists());
         assert_eq!(real.trees, 1);
         assert!(
             real.bytes.abs_diff(dry.bytes) <= 8192,
@@ -1298,7 +1286,7 @@ mod tests {
             1,
             "claiming it makes it a candidate"
         );
-        evict_eventually(&root, &dest);
+        evicted(&root, &dest);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1335,7 +1323,7 @@ mod tests {
         mark_guest_writable(&dest).unwrap();
         drop(guard);
 
-        evict_eventually(&root, &dest);
+        evicted(&root, &dest);
         assert!(lock.exists(), "the synchronization inode stays stable");
         // The markers go with the tree, so a slot's metadata does not grow a file per project
         // forever — and the reclaimed tree is not a candidate again either way.
@@ -1502,7 +1490,7 @@ mod tests {
 
         // Once the obstruction is gone the next sweep finishes the job.
         std::fs::set_permissions(&slot, std::fs::Permissions::from_mode(0o755)).unwrap();
-        evict_eventually(&root, &dest);
+        evicted(&root, &dest);
         assert!(!s.used.exists());
         assert!(!s.id.exists());
         let _ = std::fs::remove_dir_all(&root);

@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::vmlist::Kind;
 use crate::vms::{self, Ref, Selector, VmEntry};
+use vk_fs::LockFile;
 
 /// What a verb's caller says beside its REFs.
 #[derive(Debug, Clone, Copy)]
@@ -1049,9 +1050,10 @@ struct Planned {
     t: Target,
     stop: Vec<Step>,
     removal: Removal,
-    dir: Option<Rc<std::fs::File>>,
+    /// Unlocked as it drops: a run started next must find the dir free at once.
+    dir: Option<Rc<LockFile>>,
     /// the service directory opened during planning, if present
-    svc: Option<std::fs::File>,
+    svc: Option<LockFile>,
 }
 
 impl Planned {
@@ -1070,7 +1072,7 @@ impl Planned {
 fn plan_one(r: &OsStr, force: bool) -> Result<Planned> {
     let t = resolve(r, Among::One)?;
     let dir = match std::fs::File::open(&t.dir) {
-        Ok(f) => Some(Rc::new(f)),
+        Ok(f) => Some(Rc::new(LockFile::new(f))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("opening {}", t.dir.display())),
     };
@@ -1081,7 +1083,7 @@ fn plan_one(r: &OsStr, force: bool) -> Result<Planned> {
     if removal == Removal::Service {
         declared(&t)?;
         if let Some(dir) = &dir {
-            svc = open_service(&t, dir)?;
+            svc = open_service(&t, dir)?.map(LockFile::new);
         }
     }
     Ok(Planned {
@@ -1139,7 +1141,7 @@ fn declared(t: &Target) -> Result<()> {
 /// Lock the directory opened during planning and verify its path still names it. A run holds
 /// this lock from before its pull through exit, even if it never registers. A directory
 /// missing during planning must still be absent.
-fn hold(p: &Planned) -> Result<Option<&std::fs::File>> {
+fn hold(p: &Planned) -> Result<Option<&LockFile>> {
     let t = &p.t;
     let Some(dir) = p.dir.as_deref() else {
         if exists(&t.dir)? {
@@ -1212,7 +1214,7 @@ fn still_at(t: &Target, dir: &std::fs::File) -> Result<()> {
 }
 
 /// Apply the planned removal with the state directory lock from [`hold`].
-fn remove(p: &Planned, lock: Option<&std::fs::File>) -> Result<String> {
+fn remove(p: &Planned, lock: Option<&LockFile>) -> Result<String> {
     let t = &p.t;
     let idx = crate::names::Index::open()?;
     let Some(lock) = lock else {
@@ -1888,10 +1890,9 @@ mod tests {
         assert_eq!(kind_of(&elsewhere).unwrap(), Kind::Dev);
     }
 
-    /// Whether `vk delete -y REFS` succeeds, retried while a lock it takes is still held by
-    /// a child another test is spawning (see [`crate::testutil::released`]).
+    /// Whether `vk delete -y REFS` succeeds.
     fn deleted(refs: &[OsString]) -> bool {
-        crate::testutil::released(|| delete(refs, false, true, false, O) == ExitCode::SUCCESS)
+        delete(refs, false, true, false, O) == ExitCode::SUCCESS
     }
 
     const O: Opts = Opts {
@@ -1974,7 +1975,7 @@ mod tests {
         assert!(format!("{err:#}").contains("in use"), "{err:#}");
         assert!(dir.join("svc-db/data").exists());
         drop(run);
-        let lock = crate::testutil::acquired(|| hold(&p).ok().flatten()).unwrap();
+        let lock = hold(&p).unwrap().unwrap();
         assert_eq!(remove(&p, Some(lock)).unwrap(), "removed app/db\n");
         assert!(!dir.join("svc-db").exists() && dir.join("svc-notes/data").exists());
         // A link where the service's directory would be is left, and what it leads to.
@@ -2239,7 +2240,7 @@ mod tests {
         std::fs::write(mine.join(crate::names::RECIPE), b"{}").unwrap();
         let p = plan_one(&os("mine"), false).unwrap();
         assert_eq!(p.removal, Removal::Forget);
-        let lock = crate::testutil::once_released("in use", || hold(&p)).unwrap();
+        let lock = hold(&p).unwrap();
         let moved = homes.dir().join("moved");
         std::fs::rename(&mine, &moved).unwrap();
         std::fs::create_dir(&mine).unwrap();
@@ -2284,7 +2285,7 @@ mod tests {
         let p = plan_one(&os("a"), false).unwrap();
         std::fs::remove_dir_all(&a).unwrap();
         std::fs::create_dir(&a).unwrap();
-        let err = crate::testutil::once_released("in use", || hold(&p)).unwrap_err();
+        let err = hold(&p).unwrap_err();
         assert!(format!("{err:#}").contains("another directory"), "{err:#}");
         // Gone, and its name taken for another dir since: that name stays.
         std::fs::remove_dir_all(&a).unwrap();

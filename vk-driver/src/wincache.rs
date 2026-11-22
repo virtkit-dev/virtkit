@@ -918,19 +918,17 @@ mod tests {
             reference(&layers.join(key(1))).unwrap(),
             reference(&pulled).unwrap(),
         ];
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            gc(&root, idle);
+        gc(&root, idle);
+        assert!(
             !layers.join(key(2)).exists() && !root.join("winiso/settled").join(key(3)).exists()
-        }));
+        );
         assert!(layers.join(key(1)).exists() && pulled.exists());
         assert!(chunks.join(key(7)).exists(), "a pulled layer's chunk stays");
         assert!(!chunks.join(key(8)).exists(), "an unread chunk goes");
 
         drop(held);
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            gc(&root, idle);
-            !layers.join(key(1)).exists() && !pulled.exists()
-        }));
+        gc(&root, idle);
+        assert!(!layers.join(key(1)).exists() && !pulled.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -953,10 +951,8 @@ mod tests {
             entries.iter().all(|e| e.exists()),
             "undated entries are dated first"
         );
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            gc_all(&root, idle);
-            entries.iter().all(|e| !e.exists())
-        }));
+        gc_all(&root, idle);
+        assert!(entries.iter().all(|e| !e.exists()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1120,11 +1116,9 @@ mod tests {
         set_old(&sidecars(&never).1);
 
         let (lock, used) = sidecars(&never);
+        gc(&root, std::time::Duration::from_secs(60));
         assert!(
-            crate::cachelock::reclaimed_eventually(|| {
-                gc(&root, std::time::Duration::from_secs(60));
-                !used.exists() && !lock.exists()
-            }),
+            !used.exists() && !lock.exists(),
             "orphan sidecars go once idle"
         );
         assert!(install.exists(), "the install under an undated layer stays");
@@ -1179,10 +1173,8 @@ mod tests {
         assert!(install.exists() && step.exists());
         drop(held);
         age(&step);
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            gc(&root, std::time::Duration::from_secs(60));
-            !install.exists() && !step.exists()
-        }));
+        gc(&root, std::time::Duration::from_secs(60));
+        assert!(!install.exists() && !step.exists());
         let (lock, used) = sidecars(&install);
         assert!(
             !lock.exists() && !used.exists(),
@@ -1237,10 +1229,8 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         drop(reference(&other).unwrap());
         age(&other);
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            gc(&root, std::time::Duration::from_secs(60));
-            !other.exists()
-        }));
+        gc(&root, std::time::Duration::from_secs(60));
+        assert!(!other.exists());
         assert!(step.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1263,10 +1253,8 @@ mod tests {
         assert_eq!(sweep_chunks(&root, idle, std::time::SystemTime::now()), 0);
         assert!(old.exists());
         drop(pull);
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            sweep_chunks(&root, idle, std::time::SystemTime::now());
-            !old.exists()
-        }));
+        sweep_chunks(&root, idle, std::time::SystemTime::now());
+        assert!(!old.exists());
         assert!(new.exists(), "a chunk written lately stays");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1306,9 +1294,7 @@ mod tests {
         assert!(!discard(&install).unwrap());
         assert!(install.exists(), "an entry another build holds stays");
         drop(other);
-        assert!(crate::cachelock::reclaimed_eventually(
-            || discard(&install).unwrap()
-        ));
+        assert!(discard(&install).unwrap());
         let (lock, used) = sidecars(&install);
         assert!(!install.exists() && !lock.exists() && !used.exists());
         let _ = std::fs::remove_dir_all(&root);

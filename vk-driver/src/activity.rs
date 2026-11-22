@@ -20,6 +20,9 @@ pub struct Sink {
     path: Option<PathBuf>,
     /// The last id given, and what is said, innermost last.
     said: Mutex<(u64, Vec<(u64, Activity)>)>,
+    /// Receives new and changed activities after the best-effort write.
+    #[cfg(test)]
+    heard: Option<std::sync::mpsc::Sender<Activity>>,
 }
 
 /// This process's sink: the file named in [`ENV`], or none.
@@ -34,7 +37,33 @@ impl Sink {
         Arc::new(Sink {
             path,
             said: Mutex::default(),
+            #[cfg(test)]
+            heard: None,
         })
+    }
+
+    /// Sends new and changed activities to `heard` without writing a file.
+    #[cfg(test)]
+    pub fn heard(heard: std::sync::mpsc::Sender<Activity>) -> Arc<Sink> {
+        Self::heard_at(None, heard)
+    }
+
+    /// Sends new and changed activities to `heard` after attempting to update `path`.
+    #[cfg(test)]
+    pub fn heard_at(path: Option<PathBuf>, heard: std::sync::mpsc::Sender<Activity>) -> Arc<Sink> {
+        Arc::new(Sink {
+            path,
+            said: Mutex::default(),
+            heard: Some(heard),
+        })
+    }
+
+    #[cfg(test)]
+    fn tell(&self, activity: &Activity) {
+        if let Some(heard) = &self.heard {
+            // The test may have dropped its receiver.
+            let _ = heard.send(activity.clone());
+        }
     }
 
     /// Say `activity` until the [`Said`] returned is dropped.
@@ -42,8 +71,12 @@ impl Sink {
         let mut said = self.said.lock().unwrap_or_else(PoisonError::into_inner);
         said.0 += 1;
         let id = said.0;
+        #[cfg(test)]
+        let told = activity.clone();
         said.1.push((id, activity));
         self.write(&said.1);
+        #[cfg(test)]
+        self.tell(&told);
         Said {
             sink: self.clone(),
             id,
@@ -80,10 +113,14 @@ impl Said {
             .said
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        let told = activity.clone();
         if let Some(entry) = said.1.iter_mut().find(|(id, _)| *id == self.id) {
             entry.1 = activity;
         }
         self.sink.write(&said.1);
+        #[cfg(test)]
+        self.sink.tell(&told);
     }
 }
 

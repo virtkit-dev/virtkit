@@ -857,20 +857,20 @@ const CLAIM_RETRY: Duration = Duration::from_millis(20);
 /// `remove_dir_all` empties the directory before removing it, and the directory inode — and
 /// so the sweeper's lock on it — outlives that whole walk. A build cannot end up inside a
 /// removal in progress; it either waits it out or claims the fresh directory afterwards.
-fn claim_scratch(scratch: &Path) -> Result<std::fs::File> {
+fn claim_scratch(scratch: &Path) -> Result<vk_fs::LockFile> {
     claim_scratch_until(scratch, Instant::now() + CLAIM_TIMEOUT)
 }
 
 /// [`claim_scratch`] with the retry deadline spelled out, so a test can ask for a single
 /// attempt (`Instant::now()`) instead of waiting the real one out.
-fn claim_scratch_until(scratch: &Path, deadline: Instant) -> Result<std::fs::File> {
+fn claim_scratch_until(scratch: &Path, deadline: Instant) -> Result<vk_fs::LockFile> {
     use std::os::unix::io::AsRawFd;
 
     loop {
         std::fs::create_dir_all(scratch)
             .with_context(|| format!("creating the build scratch dir {}", scratch.display()))?;
         let dir = match std::fs::File::open(scratch) {
-            Ok(dir) => Some(dir),
+            Ok(dir) => Some(vk_fs::LockFile::new(dir)),
             // Swept between our create and our open — we had nothing to lock yet, so a sweep
             // was right to take it. Same answer as a `same_file` mismatch below: try again.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -3827,10 +3827,10 @@ fn sweep_stale_sessions(dir: &Path) {
 /// namespace, which is exactly what a pid cannot tell us. Anything unexpected (an unreadable
 /// dir, a filesystem without `flock`) reads as live, so a sweep never removes what it does
 /// not understand.
-fn claim_if_abandoned(path: &Path) -> Option<std::fs::File> {
+fn claim_if_abandoned(path: &Path) -> Option<vk_fs::LockFile> {
     use std::os::unix::io::AsRawFd;
 
-    let dir = std::fs::File::open(path).ok()?;
+    let dir = vk_fs::LockFile::new(std::fs::File::open(path).ok()?);
     // SAFETY: the fd is owned by `dir`, which the caller keeps alive; flock returns 0 or -1
     // and does not block under `LOCK_NB`.
     if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -4828,22 +4828,15 @@ mod tests {
         );
     }
 
-    /// Sweep `root` until `dir` is gone. A single shot is racy under parallel test load: a
-    /// concurrent test's `Command::spawn` forks with this test's lock fd still open, holding
-    /// the lock alive until the child `exec`s — the same hazard `cachelock` documents for its
-    /// own sweeps. Converges once the transient inheriting child is gone.
-    fn swept_eventually(root: &Path, dir: &Path) -> bool {
-        crate::cachelock::reclaimed_eventually(|| {
-            sweep_stale_scratch(root, SCRATCH_PREFIX);
-            !dir.exists()
-        })
+    /// Whether a sweep of `root` takes `dir`.
+    fn swept(root: &Path, dir: &Path) -> bool {
+        sweep_stale_scratch(root, SCRATCH_PREFIX);
+        !dir.exists()
     }
 
-    /// A sweep's claim on `dir`, whose own claim a test has just dropped. A child another test
-    /// forked meanwhile can hold that claim until it execs: see `crate::testutil::released`.
-    fn abandoned(dir: &Path) -> std::fs::File {
-        crate::testutil::acquired(|| claim_if_abandoned(dir))
-            .expect("an unlocked scratch dir is abandoned")
+    /// A sweep's claim on `dir`, whose own claim a test has just dropped.
+    fn abandoned(dir: &Path) -> vk_fs::LockFile {
+        claim_if_abandoned(dir).expect("an unlocked scratch dir is abandoned")
     }
 
     /// A pid that has certainly been reaped, so a dir named after it never looks live on
@@ -4868,7 +4861,7 @@ mod tests {
         }
 
         assert!(
-            swept_eventually(&root, &orphan),
+            swept(&root, &orphan),
             "scratch nobody holds should be swept"
         );
         assert!(own_dir.exists(), "this process's own scratch must be kept");
@@ -4935,7 +4928,7 @@ mod tests {
         // The owner goes away (the process exited, the kernel dropped its lock).
         drop(owner);
         assert!(
-            swept_eventually(&root, &claimed),
+            swept(&root, &claimed),
             "once nobody holds the lock the scratch is collectable"
         );
 
@@ -4958,9 +4951,10 @@ mod tests {
     /// How libtest addresses [`scratch_claim_holder`], for the re-exec below.
     const SCRATCH_HOLDER: &str = "build::tests::scratch_claim_holder";
 
-    /// A child killed however its test ends. The holder below blocks forever by design, so
-    /// a panicking assertion between spawning and killing it would otherwise leak a process
-    /// still holding a lock under `$TMPDIR`.
+    /// The line [`scratch_claim_holder`] writes once its claim is held.
+    const SCRATCH_CLAIMED: &[u8] = b"scratch claimed";
+
+    /// Kills and reaps the holder even if an assertion panics while it owns the scratch lock.
     struct Reaped(std::process::Child);
 
     impl Drop for Reaped {
@@ -4970,24 +4964,22 @@ mod tests {
         }
     }
 
-    /// Not a test in its own right: the subprocess half of
-    /// [`sweep_reclaims_a_scratch_whose_owner_was_killed`]. Claims the scratch dir named by
-    /// `VK_TEST_SCRATCH_CLAIM`, reports itself ready, and blocks until killed. `#[ignore]`
-    /// keeps it out of ordinary runs; the parent re-runs this binary to reach it.
+    /// Child process for [`sweep_reclaims_a_scratch_whose_owner_was_killed`]. With
+    /// `VK_TEST_SCRATCH_CLAIM` set, it claims that directory, signals readiness on stdout,
+    /// and waits on stdin until killed or the parent closes the pipe. Otherwise it returns.
     #[test]
-    #[ignore]
     fn scratch_claim_holder() {
-        let (Ok(dir), Ok(ready)) = (
-            std::env::var("VK_TEST_SCRATCH_CLAIM"),
-            std::env::var("VK_TEST_SCRATCH_READY"),
-        ) else {
+        use std::io::{Read, Write};
+        let Some(dir) = std::env::var_os("VK_TEST_SCRATCH_CLAIM") else {
             return;
         };
         let _owner = claim_scratch(Path::new(&dir)).unwrap();
-        std::fs::write(&ready, b"claimed").unwrap();
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
-        }
+        let mut out = std::io::stdout();
+        // On a line of its own: libtest may have left its `test <name> ... ` line open.
+        out.write_all(&[b"\n", SCRATCH_CLAIMED, b"\n"].concat())
+            .unwrap();
+        out.flush().unwrap();
+        let _ = std::io::stdin().read(&mut [0]);
     }
 
     /// What the lock actually buys is that a *hard-killed* build stops holding its
@@ -4999,27 +4991,26 @@ mod tests {
         let root = tmpdir("sweep-killed-owner");
         // Named after a dead pid, so only the subprocess's lock keeps it from the sweep.
         let claimed = root.join(format!("{SCRATCH_PREFIX}{}-0", dead_pid()));
-        let ready = root.join("ready");
 
         let mut holder = Reaped(
             std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "--ignored", SCRATCH_HOLDER])
+                .args(["--exact", SCRATCH_HOLDER])
                 .env("VK_TEST_SCRATCH_CLAIM", &claimed)
-                .env("VK_TEST_SCRATCH_READY", &ready)
-                .stdout(std::process::Stdio::null())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap(),
         );
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while !ready.exists() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the holder never claimed {}",
-                claimed.display()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        // Its claim is held once it says so, after libtest's own lines.
+        let out = std::io::BufReader::new(holder.0.stdout.take().unwrap());
+        let claimed_line = std::io::BufRead::split(out, b'\n')
+            .map(|line| line.unwrap())
+            .any(|line| line == SCRATCH_CLAIMED);
+        assert!(
+            claimed_line,
+            "the holder never claimed {}",
+            claimed.display()
+        );
 
         sweep_stale_scratch(&root, SCRATCH_PREFIX);
         assert!(
@@ -5036,7 +5027,7 @@ mod tests {
             "the holder was meant to still be blocking on its claim"
         );
         assert!(
-            swept_eventually(&root, &claimed),
+            swept(&root, &claimed),
             "a killed owner's lock dies with it, making its scratch collectable"
         );
 
@@ -5054,7 +5045,7 @@ mod tests {
         drop(claim_scratch(&stale).unwrap());
 
         assert!(
-            swept_eventually(&root, &stale),
+            swept(&root, &stale),
             "a free lock means nobody owns the dir, whatever its pid"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -5095,10 +5086,7 @@ mod tests {
         let root = tmpdir("claim-after-sweep");
         let dir = root.join(format!("{SCRATCH_PREFIX}{}-0", dead_pid()));
         drop(claim_scratch(&dir).unwrap());
-        assert!(
-            swept_eventually(&root, &dir),
-            "an unlocked scratch dir is swept"
-        );
+        assert!(swept(&root, &dir), "an unlocked scratch dir is swept");
 
         let owner = claim_scratch(&dir).unwrap();
         assert!(

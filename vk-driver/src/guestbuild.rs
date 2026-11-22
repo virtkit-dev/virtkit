@@ -318,6 +318,17 @@ fn watch_parent(
 /// Take the job's build lock in the job dir `job`, waiting at most `wait` for it: one build at
 /// a time, and the previous one's reaper done.
 fn lock(job: BorrowedFd<'_>, wait: std::time::Duration) -> Result<std::fs::File, Denied> {
+    lock_with(job, wait, || {
+        std::thread::sleep(std::time::Duration::from_millis(100))
+    })
+}
+
+/// [`lock`] calling `pause` after each refusal within `wait` instead of sleeping 100 ms.
+fn lock_with(
+    job: BorrowedFd<'_>,
+    wait: std::time::Duration,
+    mut pause: impl FnMut(),
+) -> Result<std::fs::File, Denied> {
     // SAFETY: the descriptor is live and the name is NUL-terminated and outlives the call.
     let fd = unsafe {
         libc::openat(
@@ -353,7 +364,7 @@ fn lock(job: BorrowedFd<'_>, wait: std::time::Duration) -> Result<std::fs::File,
                  removed: a job runs one at a time"
             )));
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        pause();
     }
 }
 
@@ -1109,7 +1120,8 @@ mod tests {
     #[test]
     fn one_build_at_a_time_per_job() {
         let dir = tmpdir("lock");
-        let first = lock_now(&dir).unwrap();
+        // The test owns this lock. A real build passes its lock to the reaper.
+        let first = vk_fs::LockFile::new(lock_now(&dir).unwrap());
         match lock_now(&dir) {
             Err(Denied::Refused(e)) => assert!(format!("{e:#}").contains("one at a time"), "{e:#}"),
             other => panic!("{other:?}"),
@@ -1124,14 +1136,14 @@ mod tests {
     #[test]
     fn a_build_waits_for_the_previous_ones_lock() {
         let dir = tmpdir("lock-wait");
-        let first = lock_now(&dir).unwrap();
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            drop(first);
-        });
+        // The previous build's lock, let go once the next one has been refused it.
+        let mut first = Some(vk_fs::LockFile::new(lock_now(&dir).unwrap()));
         let job = vk_fs::open_dir(&dir).unwrap();
-        lock(job.as_fd(), std::time::Duration::from_secs(20)).unwrap();
-        release.join().unwrap();
+        lock_with(job.as_fd(), std::time::Duration::from_secs(20), || {
+            drop(first.take().expect("one refusal"))
+        })
+        .unwrap();
+        assert!(first.is_none(), "the lock was free at the first attempt");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

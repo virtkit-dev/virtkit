@@ -504,11 +504,9 @@ mod tests {
         );
 
         drop(guard);
+        crate::image::gc_idle(&build_root, Duration::ZERO);
         assert!(
-            crate::cachelock::reclaimed_eventually(|| {
-                crate::image::gc_idle(&build_root, Duration::ZERO);
-                !dir.exists()
-            }),
+            !dir.exists(),
             "the base must become reclaimable once the guard is released"
         );
 

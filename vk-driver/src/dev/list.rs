@@ -773,9 +773,9 @@ pub fn preview(selected: &[Row]) -> String {
 
 /// Take a state directory's lock — the one a boot and a live run hold — for as long as the
 /// returned file lives. `None` when somebody else holds it, or when the directory is gone.
-pub(crate) fn try_lock_state_dir(dir: &Path) -> Option<std::fs::File> {
+pub(crate) fn try_lock_state_dir(dir: &Path) -> Option<vk_fs::LockFile> {
     use std::os::fd::AsRawFd;
-    let f = std::fs::File::open(dir).ok()?;
+    let f = vk_fs::LockFile::new(std::fs::File::open(dir).ok()?);
     // SAFETY: the fd is owned by `f`, which the caller keeps alive; LOCK_NB does not block.
     match unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } {
         0 => Some(f),
@@ -1348,8 +1348,6 @@ mod tests {
 
     #[test]
     fn a_directory_somebody_is_booting_is_not_removed() {
-        // Holds a state-dir lock across the assertions; a concurrent fork must not inherit it.
-        let _env = crate::dev::testutil::env_guard();
         let tmp = scratch("locked");
         let base = tmp.0.join("state");
         std::fs::create_dir_all(&base).unwrap();
@@ -1368,9 +1366,7 @@ mod tests {
         assert!(format!("{e:#}").contains("is in use by"), "{e:#}");
         assert!(dir.exists(), "the boot's state directory survived");
         drop(held);
-        let removed =
-            crate::testutil::once_released("is in use by", || remove(&selected, &index(&base)))
-                .unwrap();
+        let removed = remove(&selected, &index(&base)).unwrap();
         assert!(removed.starts_with("removed gone-bbbb"));
         assert!(!dir.exists());
     }

@@ -338,9 +338,7 @@ impl Ledger {
         ids
     }
 
-    /// Drop reservation `id` and its ledger entry. The entry's file goes too: closing it is
-    /// not enough, as a child forked meanwhile and not yet exec'd shares its lock, keeping
-    /// it counted until then.
+    /// Drops reservation `id` and attempts to unlink its admission file if it held one.
     fn drop_entry(&mut self, id: &str) {
         if let Some(Entry { held: Some(_), .. }) = self.entries.remove(id) {
             admit::release(&self.limits.admit_dir, &ledger_name(id));
@@ -629,9 +627,7 @@ mod tests {
         // Within it: the base goes, whatever its idle window, unless it is kept.
         assert_eq!(l.limits.reclaim(1, std::slice::from_ref(&base)).freed, 0);
         assert!(base.exists());
-        assert!(crate::cachelock::reclaimed_eventually(|| {
-            l.limits.reclaim(1, &[]).freed > 0
-        }));
+        assert!(l.limits.reclaim(1, &[]).freed > 0);
         assert!(!base.exists());
         drop(blocker);
         let _ = std::fs::remove_dir_all(dir);

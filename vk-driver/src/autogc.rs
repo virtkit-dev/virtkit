@@ -148,6 +148,7 @@ fn start(cfg: &Config, state_dir: &Path, now: SystemTime) -> anyhow::Result<()> 
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(state_dir.join(STARTED))
+        .map(vk_fs::LockFile::new)
         .context("claiming the pass")?;
     // SAFETY: the fd is owned by `claim`, open across the call; LOCK_NB never waits.
     if unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -258,7 +259,7 @@ pub(crate) const MANUAL_WAIT: Duration = Duration::from_secs(60);
 /// What [`lock`] got.
 pub(crate) enum Pass {
     /// [`LOCK`], held for the pass.
-    Held { _lock: std::fs::File },
+    Held { _lock: vk_fs::LockFile },
     /// Another pass holds it, past the wait.
     Busy,
     /// It cannot be opened, which a manual pass goes on without.
@@ -282,7 +283,9 @@ pub(crate) fn lock(state_dir: &Path, wait: Duration) -> Pass {
     loop {
         // SAFETY: the fd is owned by `file`, open across the call; LOCK_NB never waits.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Pass::Held { _lock: file };
+            return Pass::Held {
+                _lock: vk_fs::LockFile::new(file),
+            };
         }
         if std::time::Instant::now() >= deadline {
             return Pass::Busy;
@@ -454,12 +457,7 @@ mod tests {
             "a wait is waited out"
         );
         drop(held);
-        // A child another test forks meanwhile shares the lock's open file description until
-        // it execs, so the dropped lock can briefly stay held: wait for it.
-        assert!(matches!(
-            lock(&dir, Duration::from_secs(10)),
-            Pass::Held { .. }
-        ));
+        assert!(matches!(lock(&dir, Duration::ZERO), Pass::Held { .. }));
 
         // A pass short of space dates it, one back above the floor clears it, and only a
         // complete one dates the interval.

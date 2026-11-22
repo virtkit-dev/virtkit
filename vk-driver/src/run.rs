@@ -1040,7 +1040,10 @@ fn dead_launch_dirs_in(base: &Path, grace: Duration, dry_run: bool) -> DeadLaunc
         let Ok(dir) = vk_fs::open_dir_in(top.as_fd(), &name) else {
             continue;
         };
-        let Ok(lock) = vk_fs::reopen_dir(dir.as_fd()).map(std::fs::File::from) else {
+        // Release the directory lock on drop, including after a dry run.
+        let Ok(lock) =
+            vk_fs::reopen_dir(dir.as_fd()).map(|fd| vk_fs::LockFile::new(std::fs::File::from(fd)))
+        else {
             continue;
         };
         // SAFETY: the fd is owned by `lock`, open across the call; LOCK_NB never waits.
@@ -9163,20 +9166,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // A probe like `vms::alive`'s: the lock taken through its own descriptor, and dropped
-        // as soon as the lock was refused. The grace is the five seconds `testutil::released`
-        // gives a forked child's copy of the probe, not a race against a 100 ms clock.
-        let probe = std::fs::File::open(&dir).unwrap();
+        // Model `vms::alive` holding the lock through a separate descriptor until the
+        // launcher's first attempt is refused.
+        let probe = vk_fs::LockFile::new(std::fs::File::open(&dir).unwrap());
         // SAFETY: flock(2) on an fd owned by `probe`, which outlives the call.
         assert_eq!(
             unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
         let mut probe = Some(probe);
-        let held = lock_state_dir_within(&dir, Duration::from_secs(5), || {
-            drop(probe.take());
-            std::thread::sleep(STATE_DIR_LOCK_RETRY);
-        });
+        let held = lock_state_dir_within(&dir, Duration::from_secs(5), || drop(probe.take()));
         assert!(
             held.is_ok(),
             "a probe must not read as a live run: {:#}",

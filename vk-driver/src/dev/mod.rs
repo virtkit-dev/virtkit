@@ -145,11 +145,10 @@ pub(crate) mod testutil {
         TmpDir(dir)
     }
 
-    /// Serializes every test that mutates the environment, forks a process, or holds a file
-    /// lock across an assertion. A `set_var` racing another thread's `fork`, which copies
-    /// `environ`, is undefined behaviour; a lock held here is inherited by any child forked
-    /// meanwhile and stays held until that child execs, outliving its `drop`. Poison is taken
-    /// back rather than failing every later test after one panics under it.
+    /// Coordinates environment changes with child spawns that take this guard. A concurrent
+    /// environment read during `set_var` is unsafe. Inherited flocks need no serialization
+    /// because [`vk_fs::LockFile`] explicitly unlocks them. Recover poison so a panic in one
+    /// test does not fail later tests.
     pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
         ENV.lock().unwrap_or_else(|e| e.into_inner())
@@ -257,7 +256,7 @@ pub(crate) mod testutil {
     /// `plan`'s VM as up, managed by this process: its registry entry, and the state dir lock
     /// its `vk run` would hold, which is what makes the registry read it as alive. Only in a
     /// test process of its own, given a scratch `XDG_DATA_HOME`: the registry is per user.
-    pub(super) fn register_vm(plan: &Plan) -> (crate::vms::Registration, std::fs::File) {
+    pub(super) fn register_vm(plan: &Plan) -> (crate::vms::Registration, vk_fs::LockFile) {
         register_vm_as(plan, std::process::id())
     }
 
@@ -267,12 +266,9 @@ pub(crate) mod testutil {
     pub(super) fn register_vm_as(
         plan: &Plan,
         pid: u32,
-    ) -> (crate::vms::Registration, std::fs::File) {
+    ) -> (crate::vms::Registration, vk_fs::LockFile) {
         std::fs::create_dir_all(&plan.state_dir).unwrap();
-        // A test may have just dropped its own hold on it: see `crate::testutil::released`.
-        let lock =
-            crate::testutil::acquired(|| crate::dev::list::try_lock_state_dir(&plan.state_dir))
-                .expect("lock it");
+        let lock = crate::dev::list::try_lock_state_dir(&plan.state_dir).expect("lock it");
         (register_entry(plan, pid), lock)
     }
 
@@ -375,7 +371,7 @@ pub(crate) mod testutil {
 
     /// Rerun test `name` in its own process with `XDG_DATA_HOME` under `dir` and `var` set to
     /// `dir`. Check both success and the test count: a name matching no test also exits 0.
-    pub(super) fn in_child(name: &str, var: &str, dir: &Path) {
+    pub(crate) fn in_child(name: &str, var: &str, dir: &Path) {
         let _guard = env_guard();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", name, "--nocapture"])
