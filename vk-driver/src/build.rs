@@ -2900,15 +2900,18 @@ struct MemLedger {
     /// `MemTotal`. `None` disables the gate entirely — no queue, no measuring
     /// ([`MemLedger::reserve`]): `/proc/meminfo` unreadable, `[build] no_mem_gate`, and the
     /// sequential backends, which run one stage at a time and have nothing to hold back.
-    ///
-    /// The ledger tests do give a total, and so do measure the machine they run on. They
-    /// pass it a total of 1 MiB, which no stage can ever fit in, so what the host happens to
-    /// report cannot change the answer.
     total_mib: Option<u64>,
     /// Held back from `total_mib` — see [`BUILD_RESERVE_PCT`].
     reserve_mib: u64,
+    /// Measures memory committed outside the build, in MiB. Tests replace [`measure_foreign_mib`].
+    foreign_mib: fn() -> Option<u64>,
+    /// Maximum wait before the queue head measures again. Defaults to [`MEM_POLL`].
+    poll: Duration,
     state: Mutex<LedgerState>,
     cv: Condvar,
+    /// Wakes tests when a stage joins the queue or parks on `cv`.
+    #[cfg(test)]
+    arrived: Condvar,
 }
 
 /// [`MemLedger`]'s mutable half. Kept behind one lock so a queue position and the figure it
@@ -2923,6 +2926,9 @@ struct LedgerState {
     /// rather than a counter so a stage that gives up (cancelled) drops out of the middle
     /// without stalling everyone queued behind it.
     waiting: BTreeSet<u64>,
+    /// Total waits on [`MemLedger::cv`], incremented under the lock before each wait.
+    #[cfg(test)]
+    parked: usize,
 }
 
 impl MemLedger {
@@ -2930,8 +2936,12 @@ impl MemLedger {
         Self {
             total_mib,
             reserve_mib: total_mib.map(build_reserve_mib).unwrap_or(0),
+            foreign_mib: measure_foreign_mib,
+            poll: MEM_POLL,
             state: Mutex::new(LedgerState::default()),
             cv: Condvar::new(),
+            #[cfg(test)]
+            arrived: Condvar::new(),
         }
     }
 
@@ -2992,12 +3002,18 @@ impl MemLedger {
                 // Measured with the lock released: this walks `/proc`, and a stage releasing
                 // its own reservation must never queue behind that.
                 drop(st);
-                let foreign = measure_foreign_mib().unwrap_or(0);
+                let foreign = (self.foreign_mib)().unwrap_or(0);
                 st = self.lock();
-                // Judged against what is held *now*, not against a snapshot from before the
-                // walk: a reservation released in that window would otherwise go unseen
-                // until the next poll, and a waiter that gave up mid-walk raises `held_mib`
-                // from behind us. Only `foreign` is allowed to be a moment stale.
+                // Cancellation takes precedence over a release during the walk.
+                if cancel.is_some_and(|c| c.is_cancelled()) {
+                    break false;
+                }
+                // Only `foreign` may be stale. A cancelled waiter can raise `held_mib`
+                // during the walk. The last reservation can also drop while this head is
+                // measuring, so its notification is lost. Admit the head before it parks.
+                if st.held_mib == 0 {
+                    break true;
+                }
                 let short = self.short_by(want_mib, st.held_mib, foreign);
                 if short == 0 {
                     break true;
@@ -3010,11 +3026,16 @@ impl MemLedger {
                     continue; // the host may have moved on while that was reported
                 }
             }
+            #[cfg(test)]
+            {
+                st.parked += 1;
+                self.arrived.notify_all();
+            }
             // Timed, not a plain wait: the memory being waited for is usually freed by a
             // process outside this build, which will never notify us.
             st = self
                 .cv
-                .wait_timeout(st, MEM_POLL)
+                .wait_timeout(st, self.poll)
                 .unwrap_or_else(poisoned)
                 .0;
         };
@@ -3080,6 +3101,8 @@ impl<'a> QueuedTicket<'a> {
         let ticket = st.next_ticket;
         st.next_ticket = st.next_ticket.saturating_add(1);
         st.waiting.insert(ticket);
+        #[cfg(test)]
+        ledger.arrived.notify_all();
         Self { ledger, ticket }
     }
 }
@@ -8246,13 +8269,109 @@ RUN ship
         );
     }
 
+    /// Give the test stages 1 MiB total and zero foreign commitments. They cannot fit
+    /// side by side, and the day-long poll exceeds the test deadlines.
+    fn ledger() -> MemLedger {
+        MemLedger {
+            foreign_mib: || Some(0),
+            poll: Duration::from_secs(24 * 3600),
+            ..MemLedger::new(Some(1))
+        }
+    }
+
+    /// Wait for `ledger` to have `n` stages queued.
+    fn queued(ledger: &MemLedger, n: usize) {
+        let st = ledger.lock();
+        let (st, _) = ledger
+            .arrived
+            .wait_timeout_while(st, Duration::from_secs(60), |s| s.waiting.len() < n)
+            .unwrap_or_else(poisoned);
+        assert_eq!(
+            st.waiting.len(),
+            n,
+            "expected {n} stages queued, observed {}",
+            st.waiting.len()
+        );
+    }
+
+    /// Wait for at least `n` parks in total. Taking the same lock ensures the last
+    /// counted waiter has released it in `wait_timeout`.
+    fn parked(ledger: &MemLedger, n: usize) {
+        let st = ledger.lock();
+        let (st, _) = ledger
+            .arrived
+            .wait_timeout_while(st, Duration::from_secs(60), |s| s.parked < n)
+            .unwrap_or_else(poisoned);
+        // At least: a spurious wakeup parks a stage again.
+        assert!(st.parked >= n, "expected {n} parks, observed {}", st.parked);
+    }
+
+    /// Report zero foreign commitments and pause measurement number `held` so the test
+    /// can act between [`Walk::started`] and [`Walk::finish`].
+    struct Walk {
+        calls: AtomicUsize,
+        held: usize,
+        step: Mutex<WalkStep>,
+        cv: Condvar,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum WalkStep {
+        NotYet,
+        Started,
+        MayFinish,
+    }
+
+    impl Walk {
+        const fn new(held: usize) -> Self {
+            Walk {
+                calls: AtomicUsize::new(0),
+                held,
+                step: Mutex::new(WalkStep::NotYet),
+                cv: Condvar::new(),
+            }
+        }
+
+        fn measure(&self) -> Option<u64> {
+            if self.calls.fetch_add(1, SeqCst) + 1 == self.held {
+                let mut step = self.step.lock().unwrap();
+                *step = WalkStep::Started;
+                self.cv.notify_all();
+                let (step, _) = self
+                    .cv
+                    .wait_timeout_while(step, Duration::from_secs(60), |s| {
+                        *s != WalkStep::MayFinish
+                    })
+                    .unwrap();
+                assert_eq!(*step, WalkStep::MayFinish, "the walk was never let finish");
+            }
+            Some(0)
+        }
+
+        /// Wait for the stage to be in its `held`th walk.
+        fn started(&self) {
+            let step = self.step.lock().unwrap();
+            let (step, _) = self
+                .cv
+                .wait_timeout_while(step, Duration::from_secs(60), |s| *s == WalkStep::NotYet)
+                .unwrap();
+            assert_eq!(*step, WalkStep::Started, "walk {} never started", self.held);
+        }
+
+        /// Let the stage end the walk [`Walk::started`] waited for.
+        fn finish(&self) {
+            *self.step.lock().unwrap() = WalkStep::MayFinish;
+            self.cv.notify_all();
+        }
+    }
+
     #[test]
     fn the_ledger_admits_the_first_stage_and_holds_the_next() {
         // A host too small for even one stage, so the fit check can never pass: the first
         // reservation must still go through (a build with nothing running has no way to make
         // room, and parking it forever would deadlock rather than throttle), and the second
         // must wait for that one to be released rather than pile on.
-        let ledger = Arc::new(MemLedger::new(Some(1)));
+        let ledger = Arc::new(ledger());
         let (first, wait) = ledger.reserve(4096, None, |_| {});
         assert_eq!(
             wait,
@@ -8300,32 +8419,21 @@ RUN ship
         // Mixed sizes on a host with no room: the big stage queued first must get the
         // memory the release frees, even though the small one behind it would also fit.
         // Without that, a large stage is overtaken by every small one and never runs.
-        let ledger = Arc::new(MemLedger::new(Some(1)));
+        let ledger = Arc::new(ledger());
         let (held, _) = ledger.reserve(1024, None, |_| {});
         // Queue depth, not the wait callback: only the oldest waiter measures the host and
         // so only it ever calls back, which is the very property under test.
-        let queued = |n: usize| {
-            for _ in 0..2000 {
-                if ledger.state.lock().unwrap().waiting.len() == n {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            panic!("waited for {n} queued stage(s) and never saw them");
-        };
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut waiters = Vec::new();
         for (i, (label, want)) in [("big", 8192u64), ("small", 512)].into_iter().enumerate() {
             let (l, o) = (Arc::clone(&ledger), Arc::clone(&order));
             waiters.push(std::thread::spawn(move || {
                 let (_r, _) = l.reserve(want, None, |_| {});
+                // Record admission before releasing the only reservation that fits.
                 o.lock().unwrap().push(label);
-                // Hold until every waiter has been admitted, so the order recorded is the
-                // order they were let in and not the order they happened to finish.
-                std::thread::sleep(Duration::from_millis(50));
             }));
             // Queue strictly: only once this one has a ticket does the next take one.
-            queued(i + 1);
+            queued(&ledger, i + 1);
         }
         drop(held);
         for w in waiters {
@@ -8342,7 +8450,7 @@ RUN ship
     fn a_guest_less_backend_never_queues() {
         // `DryRun`/`Planner`/`Host` declare no stage RAM (`stage_mem_mib` is None -> 0), so
         // they must pass straight through a ledger that is otherwise wedged shut.
-        let ledger = MemLedger::new(Some(1));
+        let ledger = ledger();
         let (_blocking, _) = ledger.reserve(4096, None, |_| {});
         let (free, wait) = ledger.reserve(0, None, |_| panic!("must not park"));
         assert_eq!(wait, MemWait::No);
@@ -8363,7 +8471,7 @@ RUN ship
         // Same unfittable host, but the build is already cancelled: the stage is let through
         // to fail at its own cancellation check instead of parking behind memory that a
         // build now tearing down will never free.
-        let ledger = MemLedger::new(Some(1));
+        let ledger = ledger();
         let (_first, _) = ledger.reserve(4096, None, |_| {});
         let cancel = CancellationToken::new();
         cancel.cancel();
@@ -8421,7 +8529,7 @@ RUN ship
         // moment a build's output is piped into something that stops reading. The queue
         // place has to come back regardless: a ticket stranded by that unwind would be a
         // head that never advances, and the build would hang instead of failing.
-        let ledger = Arc::new(MemLedger::new(Some(1)));
+        let ledger = Arc::new(ledger());
         let (held, _) = ledger.reserve(4096, None, |_| {});
         let l = Arc::clone(&ledger);
         let died = std::thread::spawn(move || {
@@ -8441,50 +8549,134 @@ RUN ship
     }
 
     #[test]
-    fn admitting_one_stage_wakes_the_next_in_the_queue() {
-        // Leaving the queue has to notify, not just releasing memory does. Otherwise the
-        // stage that becomes head sleeps out a whole `MEM_POLL` before it even looks —
-        // once per admission, on a host with nothing wrong with it.
-        let ledger = Arc::new(MemLedger::new(Some(1)));
+    fn a_release_while_the_head_measures_lets_it_in() {
+        // Release the last reservation during the head's first measurement, before it
+        // can receive the notification.
+        static WALK: Walk = Walk::new(1);
+        let ledger = Arc::new(MemLedger {
+            foreign_mib: || WALK.measure(),
+            ..ledger()
+        });
         let (first, _) = ledger.reserve(4096, None, |_| {});
-        let queued = |n: usize| {
-            for _ in 0..2000 {
-                if ledger.state.lock().unwrap().waiting.len() == n {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            panic!("waited for {n} queued stage(s) and never saw them");
-        };
-        // The head: parks now, and is admitted as soon as `first` lets go.
-        let (head_tx, head_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let l = Arc::clone(&ledger);
         let head = std::thread::spawn(move || {
-            let (r, _) = l.reserve(4096, None, |_| {});
-            head_tx.send(Instant::now()).unwrap();
-            std::thread::sleep(Duration::from_millis(100)); // hold, so the next one parks
-            drop(r);
+            let (_r, wait) = l.reserve(4096, None, |_| {});
+            tx.send(wait).unwrap();
         });
-        queued(1);
-        // Behind it: cannot measure anything until the head leaves, so the moment it first
-        // reports a shortfall is the moment it learned its turn had come.
-        let (next_tx, next_rx) = std::sync::mpsc::channel();
+        WALK.started();
+        drop(first);
+        WALK.finish();
+        // Missing the release here would report a shortfall before retrying.
+        let wait = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("a release during the walk went unseen");
+        assert_eq!(
+            wait,
+            MemWait::No,
+            "let in on the walk, without ever parking"
+        );
+        head.join().unwrap();
+    }
+
+    #[test]
+    fn a_release_while_a_waiting_head_measures_again_lets_it_in() {
+        // After reporting a shortfall, the head would park for a full poll if it missed
+        // the release during its next measurement.
+        static WALK: Walk = Walk::new(2);
+        let ledger = Arc::new(MemLedger {
+            foreign_mib: || WALK.measure(),
+            ..ledger()
+        });
+        let (first, _) = ledger.reserve(4096, None, |_| {});
+        let (tx, rx) = std::sync::mpsc::channel();
+        let l = Arc::clone(&ledger);
+        let head = std::thread::spawn(move || {
+            let (_r, wait) = l.reserve(4096, None, |_| {});
+            tx.send(wait).unwrap();
+        });
+        WALK.started();
+        drop(first);
+        WALK.finish();
+        let wait = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("a release during the walk went unseen");
+        assert_eq!(wait, MemWait::Admitted);
+        head.join().unwrap();
+    }
+
+    #[test]
+    fn a_build_cancelled_while_the_head_measures_is_not_announced() {
+        // Cancel and release the last reservation during the same measurement. The stage
+        // must reach its cancellation check without announcing a start.
+        static WALK: Walk = Walk::new(2);
+        let ledger = Arc::new(MemLedger {
+            foreign_mib: || WALK.measure(),
+            ..ledger()
+        });
+        let (first, _) = ledger.reserve(4096, None, |_| {});
+        let cancel = CancellationToken::new();
+        let l = Arc::clone(&ledger);
+        let c = cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let head = std::thread::spawn(move || {
+            let (_r, wait) = l.reserve(4096, Some(&c), |_| {});
+            tx.send(wait).unwrap();
+        });
+        WALK.started();
+        cancel.cancel();
+        drop(first);
+        WALK.finish();
+        let wait = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the cancelled head never left the queue");
+        assert_eq!(wait, MemWait::Abandoned);
+        head.join().unwrap();
+    }
+
+    #[test]
+    fn admitting_one_stage_wakes_the_next_in_the_queue() {
+        // Admission must wake the next head. Both reservations stay held and the poll
+        // outlasts the test, so only that notification or a spurious wakeup can wake it.
+        static WALK: Walk = Walk::new(1);
+        // Room for two stages: the head is admitted beside `first`, and the stage behind it
+        // then finds no room left.
+        let ledger = Arc::new(MemLedger {
+            total_mib: Some(8192),
+            reserve_mib: 0,
+            foreign_mib: || WALK.measure(),
+            ..ledger()
+        });
+        let (first, _) = ledger.reserve(4096, None, |_| {});
+        // Keep the head's reservation until the next waiter reports a shortfall.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let l = Arc::clone(&ledger);
+        let head = std::thread::spawn(move || {
+            let (_r, wait) = l.reserve(4096, None, |_| {});
+            release_rx.recv().unwrap();
+            wait
+        });
+        WALK.started();
+        // Only the queue head measures, so a shortfall proves the handoff occurred.
+        let (noticed_tx, noticed_rx) = std::sync::mpsc::channel();
         let l = Arc::clone(&ledger);
         let next = std::thread::spawn(move || {
-            let (_r, _) = l.reserve(4096, None, |_| next_tx.send(Instant::now()).unwrap());
+            let (_r, wait) = l.reserve(4096, None, |short| noticed_tx.send(short).unwrap());
+            wait
         });
-        queued(2);
-        drop(first);
-        let (admitted_at, noticed_at) = (head_rx.recv().unwrap(), next_rx.recv().unwrap());
-        head.join().unwrap();
-        next.join().unwrap();
-        // Generously under the poll interval: the handoff is a condvar wake and a `/proc`
-        // walk, microseconds of work. Without the notify it is the full `MEM_POLL`.
+        parked(&ledger, 1);
+        WALK.finish();
+        let short = noticed_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the new head was never woken to notice its turn");
         assert!(
-            noticed_at.duration_since(admitted_at) < MEM_POLL / 2,
-            "the new head waited {:?} to notice its turn",
-            noticed_at.duration_since(admitted_at),
+            short > 0,
+            "it found the head still holding what it was given"
         );
+        release_tx.send(()).unwrap();
+        assert_eq!(head.join().unwrap(), MemWait::No);
+        assert_eq!(next.join().unwrap(), MemWait::Admitted);
+        drop(first);
     }
 
     #[test]

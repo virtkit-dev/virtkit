@@ -110,6 +110,8 @@ All notable changes to virtkit will be documented in this file.
   active queue limits for capacity requests.
 - `vk-gitlab` no longer waits 30 seconds for a request queued just as the hub connection
   stops accepting requests.
+- A parallel `vk build` no longer waits up to two extra seconds to start the next stage
+  when the last running stage finishes during a memory check.
 
 ## [0.114.0] - 2026-11-20
 
