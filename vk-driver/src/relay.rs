@@ -203,6 +203,8 @@ struct Relay<'a> {
     deadline: Instant,
     /// the agent's output not yet split into lines
     from_guest: Vec<u8>,
+    /// Discard the rest of an oversized line through its newline or up to the sync marker.
+    discarding: bool,
 }
 
 impl<'a> Relay<'a> {
@@ -216,6 +218,7 @@ impl<'a> Relay<'a> {
             awaiting: Awaiting::Nothing,
             deadline: Instant::now(),
             from_guest: Vec::new(),
+            discarding: false,
         }
     }
 
@@ -345,15 +348,34 @@ impl<'a> Relay<'a> {
         Some((key, pending.drain(..=end).collect()))
     }
 
-    fn on_agent_output(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+    fn on_agent_output(&mut self, mut bytes: &[u8]) -> std::io::Result<()> {
+        if self.discarding {
+            // Consume the newline but keep 0xFF, which can start a sync reply immediately
+            // after a truncated answer.
+            let Some(end) = bytes.iter().position(|&b| b == b'\n' || b == 0xff) else {
+                return Ok(());
+            };
+            self.discarding = false;
+            bytes = &bytes[end + usize::from(bytes[end] == b'\n')..];
+        }
+        // The buffered prefix has no newline. Rescanning it on every read would be quadratic.
+        let mut scanned = self.from_guest.len();
         self.from_guest.extend_from_slice(bytes);
-        while let Some(end) = self.from_guest.iter().position(|&b| b == b'\n') {
+        while let Some(at) = self.from_guest[scanned..].iter().position(|&b| b == b'\n') {
+            let end = scanned + at;
+            scanned = 0;
+            if end > MAX_ANSWER {
+                self.from_guest.drain(..=end);
+                self.abandon()?;
+                continue;
+            }
             let line: Vec<u8> = self.from_guest.drain(..=end).collect();
             self.on_agent_line(&line);
         }
         if self.from_guest.len() > MAX_ANSWER {
-            // Its end will read as a line nobody waits for.
+            // Discard subsequent fragments without sending another sync.
             self.from_guest.clear();
+            self.discarding = true;
             self.abandon()?;
         }
         Ok(())
@@ -728,5 +750,72 @@ mod tests {
         assert_eq!(line(&port), request("c"));
         port.write_all(b"answer c\n").unwrap();
         assert_eq!(line(&client), b"answer c\n");
+    }
+
+    #[test]
+    fn an_answer_too_long_is_dropped_however_the_reads_split_it() {
+        const M: usize = MAX_ANSWER;
+        // Vary the first read so overflow occurs before or with the newline. Even a reply
+        // over twice the limit should trigger only one sync.
+        for (len, first) in [
+            (M + 1, M),
+            (M + 1, M + 1),
+            (2 * M + 2, M + 1),
+            (2 * M + 2, M + 2),
+        ] {
+            let (port, host) = UnixStream::pair().unwrap();
+            let mut relay = Relay::new(&host, REPLY_TIMEOUT);
+            relay.awaiting = Awaiting::Answer(None);
+            relay.on_agent_output(&vec![b'x'; first]).unwrap();
+            let rest = [vec![b'x'; len - first], b"\n".to_vec()].concat();
+            let sync = if first > M {
+                // The first read triggered the sync. Its reply arrives with the discarded tail.
+                let sync = relay_sync(&port);
+                let answer = [
+                    crate::qga::tests::STRAY_FF,
+                    &crate::qga::tests::synced(&sync),
+                ];
+                relay
+                    .on_agent_output(&[&rest[..], &answer.concat()].concat())
+                    .unwrap();
+                sync
+            } else {
+                relay.on_agent_output(&rest).unwrap();
+                let sync = relay_sync(&port);
+                relay.on_agent_output(crate::qga::tests::STRAY_FF).unwrap();
+                relay
+                    .on_agent_output(&crate::qga::tests::synced(&sync))
+                    .unwrap();
+                sync
+            };
+            assert!(
+                relay.awaiting == Awaiting::Nothing,
+                "{len} bytes, {first} first: the answer to sync {sync} did not free the relay"
+            );
+            assert!(relay.from_guest.is_empty(), "{len} bytes, {first} first");
+            // A second sync would leave another request on the port.
+            port.set_nonblocking(true).unwrap();
+            let e = (&port).read(&mut [0u8; 1]).unwrap_err();
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock,
+                "{len} bytes, {first} first"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sync_answer_right_after_an_answer_too_long_frees_the_relay() {
+        let (port, host) = UnixStream::pair().unwrap();
+        let mut relay = Relay::new(&host, REPLY_TIMEOUT);
+        relay.awaiting = Awaiting::Answer(None);
+        relay.on_agent_output(&vec![b'x'; MAX_ANSWER + 1]).unwrap();
+        let sync = relay_sync(&port);
+        // No newline separates the oversized answer from the sync reply.
+        relay
+            .on_agent_output(&[&b"xx"[..], &crate::qga::tests::synced(&sync)].concat())
+            .unwrap();
+        assert!(relay.awaiting == Awaiting::Nothing);
+        assert!(relay.from_guest.is_empty());
     }
 }
