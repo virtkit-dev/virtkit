@@ -1,7 +1,7 @@
 use crate::addr::SocketAddr;
 use crate::framing::{DeSink, SerStream};
 use crate::messages::{self, CmdExec, CmdResult, Message, RunMode, Status};
-use crate::net::{listen, raw_connect_any};
+use crate::net::{Listeners, listen, raw_connect_any};
 use crate::pty;
 use crate::status::get_status;
 use anyhow::anyhow;
@@ -161,9 +161,36 @@ pub async fn run_server_routed(
     vk_route: Option<VkRoute>,
     limits: Limits,
 ) -> Result<(), anyhow::Error> {
-    // Zero means no watchdog at all. Normalizing it away here keeps the rest of the function
-    // from reading it as a timeout that has always already elapsed, and hands a zero-timeout
-    // caller the fallback watchdog below like any other caller that asked for no timeout.
+    let listener = listen(socket)?;
+    serve_routed(
+        listener,
+        socket,
+        inactivity_timeout,
+        exec_wrapper,
+        exec_wrapper_env,
+        exec_wrapper_args,
+        vk_route,
+        limits,
+    )
+    .await
+}
+
+/// Serves the routed exec channel on the listeners returned by [`listen`] for `socket`.
+/// Binding before spawning the server reports bind errors to the caller and lets clients
+/// connect immediately. See [`run_server_routed`] for routing and limits.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_routed(
+    listener: Listeners,
+    socket: &SocketAddr,
+    inactivity_timeout: Option<Duration>,
+    exec_wrapper: Option<PathBuf>,
+    exec_wrapper_env: Vec<String>,
+    exec_wrapper_args: Vec<String>,
+    vk_route: Option<VkRoute>,
+    limits: Limits,
+) -> Result<(), anyhow::Error> {
+    // Zero disables inactivity expiry. Like `None`, it enables the fallback watchdog on a
+    // plain Unix socket.
     let inactivity_timeout = inactivity_timeout.filter(|timeout| !timeout.is_zero());
     let status = Status::default();
     // Force every exec through this program (like SSH's ForceCommand): it receives
@@ -178,8 +205,6 @@ pub async fn run_server_routed(
     let allow_background = limits.background;
     let first_message_timeout = limits.first_message_timeout;
     let limit = limits.max_concurrent.map(|n| Limit::new(n, "requests"));
-
-    let listener = listen(socket)?;
     if let Some(listening) = ON_LISTENING.lock().unwrap().take() {
         listening();
     }
@@ -299,15 +324,17 @@ struct Limit {
 }
 
 impl Limit {
+    /// Clamp the permit count to avoid a panic after binding. Keep the configured limit
+    /// for refusal messages.
     fn new(max: NonZeroUsize, what: &'static str) -> Self {
         Limit {
             max: max.get(),
-            permits: Arc::new(Semaphore::new(max.get())),
+            permits: Arc::new(Semaphore::new(max.get().min(Semaphore::MAX_PERMITS))),
             what,
         }
     }
 
-    /// A permit to run one request, held until it ends; `None` when `max` already run.
+    /// A permit held until the request ends, or `None` when all permits are in use.
     fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
         Arc::clone(&self.permits).try_acquire_owned().ok()
     }
@@ -1585,6 +1612,63 @@ mod tests {
     use crate::messages::{CmdExec, RunMode};
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn limit_beyond_semaphore_capacity_builds() {
+        let limit = super::Limit::new(std::num::NonZeroUsize::MAX, "requests");
+        assert!(limit.try_acquire().is_some());
+    }
+
+    /// The process-wide [`super::on_listening`] callback is safe to use here because no
+    /// other test in this unit-test binary starts the exec server.
+    #[tokio::test]
+    async fn serving_a_bound_listener_reports_listening() {
+        use std::os::unix::ffi::OsStringExt as _;
+        struct Dir(std::path::PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0); // best effort, from a test
+            }
+        }
+        // Isolate the socket from concurrent test runs.
+        let mut template = std::env::temp_dir()
+            .join("vk-core-listening-XXXXXX")
+            .into_os_string()
+            .into_vec();
+        template.push(0);
+        // SAFETY: `template` is a NUL-terminated buffer mkdtemp rewrites in place.
+        let made = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+        assert!(
+            !made.is_null(),
+            "mkdtemp: {}",
+            std::io::Error::last_os_error()
+        );
+        template.pop();
+        let dir = Dir(std::ffi::OsString::from_vec(template).into());
+        let addr = crate::addr::SocketAddr::Unix(dir.0.join("exec.socket"));
+        let (listening_tx, listening) = tokio::sync::oneshot::channel();
+        super::on_listening(move || listening_tx.send(()).unwrap());
+        let listener = crate::net::listen(&addr).unwrap();
+        let server = tokio::spawn(async move {
+            // Disable the watchdog's socket probes during the test.
+            super::serve_routed(
+                listener,
+                &addr,
+                Some(Duration::from_secs(60)),
+                None,
+                vec![],
+                vec![],
+                None,
+                super::Limits::default(),
+            )
+            .await
+        });
+        let notified = tokio::time::timeout(Duration::from_secs(10), listening).await;
+        server.abort();
+        notified
+            .expect("serve_routed never reported listening")
+            .unwrap();
+    }
 
     #[test]
     fn split_user_group_forms() {
