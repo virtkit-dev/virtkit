@@ -28,11 +28,17 @@
 //! [`entry_in`] exposes the fourth to callers walking a path, links included: it says whether
 //! an entry could have been put there, or swapped since, by another user.
 //!
+//! [`LockFile`] releases its flock on drop even if a forked child still has the file open.
+//!
 //! [`chown_tree`] keeps the third when root transfers a tree to a user who may already write
 //! in it. Entries are opened from their parent's descriptor and changed through their own,
 //! so name swaps cannot redirect the changes. [`remove_tree_in`] removes a tree the same way,
 //! the very directory its caller opened, a link always as itself, nothing past a mount and
 //! nothing another user owns.
+
+mod lockfile;
+
+pub use lockfile::LockFile;
 
 use anyhow::{Context, anyhow, bail};
 use std::ffi::{CString, OsStr};
