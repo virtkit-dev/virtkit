@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -29,6 +29,8 @@ pub struct Recorded {
     pub query: String,
     pub headers: hyper::HeaderMap,
     pub body: Bytes,
+    /// When the fake starts handling the request, before it reads the body.
+    pub at: Instant,
 }
 
 impl Recorded {
@@ -196,6 +198,7 @@ impl FakeGitLab {
                         let handler = Arc::clone(&handler);
                         let recs = Arc::clone(&recs);
                         async move {
+                            let at = Instant::now();
                             let (parts, body) = req.into_parts();
                             let body = body
                                 .collect()
@@ -208,6 +211,7 @@ impl FakeGitLab {
                                 query: parts.uri.query().unwrap_or("").to_owned(),
                                 headers: parts.headers,
                                 body,
+                                at,
                             };
                             recs.lock().unwrap().push(rec.clone());
                             let reply = handler(&rec);

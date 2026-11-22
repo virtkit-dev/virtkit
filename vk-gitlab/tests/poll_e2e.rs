@@ -593,32 +593,34 @@ async fn an_unhealthy_runner_backs_off(via: Via) {
     assert!(hub.reservations().is_empty());
 }
 
-/// How long after the first job request the second one started.
-async fn second_request_gap(via: Via, strict: bool) -> Duration {
-    let extra = if strict {
-        "strict_check_interval = true\n"
-    } else {
-        ""
-    };
-    let h = Harness::start_with(5, via, runner_toml("r1", TOKEN, extra)).await;
+/// Measures from just before daemon startup to the second job request at the fake GitLab.
+/// One request loop serves two waiting jobs with `extra` in the runner's configuration.
+async fn second_request_after(via: Via, extra: &str) -> Duration {
+    let mut h = Harness::unstarted(5, via).await;
+    h.runners = runner_toml("r1", TOKEN, extra);
+    // Make jobs and capacity available before the first poll.
     h.gl.push_job(job_json(25));
     h.gl.push_job(job_json(26));
     h.hub.set_slots("r1", 5);
-    eventually("the first request", || h.job_requests() >= 1).await;
-    let first = Instant::now();
+    // Start the clock before the runner can claim its first polling turn.
+    let started = Instant::now();
+    h.daemon = h.spawn_daemon();
     eventually("the second request", || h.job_requests() >= 2).await;
-    let gap = first.elapsed();
+    let at = h.fake.requests_to("/api/v4/jobs/request")[1]
+        .at
+        .duration_since(started);
     let mut daemon = h.daemon;
     daemon.stop_handle().abort();
     daemon.join().await;
-    gap
+    at
 }
 
 async fn strict_check_interval_paces_requests_after_a_job(via: Via) {
-    let gap = second_request_gap(via, true).await;
-    assert!(gap >= Duration::from_millis(700), "{gap:?}");
-    let gap = second_request_gap(via, false).await;
-    assert!(gap < Duration::from_millis(700), "{gap:?}");
+    // Strict polling keeps the check interval after a job, as after an empty response.
+    let at = second_request_after(via, "check_interval = 2\nstrict_check_interval = true\n").await;
+    assert!(at >= Duration::from_secs(2), "{at:?}");
+    // A non-strict runner polls again after a job. Its next scheduled turn is an hour away.
+    second_request_after(via, "check_interval = 3600\n").await;
 }
 
 async fn output_the_hub_lost_fails_the_job(via: Via) {
