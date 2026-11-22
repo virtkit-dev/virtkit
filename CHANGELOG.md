@@ -108,6 +108,8 @@ All notable changes to virtkit will be documented in this file.
   the hub hands over.
 - Released grants and grants past their claim deadline no longer count toward the hub's
   active queue limits for capacity requests.
+- `vk-gitlab` no longer waits 30 seconds for a request queued just as the hub connection
+  stops accepting requests.
 
 ## [0.114.0] - 2026-11-20
 

@@ -3,7 +3,7 @@
 
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -115,11 +115,89 @@ impl std::error::Error for Outdated {}
 pub struct RelayConnection<B> {
     pub ws: Ws,
     /// Requests on the connection, served as the relay's once its session's handshake passed.
-    pub sender: http2::SendRequest<B>,
+    pub sender: Requests<B>,
     /// The TLS keying material the session's auth is bound to; `None` on plain TCP.
     pub exported: Option<[u8; TLS_EXPORTER_LEN]>,
     /// The `host:port` it reached, which a request's URI names.
     pub authority: String,
+}
+
+/// Sends relay requests over a hub connection driven by a separate task.
+///
+/// `gate` serializes enqueueing with dispatcher teardown. Otherwise a request queued during
+/// the final drain can remain unanswered while a sender clone lives. Teardown fails queued
+/// requests. h2 still delivers responses or errors for requests already dispatched.
+pub struct Requests<B> {
+    sender: http2::SendRequest<B>,
+    gate: Arc<Mutex<()>>,
+}
+
+impl<B> Clone for Requests<B> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            gate: Arc::clone(&self.gate),
+        }
+    }
+}
+
+impl<B> Requests<B>
+where
+    B: hyper::body::Body + 'static,
+{
+    /// Drives `conn` on a background task and returns its request sender.
+    pub fn spawn<C>(sender: http2::SendRequest<B>, conn: C) -> Self
+    where
+        C: Future<Output = hyper::Result<()>> + Unpin + Send + 'static,
+    {
+        let gate = Arc::new(Mutex::new(()));
+        let mut driven = Driven {
+            conn: Some(conn),
+            gate: Arc::clone(&gate),
+        };
+        tokio::spawn(async move {
+            if let Some(conn) = driven.conn.as_mut()
+                && let Err(e) = conn.await
+            {
+                log::debug!("The connection to the hub ended: {e}");
+            }
+        });
+        Self { sender, gate }
+    }
+
+    /// Send `req` on the connection.
+    pub fn send_request(
+        &self,
+        req: hyper::Request<B>,
+    ) -> impl Future<Output = hyper::Result<hyper::Response<hyper::body::Incoming>>> + use<B> {
+        // hyper queues the request during this call. Waiting for its response needs no lock.
+        let _queueing = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.sender.clone().send_request(req)
+    }
+
+    /// Whether the connection takes no more requests.
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+}
+
+/// Drops the dispatcher under the [`Requests`] gate even if its task is cancelled.
+struct Driven<C> {
+    conn: Option<C>,
+    gate: Arc<Mutex<()>>,
+}
+
+impl<C> Drop for Driven<C> {
+    fn drop(&mut self) {
+        let _dropping = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(self.conn.take());
+    }
 }
 
 /// Dial the hub as a relay: TLS offering [`vk_hub_proto::gitlab::ALPN`] (or HTTP/2 with prior
@@ -185,11 +263,7 @@ where
         ))));
     }
     let resp = answered.map_err(|e| anyhow!("opening the session with {hub}: {e}"))?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            log::debug!("The connection to the hub ended: {e}");
-        }
-    });
+    let sender = Requests::spawn(sender, conn);
     match resp.status() {
         hyper::StatusCode::OK => {}
         // The hub's bound on handshakes in flight: transient by design.

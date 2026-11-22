@@ -44,6 +44,7 @@ use vk_hub_proto::client::{
 use vk_hub_proto::dispatch::MAX_LEASE_SECS;
 use vk_hub_proto::job::MAX_JOB_SPEC;
 use vk_hub_proto::valid_id;
+use vk_peer::session::Requests;
 
 use crate::backoff::Backoff;
 use crate::dispatch::{
@@ -112,7 +113,7 @@ struct LinkState {
 /// A session's connection.
 #[derive(Clone)]
 struct Conn {
-    sender: http2::SendRequest<Full<Bytes>>,
+    sender: Requests<Full<Bytes>>,
     /// `scheme://host:port`, which a request's URI starts with.
     base: String,
 }
@@ -186,7 +187,7 @@ impl Link {
     /// A session is up on the connection `sender` sends on, reached at `base`
     /// (`scheme://host:port`): requests go on it until the [`Up`] is dropped. A new session
     /// tells every waiter to fetch, as a notice about everything would.
-    pub fn up(&self, sender: http2::SendRequest<Full<Bytes>>, base: String) -> Up<'_> {
+    pub fn up(&self, sender: Requests<Full<Bytes>>, base: String) -> Up<'_> {
         let session = self.modify(|s| {
             s.sessions = s.sessions.wrapping_add(1);
             s.conn = Some(Conn { sender, base });
@@ -447,7 +448,6 @@ impl HubClient {
             let sent = Instant::now();
             let resp = conn
                 .sender
-                .clone()
                 .send_request(request)
                 .await
                 .map_err(|e| transport("sending the request", &e))?;
@@ -1093,6 +1093,137 @@ mod queue_tests {
         };
         assert_eq!(grant.admission.as_deref(), Some("c".repeat(32).as_str()));
         assert_eq!(grant.lease, Duration::from_secs(7));
+    }
+
+    /// Serves HTTP/2 on `accepted` and drains active streams on `shutdown`.
+    fn serve<S>(
+        accepted: tokio::net::TcpStream,
+        service: S,
+        max_streams: u32,
+        shutdown: tokio::sync::oneshot::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        S: hyper::service::Service<
+                hyper::Request<hyper::body::Incoming>,
+                Response = hyper::Response<Full<Bytes>>,
+                Error = std::convert::Infallible,
+            > + Send
+            + 'static,
+        S::Future: Send + 'static,
+    {
+        tokio::spawn(async move {
+            let hub = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .max_concurrent_streams(max_streams)
+                .serve_connection(hyper_util::rt::TokioIo::new(accepted), service);
+            tokio::pin!(hub);
+            tokio::select! {
+                _ = hub.as_mut() => return,
+                _ = shutdown => {}
+            }
+            hub.as_mut().graceful_shutdown();
+            // Tests assert the client-side result.
+            let _ = hub.await;
+        })
+    }
+
+    /// Abrupt disconnect must produce a transport error before the request timeout.
+    #[tokio::test]
+    async fn a_request_fails_once_its_connection_ends_unanswered() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tcp, accepted) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        // A hub that takes the request and never answers it.
+        let (taken_tx, mut taken) = tokio::sync::mpsc::unbounded_channel();
+        let service = hyper::service::service_fn(move |_| {
+            taken_tx.send(()).unwrap();
+            std::future::pending::<Result<hyper::Response<Full<Bytes>>, std::convert::Infallible>>()
+        });
+        let (_shut_down, shutdown) = tokio::sync::oneshot::channel();
+        let hub = serve(accepted.unwrap().0, service, 100, shutdown);
+        let (sender, conn) = http2_builder()
+            .handshake::<_, Full<Bytes>>(hyper_util::rt::TokioIo::new(tcp.unwrap()))
+            .await
+            .unwrap();
+        let link = Link::new();
+        let _up = link.up(Requests::spawn(sender, conn), format!("http://{addr}"));
+        let client = HubClient::new(link.clone(), HubRetry::default());
+        let body = Bytes::new();
+        let send = client.send(&Method::GET, "/v1/capacity", &body, None);
+        // Abort after the service receives the request.
+        let hang_up = async {
+            taken.recv().await.unwrap();
+            hub.abort();
+        };
+        let (sent, ()) = tokio::join!(send, hang_up);
+        let Err(e) = sent else {
+            panic!("answered by a hub that never answers")
+        };
+        assert_eq!(e.kind, ErrorKind::Transport);
+        assert!(!e.to_string().contains("did not answer within"), "{e}");
+    }
+
+    /// An accepted stream can finish after graceful shutdown stops the dispatcher.
+    #[tokio::test]
+    async fn a_request_taken_is_answered_through_a_graceful_shutdown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tcp, accepted) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        // A hub that answers `/held` once released, and the rest at once, one at a time.
+        let (taken_tx, mut taken) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let releasing = Arc::clone(&release);
+        let service = hyper::service::service_fn(move |req| {
+            let held = req.uri().path() == "/held";
+            let taken_tx = taken_tx.clone();
+            let releasing = Arc::clone(&releasing);
+            async move {
+                if held {
+                    taken_tx.send(()).unwrap();
+                    releasing.notified().await;
+                }
+                Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(Bytes::new())))
+            }
+        });
+        let (shut_down, shutdown) = tokio::sync::oneshot::channel();
+        serve(accepted.unwrap().0, service, 1, shutdown);
+        let (sender, conn) = http2_builder()
+            .handshake::<_, Full<Bytes>>(hyper_util::rt::TokioIo::new(tcp.unwrap()))
+            .await
+            .unwrap();
+        // Signal when hyper's connection future completes.
+        let (stopped_tx, stopped) = tokio::sync::oneshot::channel();
+        let conn = Box::pin(async move {
+            let out = conn.await;
+            stopped_tx.send(()).unwrap();
+            out
+        });
+        let link = Link::new();
+        let _up = link.up(Requests::spawn(sender, conn), format!("http://{addr}"));
+        let client = HubClient::new(link.clone(), HubRetry::default());
+        let body = Bytes::new();
+        // The first response confirms the relay has read the one-stream limit in SETTINGS.
+        let now = client
+            .send(&Method::GET, "/now", &body, None)
+            .await
+            .unwrap();
+        assert_eq!(now.status, StatusCode::OK);
+        let held = client.send(&Method::GET, "/held", &body, None);
+        let drain = async {
+            taken.recv().await.unwrap();
+            // `/held` occupies the only stream. `/after` wakes the dispatcher so it observes
+            // GOAWAY whether the request was queued before or after shutdown began.
+            let after = client.send(&Method::GET, "/after", &body, None);
+            shut_down.send(()).unwrap();
+            let (after, stopped) = tokio::join!(after, stopped);
+            stopped.unwrap();
+            let Err(e) = after else {
+                panic!("answered on a connection the hub shut down")
+            };
+            assert_eq!(e.kind, ErrorKind::Transport);
+            release.notify_one();
+        };
+        let (held, ()) = tokio::join!(held, drain);
+        assert_eq!(held.unwrap().status, StatusCode::OK);
     }
 
     #[test]
