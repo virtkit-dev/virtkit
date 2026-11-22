@@ -354,10 +354,23 @@ pub(crate) fn reboot(dir: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// A project dir of this test's own.
+    fn project() -> crate::testtmp::Scratch {
+        crate::testtmp::Scratch::dir(format!(
+            "vk-winsvc-{}-{}",
+            std::process::id(),
+            crate::scratch::random_nonce().unwrap()
+        ))
+    }
+
     /// The provisioning of the service `dc` that `compose` declares over a bundle whose image's
     /// `CMD` is `cmd /c image.cmd`.
     fn provisioning_of(compose: &str) -> Result<Provisioning> {
-        let base = std::env::temp_dir().join(format!("vk-winsvc-{}", std::process::id()));
+        provisioning_in(&project(), compose)
+    }
+
+    /// [`provisioning_of`], for the project in `base`.
+    fn provisioning_in(base: &Path, compose: &str) -> Result<Provisioning> {
         let bundle = base.join(format!("win-{}", crate::scratch::random_nonce().unwrap()));
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::write(bundle.join(crate::uefi::MANIFEST), "{}").unwrap();
@@ -374,7 +387,7 @@ mod tests {
             "services:\n  dc:\n    image: ./{}\n{compose}",
             bundle.file_name().unwrap().to_str().unwrap()
         );
-        let parsed = crate::compose::parse(&yaml, &base, &|_| None, None);
+        let parsed = crate::compose::parse(&yaml, base, &|_| None, None);
         let provisioning = parsed.and_then(|units| {
             let unit = &units[0];
             let svc = crate::units::provisioned(
@@ -460,11 +473,13 @@ mod tests {
 
     #[test]
     fn a_secret_reaches_the_provisioning_of_a_windows_service() {
-        let base = std::env::temp_dir().join(format!("vk-winsvc-{}", std::process::id()));
-        std::fs::create_dir_all(&base).unwrap();
+        let base = project();
         std::fs::write(base.join("pw.txt"), "s3cret").unwrap();
-        let p =
-            provisioning_of("    secrets: [pw]\nsecrets:\n  pw:\n    file: ./pw.txt\n").unwrap();
+        let p = provisioning_in(
+            &base,
+            "    secrets: [pw]\nsecrets:\n  pw:\n    file: ./pw.txt\n",
+        )
+        .unwrap();
         assert_eq!(
             p.secrets,
             [crate::compose::Secret {
@@ -481,11 +496,10 @@ mod tests {
     ) -> (Result<()>, Vec<String>, Vec<String>) {
         use crate::qga::tests::{client, synced};
         use std::sync::{Arc, Mutex};
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::testtmp::Scratch::dir(format!(
             "vk-winsvc-put-{}",
             crate::scratch::random_nonce().unwrap()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("pw.txt"), "s3cret").unwrap();
         let runs = Arc::new(Mutex::new(Vec::new()));
         let opened = Arc::new(Mutex::new(Vec::new()));
@@ -524,7 +538,7 @@ mod tests {
         });
         let p = Provisioning {
             name: "dc".into(),
-            dir: dir.clone(),
+            dir: dir.to_path_buf(),
             command: None,
             workdir: None,
             env: Vec::new(),
@@ -537,7 +551,7 @@ mod tests {
             tap_hosts: Vec::new(),
         };
         let result = p.put_secrets(&mut ga);
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
         let runs = runs.lock().unwrap().clone();
         let opened = opened.lock().unwrap().clone();
         (result, runs, opened)
@@ -575,7 +589,7 @@ mod tests {
 
     #[test]
     fn a_new_start_drops_the_last_machines_variable_store_and_ids() {
-        let base = std::env::temp_dir().join(format!(
+        let base = crate::testtmp::Scratch::path(format!(
             "vk-winsvc-new-{}",
             crate::scratch::random_nonce().unwrap()
         ));
@@ -601,6 +615,5 @@ mod tests {
         assert!(!dir.join(crate::uefi::UEFI_VARS).exists());
         assert!(!dir.join(crate::uefi::GENERATION_ID).exists());
         assert!(!dir.join(crate::uefi::SYSTEM_UUID).exists());
-        let _ = std::fs::remove_dir_all(base);
     }
 }

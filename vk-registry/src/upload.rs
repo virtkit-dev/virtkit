@@ -657,7 +657,7 @@ mod tests {
     use std::time::Duration;
 
     fn memdb() -> Db {
-        let dir = std::env::temp_dir().join(format!("vk-upload-test-{}", std::process::id()));
+        let dir = crate::testtmp::root().join("upload-test");
         let _ = std::fs::remove_dir_all(&dir);
         Db::open(&dir.join("registry.db")).unwrap()
     }

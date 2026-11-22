@@ -738,7 +738,7 @@ mod tests {
     use super::*;
 
     fn tmpdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("vk-numa-{name}-{}", std::process::id()));
+        let dir = crate::testtmp::root().join(format!("numa-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

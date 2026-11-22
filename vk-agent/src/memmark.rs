@@ -447,10 +447,9 @@ mod tests {
         assert_eq!(reported(&path), Some((u64::MAX, 4096)));
     }
 
-    /// Return a per-test, per-process path, removing leftovers from a recycled PID.
+    /// Clear the test's named file in the process scratch directory.
     fn tempfile(name: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("vk-agent-memmark-{name}-{}", std::process::id()));
+        let path = crate::testtmp::root().join(format!("memmark-{name}"));
         let _ = std::fs::remove_file(&path);
         path
     }

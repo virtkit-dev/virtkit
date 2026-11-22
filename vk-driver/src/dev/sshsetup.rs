@@ -242,14 +242,10 @@ mod tests {
     }
 
     /// A fresh scratch directory unique across this binary's parallel tests.
-    fn tmp(tag: &str) -> PathBuf {
+    fn tmp(tag: &str) -> crate::testtmp::Scratch {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("vk-sshsetup-{tag}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testtmp::Scratch::dir(format!("vk-sshsetup-{tag}-{}-{n}", std::process::id()))
     }
 
     #[test]
@@ -390,7 +386,7 @@ mod tests {
     #[test]
     fn resolve_empty_union_forwards_the_whole_agent_with_a_config() {
         let home = tmp("whole-home");
-        let scratch = tmp("whole-scratch").join("allow");
+        let scratch = home.join("allow");
         // A present but empty [dev.ssh]: no tokens ⇒ whole agent (None), config still injected.
         let (allow, cfg, warnings) = resolve(&Ssh::default(), &home, None, &scratch).unwrap();
         assert_eq!(allow, None);
@@ -406,7 +402,7 @@ mod tests {
     #[test]
     fn resolve_fails_closed_when_a_named_key_does_not_resolve() {
         let home = tmp("closed-home"); // no ~/.ssh, so a bare name finds no file
-        let scratch = tmp("closed-scratch").join("allow");
+        let scratch = home.join("allow");
         let ssh = Ssh {
             keys: vec!["ghost".into()],
             host: BTreeMap::new(),
@@ -421,7 +417,7 @@ mod tests {
     #[test]
     fn resolve_rejects_control_chars_reaching_the_guest_config() {
         let home = tmp("ctl-home");
-        let scratch = tmp("ctl-scratch").join("allow");
+        let scratch = home.join("allow");
         let with_host = |alias: &str, h: SshHost| {
             let mut ssh = Ssh::default();
             ssh.host.insert(alias.into(), h);

@@ -117,10 +117,9 @@ mod tests {
     use super::*;
     use crate::accounts::EmailUpdate;
 
-    /// A store of this test's own. Unit tests run as threads in one process, so the pid
-    /// alone does not separate two of them — the caller's tag does.
+    /// The caller's tag distinguishes stores under the process scratch directory.
     fn store_for(tag: &str) -> Db {
-        let dir = std::env::temp_dir().join(format!("vk-forms-test-{tag}-{}", std::process::id()));
+        let dir = crate::testtmp::root().join(format!("forms-test-{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         Db::open(&dir.join("registry.db")).unwrap()
     }

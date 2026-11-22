@@ -1418,7 +1418,7 @@ mod tests {
     /// be an error rather than a quiet fall back to shared-secret auth.
     #[test]
     fn the_auth_mode_is_parsed_and_every_wrong_way_to_write_it_is_an_error() {
-        let dir = std::env::temp_dir().join(format!("vk-regserve-mode-{}", std::process::id()));
+        let dir = crate::testtmp::root().join("regserve-mode");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let write = |name: &str, body: &str| {

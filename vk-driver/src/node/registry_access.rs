@@ -329,12 +329,8 @@ pub(crate) mod tests {
         Source::new(dir, issuer("n1"), origin.into(), None)
     }
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("vk-registry-access-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(tag: &str) -> crate::testtmp::Scratch {
+        crate::testtmp::Scratch::dir(format!("vk-registry-access-{tag}-{}", std::process::id()))
     }
 
     pub(crate) fn issuer(node_id: &str) -> Issuer {

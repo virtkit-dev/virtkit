@@ -4701,14 +4701,11 @@ mod tests {
         assert_eq!(anon.username, "");
     }
 
-    /// A private directory for one test, removed and recreated so a rerun starts clean.
-    /// Shared with the `exec` submodule's tests, so every temp dir the build tests take is
-    /// minted here: nothing else under `std::env::temp_dir()` takes the `vk-build-` prefix,
-    /// and the pid keeps a second suite on the same host off these paths. Keep `tag` unique
-    /// across both test modules — two tests sharing a tag pull each other's tree out
-    /// mid-run, as a hand-rolled pair once did.
+    /// A private directory under [`crate::testtmp::root`], cleaned up with it. This helper
+    /// owns the `build-` prefix. Keep tags unique across the build and `exec` tests so they
+    /// cannot remove each other's directories.
     pub(super) fn tmpdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("vk-build-{tag}-{}", std::process::id()));
+        let dir = crate::testtmp::root().join(format!("build-{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -6125,9 +6122,7 @@ mod tests {
     /// names, another origin or plain HTTP gets none of it.
     #[test]
     fn a_cache_on_the_hubs_registry_takes_the_nodes_access() {
-        let dir = std::env::temp_dir().join(format!("vk-cache-node-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tmpdir("cache-node");
         let access = crate::node::registry_access::tests::held(&dir, "vkt_node", u64::MAX);
         let ca = dir.join("ca.pem");
         let access = crate::node::registry_access::Source::new(
@@ -6164,7 +6159,6 @@ mod tests {
                 .node_access
                 .is_none()
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

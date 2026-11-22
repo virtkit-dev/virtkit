@@ -428,9 +428,7 @@ pub(super) fn use_test_cache() -> PathBuf {
     TEST_CACHE
         .lock()
         .unwrap()
-        .get_or_insert_with(|| {
-            std::env::temp_dir().join(format!("vk-add-cache-{}", std::process::id()))
-        })
+        .get_or_insert_with(|| crate::testtmp::root().join("add-cache"))
         .clone()
 }
 

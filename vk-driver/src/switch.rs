@@ -2197,6 +2197,8 @@ pub async fn run(
     record_limit: Option<u64>,
     // An `--egress-file` to follow, with the bytes `egress` was loaded from.
     egress_file: Option<(PathBuf, Vec<u8>)>,
+    // Signal when all listeners are bound. An early failure drops the sender.
+    bound: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     if listen.is_empty() {
         bail!("switch: at least one --listen is required");
@@ -2377,6 +2379,9 @@ pub async fn run(
                 }
             }
         }));
+    }
+    if let Some(bound) = bound {
+        let _ = bound.send(());
     }
     for a in accepts {
         let _ = a.await;
@@ -9416,12 +9421,26 @@ mod tests {
         buf
     }
 
-    /// Start a switch serving `listen` on 192.168.127.1/24 with egress open, and wait for its
-    /// sockets to appear.
+    /// Send a unicast ARP request from `mac` at `ip` to the gateway. Its reply on `s`
+    /// confirms the switch registered the port and learned its MAC.
+    async fn registered(s: &mut UnixStream, mac: Mac, ip: Ipv4Addr) {
+        let mut request = arp_request_for([192, 168, 127, 1], mac, ip.octets());
+        request[0..6].copy_from_slice(&GW_MAC);
+        send(s, &request).await;
+        let reply = tokio::time::timeout(Duration::from_secs(2), recv(s))
+            .await
+            .unwrap();
+        assert_eq!(&reply[0..6], &mac, "{reply:?}");
+        assert_eq!(&reply[12..14], &ETHERTYPE_ARP.to_be_bytes(), "{reply:?}");
+        assert_eq!(reply[21], 2, "an ARP reply: {reply:?}");
+    }
+
+    /// Start a switch on 192.168.127.1/24 with open egress. Wait for every socket in
+    /// `listen` to bind and propagate startup errors to the test.
     async fn spawn_switch(listen: Vec<(PathBuf, Ipv4Addr, VmId)>) {
-        let paths: Vec<PathBuf> = listen.iter().map(|(p, _, _)| p.clone()).collect();
-        tokio::spawn(async move {
-            let _ = run(
+        let (bound, bound_rx) = tokio::sync::oneshot::channel();
+        let switch = tokio::spawn(async move {
+            run(
                 &listen,
                 Ipv4Addr::new(192, 168, 127, 1),
                 24,
@@ -9441,14 +9460,12 @@ mod tests {
                 None,
                 None,
                 None,
+                Some(bound),
             )
-            .await;
+            .await
         });
-        for _ in 0..100 {
-            if paths.iter().all(|p| p.exists()) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        if bound_rx.await.is_err() {
+            panic!("the switch did not start: {:?}", switch.await);
         }
     }
 
@@ -9457,8 +9474,7 @@ mod tests {
     #[tokio::test]
     async fn forwards_between_vms() {
         use std::time::Duration;
-        let dir = std::env::temp_dir().join(format!("switchtest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testtmp::Scratch::dir(format!("switchtest-{}", std::process::id()));
         let (sa, sb) = (dir.join("a.sock"), dir.join("b.sock"));
         let (ip_a, ip_b) = (
             Ipv4Addr::new(192, 168, 127, 2),
@@ -9471,13 +9487,8 @@ mod tests {
         let mut b = UnixStream::connect(&sb).await.unwrap();
         let (mac_a, mac_b) = ([2, 0, 0, 0, 0, 0xaa], [2, 0, 0, 0, 0, 0xbb]);
 
-        // B sends first (from its own address) so the switch learns mac_b → B's port.
-        send(
-            &mut b,
-            &eth(mac_a, mac_b, ETHERTYPE_IPV4, &ipv4_payload(ip_b, b"")),
-        )
-        .await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Register B and teach the switch its MAC.
+        registered(&mut b, mac_b, ip_b).await;
 
         // Unicast A → B (from A's own address) is delivered to B.
         let unicast = eth(mac_b, mac_a, ETHERTYPE_IPV4, &ipv4_payload(ip_a, b"to-b"));
@@ -9501,7 +9512,7 @@ mod tests {
     /// dialling through `unixpath` reaches it.
     #[tokio::test]
     async fn serves_ports_bound_deeper_than_sun_path_holds() {
-        let root = std::env::temp_dir().join(format!("switchtest-deep-{}", std::process::id()));
+        let root = crate::testtmp::Scratch::path(format!("switchtest-deep-{}", std::process::id()));
         let env = root.join("e".repeat(90));
         let svc = env.join("svc-runner");
         std::fs::create_dir_all(&svc).unwrap();
@@ -9515,14 +9526,14 @@ mod tests {
         spawn_switch(listen).await;
         let mut a = vk_core::unixpath::connect_tokio(&sa).await.unwrap();
         let mut b = vk_core::unixpath::connect_tokio(&sb).await.unwrap();
-        let mac_a = [2, 0, 0, 0, 0, 0xaa];
+        let (mac_a, mac_b) = ([2, 0, 0, 0, 0, 0xaa], [2, 0, 0, 0, 0, 0xbb]);
+        registered(&mut b, mac_b, ip_b).await;
         let bcast = eth(BCAST_MAC, mac_a, 0x88b5, b"broadcast-payload");
         send(&mut a, &bcast).await;
         let got = tokio::time::timeout(Duration::from_secs(2), recv(&mut b))
             .await
             .unwrap();
         assert_eq!(got, bcast);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A VM may only source IPv4 from the address bound to its socket: a frame forging a
@@ -9532,8 +9543,7 @@ mod tests {
     #[tokio::test]
     async fn drops_source_spoofed_frames() {
         use std::time::Duration;
-        let dir = std::env::temp_dir().join(format!("switchspoof-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testtmp::Scratch::dir(format!("switchspoof-{}", std::process::id()));
         let (sa, sb) = (dir.join("a.sock"), dir.join("b.sock"));
         let (ip_a, ip_b) = (
             Ipv4Addr::new(192, 168, 127, 2),
@@ -9544,7 +9554,10 @@ mod tests {
         spawn_switch(listen).await;
         let mut a = UnixStream::connect(&sa).await.unwrap();
         let mut b = UnixStream::connect(&sb).await.unwrap();
-        let mac_b = [2, 0, 0, 0, 0, 0xbb];
+        let (mac_a, mac_b) = ([2, 0, 0, 0, 0, 0xaa], [2, 0, 0, 0, 0, 0xbb]);
+
+        // Establish that a flooded frame can reach A before testing the spoof.
+        registered(&mut a, mac_a, ip_a).await;
 
         // B broadcasts a frame forging A's source address: it is dropped before the flood,
         // so A receives nothing.
@@ -9582,8 +9595,7 @@ mod tests {
     #[tokio::test]
     async fn a_multi_nic_guest_may_source_any_of_its_own_addresses() {
         use std::time::Duration;
-        let dir = std::env::temp_dir().join(format!("switchmultinic-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testtmp::Scratch::dir(format!("switchmultinic-{}", std::process::id()));
         let (s0, s1, s_other) = (
             dir.join("eth0.sock"),
             dir.join("eth1.sock"),
@@ -9603,7 +9615,10 @@ mod tests {
         spawn_switch(listen).await;
         let mut eth0 = UnixStream::connect(&s0).await.unwrap();
         let mut other = UnixStream::connect(&s_other).await.unwrap();
-        let mac0 = [2, 0, 0, 0, 0, 0x01];
+        let (mac0, mac_other) = ([2, 0, 0, 0, 0, 0x01], [2, 0, 0, 0, 0, 0x03]);
+
+        // Register the observer before checking which frames the switch refuses.
+        registered(&mut other, mac_other, ip_other).await;
 
         // Cross-NIC traffic within one VM must be forwarded.
         let cross = eth(

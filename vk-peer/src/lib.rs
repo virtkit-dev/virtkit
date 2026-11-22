@@ -10,6 +10,8 @@ pub mod net;
 pub mod notify;
 pub mod release_key;
 pub mod session;
+#[cfg(test)]
+mod testtmp;
 pub mod token;
 pub mod trial;
 pub mod update;

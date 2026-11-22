@@ -5575,8 +5575,7 @@ mod tests {
     /// the test admit a replacement at the claim deadline and deliver a late renewal.
     #[tokio::test(start_paused = true)]
     async fn an_ended_grant_frees_its_place_before_the_next_pass() {
-        let dir =
-            std::env::temp_dir().join(format!("vk-hub-jobs-ended-grant-{}", std::process::id()));
+        let dir = crate::testtmp::root().join("jobs-ended-grant");
         let _ = std::fs::remove_dir_all(&dir);
         let hub = Hub::new(Arc::new(crate::store::Db::open_memory().unwrap()), None)
             .with_jobs(dir.clone(), DEFAULT_LOST_AFTER, None)

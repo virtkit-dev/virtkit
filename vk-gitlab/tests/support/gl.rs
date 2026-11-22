@@ -161,19 +161,54 @@ pub fn job_json(id: i64) -> serde_json::Value {
     })
 }
 
+/// The directory every [`temp_dir`] of this test process is in.
+static SCRATCH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Create a private directory with mkdtemp(3) on first use to avoid PID-reuse collisions.
+/// Clean it up on normal process exit, including after test failures.
+fn scratch() -> &'static Path {
+    extern "C" fn remove_scratch() {
+        use std::io::Write as _;
+        if let Some(dir) = SCRATCH.get()
+            && let Err(err) = std::fs::remove_dir_all(dir)
+        {
+            // Not eprintln!: a panic cannot unwind out of this callback.
+            let _ = writeln!(std::io::stderr(), "cannot remove {}: {err}", dir.display());
+        }
+    }
+    SCRATCH.get_or_init(|| {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+        let template = std::env::temp_dir().join("vk-gitlab-test-XXXXXX");
+        let mut template = std::ffi::CString::new(template.as_os_str().as_bytes())
+            .unwrap()
+            .into_bytes_with_nul();
+        // SAFETY: `template` is a NUL-terminated buffer mkdtemp rewrites in place.
+        let made = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+        assert!(
+            !made.is_null(),
+            "mkdtemp: {}",
+            std::io::Error::last_os_error()
+        );
+        template.pop();
+        let dir = PathBuf::from(std::ffi::OsString::from_vec(template));
+        // SAFETY: atexit(3) only records the function, which takes no arguments.
+        if unsafe { libc::atexit(remove_scratch) } != 0 {
+            let _ = std::fs::remove_dir(&dir); // just made, still empty
+            panic!("atexit: cannot register the removal of {}", dir.display());
+        }
+        dir
+    })
+}
+
+/// Create a private directory named for `what` and a process-local sequence number.
 pub fn temp_dir(what: &str) -> PathBuf {
-    let n: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    let dir = std::env::temp_dir().join(format!("vk-gitlab-{what}-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    // A state directory must be private.
-    std::fs::set_permissions(
-        &dir,
-        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
-    )
-    .unwrap();
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = scratch().join(format!("{what}-{n}"));
+    // A state directory must be private; failing if it exists, it is this call's alone.
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+        .create(&dir)
+        .unwrap();
     dir
 }
 

@@ -1171,7 +1171,7 @@ mod tests {
 
     /// A checkout root with two slot/project trees in it, one of them ours to reclaim.
     fn root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("vk-checkout-{name}-{}", std::process::id()));
+        let root = crate::testtmp::root().join(format!("checkout-{name}"));
         let _ = std::fs::remove_dir_all(&root);
         root
     }

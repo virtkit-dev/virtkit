@@ -894,8 +894,7 @@ mod tests {
 
     /// A fresh store `tag`, enrolled with a hub it never reaches.
     fn enrolled(tag: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("vk-registry-link-{tag}-{}", std::process::id()));
+        let root = crate::testtmp::root().join(format!("registry-link-{tag}"));
         let _ = std::fs::remove_dir_all(&root);
         let dir = dir(&root);
         vk_peer::net::create_dir(&dir).unwrap();

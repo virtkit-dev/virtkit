@@ -63,6 +63,8 @@ pub mod oidc;
 pub mod relay;
 pub(crate) mod staging;
 pub(crate) mod tags;
+#[cfg(test)]
+mod testtmp;
 pub(crate) mod upload;
 
 pub use client::{ClientAuth, FailInfo, Held, LockClient};

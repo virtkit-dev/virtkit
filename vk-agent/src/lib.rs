@@ -33,4 +33,6 @@ pub mod sftp;
 #[cfg(feature = "ssh")]
 pub mod ssh;
 pub mod taskstats;
+#[cfg(test)]
+mod testtmp;
 pub mod tools;

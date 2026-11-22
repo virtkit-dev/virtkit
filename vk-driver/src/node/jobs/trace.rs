@@ -330,11 +330,11 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
-    fn tmp(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("vk-trace-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("output")
+    /// A dir of the test's own, and the output file in it.
+    fn tmp(tag: &str) -> (crate::testtmp::Scratch, std::path::PathBuf) {
+        let dir = crate::testtmp::Scratch::dir(format!("vk-trace-{tag}-{}", std::process::id()));
+        let output = dir.join("output");
+        (dir, output)
     }
 
     /// `output` with each line's time replaced by `T`, checking it has the stamp's shape.
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn lines_are_coloured_and_masked_as_gitlab_runner_writes_them() {
-        let path = tmp("lines");
+        let (_dir, path) = tmp("lines");
         let trace = Trace::open(&path, &["hunter22".into()], &[], 1 << 20, true, false).unwrap();
         trace.warning("the password is hunter22");
         let mut out = trace.stream(stamp::STREAM_WORK, Kind::Stdout);
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn stamped_lines_name_their_stream_and_continue_section_markers() {
-        let path = tmp("stamped");
+        let (_dir, path) = tmp("stamped");
         let trace = Trace::open(&path, &["hunter22".into()], &[], 1 << 20, true, true).unwrap();
         trace.print("Running with vk");
         trace.section_start("step_script");
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn the_limit_counts_the_stamps_and_its_notice_is_not_stamped() {
-        let path = tmp("stamped-limit");
+        let (_dir, path) = tmp("stamped-limit");
         let trace = Trace::open(&path, &[], &[], 40, false, true).unwrap();
         let mut out = trace.stream(stamp::STREAM_WORK, Kind::Stdout);
         trace.write(&mut out, b"12345678\n");
@@ -439,7 +439,7 @@ mod tests {
 
     #[test]
     fn output_past_the_limit_is_cut_with_gitlab_runners_notice() {
-        let path = tmp("limit");
+        let (_dir, path) = tmp("limit");
         let trace = Trace::open(&path, &[], &[], 9, false, false).unwrap();
         let mut out = trace.stream(stamp::STREAM_WORK, Kind::Stdout);
         trace.write(&mut out, "12345678é9".as_bytes());
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn a_write_that_fills_the_limit_exactly_is_cut() {
-        let path = tmp("exact");
+        let (_dir, path) = tmp("exact");
         let trace = Trace::open(&path, &[], &[], 4, false, false).unwrap();
         let mut out = trace.stream(stamp::STREAM_WORK, Kind::Stdout);
         trace.write(&mut out, b"123");
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn a_reopened_output_continues_from_its_length() {
-        let path = tmp("reopen");
+        let (_dir, path) = tmp("reopen");
         std::fs::write(&path, b"earlier\n").unwrap();
         let trace = Trace::open(&path, &[], &[], 1 << 20, false, false).unwrap();
         assert_eq!(trace.len(), 8);
@@ -487,12 +487,12 @@ mod tests {
 
     #[test]
     fn sections_are_written_only_when_gitlab_folds_them() {
-        let path = tmp("sections");
+        let (_dir, path) = tmp("sections");
         let trace = Trace::open(&path, &[], &[], 1 << 20, false, true).unwrap();
         trace.section_start("step_script");
         trace.section_end("step_script");
         assert_eq!(std::fs::read(&path).unwrap(), b"");
-        let path = tmp("sections-on");
+        let (_dir, path) = tmp("sections-on");
         let trace = Trace::open(&path, &[], &[], 1 << 20, true, false).unwrap();
         trace.section_start("step_script");
         let out = std::fs::read_to_string(&path).unwrap();

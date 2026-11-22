@@ -102,6 +102,8 @@ mod switch;
 mod task;
 mod term;
 mod termclean;
+#[cfg(test)]
+mod testtmp;
 mod tidy;
 mod timing;
 mod toolchain;
@@ -5510,6 +5512,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             hub,
             *record_limit,
             followed,
+            None,
         )
         .await
         {

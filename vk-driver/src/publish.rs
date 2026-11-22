@@ -1097,7 +1097,7 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use vk_core::exec::server::run_server;
+    use vk_core::exec::server::serve_routed;
 
     /// A TCP echo server, standing in for a target reachable only from the guest's
     /// own network — the thing `vk publish` relays a local connection to.
@@ -1169,34 +1169,39 @@ mod tests {
         front_addr
     }
 
-    /// End to end through the accept loop `run` serves on: a local TCP client -> `serve_on`
-    /// -> a fake agent (a real `run_server`) -> an echo target on its "network". Proves
-    /// the accept/dial/relay glue this module adds on top of `client_run_connect` (which
-    /// `vk-core/tests/exec.rs` already covers directly) is wired correctly end to end.
-    #[tokio::test]
-    async fn relays_a_published_connection_to_the_target() {
-        let agent_path = std::env::temp_dir().join(format!(
-            "virtkit-publish-test-{}.socket",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&agent_path);
-        let agent_addr = SocketAddr::Unix(agent_path.clone());
-        let server_addr = agent_addr.clone();
+    /// Bind a fresh Unix socket before spawning `serve_routed` so clients can connect
+    /// immediately and bind errors fail the test here.
+    fn agent(name: String) -> (crate::testtmp::Scratch, SocketAddr) {
+        let path = crate::testtmp::Scratch::path(name);
+        let addr = SocketAddr::Unix(path.to_path_buf());
+        let listener = vk_core::net::listen(&addr).unwrap();
+        let server_addr = addr.clone();
         tokio::spawn(async move {
-            run_server(
+            serve_routed(
+                listener,
                 &server_addr,
                 Some(Duration::from_secs(60)),
                 None,
                 vec![],
                 vec![],
+                None,
                 vk_core::exec::server::Limits::default(),
             )
             .await
             .unwrap();
         });
-        while !agent_path.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        (path, addr)
+    }
+
+    /// Send a local TCP client through `run`'s `serve_on` accept loop and a real exec server
+    /// standing in for the agent to an echo target. This exercises the relay around
+    /// `client_run_connect`, tested directly in `vk-core/tests/exec.rs`.
+    #[tokio::test]
+    async fn relays_a_published_connection_to_the_target() {
+        let (_agent_path, agent_addr) = agent(format!(
+            "virtkit-publish-test-{}.socket",
+            std::process::id()
+        ));
 
         let echo_addr = echo_server().await;
         let target = format!("tcp://{echo_addr}");
@@ -1226,28 +1231,10 @@ mod tests {
 
     #[tokio::test]
     async fn relays_a_target_that_speaks_first() {
-        let agent_path = std::env::temp_dir().join(format!(
+        let (_agent_path, agent_addr) = agent(format!(
             "virtkit-publish-test-greeter-{}.socket",
             std::process::id()
         ));
-        let _ = std::fs::remove_file(&agent_path);
-        let agent_addr = SocketAddr::Unix(agent_path.clone());
-        let server_addr = agent_addr.clone();
-        tokio::spawn(async move {
-            run_server(
-                &server_addr,
-                Some(Duration::from_secs(60)),
-                None,
-                vec![],
-                vec![],
-                vk_core::exec::server::Limits::default(),
-            )
-            .await
-            .unwrap();
-        });
-        while !agent_path.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
 
         let greet_addr = greeter_server().await;
         let target = format!("tcp://{greet_addr}");
@@ -1269,28 +1256,10 @@ mod tests {
     /// validation. "localhost" stands in for a compose sibling's hostname.
     #[tokio::test]
     async fn relays_to_a_hostname_target() {
-        let agent_path = std::env::temp_dir().join(format!(
+        let (_agent_path, agent_addr) = agent(format!(
             "virtkit-publish-test-hostname-{}.socket",
             std::process::id()
         ));
-        let _ = std::fs::remove_file(&agent_path);
-        let agent_addr = SocketAddr::Unix(agent_path.clone());
-        let server_addr = agent_addr.clone();
-        tokio::spawn(async move {
-            run_server(
-                &server_addr,
-                Some(Duration::from_secs(60)),
-                None,
-                vec![],
-                vec![],
-                vk_core::exec::server::Limits::default(),
-            )
-            .await
-            .unwrap();
-        });
-        while !agent_path.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
 
         let port = localhost_echo_server().await;
         let target = format!("tcp://localhost:{port}");

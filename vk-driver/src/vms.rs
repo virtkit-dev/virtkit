@@ -2861,10 +2861,9 @@ pub(crate) mod tests {
     fn tmpdir(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        let d = std::env::temp_dir().join(format!(
-            "vk-vms-{}-{}-{}",
+        let d = crate::testtmp::root().join(format!(
+            "vms-{}-{}",
             tag,
-            std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&d).unwrap();

@@ -2009,9 +2009,7 @@ mod tests {
     /// test below) does not prove the manifest describes something mountable.
     #[test]
     fn a_materialized_view_is_a_filesystem_fsck_accepts() {
-        let dir = std::env::temp_dir().join(format!("vk-materialize-fs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testtmp::Scratch::dir(format!("vk-materialize-fs-{}", std::process::id()));
 
         let fs = dir.join("stage.ext4");
         crate::ext4::build_empty(&fs, 1024).unwrap();
@@ -2061,8 +2059,6 @@ mod tests {
                 panic!("a materialized view must be a clean ext4:\n{report}")
             }
         }
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `materialize_to_raw` must turn a `.vk_ro_img` into exactly the image it stands for —

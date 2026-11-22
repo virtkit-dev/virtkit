@@ -9,40 +9,87 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use vk_core::addr::SocketAddr;
 use vk_core::exec::client::{Stdin, client_run_connect};
-use vk_core::exec::server::{Limits, VkRoute, run_server, run_server_routed};
+use vk_core::exec::server::{Limits, VkRoute, serve_routed};
 use vk_core::framing::{DeSink, SerStream};
 use vk_core::messages::{CmdExec, Fd, Message, RunMode, Tty};
-use vk_core::net::connect;
+use vk_core::net::{connect, listen};
 use vk_core::status::get_status;
 
-fn tmp_socket_path(tag: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "virtkit-agent-test-{}-{tag}.socket",
-        std::process::id()
-    ))
+/// The directory every test here keeps its sockets and files in.
+static SCRATCH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Create a private directory with mkdtemp(3) on first use to avoid PID-reuse collisions.
+/// Clean it up on normal process exit, including after test failures.
+fn scratch() -> &'static std::path::Path {
+    extern "C" fn remove_scratch() {
+        use std::io::Write as _;
+        if let Some(dir) = SCRATCH.get()
+            && let Err(err) = std::fs::remove_dir_all(dir)
+        {
+            // Not eprintln!: a panic cannot unwind out of this callback.
+            let _ = writeln!(std::io::stderr(), "cannot remove {}: {err}", dir.display());
+        }
+    }
+    SCRATCH.get_or_init(|| {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+        let template = std::env::temp_dir().join("vk-core-test-XXXXXX");
+        let mut template = std::ffi::CString::new(template.as_os_str().as_bytes())
+            .unwrap()
+            .into_bytes_with_nul();
+        // SAFETY: `template` is a NUL-terminated buffer mkdtemp rewrites in place.
+        let made = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+        assert!(
+            !made.is_null(),
+            "mkdtemp: {}",
+            std::io::Error::last_os_error()
+        );
+        template.pop();
+        let dir = std::path::PathBuf::from(std::ffi::OsString::from_vec(template));
+        // SAFETY: atexit(3) only records the function, which takes no arguments.
+        if unsafe { libc::atexit(remove_scratch) } != 0 {
+            let _ = std::fs::remove_dir(&dir); // just made, still empty
+            panic!("atexit: cannot register the removal of {}", dir.display());
+        }
+        dir
+    })
 }
 
-async fn start_server(tag: &str) -> SocketAddr {
-    let path = tmp_socket_path(tag);
-    let _ = std::fs::remove_file(&path);
-    let addr = SocketAddr::Unix(path.clone());
+fn tmp_socket_path(tag: &str) -> std::path::PathBuf {
+    scratch().join(format!("{tag}.socket"))
+}
+
+/// Bind `tag`'s socket before spawning [`serve_routed`] with a one-minute inactivity timeout.
+/// Bind errors fail the test here, and clients can connect immediately.
+fn serve(
+    tag: &str,
+    exec_wrapper: Option<std::path::PathBuf>,
+    exec_wrapper_env: Vec<String>,
+    exec_wrapper_args: Vec<String>,
+    vk_route: Option<VkRoute>,
+    limits: Limits,
+) -> SocketAddr {
+    let addr = SocketAddr::Unix(tmp_socket_path(tag));
+    let listener = listen(&addr).unwrap();
     let server_addr = addr.clone();
     tokio::spawn(async move {
-        run_server(
+        serve_routed(
+            listener,
             &server_addr,
             Some(Duration::from_secs(60)),
-            None,
-            vec![],
-            vec![],
-            Limits::default(),
+            exec_wrapper,
+            exec_wrapper_env,
+            exec_wrapper_args,
+            vk_route,
+            limits,
         )
         .await
         .unwrap();
     });
-    while !path.exists() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
     addr
+}
+
+async fn start_server(tag: &str) -> SocketAddr {
+    serve(tag, None, vec![], vec![], None, Limits::default())
 }
 
 /// Run the command as whoever the test process is. `build_command` falls back to
@@ -251,25 +298,14 @@ async fn connect_to_missing_target_gets_start_err() {
 /// rather than let it bypass the allowlist.
 #[tokio::test]
 async fn connect_refused_on_wrapped_channel() {
-    let path = tmp_socket_path("connect-wrapped");
-    let _ = std::fs::remove_file(&path);
-    let addr = SocketAddr::Unix(path.clone());
-    let server_addr = addr.clone();
-    tokio::spawn(async move {
-        run_server(
-            &server_addr,
-            Some(Duration::from_secs(60)),
-            Some(std::path::PathBuf::from("/bin/true")),
-            vec![],
-            vec![],
-            Limits::default(),
-        )
-        .await
-        .unwrap();
-    });
-    while !path.exists() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let addr = serve(
+        "connect-wrapped",
+        Some(std::path::PathBuf::from("/bin/true")),
+        vec![],
+        vec![],
+        None,
+        Limits::default(),
+    );
 
     let (mut stream, mut sink) = connect(&addr).await.unwrap();
     sink.send(Message::CmdConnect {
@@ -289,26 +325,15 @@ async fn connect_refused_on_wrapped_channel() {
 /// wrapper falling back to it would fail on.
 #[tokio::test]
 async fn a_wrapped_exec_ignores_the_client_user_and_dir() {
-    let path = tmp_socket_path("wrapped-user-dir");
-    let _ = std::fs::remove_file(&path);
-    let addr = SocketAddr::Unix(path.clone());
-    let server_addr = addr.clone();
     // /bin/sh as the wrapper: the request's name and args become `sh -c SCRIPT ls -l`.
-    tokio::spawn(async move {
-        run_server(
-            &server_addr,
-            Some(Duration::from_secs(60)),
-            Some(std::path::PathBuf::from("/bin/sh")),
-            vec![],
-            vec![],
-            Limits::default(),
-        )
-        .await
-        .unwrap();
-    });
-    while !path.exists() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let addr = serve(
+        "wrapped-user-dir",
+        Some(std::path::PathBuf::from("/bin/sh")),
+        vec![],
+        vec![],
+        None,
+        Limits::default(),
+    );
 
     let (mut stream, mut sink) = connect(&addr).await.unwrap();
     sink.send(Message::CmdExec(CmdExec {
@@ -358,35 +383,23 @@ async fn a_wrapped_exec_ignores_the_client_user_and_dir() {
 /// wrapper, in the background too and outside that cap.
 #[tokio::test]
 async fn a_routed_channel_sends_only_vk_to_the_vk_route() {
-    let path = tmp_socket_path("vk-route");
-    let _ = std::fs::remove_file(&path);
-    let addr = SocketAddr::Unix(path.clone());
-    let server_addr = addr.clone();
-    // Each wrapper echoes its tag, then the requested command line; `hold` keeps it running.
+    // Each wrapper echoes its tag and command line. `hold` waits for a line from the test.
     let echo = |tag: &str| {
-        let script = format!("echo {tag} \"$@\"; [ \"$2\" != hold ] || sleep 5");
+        let script = format!("echo {tag} \"$@\"; [ \"$2\" != hold ] || read _");
         vec!["-c".into(), script, "sh".into()]
     };
-    tokio::spawn(async move {
-        run_server_routed(
-            &server_addr,
-            Some(Duration::from_secs(60)),
-            Some(std::path::PathBuf::from("/bin/sh")),
-            vec![],
-            echo("MAIN"),
-            Some(VkRoute {
-                path: std::path::PathBuf::from("/bin/sh"),
-                args: echo("VKROUTE"),
-                max_concurrent: std::num::NonZeroUsize::new(1),
-            }),
-            Limits::default(),
-        )
-        .await
-        .unwrap();
-    });
-    while !path.exists() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let addr = serve(
+        "vk-route",
+        Some(std::path::PathBuf::from("/bin/sh")),
+        vec![],
+        echo("MAIN"),
+        Some(VkRoute {
+            path: std::path::PathBuf::from("/bin/sh"),
+            args: echo("VKROUTE"),
+            max_concurrent: std::num::NonZeroUsize::new(1),
+        }),
+        Limits::default(),
+    );
 
     let request = |name: &str, arg: &str, mode| {
         Message::CmdExec(CmdExec {
@@ -474,56 +487,45 @@ async fn a_routed_channel_sends_only_vk_to_the_vk_route() {
         Message::StartOK
     ));
 
-    // The slot goes back as the held `vk` session ends, just after its connection closes,
-    // despite the refusal while it ran.
-    timeout(Duration::from_secs(10), async {
-        while !matches!(held.next().await.unwrap().unwrap(), Message::ExecDone(_)) {}
-    })
-    .await
-    .unwrap();
-    drop((held, held_sink));
-    let started = Instant::now();
-    loop {
-        match first("vk", RunMode::Interactive).await {
-            Message::StartOK => break,
-            _ if started.elapsed() < Duration::from_secs(5) => {}
-            reply => panic!("the `vk` cap did not free up: {reply:?}"),
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    // The refused request consumes no slot. The held `vk` releases its slot by ExecDone,
+    // while its session is still open.
+    held_sink
+        .send(Message::Data {
+            fd: Fd::Stdin,
+            msg: b"\n".to_vec(),
+        })
+        .await
+        .unwrap();
+    let code = timeout(Duration::from_secs(10), exec_done(&mut held))
+        .await
+        .unwrap();
+    assert_eq!(code, Some(0));
+    assert!(matches!(
+        first("vk", RunMode::Interactive).await,
+        Message::StartOK
+    ));
 }
 
 /// The channel's cap counts both routes: a `git` filling it refuses a `vk` too.
 #[tokio::test]
 async fn a_routed_channel_counts_vk_within_the_channel_cap() {
-    let path = tmp_socket_path("vk-route-cap");
-    let _ = std::fs::remove_file(&path);
-    let addr = SocketAddr::Unix(path.clone());
-    let server_addr = addr.clone();
-    let hold = || vec!["-c".into(), "echo up; sleep 5".into(), "sh".into()];
-    tokio::spawn(async move {
-        run_server_routed(
-            &server_addr,
-            Some(Duration::from_secs(60)),
-            Some(std::path::PathBuf::from("/bin/sh")),
-            vec![],
-            hold(),
-            Some(VkRoute {
-                path: std::path::PathBuf::from("/bin/sh"),
-                args: hold(),
-                max_concurrent: std::num::NonZeroUsize::new(1),
-            }),
-            Limits {
-                max_concurrent: std::num::NonZeroUsize::new(1),
-                ..Limits::default()
-            },
-        )
-        .await
-        .unwrap();
-    });
-    while !path.exists() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // Each command runs until the test sends it a line.
+    let hold = || vec!["-c".into(), "echo up; read _".into(), "sh".into()];
+    let addr = serve(
+        "vk-route-cap",
+        Some(std::path::PathBuf::from("/bin/sh")),
+        vec![],
+        hold(),
+        Some(VkRoute {
+            path: std::path::PathBuf::from("/bin/sh"),
+            args: hold(),
+            max_concurrent: std::num::NonZeroUsize::new(1),
+        }),
+        Limits {
+            max_concurrent: std::num::NonZeroUsize::new(1),
+            ..Limits::default()
+        },
+    );
     let request = |name: &str| {
         Message::CmdExec(CmdExec {
             name: name.into(),
@@ -561,6 +563,29 @@ async fn a_routed_channel_counts_vk_within_the_channel_cap() {
         ),
         other => panic!("expected StartErr, got {other:?}"),
     }
+
+    // After `git` exits, `vk` fits both caps while the `git` session remains open.
+    held_sink
+        .send(Message::Data {
+            fd: Fd::Stdin,
+            msg: b"\n".to_vec(),
+        })
+        .await
+        .unwrap();
+    let code = timeout(Duration::from_secs(10), exec_done(&mut held))
+        .await
+        .unwrap();
+    assert_eq!(code, Some(0));
+    let (mut stream, mut sink) = connect(&addr).await.unwrap();
+    sink.send(request("vk")).await.unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(10), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Message::StartOK
+    ));
 }
 
 /// `client_run_connect` end to end: a real local TCP connection (standing in for
@@ -715,10 +740,7 @@ fn reaped_or_zombie(pid: i32) -> bool {
 #[tokio::test]
 async fn disconnect_kills_remote_process() {
     let addr = start_server("kill").await;
-    let pid_file = std::env::temp_dir().join(format!(
-        "virtkit-agent-test-{}-kill.pid",
-        std::process::id()
-    ));
+    let pid_file = scratch().join("kill.pid");
     let _ = std::fs::remove_file(&pid_file);
 
     let (mut stream, sink) = connect(&addr).await.unwrap();
@@ -777,10 +799,7 @@ async fn disconnect_kills_remote_process() {
 #[tokio::test]
 async fn disconnect_hangs_up_a_tty_exec() {
     let addr = start_server("tty-hangup").await;
-    let pid_file = std::env::temp_dir().join(format!(
-        "virtkit-agent-test-{}-hangup.pid",
-        std::process::id()
-    ));
+    let pid_file = scratch().join("hangup.pid");
     let hup_file = pid_file.with_extension("hup");
     let _ = std::fs::remove_file(&pid_file);
     let _ = std::fs::remove_file(&hup_file);
@@ -999,10 +1018,22 @@ async fn unix_status() {
 
 /// A request to `addr` for `script` (in the background when `background`): its first reply.
 async fn first_reply(addr: &SocketAddr, script: &str, background: bool) -> Message {
+    first_reply_args(addr, script, &[], background).await
+}
+
+/// [`first_reply`], with `args` as the script's `$1`...
+async fn first_reply_args(
+    addr: &SocketAddr,
+    script: &str,
+    args: &[&str],
+    background: bool,
+) -> Message {
     let (mut stream, mut sink) = connect(addr).await.unwrap();
+    let mut argv = vec!["-c".into(), script.into(), "sh".into()];
+    argv.extend(args.iter().map(|arg| (*arg).into()));
     sink.send(Message::CmdExec(CmdExec {
         name: "sh".into(),
-        args: vec!["-c".into(), script.into()],
+        args: argv,
         env: vec![],
         clear_env: false,
         mode: if background {
@@ -1022,116 +1053,114 @@ async fn first_reply(addr: &SocketAddr, script: &str, background: bool) -> Messa
     reply.unwrap().unwrap()
 }
 
-/// A channel capped at one request refuses the next one while the first runs — a background
-/// command until it exits — still answers status probes, and takes requests again after.
+/// A one-slot channel answers status probes but refuses new commands while a foreground or
+/// background command runs. After ExecDone a new command can start on another session.
 #[tokio::test]
 async fn a_capped_channel_refuses_a_request_past_its_cap() {
-    let path = tmp_socket_path("capped");
-    let _ = std::fs::remove_file(&path);
-    let addr = SocketAddr::Unix(path.clone());
-    let server_addr = addr.clone();
-    tokio::spawn(async move {
-        run_server(
-            &server_addr,
-            Some(Duration::from_secs(60)),
-            None,
-            vec![],
-            vec![],
-            Limits {
-                max_concurrent: std::num::NonZeroUsize::new(1),
-                ..Limits::default()
-            },
-        )
-        .await
-        .unwrap();
-    });
-    while !path.exists() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let addr = serve(
+        "capped",
+        None,
+        vec![],
+        vec![],
+        None,
+        Limits {
+            max_concurrent: std::num::NonZeroUsize::new(1),
+            ..Limits::default()
+        },
+    );
 
     let refused = |reply: Message| match reply {
         Message::StartErr { msg } => assert!(msg.contains("at most 1"), "got: {msg}"),
         other => panic!("expected StartErr, got {other:?}"),
     };
-    let (mut first, first_sink) = start_exec(&addr, "sleep 1", None).await;
-    refused(first_reply(&addr, "true", false).await);
-    timeout(Duration::from_secs(10), get_status(&addr))
-        .await
-        .unwrap()
-        .unwrap();
-    let code = timeout(Duration::from_secs(10), exec_done(&mut first))
-        .await
-        .unwrap();
-    assert_eq!(code, Some(0));
-    drop((first, first_sink));
-
-    // The permit goes back as the first session ends, just after its connection closes.
-    let pid_file = tmp_socket_path("capped-pid");
-    let _ = std::fs::remove_file(&pid_file);
-    let _sleep = KillOnDrop(pid_file.clone());
-    let background = format!("echo $$ > {}; exec sleep 30", pid_file.display());
-    let started = Instant::now();
-    loop {
-        match first_reply(&addr, &background, true).await {
-            Message::StartOK => break,
-            _ if started.elapsed() < Duration::from_secs(5) => {}
-            reply => panic!("the cap did not free up: {reply:?}"),
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let tty = Tty {
+        term: Some("xterm".into()),
+        rows: 24,
+        cols: 80,
+        modes: vec![],
+    };
+    for tty in [None, Some(tty)] {
+        // The first command runs until the test sends it a line.
+        let (mut first, mut first_sink) = start_exec(&addr, "read _", tty).await;
+        refused(first_reply(&addr, "true", false).await);
+        timeout(Duration::from_secs(10), get_status(&addr))
+            .await
+            .unwrap()
+            .unwrap();
+        first_sink
+            .send(Message::Data {
+                fd: Fd::Stdin,
+                msg: b"\n".to_vec(),
+            })
+            .await
+            .unwrap();
+        let code = timeout(Duration::from_secs(10), exec_done(&mut first))
+            .await
+            .unwrap();
+        assert_eq!(code, Some(0));
+        // The permit went back before the ExecDone: the next request starts while the first
+        // session is still open, and so does the one after it.
+        let (mut next, _next_sink) = start_exec(&addr, "true", None).await;
+        let code = timeout(Duration::from_secs(10), exec_done(&mut next))
+            .await
+            .unwrap();
+        assert_eq!(code, Some(0));
     }
+
+    // A background command blocks opening this fifo until the test opens its other end.
+    let fifo = scratch().join("capped-fifo");
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated path.
+        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    }
+    let release = ReleaseFifoReader(fifo);
+    assert!(matches!(
+        first_reply_args(
+            &addr,
+            "read _ < \"$1\"",
+            &[release.0.to_str().unwrap()],
+            true
+        )
+        .await,
+        Message::StartOK
+    ));
     refused(first_reply(&addr, "true", false).await);
 }
 
-/// Kills the process whose pid is in the file, if any, and removes the file — on drop, so a
-/// failed assertion leaves no process behind.
-struct KillOnDrop(std::path::PathBuf);
+/// Release the FIFO reader on drop without waiting for the command. Opening both ends
+/// unblocks a waiting reader. Unlinking prevents a late open, and closing sends EOF.
+struct ReleaseFifoReader(std::path::PathBuf);
 
-impl Drop for KillOnDrop {
+impl Drop for ReleaseFifoReader {
     fn drop(&mut self) {
-        // The process writes the file as it starts; one that never started left none.
-        let started = Instant::now();
-        let mut pid = None;
-        while pid.is_none() && started.elapsed() < Duration::from_secs(5) {
-            pid = std::fs::read_to_string(&self.0)
-                .ok()
-                .and_then(|p| p.trim().parse::<i32>().ok());
-            if pid.is_none() {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.0);
+        let removed = std::fs::remove_file(&self.0);
+        if let Err(err) = removed.and(opened.map(drop)) {
+            eprintln!("cannot release the reader of {}: {err}", self.0.display());
         }
-        if let Some(pid) = pid {
-            // SAFETY: plain kill(2) of the process this test started.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
-        let _ = std::fs::remove_file(&self.0);
     }
 }
 
 /// A server that does not allow background commands refuses one, before running anything.
 #[tokio::test]
 async fn background_commands_can_be_refused() {
-    let path = tmp_socket_path("no-background");
-    let _ = std::fs::remove_file(&path);
-    let addr = SocketAddr::Unix(path.clone());
-    let server_addr = addr.clone();
-    tokio::spawn(async move {
-        run_server(
-            &server_addr,
-            Some(Duration::from_secs(60)),
-            None,
-            vec![],
-            vec![],
-            Limits {
-                background: false,
-                ..Limits::default()
-            },
-        )
-        .await
-        .unwrap();
-    });
-    while !path.exists() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let addr = serve(
+        "no-background",
+        None,
+        vec![],
+        vec![],
+        None,
+        Limits {
+            background: false,
+            ..Limits::default()
+        },
+    );
     let marker = tmp_socket_path("no-background-marker");
     let _ = std::fs::remove_file(&marker);
     match first_reply(&addr, &format!("touch {}", marker.display()), true).await {
@@ -1149,29 +1178,18 @@ async fn background_commands_can_be_refused() {
 /// connections hold nothing open for long.
 #[tokio::test]
 async fn an_idle_connection_is_closed() {
-    let path = tmp_socket_path("idle");
-    let _ = std::fs::remove_file(&path);
-    let addr = SocketAddr::Unix(path.clone());
-    let server_addr = addr.clone();
     let wait = Duration::from_millis(300);
-    tokio::spawn(async move {
-        run_server(
-            &server_addr,
-            Some(Duration::from_secs(60)),
-            None,
-            vec![],
-            vec![],
-            Limits {
-                first_message_timeout: wait,
-                ..Limits::default()
-            },
-        )
-        .await
-        .unwrap();
-    });
-    while !path.exists() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let addr = serve(
+        "idle",
+        None,
+        vec![],
+        vec![],
+        None,
+        Limits {
+            first_message_timeout: wait,
+            ..Limits::default()
+        },
+    );
     let (mut stream, _sink) = connect(&addr).await.unwrap();
     let started = Instant::now();
     let end = timeout(Duration::from_secs(10), stream.next())

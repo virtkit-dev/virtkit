@@ -50,6 +50,8 @@ mod settings;
 mod store;
 mod subject;
 mod target;
+#[cfg(test)]
+mod testtmp;
 mod tokens;
 mod tools;
 mod ui;

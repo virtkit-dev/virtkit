@@ -11,7 +11,7 @@ use crate::tokens::Keys;
 pub(super) const REGISTRY_URL: &str = "https://reg.example.com";
 
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("vk-hub-tokens-{tag}-{}", std::process::id()));
+    let dir = crate::testtmp::root().join(format!("tokens-{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

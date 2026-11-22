@@ -40,7 +40,7 @@ const V3: VersionRange = VersionRange { min: 1, max: JOBS };
 const V2: VersionRange = VersionRange { min: 1, max: 2 };
 
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("vk-hub-jobs-{tag}-{}", std::process::id()));
+    let dir = crate::testtmp::root().join(format!("jobs-{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

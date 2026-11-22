@@ -1330,8 +1330,7 @@ mod tests {
 
     #[test]
     fn discovery_prefers_the_directory_form_then_the_dotfile() {
-        let dir = std::env::temp_dir().join(format!("vk-dc-discover-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("discover");
         std::fs::create_dir_all(dir.join(".devcontainer")).unwrap();
         assert!(discover(&dir, None).is_err(), "nothing to find yet");
 
@@ -1353,7 +1352,6 @@ mod tests {
         // silent fall back to discovery.
         assert_eq!(discover(&dir, Some(&nested)).unwrap(), nested);
         assert!(discover(&dir, Some(&dir.join("nope.json"))).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1387,11 +1385,8 @@ mod tests {
     use crate::dev::config::Fate;
 
     /// A fresh empty workspace directory, named for the test.
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("vk-dc-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(tag: &str) -> crate::testtmp::Scratch {
+        crate::testtmp::Scratch::dir(format!("vk-dc-{tag}-{}", std::process::id()))
     }
 
     /// Translate `json` as a `.devcontainer.json` at the root of `ws`.
@@ -1551,18 +1546,16 @@ mod tests {
             actioned(&d, "forwardPorts"),
             "db:5432 needs a compose source"
         );
-        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
     fn an_escaping_dockerfile_is_reported_and_never_read() {
-        let ws = scratch("escape");
+        let parent = scratch("escape");
+        let ws = parent.join("workspace");
+        std::fs::create_dir(&ws).unwrap();
         // A real multi-stage Dockerfile outside the workspace: reading it would set `target`.
-        let outside = ws
-            .parent()
-            .unwrap()
-            .join(format!("vk-dc-outside-{}", std::process::id()));
-        std::fs::create_dir_all(&outside).unwrap();
+        let outside = parent.join("outside");
+        std::fs::create_dir(&outside).unwrap();
         let df = outside.join("Dockerfile");
         std::fs::write(&df, "FROM x AS a\nFROM x AS b\n").unwrap();
 
@@ -1592,9 +1585,6 @@ mod tests {
             actioned(&d, "build.dockerfile"),
             "a `..` escape must be reported"
         );
-
-        let _ = std::fs::remove_dir_all(&ws);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]
@@ -1618,7 +1608,6 @@ mod tests {
             !note.contains("compose"),
             "no compose reference here: {note}"
         );
-        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
@@ -1632,7 +1621,6 @@ mod tests {
         );
         assert!(translated(&d, "forwardPorts"));
         assert!(!actioned(&d, "forwardPorts"));
-        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
@@ -1650,7 +1638,6 @@ mod tests {
             cfg["dev"].get("endpoints").is_none(),
             "neither out-of-range port becomes an endpoint"
         );
-        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
@@ -1664,7 +1651,6 @@ mod tests {
             actioned(&d, "customizations.vscode"),
             "a string vscode is not an object"
         );
-        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
@@ -1678,6 +1664,5 @@ mod tests {
             actioned(&d, "remoteEnv"),
             "containerEnv var has no equivalent"
         );
-        let _ = std::fs::remove_dir_all(&ws);
     }
 }

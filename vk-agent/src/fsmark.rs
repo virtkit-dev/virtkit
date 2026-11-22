@@ -225,12 +225,9 @@ mod tests {
         assert_eq!(published(&dir), Some((1_000, 10_000)));
     }
 
-    /// A private directory for one test, named after the test and the pid so two suites on the
-    /// same host never share a path and pull each other's tree out mid-run. Removed first all
-    /// the same, so a recycled pid starts clean instead of on an older run's leftovers.
+    /// Use a distinct name for each test in the process's private scratch directory.
     fn tempdir(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("vk-agent-fsmark-{name}-{}", std::process::id()));
+        let dir = crate::testtmp::root().join(format!("fsmark-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

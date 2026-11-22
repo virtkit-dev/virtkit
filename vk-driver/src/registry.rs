@@ -6930,8 +6930,7 @@ pub(crate) mod tests {
     /// in-process — no server.
     #[test]
     fn local_store_roundtrip_is_sparse_and_byte_exact() {
-        let root = std::env::temp_dir().join(format!("vk-localreg-rt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::testtmp::Scratch::path(format!("vk-localreg-rt-{}", std::process::id()));
         let rg = local_registry(&root);
         assert!(rg.local_root().is_some(), "a path repo must route local");
 
@@ -6990,15 +6989,14 @@ pub(crate) mod tests {
             .unwrap()
             .is_none()
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A local diff push over an untouched overlay reuses the clean parent chunk
     /// descriptors verbatim and still reassembles byte-exactly under the new tag.
     #[test]
     fn local_diff_push_reuses_clean_chunks() {
-        let root = std::env::temp_dir().join(format!("vk-localreg-diff-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root =
+            crate::testtmp::Scratch::path(format!("vk-localreg-diff-{}", std::process::id()));
         let rg = local_registry(&root);
         let dir = root.join("work");
         std::fs::create_dir_all(&dir).unwrap();
@@ -7048,7 +7046,6 @@ pub(crate) mod tests {
             std::fs::read(&base).unwrap(),
             "an untouched overlay's child must equal the base"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Regression test for the tag-clobber bug `MicroVm::parent_for_push` used to be
@@ -7061,8 +7058,8 @@ pub(crate) mod tests {
     /// fix exists.
     #[test]
     fn fetch_chunks_by_digest_ignores_a_concurrent_tag_overwrite() {
-        let root = std::env::temp_dir().join(format!("vk-localreg-tagrace-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root =
+            crate::testtmp::Scratch::path(format!("vk-localreg-tagrace-{}", std::process::id()));
         let rg = local_registry(&root);
         let dir = root.join("work");
         std::fs::create_dir_all(&dir).unwrap();
@@ -7110,8 +7107,6 @@ pub(crate) mod tests {
             digest_of(&chunks_a),
             "a pinned digest must not follow a concurrent tag clobber"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A bundle push through the PUBLIC dispatch (`push` with a store-path repo — the
@@ -7121,8 +7116,8 @@ pub(crate) mod tests {
     /// reassembles byte-exactly.
     #[test]
     fn local_bundle_push_records_extras_and_still_pulls() {
-        let root = std::env::temp_dir().join(format!("vk-localreg-bundle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root =
+            crate::testtmp::Scratch::path(format!("vk-localreg-bundle-{}", std::process::id()));
         let rg = local_registry(&root);
         let cfg = crate::config::Config {
             registry: Some(local_registry(&root)),
@@ -7184,7 +7179,6 @@ pub(crate) mod tests {
                 .is_some()
         );
         assert_eq!(std::fs::read(&dest).unwrap(), std::fs::read(&ext4).unwrap());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A hole (a discarded/trimmed region) must clear the parent's bytes there, not reuse
@@ -7193,8 +7187,8 @@ pub(crate) mod tests {
     /// region reassembles as zeros.
     #[test]
     fn local_diff_push_holes_clear_parent_bytes() {
-        let root = std::env::temp_dir().join(format!("vk-localreg-holes-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root =
+            crate::testtmp::Scratch::path(format!("vk-localreg-holes-{}", std::process::id()));
         let rg = local_registry(&root);
         let dir = root.join("work");
         std::fs::create_dir_all(&dir).unwrap();
@@ -7241,7 +7235,6 @@ pub(crate) mod tests {
             child, expected,
             "a hole must clear only the freed cluster, leaving every live byte intact"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The static push splits one image's clusters into `dirty` data and explicit-zero `holes`.
@@ -7249,8 +7242,8 @@ pub(crate) mod tests {
     /// adjacent hole, even when both share one content-defined parent chunk.
     #[test]
     fn local_diff_push_splits_one_image_into_dirty_and_holes() {
-        let root = std::env::temp_dir().join(format!("vk-localreg-split-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root =
+            crate::testtmp::Scratch::path(format!("vk-localreg-split-{}", std::process::id()));
         let rg = local_registry(&root);
         let dir = root.join("work");
         std::fs::create_dir_all(&dir).unwrap();
@@ -7292,7 +7285,6 @@ pub(crate) mod tests {
             child, expected,
             "the hole must clear only its own range, leaving the adjacent dirty range intact"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// With no reusable parent manifest, a diff push must become a full qcow2-chain
@@ -7301,8 +7293,7 @@ pub(crate) mod tests {
     #[test]
     fn local_diff_push_without_parent_rechunks_full_chain() {
         let root =
-            std::env::temp_dir().join(format!("vk-localreg-noparent-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+            crate::testtmp::Scratch::path(format!("vk-localreg-noparent-{}", std::process::id()));
         let rg = local_registry(&root);
         let dir = root.join("work");
         std::fs::create_dir_all(&dir).unwrap();
@@ -7354,7 +7345,6 @@ pub(crate) mod tests {
             std::fs::read(&base).unwrap(),
             "a no-parent diff push must publish the full chain, not only dirty clusters"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Concurrent local-backend pushes and pulls against one store: several threads
@@ -7364,8 +7354,8 @@ pub(crate) mod tests {
     /// fully materialized: every pull must succeed byte-exactly, mid-push or not.
     #[test]
     fn local_concurrent_push_pull_is_consistent() {
-        let root = std::env::temp_dir().join(format!("vk-localreg-conc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root =
+            crate::testtmp::Scratch::path(format!("vk-localreg-conc-{}", std::process::id()));
         let rg = local_registry(&root);
         let dir = root.join("work");
         std::fs::create_dir_all(&dir).unwrap();
@@ -7410,7 +7400,6 @@ pub(crate) mod tests {
                 });
             }
         });
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Concurrent DIFF-pushes and pulls against one store, with heterogeneous content that
@@ -7425,8 +7414,7 @@ pub(crate) mod tests {
     #[test]
     fn local_concurrent_diff_push_pull_is_byte_exact() {
         let root =
-            std::env::temp_dir().join(format!("vk-localreg-diffconc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+            crate::testtmp::Scratch::path(format!("vk-localreg-diffconc-{}", std::process::id()));
         let rg = local_registry(&root);
         let dir = root.join("work");
         std::fs::create_dir_all(&dir).unwrap();
@@ -7505,7 +7493,6 @@ pub(crate) mod tests {
                 });
             }
         });
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `vk registry gc` over a local-backend store: after one image's tag expires,
@@ -7516,8 +7503,7 @@ pub(crate) mod tests {
     #[test]
     fn local_store_gc_keeps_live_image_pullable() {
         let day = std::time::Duration::from_secs(86_400);
-        let root = std::env::temp_dir().join(format!("vk-localreg-gc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::testtmp::Scratch::path(format!("vk-localreg-gc-{}", std::process::id()));
         let rg = local_registry(&root);
         let dir = root.join("work");
         std::fs::create_dir_all(&dir).unwrap();
@@ -7544,7 +7530,7 @@ pub(crate) mod tests {
         }
         assert!(exists(&rg, "build-cache", "live"));
 
-        let store = vk_registry::Store::new(root.clone()).unwrap();
+        let store = vk_registry::Store::new(root.to_path_buf()).unwrap();
         let report = store.gc(day * 30, day, false).unwrap();
         assert_eq!(report.tags_dropped, 1);
         assert!(
@@ -7564,7 +7550,6 @@ pub(crate) mod tests {
             std::fs::read(&live_src).unwrap(),
             "a gc must never break a live image"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The production streaming path round-trips through the REAL sparse reassembly:

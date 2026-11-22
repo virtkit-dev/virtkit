@@ -156,8 +156,8 @@ mod tests {
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("vk-token-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir); // a leftover of an earlier run, if any
+        let dir = crate::testtmp::root().join(format!("token-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

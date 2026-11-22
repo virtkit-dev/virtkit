@@ -692,11 +692,8 @@ pub(crate) fn status(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn tmpdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("vk-toolchain-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmpdir(name: &str) -> crate::testtmp::Scratch {
+        crate::testtmp::Scratch::dir(format!("vk-toolchain-{name}-{}", std::process::id()))
     }
 
     fn artifact(name: &str, sha: &str) -> vk_selfupdate::Artifact {
