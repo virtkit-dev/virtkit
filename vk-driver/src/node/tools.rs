@@ -875,19 +875,10 @@ fn extract(image: &Path, stage: &Path) -> Result<BTreeMap<String, ToolsFile>> {
                 let data = fs
                     .read_file(&format!("/{name}"), MAX_TOOL)
                     .with_context(|| format!("reading {name} from the tools stage"))?;
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o700)
-                    .open(&to)
-                    .with_context(|| format!("creating {}", to.display()))?;
-                file.write_all_at(&data, 0)
-                    .with_context(|| format!("writing {}", to.display()))?;
-                // Still private to this user in the stage directory: set whatever the umask.
-                file.set_permissions(std::fs::Permissions::from_mode(0o755))
-                    .with_context(|| format!("setting the mode on {}", to.display()))?;
-                file.sync_all()
-                    .with_context(|| format!("flushing {}", to.display()))?;
+                // Write in a child so a concurrent job fork cannot inherit the descriptor
+                // and cause ETXTBSY during the version probe. The private stage directory
+                // lets us apply the final mode here regardless of umask.
+                vk_fs::write_executable_new(&to, &data, 0o755)?;
                 files.insert(
                     name.clone(),
                     ToolsFile::File {

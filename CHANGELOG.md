@@ -98,6 +98,8 @@ All notable changes to virtkit will be documented in this file.
   reports the error.
 - `vk dev` no longer reports an environment as booting after the previous command finishes.
 - `vk gc --dry-run` checks for active image pulls without taking the pull lock.
+- `vk node` no longer intermittently omits a newly installed CI tool's version when a job
+  starts during extraction.
 
 ## [0.114.0] - 2026-11-20
 
