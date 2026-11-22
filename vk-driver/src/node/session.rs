@@ -847,37 +847,64 @@ mod tests {
     /// session at once rather than when the send's deadline runs out.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stop_is_honored_while_a_send_is_stuck() {
+        use std::os::fd::AsRawFd;
+        use tokio::io::AsyncReadExt;
+        // Leave room for the rest of the inventory under the 1 MiB message limit.
+        const HOSTNAME: usize = 768 << 10;
+        // Read more bytes than the node sends before the inventory.
+        const OBSERVED: usize = 64 << 10;
         let mut f = fixture("stuck").await;
         let (node, _, stopped, listener, stop) = f.parts();
         let key = node.identity.public_key().to_vec();
-        // Reports fed by hand, each large and new, so they fill the socket fast.
-        let (feed, answers) = mpsc::channel(4);
+        let rcvbuf = pin_buffer(listener.as_raw_fd(), libc::SO_RCVBUF, 64 << 10);
+        // Wait for the request so the session cannot discard this inventory with stale answers.
+        let asked = Arc::new(Asked::default());
+        let (feed, answers) = mpsc::channel(1);
         let mut gatherer = Gatherer {
-            asked: Arc::new(Asked::default()),
+            asked: asked.clone(),
             answers,
         };
         let feeder = tokio::spawn(async move {
-            for i in 0u32.. {
-                let inventory = Inventory {
-                    hostname: format!("{i}-{}", "x".repeat(256 * 1024)),
-                    ..Default::default()
-                };
-                if feed
-                    .send(Gathered::Inventory(Box::new(inventory)))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
+            asked.wake.notified().await;
+            let inventory = Inventory {
+                hostname: "x".repeat(HOSTNAME),
+                ..Default::default()
+            };
+            feed.send(Gathered::Inventory(Box::new(inventory)))
+                .await
+                .unwrap();
         });
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<()>();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let hub = async {
             let mut ws = accept(listener).await;
+            // The unread part of the inventory must exceed both socket buffers combined.
+            let tcp = ws.get_ref();
+            let node_end = socket_of(tcp.peer_addr().unwrap(), tcp.local_addr().unwrap());
+            let sndbuf = pin_buffer(node_end, libc::SO_SNDBUF, 64 << 10);
+            assert!(
+                HOSTNAME > OBSERVED + rcvbuf + sndbuf,
+                "the connection holds the inventory: {rcvbuf} + {sndbuf} bytes"
+            );
             assert!(challenge(&mut ws, &key, PROTOCOL, PROTOCOL.max).await);
-            // A minute's deadline on each send, and nothing read from here on.
             hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
-            let _ = done_rx.await;
+            // Stop reading partway through the inventory frame to keep the send blocked.
+            let tcp = ws.get_mut();
+            let mut buf = vec![0u8; OBSERVED];
+            let mut read = 0;
+            // Fail if the send never starts.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while read < OBSERVED {
+                    match tcp.read(&mut buf[read..]).await.unwrap() {
+                        0 => panic!("the node closed the connection"),
+                        n => read += n,
+                    }
+                }
+            })
+            .await
+            .expect("the inventory's send did not start");
+            seen_tx.send(()).unwrap();
+            done_rx.await.unwrap();
             drop(ws);
         };
         let node = async {
@@ -885,17 +912,76 @@ mod tests {
             tokio::pin!(session);
             tokio::select! {
                 ended = &mut session => panic!("the session ended early: {:?}", ended.err()),
-                () = tokio::time::sleep(Duration::from_secs(2)) => {}
+                seen = seen_rx => seen.unwrap(),
             }
             stop.send(true).unwrap();
             // Well short of the stuck send's 60s deadline.
             let ended = tokio::time::timeout(Duration::from_secs(10), session).await;
-            let _ = done_tx.send(());
+            done_tx.send(()).unwrap();
             ended
         };
         let (_, ended) = tokio::join!(hub, node);
-        feeder.abort();
+        feeder.await.unwrap();
         ended.expect("the session outlived its stop").unwrap();
+    }
+
+    /// The socket of this process connected from `local` to `peer`.
+    fn socket_of(local: std::net::SocketAddr, peer: std::net::SocketAddr) -> std::os::fd::RawFd {
+        type GetName = unsafe extern "C" fn(
+            libc::c_int,
+            *mut libc::sockaddr,
+            *mut libc::socklen_t,
+        ) -> libc::c_int;
+        let inet = |fd, get: GetName| {
+            // SAFETY: all zeroes is a valid sockaddr_in.
+            let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            // SAFETY: a sockaddr_in, passed by pointer with its size; any fd but an IPv4
+            // socket only fails or names another family.
+            let got = unsafe { get(fd, (&raw mut addr).cast(), &mut len) };
+            (got == 0 && addr.sin_family == libc::AF_INET as libc::sa_family_t).then(|| {
+                let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+                std::net::SocketAddr::from((ip, u16::from_be(addr.sin_port)))
+            })
+        };
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_str().unwrap().parse().unwrap())
+            .find(|&fd| {
+                inet(fd, libc::getsockname) == Some(local)
+                    && inet(fd, libc::getpeername) == Some(peer)
+            })
+            .unwrap_or_else(|| panic!("no socket from {local} to {peer}"))
+    }
+
+    /// Set the socket buffer and return the size Linux reports, including its bookkeeping
+    /// allowance. A listener passes the setting to accepted sockets.
+    fn pin_buffer(fd: std::os::fd::RawFd, option: libc::c_int, bytes: libc::c_int) -> usize {
+        let size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: an int option, passed by pointer with its size.
+        let set = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&raw const bytes).cast(),
+                size,
+            )
+        };
+        assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
+        let (mut value, mut len): (libc::c_int, _) = (0, size);
+        // SAFETY: an int option, read into an int of that size.
+        let got = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&raw mut value).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(got, 0, "{}", std::io::Error::last_os_error());
+        usize::try_from(value).unwrap()
     }
 
     /// Workloads are reported once, then again only when they change, not on every heartbeat.
