@@ -782,6 +782,146 @@ mod tests {
         assert!(!out.contains("/var/lib/virtkit"), "{out}");
     }
 
+    /// Snapshot paths and symlink targets. For other entries, record type, size and mtime.
+    fn tree(root: &Path) -> Vec<(PathBuf, String)> {
+        let mut out = Vec::new();
+        let mut todo = vec![root.to_path_buf()];
+        while let Some(dir) = todo.pop() {
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let path = e.unwrap().path();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                let what = if meta.is_symlink() {
+                    format!("-> {}", std::fs::read_link(&path).unwrap().display())
+                } else {
+                    format!(
+                        "{:?} {} {:?}",
+                        meta.file_type(),
+                        meta.len(),
+                        meta.modified().unwrap()
+                    )
+                };
+                if meta.is_dir() {
+                    todo.push(path.clone());
+                }
+                out.push((path, what));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Dry-run GC preserves registrations, names, state records and the run ledger for an
+    /// idle `vk run --state-dir` and a stopped dev environment. A real pass reclaims the
+    /// root images listed in the preview.
+    #[test]
+    fn a_dry_run_changes_no_registration_name_or_record() {
+        // Set the XDG homes on a child process so other test threads keep their environment.
+        const CHILD: &str = "VK_TEST_GC_DRY_RUN_HOMES";
+        let Some(home) = std::env::var_os(CHILD).map(PathBuf::from) else {
+            let _guard = crate::dev::testutil::env_guard();
+            let tmp = crate::dev::testutil::scratch("gc-dry-run");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gc::tests::a_dry_run_changes_no_registration_name_or_record",
+                    "--nocapture",
+                ])
+                .env(CHILD, &tmp.0)
+                .envs(
+                    ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"]
+                        .map(|v| (v, tmp.0.join(v))),
+                )
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        };
+        let name = |state: &Path, name: &str| {
+            crate::names::Index::open()
+                .unwrap()
+                .claim_exact(state, name)
+                .unwrap();
+        };
+        let old = std::time::SystemTime::now() - Duration::from_secs(2 * 86_400);
+        let idle_vm = |dir: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("root.qcow2"), vec![1u8; 16 * 1024]).unwrap();
+            let stamp = dir.join(crate::run::ACTIVE_STAMP);
+            std::fs::write(&stamp, b"").unwrap();
+            std::fs::File::open(&stamp)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            // A killed run leaves a registration but releases the directory lock.
+            let entry = serde_json::from_value(serde_json::json!({
+                "state_dir": crate::vms::canonical(dir),
+                "pid": std::process::id(),
+                "label": "gone",
+                "exec_addr": "unused",
+                "created_secs": 7,
+            }))
+            .unwrap();
+            crate::vms::register(entry)
+        };
+        let run_dir = home.join("run-state");
+        let _run = idle_vm(&run_dir);
+        crate::rundirs::record(&run_dir).unwrap();
+        name(&run_dir, "old-run");
+        let dev_dir = crate::dev::plan::dev_state_base()
+            .unwrap()
+            .join("proj-1a2b");
+        let _dev = idle_vm(&dev_dir);
+        let identity = crate::dev::Identity {
+            digest: "d".into(),
+            booted_secs: 0,
+            created_by: String::new(),
+            generation: String::new(),
+            manifest: serde_json::json!({ "environment": "dev", "hooks": { "create": null } }),
+            storage_backings: Some(Vec::new()),
+            readied_by_its_boot: true,
+        };
+        std::fs::write(
+            dev_dir.join("dev.json"),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+        name(&dev_dir, "old-dev");
+        assert_eq!(crate::vms::registered().1.len(), 2);
+
+        let state_dir = home.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let cfg = Config {
+            state_dir: Some(state_dir.clone()),
+            ..Config::default()
+        };
+        let req = |dry_run| Request {
+            dry_run,
+            all_unused: true,
+            auto: false,
+            image_idle: crate::image::EVICT_GRACE,
+            checkout_idle: crate::image::EVICT_GRACE,
+        };
+        let count = |sum: &Summary, category| {
+            sum.rows
+                .iter()
+                .filter(|r| r.category == category)
+                .map(|r| r.count)
+                .sum::<u64>()
+        };
+        let before = tree(&home);
+        let dry = run(&cfg, &state_dir, &req(true));
+        assert_eq!(tree(&home), before, "{}", dry.render());
+        assert_eq!(count(&dry, "dev images"), 1, "{}", dry.render());
+        assert_eq!(count(&dry, "run images"), 1, "{}", dry.render());
+
+        let real = run(&cfg, &state_dir, &req(false));
+        assert_eq!(count(&real, "dev images"), 1, "{}", real.render());
+        assert_eq!(count(&real, "run images"), 1, "{}", real.render());
+        assert!(!run_dir.join("root.qcow2").exists());
+        assert!(!dev_dir.join("root.qcow2").exists());
+        assert!(crate::vms::registered().1.is_empty(), "a real pass prunes");
+    }
+
     #[test]
     fn durations_take_their_largest_whole_unit() {
         assert_eq!(fmt_secs(Duration::from_secs(1800)), "30m");

@@ -112,6 +112,8 @@ All notable changes to virtkit will be documented in this file.
   stops accepting requests.
 - A parallel `vk build` no longer waits up to two extra seconds to start the next stage
   when the last running stage finishes during a memory check.
+- `vk gc --dry-run`, `vk reset --dry-run` and `vk dev prune --dry-run` no longer remove
+  stale VM records.
 
 ## [0.114.0] - 2026-11-20
 

@@ -1349,6 +1349,8 @@ mod tests {
     #[test]
     fn a_directory_somebody_is_booting_is_not_removed() {
         let tmp = scratch("locked");
+        // Give `remove` a private VM registry to prune.
+        let _registry = crate::vms::ThreadRegistry::set(&tmp.0.join("vms"));
         let base = tmp.0.join("state");
         std::fs::create_dir_all(&base).unwrap();
         let dir = booted(
@@ -1478,6 +1480,8 @@ mod tests {
     #[test]
     fn removal_forgets_the_name() {
         let tmp = scratch("forget");
+        // Give `remove` a private VM registry to prune.
+        let _registry = crate::vms::ThreadRegistry::set(&tmp.0.join("vms"));
         let base = tmp.0.join("state");
         std::fs::create_dir_all(&base).unwrap();
         let dir = booted(
@@ -1568,6 +1572,8 @@ mod tests {
     #[test]
     fn gc_lists_the_storage_it_would_remove_and_then_removes_exactly_that() {
         let tmp = scratch("gc");
+        // Give `remove` a private VM registry to prune.
+        let _registry = crate::vms::ThreadRegistry::set(&tmp.0.join("vms"));
         let base = tmp.0.join("state");
         std::fs::create_dir_all(&base).unwrap();
         let workspace = tmp.0.join("repo");

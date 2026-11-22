@@ -269,7 +269,37 @@ fn combine(parts: impl Iterator<Item = Freshness>) -> Freshness {
 /// The registry directory: `<data base>/vms`, alongside `vk run`'s image cache. Public so
 /// `vk paths` can report it.
 pub fn registry_dir() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = THREAD_REGISTRY.with_borrow(Clone::clone) {
+        return Ok(dir);
+    }
     Ok(crate::run::default_data_base()?.join("vms"))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// This thread's override for [`registry_dir`].
+    static THREAD_REGISTRY: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Override [`registry_dir`] on the current thread and restore it on drop. Tests can prune
+/// a private registry without changing the process environment.
+#[cfg(test)]
+pub(crate) struct ThreadRegistry(Option<PathBuf>);
+
+#[cfg(test)]
+impl ThreadRegistry {
+    pub(crate) fn set(dir: &Path) -> ThreadRegistry {
+        ThreadRegistry(THREAD_REGISTRY.replace(Some(dir.to_path_buf())))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ThreadRegistry {
+    fn drop(&mut self) {
+        THREAD_REGISTRY.set(self.0.take());
+    }
 }
 
 /// Content-addressed file name for a state dir: a short hash of its path, so distinct state

@@ -199,7 +199,13 @@ pub(crate) struct Collected {
 /// `only_on`, only dirs on that device. A note whose dir is gone or replaced is dropped. With
 /// `dry_run`, what it would remove.
 pub(crate) fn collect(idle: Duration, only_on: Option<u64>, dry_run: bool) -> Collected {
-    let running: Vec<PathBuf> = crate::vms::running()
+    // A dry run reads the registry without pruning the dead registrations it finds.
+    let live = if dry_run {
+        crate::vms::registered().0
+    } else {
+        crate::vms::running()
+    };
+    let running: Vec<PathBuf> = live
         .iter()
         .map(|vm| crate::vms::canonical(&vm.state_dir))
         .collect();

@@ -226,9 +226,13 @@ fn select(env: &Env, opts: &Options) -> Result<Selection> {
         }
         Err(e) => return Err(e).context("opening environment state for pruning"),
     };
-    // Read liveness before taking our own lock, which would make a stale registry
-    // entry appear to have a running owner. The locks below still exclude starts.
-    let running = crate::vms::running();
+    // Check liveness before locking: our lock would make a stale entry look live.
+    // The locks below exclude concurrent starts. A dry run preserves stale registrations.
+    let running = if opts.dry_run {
+        crate::vms::registered().0
+    } else {
+        crate::vms::running()
+    };
     lock(&root)?;
     let canonical = std::fs::canonicalize(fd_path(&root))?;
     ensure!(
@@ -492,6 +496,7 @@ pub(crate) fn reclaim_images(
     }
     let opts = Options {
         images: true,
+        dry_run,
         ..Options::default()
     };
     let selected = select(&env, &opts)?;
@@ -672,6 +677,8 @@ mod tests {
 
     struct Fixture {
         _env: std::sync::MutexGuard<'static, ()>,
+        /// Keep registry cleanup inside the fixture.
+        _registry: crate::vms::ThreadRegistry,
         dir: PathBuf,
         plan: Plan,
     }
@@ -691,6 +698,7 @@ mod tests {
         let guard = super::super::testutil::env_guard();
         let dir = std::env::temp_dir().join(format!("vk-prune-{}-{name}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
+        let registry = crate::vms::ThreadRegistry::set(&dir.join("vms"));
         let mut plan = super::super::testutil::plan_in(&dir);
         std::fs::create_dir_all(&plan.workspace).unwrap();
         std::fs::write(plan.workspace.join("compose.yaml"), "services:\n  devcontainer:\n    image: test\n    x-virtkit:\n      persist_root: true\n    volumes:\n      - ${VK_STATE_DIR}/data.qcow2:/data:disk\n      - ${VK_WORKSPACE}/external.qcow2:/external:disk\n").unwrap();
@@ -729,6 +737,7 @@ mod tests {
         std::fs::write(plan.workspace.join("external.qcow2"), b"external").unwrap();
         Fixture {
             _env: guard,
+            _registry: registry,
             dir,
             plan,
         }
@@ -1099,6 +1108,15 @@ mod tests {
             .unwrap();
             assert!(!f.plan.state_dir.join("root.qcow2").exists());
             assert!(!f.plan.state_dir.join("svc-db/db-overlay.qcow2").exists());
+            // Check cleanup while the registration handles are still live.
+            assert_eq!(
+                std::fs::read_dir(crate::vms::registry_dir().unwrap())
+                    .unwrap()
+                    .count(),
+                0,
+                "a real prune prunes stale registrations"
+            );
+            drop(registrations);
             return;
         }
         let _guard = super::super::testutil::env_guard();
