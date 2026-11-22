@@ -109,7 +109,7 @@ pub fn serve_agent_socket(path: &Path, guest: UnixStream, thread: &str) -> Resul
         vk_core::unixpath::bind(path).with_context(|| format!("binding {}", path.display()))?;
     std::thread::Builder::new()
         .name(thread.into())
-        .spawn(move || Relay::new(&guest, REPLY_TIMEOUT).run(&listener))
+        .spawn(move || Relay::new(&guest, REPLY_TIMEOUT, Box::new(Instant::now)).run(&listener))
         .context("spawning the guest agent relay")?;
     Ok(())
 }
@@ -205,10 +205,12 @@ struct Relay<'a> {
     from_guest: Vec<u8>,
     /// Discard the rest of an oversized line through its newline or up to the sync marker.
     discarding: bool,
+    /// monotonic clock, advanced explicitly in timeout tests
+    clock: Box<dyn Fn() -> Instant>,
 }
 
 impl<'a> Relay<'a> {
-    fn new(guest: &'a UnixStream, timeout: Duration) -> Relay<'a> {
+    fn new(guest: &'a UnixStream, timeout: Duration, clock: Box<dyn Fn() -> Instant>) -> Relay<'a> {
         Relay {
             guest,
             timeout,
@@ -216,9 +218,10 @@ impl<'a> Relay<'a> {
             next_key: 0,
             last: 0,
             awaiting: Awaiting::Nothing,
-            deadline: Instant::now(),
+            deadline: clock(),
             from_guest: Vec::new(),
             discarding: false,
+            clock,
         }
     }
 
@@ -253,15 +256,7 @@ impl<'a> Relay<'a> {
             poll_in(self.guest.as_raw_fd()),
         ];
         fds.extend(client_fds);
-        let wait = match self.awaiting {
-            Awaiting::Nothing => -1,
-            _ => self
-                .deadline
-                .saturating_duration_since(Instant::now())
-                .as_nanos()
-                .div_ceil(1_000_000)
-                .min(i32::MAX as u128) as i32,
-        };
+        let wait = self.poll_timeout();
         // SAFETY: valid pollfds on fds borrowed for the call.
         if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, wait) } < 0 {
             let e = std::io::Error::last_os_error();
@@ -270,6 +265,8 @@ impl<'a> Relay<'a> {
                 _ => Err(e),
             };
         }
+        // Expire the request before handling ready events, even if its answer is buffered.
+        self.on_timeout()?;
         let ready =
             |fd: &libc::pollfd| fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
 
@@ -298,7 +295,20 @@ impl<'a> Relay<'a> {
             };
             self.clients.insert(self.next_key, peer);
         }
-        self.on_timeout()
+        Ok(())
+    }
+
+    /// Milliseconds until the deadline, rounded up, or -1 when idle.
+    fn poll_timeout(&self) -> i32 {
+        match self.awaiting {
+            Awaiting::Nothing => -1,
+            _ => self
+                .deadline
+                .saturating_duration_since((self.clock)())
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .min(i32::MAX as u128) as i32,
+        }
     }
 
     /// While the agent is free, send it the next request in turn.
@@ -320,12 +330,14 @@ impl<'a> Relay<'a> {
                     }
                 }
                 Request::Execute { json, no_reply } => {
+                    // Include time blocked writing to the port, as for a sync request.
+                    let deadline = (self.clock)() + self.timeout;
                     self.guest.write_all(&[json, b"\n"].concat())?;
                     if no_reply {
                         self.resync()?;
                     } else {
                         self.awaiting = Awaiting::Answer(Some(key));
-                        self.deadline = Instant::now() + self.timeout;
+                        self.deadline = deadline;
                     }
                 }
             }
@@ -424,7 +436,7 @@ impl<'a> Relay<'a> {
     }
 
     fn on_timeout(&mut self) -> std::io::Result<()> {
-        if self.awaiting != Awaiting::Nothing && Instant::now() >= self.deadline {
+        if self.awaiting != Awaiting::Nothing && (self.clock)() >= self.deadline {
             self.abandon()?;
         }
         Ok(())
@@ -441,9 +453,9 @@ impl<'a> Relay<'a> {
     /// Send the agent a `guest-sync-delimited` that skips whatever it answers before.
     fn resync(&mut self) -> std::io::Result<()> {
         let id = crate::qga::sync_id();
+        self.deadline = (self.clock)() + self.timeout;
         self.guest.write_all(&crate::qga::sync_request(id))?;
         self.awaiting = Awaiting::Sync(id);
-        self.deadline = Instant::now() + self.timeout;
         Ok(())
     }
 }
@@ -459,6 +471,8 @@ fn copy(mut from: &UnixStream, mut to: &UnixStream, buf: &mut [u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn clients_take_turns_on_the_port() {
@@ -552,13 +566,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The qemu-ga relay on a socket in `dir`, with `timeout` for answers, and its agent's end.
-    fn shared(dir: &Path, timeout: Duration) -> (std::path::PathBuf, UnixStream) {
+    /// A frozen clock and its offset in milliseconds.
+    fn frozen() -> (Box<dyn Fn() -> Instant + Send>, Arc<AtomicU64>) {
+        let moved = Arc::new(AtomicU64::new(0));
+        let start = Instant::now();
+        let clock = {
+            let moved = moved.clone();
+            move || start + Duration::from_millis(moved.load(Ordering::SeqCst))
+        };
+        (Box::new(clock), moved)
+    }
+
+    /// Starts a relay on a socket in `dir` and returns the socket path, agent endpoint, and
+    /// [`frozen`] clock offset. Only advancing the clock can expire a reply deadline.
+    fn shared(dir: &Path) -> (std::path::PathBuf, UnixStream, Arc<AtomicU64>) {
         let sock = dir.join("qga.sock");
         let listener = vk_core::unixpath::bind(&sock).unwrap();
         let (port, host) = UnixStream::pair().unwrap();
-        std::thread::spawn(move || Relay::new(&host, timeout).run(&listener));
-        (sock, port)
+        let (clock, moved) = frozen();
+        std::thread::spawn(move || Relay::new(&host, REPLY_TIMEOUT, clock).run(&listener));
+        (sock, port, moved)
     }
 
     /// The request line running `command`.
@@ -590,7 +617,7 @@ mod tests {
     #[test]
     fn the_answer_to_a_client_that_left_goes_to_no_one() {
         let dir = crate::qga::tests::TempDir::new("relay-left");
-        let (sock, mut port) = shared(&dir.0, Duration::from_secs(5));
+        let (sock, mut port, _) = shared(&dir.0);
 
         let mut left = vk_core::unixpath::connect(&sock).unwrap();
         left.write_all(&request("a")).unwrap();
@@ -608,11 +635,13 @@ mod tests {
     #[test]
     fn an_unanswered_request_costs_its_client_and_the_relay_resyncs() {
         let dir = crate::qga::tests::TempDir::new("relay-unanswered");
-        let (sock, mut port) = shared(&dir.0, Duration::from_millis(200));
+        let (sock, mut port, clock) = shared(&dir.0);
 
         let mut stuck = vk_core::unixpath::connect(&sock).unwrap();
         stuck.write_all(&request("a")).unwrap();
         assert_eq!(line(&port), request("a"));
+        // Expire `a` before the next client wakes the relay.
+        clock.fetch_add(REPLY_TIMEOUT.as_millis() as u64, Ordering::SeqCst);
         let mut client = vk_core::unixpath::connect(&sock).unwrap();
         client.write_all(&request("b")).unwrap();
 
@@ -631,7 +660,7 @@ mod tests {
     #[test]
     fn a_line_that_is_not_one_json_object_is_answered_by_the_relay() {
         let dir = crate::qga::tests::TempDir::new("relay-invalid");
-        let (sock, mut port) = shared(&dir.0, Duration::from_secs(5));
+        let (sock, mut port, _) = shared(&dir.0);
 
         let mut client = vk_core::unixpath::connect(&sock).unwrap();
         // Blank lines get no answer, as from the agent.
@@ -653,7 +682,7 @@ mod tests {
     #[test]
     fn pipelined_requests_are_answered_in_turn() {
         let dir = crate::qga::tests::TempDir::new("relay-pipelined");
-        let (sock, mut port) = shared(&dir.0, Duration::from_secs(5));
+        let (sock, mut port, _) = shared(&dir.0);
 
         let mut client = vk_core::unixpath::connect(&sock).unwrap();
         client
@@ -670,7 +699,7 @@ mod tests {
     #[test]
     fn a_client_that_shut_down_its_sending_side_is_answered() {
         let dir = crate::qga::tests::TempDir::new("relay-half-closed");
-        let (sock, mut port) = shared(&dir.0, Duration::from_secs(5));
+        let (sock, mut port, _) = shared(&dir.0);
 
         let mut client = vk_core::unixpath::connect(&sock).unwrap();
         client
@@ -691,7 +720,7 @@ mod tests {
     #[test]
     fn a_command_with_no_reply_frees_the_agent_at_once() {
         let dir = crate::qga::tests::TempDir::new("relay-no-reply");
-        let (sock, mut port) = shared(&dir.0, Duration::from_secs(5));
+        let (sock, mut port, _) = shared(&dir.0);
 
         let mut stopping = vk_core::unixpath::connect(&sock).unwrap();
         stopping.write_all(&request("guest-shutdown")).unwrap();
@@ -709,7 +738,7 @@ mod tests {
     #[test]
     fn a_client_dropped_as_it_is_answered_does_not_stall_the_others() {
         let dir = crate::qga::tests::TempDir::new("relay-dropped");
-        let (sock, mut port) = shared(&dir.0, Duration::from_secs(5));
+        let (sock, mut port, _) = shared(&dir.0);
 
         let mut stuck = vk_core::unixpath::connect(&sock).unwrap();
         let mut leaving = vk_core::unixpath::connect(&sock).unwrap();
@@ -764,7 +793,7 @@ mod tests {
             (2 * M + 2, M + 2),
         ] {
             let (port, host) = UnixStream::pair().unwrap();
-            let mut relay = Relay::new(&host, REPLY_TIMEOUT);
+            let mut relay = Relay::new(&host, REPLY_TIMEOUT, Box::new(Instant::now));
             relay.awaiting = Awaiting::Answer(None);
             relay.on_agent_output(&vec![b'x'; first]).unwrap();
             let rest = [vec![b'x'; len - first], b"\n".to_vec()].concat();
@@ -807,7 +836,7 @@ mod tests {
     #[test]
     fn a_sync_answer_right_after_an_answer_too_long_frees_the_relay() {
         let (port, host) = UnixStream::pair().unwrap();
-        let mut relay = Relay::new(&host, REPLY_TIMEOUT);
+        let mut relay = Relay::new(&host, REPLY_TIMEOUT, Box::new(Instant::now));
         relay.awaiting = Awaiting::Answer(None);
         relay.on_agent_output(&vec![b'x'; MAX_ANSWER + 1]).unwrap();
         let sync = relay_sync(&port);
@@ -817,5 +846,68 @@ mod tests {
             .unwrap();
         assert!(relay.awaiting == Awaiting::Nothing);
         assert!(relay.from_guest.is_empty());
+    }
+
+    /// Returns a relay awaiting the answer to `a`, its client endpoint, and its clock offset.
+    fn one_request<'a>(
+        host: &'a UnixStream,
+        port: &UnixStream,
+    ) -> (Relay<'a>, UnixStream, Arc<AtomicU64>) {
+        let (stream, client) = UnixStream::pair().unwrap();
+        let (clock, moved) = frozen();
+        let mut relay = Relay::new(host, REPLY_TIMEOUT, clock);
+        assert_eq!(relay.poll_timeout(), -1);
+        let peer = Peer {
+            stream,
+            pending: request("a"),
+            eof: false,
+        };
+        relay.clients.insert(1, peer);
+        relay.next_request().unwrap();
+        assert_eq!(line(port), request("a"));
+        (relay, client, moved)
+    }
+
+    #[test]
+    fn an_outstanding_request_bounds_the_poll_of_an_idle_relay() {
+        let dir = crate::qga::tests::TempDir::new("relay-idle");
+        let listener = vk_core::unixpath::bind(&dir.0.join("qga.sock")).unwrap();
+        let (port, host) = UnixStream::pair().unwrap();
+        let (mut relay, mut client, moved) = one_request(&host, &port);
+
+        let timeout = REPLY_TIMEOUT.as_millis() as u64;
+        assert_eq!(relay.poll_timeout() as u64, timeout);
+        moved.store(timeout - 1, Ordering::SeqCst);
+        assert_eq!(relay.poll_timeout(), 1);
+        moved.store(timeout, Ordering::SeqCst);
+        assert_eq!(relay.poll_timeout(), 0);
+        // With nothing else to wake it, the relay gives up on `a` in one step.
+        relay.step(&listener, &mut [0u8; 1024]).unwrap();
+        relay_sync(&port);
+        // Fail immediately if the relay kept the client open.
+        client.set_nonblocking(true).unwrap();
+        let mut gone = [0u8; 1];
+        assert_eq!(client.read(&mut gone).unwrap(), 0);
+    }
+
+    #[test]
+    fn an_answer_read_once_its_time_is_up_is_late() {
+        let dir = crate::qga::tests::TempDir::new("relay-expired");
+        let listener = vk_core::unixpath::bind(&dir.0.join("qga.sock")).unwrap();
+        let (mut port, host) = UnixStream::pair().unwrap();
+        let (mut relay, mut client, moved) = one_request(&host, &port);
+
+        // Queue the answer before advancing the clock to the deadline.
+        port.write_all(b"answer a\n").unwrap();
+        moved.store(REPLY_TIMEOUT.as_millis() as u64, Ordering::SeqCst);
+        relay.step(&listener, &mut [0u8; 1024]).unwrap();
+        relay_sync(&port);
+        client.set_nonblocking(true).unwrap();
+        let mut gone = [0u8; 1];
+        assert_eq!(
+            client.read(&mut gone).unwrap(),
+            0,
+            "the late answer went to the client"
+        );
     }
 }

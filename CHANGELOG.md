@@ -102,6 +102,8 @@ All notable changes to virtkit will be documented in this file.
   starts during extraction.
 - `vk` handles long replies from a UEFI guest's QEMU guest agent more efficiently and
   drops oversized replies even when the final fragment crosses the 32 MiB limit.
+- Time spent sending a request to a UEFI guest's QEMU guest agent now counts toward its
+  reply timeout.
 
 ## [0.114.0] - 2026-11-20
 
