@@ -1300,8 +1300,7 @@ mod tests {
         let err = idle(&dir, 1).unwrap_err().to_string();
         assert!(err.contains("another `vk node` holds"), "{err}");
         drop(held);
-        // A child another test forks keeps the flock until it execs; let that window pass.
-        idle(&dir, 10).unwrap();
+        idle(&dir, 1).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1371,12 +1370,7 @@ mod tests {
         let err = format!("{:#}", idle_for_join(&dir, none, true).unwrap_err());
         assert!(err.contains("outside vk-node.service"), "{err}");
         drop(held);
-        // An unheld lock file passes. Not this one: a child another test forks meanwhile
-        // shares its lock until it execs.
-        let free = dir.join("free");
-        std::fs::create_dir(&free).unwrap();
-        std::fs::write(free.join(super::super::LOCK_FILE), "").unwrap();
-        idle_for_join(&free, none, true).unwrap();
+        idle_for_join(&dir, none, true).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

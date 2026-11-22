@@ -231,7 +231,7 @@ pub fn open(state_dir: &Path) -> Result<Relay> {
 /// Hold `state_dir` for as long as the returned file lives, creating it `0700` first and
 /// refusing it unless it is private to this user: one `vk-gitlab run`, `join` or `leave` at a
 /// time, so no job is recorded under an enrollment being replaced.
-pub fn lock(state_dir: &Path) -> Result<std::fs::File> {
+pub fn lock(state_dir: &Path) -> Result<vk_fs::LockFile> {
     vk_peer::net::create_dir(state_dir)?;
     vk_peer::net::lock_tries(state_dir, LOCK_FILE, 1, "vk-gitlab run, join or leave")
 }

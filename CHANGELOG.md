@@ -91,6 +91,8 @@ All notable changes to virtkit will be documented in this file.
   exits.
 - `vk-registry` no longer reports a blob upload as busy just because the previous chunk
   finished while a child process held the upload file open.
+- `vk node`, `vk tune` and `vk-gitlab` can reuse their state directory as soon as the
+  previous holder releases it.
 
 ## [0.114.0] - 2026-11-20
 

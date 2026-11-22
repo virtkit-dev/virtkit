@@ -71,9 +71,23 @@ impl std::fmt::Display for Locked {
 
 impl std::error::Error for Locked {}
 
-/// Hold `<dir>/<file>` locked for as long as the returned file lives, trying `tries` times
-/// 100 ms apart; [`Locked`] names `who` holds it otherwise.
-pub fn lock_tries(dir: &Path, file: &str, tries: u32, who: &str) -> Result<std::fs::File> {
+/// Try to lock `<dir>/<file>` up to `tries` times, 100 ms apart. On contention, [`Locked`]
+/// reports `who` as the holder. Dropping the [`vk_fs::LockFile`] releases the lock even if a
+/// forked child still has the descriptor open.
+pub fn lock_tries(dir: &Path, file: &str, tries: u32, who: &str) -> Result<vk_fs::LockFile> {
+    lock_tries_with(dir, file, tries, who, || {
+        std::thread::sleep(Duration::from_millis(100))
+    })
+}
+
+/// [`lock_tries`] calling `wait` between attempts instead of sleeping 100 ms.
+pub fn lock_tries_with(
+    dir: &Path,
+    file: &str,
+    tries: u32,
+    who: &str,
+    mut wait: impl FnMut(),
+) -> Result<vk_fs::LockFile> {
     let path = dir.join(file);
     let file = std::fs::File::options()
         .write(true)
@@ -82,6 +96,7 @@ pub fn lock_tries(dir: &Path, file: &str, tries: u32, who: &str) -> Result<std::
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
+        .map(vk_fs::LockFile::new)
         .map_err(|e| anyhow::Error::new(e).context(format!("opening {}", path.display())))?;
     for attempt in 0..tries {
         // SAFETY: the fd is owned by `file`, which outlives the call; flock returns 0 or -1.
@@ -93,7 +108,7 @@ pub fn lock_tries(dir: &Path, file: &str, tries: u32, who: &str) -> Result<std::
             return Err(e).with_context(|| format!("locking {}", path.display()));
         }
         if attempt + 1 < tries {
-            std::thread::sleep(Duration::from_millis(100));
+            wait();
         }
     }
     Err(anyhow::Error::new(Locked(format!(

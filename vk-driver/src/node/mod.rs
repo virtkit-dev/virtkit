@@ -383,7 +383,7 @@ async fn enroll_here(
 /// Lock `dir` and ensure it holds no enrollment. Refuse an existing enrollment unless
 /// `replace` is set; then move it to a unique sibling `node.replaced-<time>` and recreate
 /// `dir`. Return the lock and the previous enrollment's location.
-fn make_room(dir: &Path, replace: bool) -> Result<(std::fs::File, Option<PathBuf>)> {
+fn make_room(dir: &Path, replace: bool) -> Result<(vk_fs::LockFile, Option<PathBuf>)> {
     create_dir(dir)?;
     let lock = lock(dir).map_err(|e| {
         if e.is::<Locked>() {
@@ -885,7 +885,7 @@ fn stop_on_signal(managed: bool) -> Result<(Flag, Flag)> {
 /// Shared lock on the node's state dir for a `vk tune` pass, preventing `vk node run` from
 /// starting mid-pass. Holds nothing on a host without a node.
 pub struct TuneClaim {
-    _lock: Option<std::fs::File>,
+    _lock: Option<vk_fs::LockFile>,
 }
 
 /// Claim the concurrency for `vk tune`, or `None` when a `vk node` holds this host's node
@@ -905,7 +905,9 @@ pub fn claim_tuning(cfg: &Config) -> Result<Option<TuneClaim>> {
     };
     // SAFETY: the fd is owned by `file`, which outlives the call; flock returns 0 or -1.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
-        return Ok(Some(TuneClaim { _lock: Some(file) }));
+        return Ok(Some(TuneClaim {
+            _lock: Some(vk_fs::LockFile::new(file)),
+        }));
     }
     let e = std::io::Error::last_os_error();
     if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -974,13 +976,13 @@ type Flag = tokio::sync::watch::Receiver<bool>;
 /// Hold `<dir>/lock` for as long as the returned file lives: one `vk node` process per state
 /// dir, since two would supersede each other's sessions at the hub, or pair a key with an
 /// enrollment made for another.
-fn lock(dir: &Path) -> Result<std::fs::File> {
+fn lock(dir: &Path) -> Result<vk_fs::LockFile> {
     lock_tries(dir, LOCK_TRIES)
 }
 
 /// [`lock`] with `tries` attempts 100 ms apart, so a shared lock held for one `vk tune` pass
 /// is not mistaken for another node.
-fn lock_tries(dir: &Path, tries: u32) -> Result<std::fs::File> {
+fn lock_tries(dir: &Path, tries: u32) -> Result<vk_fs::LockFile> {
     vk_peer::net::lock_tries(dir, LOCK_FILE, tries, "vk node")
 }
 
@@ -1235,8 +1237,11 @@ concurrent = 4
         let err = lock_tries(&dir, 1).unwrap_err();
         assert!(err.is::<Locked>());
         assert!(format!("{err:#}").contains("another `vk node`"), "{err:#}");
+        // The duplicate stands in for a descriptor inherited by a forked child.
+        let copy = held.try_clone().unwrap();
         drop(held);
-        crate::testutil::once_released("another `vk node`", || lock(&dir)).unwrap();
+        lock_tries(&dir, 1).unwrap();
+        drop(copy);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1379,15 +1384,19 @@ concurrent = 4
         let held = lock(&node).unwrap();
         assert!(claim_tuning(&cfg).unwrap().is_none());
         drop(held);
-        // A tune pass holds the lock shared, and a node starting meanwhile waits it out.
+        // Keep a duplicate of the shared tune lock open as a forked child would.
         let claim = claim_tuning(&cfg).unwrap().unwrap();
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            drop(claim);
-        });
-        let held = lock(&node).unwrap();
-        release.join().unwrap();
+        let copy = claim._lock.as_ref().unwrap().try_clone().unwrap();
+        assert!(lock_tries(&node, 1).unwrap_err().is::<Locked>());
+        // End the tune pass between the node's two attempts.
+        let mut claim = Some(claim);
+        let held = vk_peer::net::lock_tries_with(&node, LOCK_FILE, 2, "vk node", || {
+            drop(claim.take().expect("one wait between two attempts"))
+        })
+        .unwrap();
+        assert!(claim.is_none(), "the first attempt met the pass");
         drop(held);
+        drop(copy);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
