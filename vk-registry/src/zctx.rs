@@ -1,10 +1,11 @@
 //! zstd contexts kept between operations.
 //!
-//! For a large store frame, zstd's tables, window and stream buffers take roughly 1 MiB
-//! to decode and 1–1.5 MiB to compress. In the static binaries, jemalloc handles Rust
-//! allocations. musl's malloc maps and unmaps each large zstd workspace. Reusing the
-//! mapping avoids the TLB shootdowns on unmap and the first-touch faults on fresh pages.
-//! Resetting the context preserves the encoded bytes.
+//! A context holds zstd's tables, its window and, for a stream, its buffers: about 1 MiB to
+//! decode a large stream and 1.5 MiB to compress one at the store's settings. A fresh
+//! context for each blob stored compressed or served decompressed repeats allocation
+//! and table setup. Even with jemalloc, the first access to a nonresident page faults.
+//! Resetting a pooled context lets zstd reuse its workspace when it fits and produces
+//! the same bytes as a fresh context.
 //!
 //! zstd's high-level reader and writer create a context or borrow one from the caller.
 //! A streamed HTTP body needs a `'static` reader, so the `zstd::stream::zio` adapters
