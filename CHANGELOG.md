@@ -116,6 +116,9 @@ All notable changes to virtkit will be documented in this file.
   stale VM records.
 - `vk dev prune` and `vk reset` no longer remove other VMs' stale records when the
   prompt is declined or there is no terminal to ask on.
+- A request to a UEFI guest's QEMU guest agent now times out when the guest stops reading
+  it, instead of blocking every later request for good. Later requests go through once the
+  agent responds again.
 - A VM command frees its slot on a capped exec channel before the client receives its
   exit status.
 

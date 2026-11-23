@@ -98,7 +98,11 @@ fn relay(listener: &UnixListener, guest: &UnixStream) {
 /// After [`REPLY_TIMEOUT`] without an answer, the relay drops the client and resynchronizes
 /// with the agent (`guest-sync-delimited`) before the next request, discarding late answers.
 /// The request may still run late, once the guest reads what the port buffered. A [`NO_REPLY`]
-/// command, answered by the agent only if it fails, is followed by such a sync at once.
+/// command gets an answer only on failure. The relay sends the sync as soon as the port
+/// accepts the whole command.
+///
+/// The same deadline covers nonblocking port writes. On timeout the relay discards any
+/// unsent bytes and disconnects the request's client, even for a [`NO_REPLY`] command.
 ///
 /// Waiting for a turn counts against each client's timeout, so one slow request can make
 /// others give up. A stop asking qemu-ga to shut down while another request holds the agent
@@ -201,6 +205,10 @@ struct Relay<'a> {
     awaiting: Awaiting,
     /// when what the relay awaits is late
     deadline: Instant,
+    /// unsent bytes of the current request or sync
+    to_guest: Vec<u8>,
+    /// sync after the port accepts the complete [`NO_REPLY`] command in `to_guest`
+    no_reply: bool,
     /// the agent's output not yet split into lines
     from_guest: Vec<u8>,
     /// Discard the rest of an oversized line through its newline or up to the sync marker.
@@ -219,6 +227,8 @@ impl<'a> Relay<'a> {
             last: 0,
             awaiting: Awaiting::Nothing,
             deadline: clock(),
+            to_guest: Vec::new(),
+            no_reply: false,
             from_guest: Vec::new(),
             discarding: false,
             clock,
@@ -253,7 +263,11 @@ impl<'a> Relay<'a> {
             .unzip();
         let mut fds = vec![
             poll_in(listener.as_raw_fd()),
-            poll_in(self.guest.as_raw_fd()),
+            libc::pollfd {
+                fd: self.guest.as_raw_fd(),
+                events: self.guest_events(),
+                revents: 0,
+            },
         ];
         fds.extend(client_fds);
         let wait = self.poll_timeout();
@@ -276,6 +290,33 @@ impl<'a> Relay<'a> {
                 n => self.on_agent_output(&buf[..n])?,
             }
         }
+        // Drain stale input before flushing. Once the queue empties, the next line
+        // can answer the current request.
+        while !self.to_guest.is_empty() {
+            // SAFETY: recv writes at most `buf.len()` bytes into `buf`, from a socket open for
+            // the borrow of `guest`. MSG_DONTWAIT makes this one call non-blocking.
+            let n = unsafe {
+                libc::recv(
+                    self.guest.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            match usize::try_from(n) {
+                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => self.on_agent_output(&buf[..n])?,
+                Err(_) => {
+                    let e = std::io::Error::last_os_error();
+                    match e.kind() {
+                        std::io::ErrorKind::Interrupted => {}
+                        std::io::ErrorKind::WouldBlock => break,
+                        _ => return Err(e),
+                    }
+                }
+            }
+        }
+        self.flush()?;
         // By key: answering may have dropped a client polled here.
         for (key, fd) in keys.into_iter().zip(&fds[2..]) {
             if ready(fd) && self.clients.contains_key(&key) {
@@ -296,6 +337,13 @@ impl<'a> Relay<'a> {
             self.clients.insert(self.next_key, peer);
         }
         Ok(())
+    }
+
+    fn guest_events(&self) -> libc::c_short {
+        match self.to_guest.is_empty() {
+            true => libc::POLLIN,
+            false => libc::POLLIN | libc::POLLOUT,
+        }
     }
 
     /// Milliseconds until the deadline, rounded up, or -1 when idle.
@@ -330,15 +378,14 @@ impl<'a> Relay<'a> {
                     }
                 }
                 Request::Execute { json, no_reply } => {
-                    // Include time blocked writing to the port, as for a sync request.
-                    let deadline = (self.clock)() + self.timeout;
-                    self.guest.write_all(&[json, b"\n"].concat())?;
-                    if no_reply {
-                        self.resync()?;
-                    } else {
-                        self.awaiting = Awaiting::Answer(Some(key));
-                        self.deadline = deadline;
-                    }
+                    // The reply deadline includes time waiting for room on the port.
+                    self.deadline = (self.clock)() + self.timeout;
+                    // Keep the client until the reply or the final write of a no-reply command.
+                    self.awaiting = Awaiting::Answer(Some(key));
+                    self.no_reply = no_reply;
+                    self.to_guest.extend_from_slice(json);
+                    self.to_guest.push(b'\n');
+                    self.flush()?;
                 }
             }
         }
@@ -395,6 +442,8 @@ impl<'a> Relay<'a> {
 
     fn on_agent_line(&mut self, line: &[u8]) {
         match self.awaiting {
+            // Input received before the final write is stale.
+            Awaiting::Answer(_) if !self.to_guest.is_empty() => {}
             Awaiting::Answer(owner) => {
                 if let Some(key) = owner
                     && let Some(peer) = self.clients.get(&key)
@@ -447,6 +496,10 @@ impl<'a> Relay<'a> {
         if let Awaiting::Answer(Some(key)) = self.awaiting {
             self.clients.remove(&key);
         }
+        // Replace any unsent request or sync. The new sync's leading 0xFF tells the
+        // agent to discard a partial request.
+        self.to_guest.clear();
+        self.no_reply = false;
         self.resync()
     }
 
@@ -454,10 +507,64 @@ impl<'a> Relay<'a> {
     fn resync(&mut self) -> std::io::Result<()> {
         let id = crate::qga::sync_id();
         self.deadline = (self.clock)() + self.timeout;
-        self.guest.write_all(&crate::qga::sync_request(id))?;
+        self.to_guest.extend(crate::qga::sync_request(id));
         self.awaiting = Awaiting::Sync(id);
+        send_ready(self.guest, &mut self.to_guest)
+    }
+
+    /// Flush queued bytes and start a sync after the final write of a [`NO_REPLY`] command.
+    fn flush(&mut self) -> std::io::Result<()> {
+        let unsent = !self.to_guest.is_empty();
+        send_ready(self.guest, &mut self.to_guest)?;
+        if unsent
+            && self.to_guest.is_empty()
+            && matches!(self.awaiting, Awaiting::Answer(_))
+            && !self.from_guest.is_empty()
+        {
+            // A line that began before the final write is stale through its newline.
+            self.from_guest.clear();
+            self.discarding = true;
+        }
+        if self.no_reply && self.to_guest.is_empty() {
+            self.no_reply = false;
+            self.resync()?;
+        }
         Ok(())
     }
+}
+
+/// Write without blocking and retain unsent bytes for the next writable poll.
+fn send_ready(guest: &UnixStream, queue: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut sent = 0;
+    let result = loop {
+        let rest = queue.get(sent..).unwrap_or_default();
+        if rest.is_empty() {
+            break Ok(());
+        }
+        // SAFETY: `rest` is valid for its length, and the fd is open for the borrow of
+        // `guest`. MSG_DONTWAIT makes this one call non-blocking on a blocking socket.
+        let n = unsafe {
+            libc::send(
+                guest.as_raw_fd(),
+                rest.as_ptr().cast(),
+                rest.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        match usize::try_from(n) {
+            Ok(n) => sent += n,
+            Err(_) => {
+                let e = std::io::Error::last_os_error();
+                match e.kind() {
+                    std::io::ErrorKind::Interrupted => {}
+                    std::io::ErrorKind::WouldBlock => break Ok(()),
+                    _ => break Err(e),
+                }
+            }
+        }
+    };
+    queue.drain(..sent);
+    result
 }
 
 /// Move ready bytes from `from` to `to`; false at end of stream or on error.
@@ -888,6 +995,185 @@ mod tests {
         client.set_nonblocking(true).unwrap();
         let mut gone = [0u8; 1];
         assert_eq!(client.read(&mut gone).unwrap(), 0);
+    }
+
+    /// Limit the relay's send buffer so a long request requires multiple writes.
+    fn small_port() -> (UnixStream, UnixStream) {
+        let (port, host) = UnixStream::pair().unwrap();
+        let small: libc::c_int = 4096;
+        // SAFETY: the option value is a c_int that outlives the call, on an open socket.
+        let rc = unsafe {
+            libc::setsockopt(
+                host.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                std::ptr::from_ref(&small).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0);
+        (port, host)
+    }
+
+    /// The request line running `command` with 200 KiB of arguments.
+    fn long_request(command: &str) -> Vec<u8> {
+        let arguments = "x".repeat(200 << 10);
+        format!("{{\"execute\":\"{command}\",\"arguments\":\"{arguments}\"}}\n").into_bytes()
+    }
+
+    /// Partially send `request` through [`small_port`] to a guest that never reads.
+    /// Return the relay, client endpoint and clock offset.
+    fn stalled<'a>(
+        host: &'a UnixStream,
+        request: &[u8],
+    ) -> (Relay<'a>, UnixStream, Arc<AtomicU64>) {
+        // A relay that blocks on the port fails here instead of hanging the test.
+        host.set_write_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let (stream, client) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        let (clock, moved) = frozen();
+        let mut relay = Relay::new(host, REPLY_TIMEOUT, clock);
+        let peer = Peer {
+            stream,
+            pending: request.to_vec(),
+            eof: false,
+        };
+        relay.clients.insert(1, peer);
+        relay.next_request().unwrap();
+        assert!(relay.awaiting == Awaiting::Answer(Some(1)));
+        let unsent = relay.to_guest.len();
+        assert!(0 < unsent && unsent < request.len(), "{unsent}");
+        assert_eq!(relay.to_guest, request[request.len() - unsent..]);
+        assert_eq!(relay.guest_events(), libc::POLLIN | libc::POLLOUT);
+        assert_eq!(relay.poll_timeout() as u128, REPLY_TIMEOUT.as_millis());
+        (relay, client, moved)
+    }
+
+    fn only_a_sync_is_queued(relay: &Relay) {
+        let Awaiting::Sync(id) = relay.awaiting else {
+            panic!("the relay awaits no sync");
+        };
+        assert_eq!(relay.to_guest, crate::qga::sync_request(id));
+    }
+
+    /// Appends to `got` what the guest can read from `port` now.
+    fn read_ready(mut port: &UnixStream, got: &mut Vec<u8>) {
+        port.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 4096];
+        loop {
+            match port.read(&mut buf) {
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(e) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_guest_that_stops_reading_costs_the_request_and_not_the_relay() {
+        let dir = crate::qga::tests::TempDir::new("relay-port-full");
+        let listener = vk_core::unixpath::bind(&dir.0.join("qga.sock")).unwrap();
+        let (port, host) = small_port();
+        let request = long_request("a");
+        let (mut relay, mut client, moved) = stalled(&host, &request);
+        let unsent = relay.to_guest.len();
+
+        // A line read before the port took the request is not its answer.
+        relay.on_agent_output(b"stale\n").unwrap();
+        assert!(relay.awaiting == Awaiting::Answer(Some(1)));
+        let e = client.read(&mut [0u8; 1]).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+
+        // Timeout disconnects the client and replaces the unsent bytes with a sync.
+        let timeout = REPLY_TIMEOUT.as_millis() as u64;
+        moved.store(timeout, Ordering::SeqCst);
+        relay.step(&listener, &mut [0u8; 1024]).unwrap();
+        // Check the client table directly. A child forked by a parallel test can delay socket EOF.
+        assert!(relay.clients.is_empty());
+        only_a_sync_is_queued(&relay);
+        // A second timeout replaces the pending sync.
+        moved.store(2 * timeout, Ordering::SeqCst);
+        relay.step(&listener, &mut [0u8; 1024]).unwrap();
+        only_a_sync_is_queued(&relay);
+        let sync = relay.to_guest.clone();
+
+        // The guest sees the request prefix followed by the sync that discards it.
+        let mut got = Vec::new();
+        read_ready(&port, &mut got);
+        assert_eq!(got, request[..request.len() - unsent]);
+        relay.step(&listener, &mut [0u8; 1024]).unwrap();
+        assert_eq!(relay.guest_events(), libc::POLLIN);
+        got.clear();
+        read_ready(&port, &mut got);
+        assert_eq!(got, sync);
+        relay.on_agent_output(crate::qga::tests::STRAY_FF).unwrap();
+        let sync = serde_json::from_slice(&sync[1..]).unwrap();
+        relay
+            .on_agent_output(&crate::qga::tests::synced(&sync))
+            .unwrap();
+        assert!(relay.awaiting == Awaiting::Nothing);
+    }
+
+    #[test]
+    fn a_line_sent_before_the_port_took_a_request_is_not_its_answer() {
+        let dir = crate::qga::tests::TempDir::new("relay-port-full-stale");
+        let listener = vk_core::unixpath::bind(&dir.0.join("qga.sock")).unwrap();
+        let (mut port, host) = small_port();
+        let request = long_request("a");
+        let (mut relay, client, _) = stalled(&host, &request);
+
+        // Queue a stale line and a partial line before every write, including the final
+        // write. The read buffer fits exactly one line, forcing a second read.
+        let mut got = Vec::new();
+        while !relay.to_guest.is_empty() {
+            port.write_all(b"stale\nsta").unwrap();
+            read_ready(&port, &mut got);
+            relay.step(&listener, &mut [0u8; 6]).unwrap();
+        }
+        read_ready(&port, &mut got);
+        assert_eq!(got, request);
+        assert!(relay.awaiting == Awaiting::Answer(Some(1)));
+
+        // Finish the stale line before sending the answer.
+        port.write_all(b"le\nanswer a\n").unwrap();
+        while relay.awaiting != Awaiting::Nothing {
+            relay.step(&listener, &mut [0u8; 6]).unwrap();
+        }
+        client.set_nonblocking(false).unwrap();
+        assert_eq!(line(&client), b"answer a\n");
+    }
+
+    #[test]
+    fn a_command_with_no_reply_is_its_clients_until_the_port_takes_it() {
+        let dir = crate::qga::tests::TempDir::new("relay-port-full-no-reply");
+        let listener = vk_core::unixpath::bind(&dir.0.join("qga.sock")).unwrap();
+        let request = long_request("guest-shutdown");
+
+        // A stalled no-reply command still times out and disconnects its client.
+        let (_port, host) = small_port();
+        let (mut relay, _client, moved) = stalled(&host, &request);
+        moved.store(REPLY_TIMEOUT.as_millis() as u64, Ordering::SeqCst);
+        relay.step(&listener, &mut [0u8; 1024]).unwrap();
+        assert!(relay.clients.is_empty());
+        only_a_sync_is_queued(&relay);
+
+        // If the write completes in time, the sync follows the command and the client stays.
+        let (port, host) = small_port();
+        let (mut relay, _client, _) = stalled(&host, &request);
+        let mut got = Vec::new();
+        while !relay.to_guest.is_empty() {
+            read_ready(&port, &mut got);
+            relay.step(&listener, &mut [0u8; 1024]).unwrap();
+        }
+        read_ready(&port, &mut got);
+        let Awaiting::Sync(id) = relay.awaiting else {
+            panic!("the relay awaits no sync");
+        };
+        assert_eq!(got, [request, crate::qga::sync_request(id)].concat());
+        assert!(relay.clients.contains_key(&1));
     }
 
     #[test]
