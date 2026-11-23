@@ -751,7 +751,10 @@ async fn loaded_node(
         Duration::from_millis(300),
     )
     .await;
-    wait_until(|| crate::jobs::testing::linked(hub, &id) && heard(hub, &id)).await;
+    until_hub(hub, || {
+        crate::jobs::testing::linked(hub, &id) && heard(hub, &id)
+    })
+    .await;
     node
 }
 
@@ -770,6 +773,24 @@ async fn reason_now(hub: &Hub, runner_id: u64) -> Option<&'static str> {
     snapshot
         .get(&("gl".to_string(), runner_id))
         .and_then(|v| v.reason)
+}
+
+/// Recheck `cond` on dispatch or node changes for up to 10 seconds. Dispatch signals after
+/// handling a node's job message and its writes. Node changes include heartbeat, inventory
+/// and report writes.
+async fn until_hub(hub: &Hub, mut cond: impl FnMut() -> bool) {
+    let mut dispatch = hub.dispatch.subscribe();
+    let mut changes = hub.subscribe();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !cond() {
+            tokio::select! {
+                changed = dispatch.changed() => changed.unwrap(),
+                changed = changes.changed() => changed.unwrap(),
+            }
+        }
+    })
+    .await
+    .expect("condition never held");
 }
 
 async fn wait_until(mut cond: impl FnMut() -> bool) {
@@ -2113,10 +2134,11 @@ async fn simultaneous_reservations_account_for_an_offer_before_selecting_again()
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_expires() {
     let dir = scratch("reserve");
-    // Keep the offer timeout longer than the test watchdogs.
+    // Keep the offer and renewal deadlines longer than the test watchdogs.
     let db = Arc::new(Db::open_memory().unwrap());
     let (addr, hub) = serve_hub_with(db, &dir, Duration::from_secs(60), |hub| {
         hub.answering_offers_within(Duration::from_secs(120))
+            .answering_renewals_within(Duration::from_secs(120))
     })
     .await;
     let key = jobs_key(&hub);
@@ -2233,7 +2255,10 @@ async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_e
         reservation: reservation.clone(),
         state: LeaseState::Held { remaining_secs: 90 },
     });
-    let resp = renew.await.unwrap();
+    let resp = tokio::time::timeout(Duration::from_secs(30), renew)
+        .await
+        .expect("the renewal was not answered")
+        .unwrap();
     assert_eq!(
         (resp.status, resp.json::<ReservationGrant>().lease_secs),
         (200, 90)
@@ -2264,7 +2289,7 @@ async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_e
             why: LeaseEnd::Expired,
         },
     });
-    wait_until(|| crate::jobs::testing::reservations(&hub) == 0).await;
+    until_hub(&hub, || crate::jobs::testing::reservations(&hub) == 0).await;
     let resp = api(
         addr,
         "POST",
@@ -2279,7 +2304,7 @@ async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_e
     );
     // Gone from memory before its audit is written.
     let expired = format!("reservation {reservation} on node {} expired", small.id);
-    wait_until(|| {
+    until_hub(&hub, || {
         let audit = hub.db.audits(Some(&small.id), 20).unwrap();
         audit.iter().any(|r| r.event == expired)
     })
