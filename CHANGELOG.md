@@ -103,6 +103,7 @@ All notable changes to virtkit will be documented in this file.
   finished while a child process held the upload file open.
 - `vk-registry` no longer stores a blob compressed if its staged file changed length
   while being stored.
+- Image and build-cache pushes report disk read errors instead of hanging.
 - `vk node`, `vk tune` and `vk-gitlab` can reuse their state directory as soon as the
   previous holder releases it.
 - `vk dev` keeps its `auto` endpoint address when a child inherits a port check or

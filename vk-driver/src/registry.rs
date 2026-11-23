@@ -1742,8 +1742,18 @@ async fn chunk_region(
 ) -> Result<Vec<(OciDescriptor, bool)>> {
     use futures::StreamExt;
     const CHUNK_CONCURRENCY: usize = 16;
-    let chunker =
+    let mut chunker =
         fastcdc::v2020::StreamCDC::new(std::io::BufReader::new(reader), CDC_MIN, CDC_AVG, CDC_MAX);
+    // Asked again, the chunker reads again, without end on a persistent error.
+    let mut failed = false;
+    let chunker = std::iter::from_fn(move || {
+        if failed {
+            return None;
+        }
+        let chunk = chunker.next()?;
+        failed = chunk.is_err();
+        Some(chunk)
+    });
     let results: Vec<Result<Option<(OciDescriptor, bool)>>> = futures::stream::iter(chunker)
         .map(|chunk| async move {
             let chunk = chunk.with_context(|| format!("chunking {}", label.display()))?;
@@ -5747,6 +5757,58 @@ pub(crate) mod tests {
         let seen = server.seen();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].path, seen[1].path);
+    }
+
+    /// Supplies zeros before the injected read error. A retry panics so the test cannot spin.
+    struct FailsAfter {
+        left: usize,
+        failed: bool,
+    }
+
+    impl Read for FailsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            assert!(!self.failed, "read again after a failed read");
+            let n = buf.len().min(self.left);
+            if n == 0 {
+                self.failed = true;
+                return Err(std::io::Error::other("the disk is gone"));
+            }
+            buf[..n].fill(0);
+            self.left -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_region_read_error_fails_the_push() {
+        install_crypto();
+        let server = FakeServer::start(Vec::new());
+        let rg = fake_registry(&server);
+        let (client, _auth) = client(&rg).unwrap();
+        let image = make_ref(&rg, "repo", "tag").unwrap();
+        // The chunker fills CDC_MAX bytes before cutting. The first chunk is all
+        // zeros and needs no upload before the read fails.
+        let reader = Box::new(FailsAfter {
+            left: CDC_MAX + CDC_MAX / 2,
+            failed: false,
+        });
+        let err = block_on(chunk_region(
+            &client,
+            None,
+            &rg,
+            &image,
+            false,
+            None,
+            reader,
+            0,
+            Path::new("disk.ext4"),
+            false,
+        ))
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("chunking disk.ext4"), "{err}");
+        assert!(err.contains("the disk is gone"), "{err}");
+        assert!(server.seen().is_empty());
     }
 
     /// Reject a complete blob with a digest mismatch without retrying.
