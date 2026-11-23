@@ -1795,8 +1795,24 @@ mod tests {
     // rather than give up on an unanswering holder, and gets the lock once it goes.
     #[test]
     fn a_lock_taken_without_waiting_is_waited_out() {
-        let dir =
-            std::env::temp_dir().join(format!("virtkit-test-try-pull-lock-{}", std::process::id()));
+        // A sibling fork could keep the listener bound after release. Its unanswered queries
+        // would make the waiter give up. Use a short job URL so the query returns it in full.
+        const CHILD: &str = "VK_TEST_PULL_WAITED_OUT";
+        const NAME: &str = "image::tests::a_lock_taken_without_waiting_is_waited_out";
+        const JOB: &str = "https://ci.example/job/7";
+        let Some(dir) = crate::dev::testutil::child_marker(CHILD).map(PathBuf::from) else {
+            let _guard = crate::dev::testutil::env_guard();
+            let dir = std::env::temp_dir()
+                .join(format!("virtkit-test-waited-out-{}", std::process::id()));
+            let output = crate::dev::testutil::child_test(NAME)
+                .env(CHILD, &dir)
+                .env("CUSTOM_ENV_CI_JOB_URL", JOB)
+                .output()
+                .unwrap();
+            crate::dev::testutil::ran_alone(NAME, &output);
+            return;
+        };
+        assert_eq!(crate::jobctx::job_identity(), JOB);
         let held = try_acquire_pull_lock(&dir).expect("a free lock is taken");
         assert!(try_acquire_pull_lock(&dir).is_none(), "a held lock is not");
         let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
@@ -1806,7 +1822,7 @@ mod tests {
         let answered = || {
             let holder = query_holder(&addr).unwrap().unwrap();
             assert_eq!(holder.uid, Some(me));
-            assert_eq!(holder.who, Some(crate::jobctx::job_identity()));
+            assert_eq!(holder.who.as_deref(), Some(JOB));
         };
         answered();
         let (heard, said) = std::sync::mpsc::channel();
@@ -1827,7 +1843,8 @@ mod tests {
         };
         // Wait for the first contention report before querying the holder again.
         assert!(matches!(
-            said.recv().unwrap(),
+            said.recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the waiter never said it waits"),
             Activity::Waiting { building: true, .. }
         ));
         // The responder must keep answering while the waiter is blocked.
@@ -1844,9 +1861,20 @@ mod tests {
     #[test]
     fn a_wait_is_said_until_the_lock_is_taken() {
         use crate::node::jobs::journal::{ACTIVITY, read_activity};
+        // Isolate the listener so a sibling fork cannot keep its address bound and
+        // unanswered when the waiter tries to claim it.
+        const CHILD: &str = "VK_TEST_PULL_WAIT_SAID";
+        let Some(root) = crate::dev::testutil::child_marker(CHILD).map(PathBuf::from) else {
+            let root =
+                std::env::temp_dir().join(format!("virtkit-test-wait-said-{}", std::process::id()));
+            crate::dev::testutil::in_child(
+                "image::tests::a_wait_is_said_until_the_lock_is_taken",
+                CHILD,
+                &root,
+            );
+            return;
+        };
         let ms = std::time::Duration::from_millis;
-        let root =
-            std::env::temp_dir().join(format!("virtkit-test-wait-said-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let (heard, said) = std::sync::mpsc::channel();
@@ -1865,33 +1893,31 @@ mod tests {
         // A holder whose answer the test changes.
         let answer = Arc::new(std::sync::Mutex::new("job 1".to_string()));
         let stop = Arc::new(AtomicBool::new(false));
+        let addr = pull_lock_addr(pull_lock_hash(&root.join("img"))).unwrap();
         let holder = {
-            let lock = UnixListener::bind_addr(
-                &pull_lock_addr(pull_lock_hash(&root.join("img"))).unwrap(),
-            )
-            .unwrap();
-            lock.set_nonblocking(true).unwrap();
+            let lock = UnixListener::bind_addr(&addr).unwrap();
             let (answer, stop) = (answer.clone(), stop.clone());
             std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    match lock.accept() {
-                        Ok((mut s, _)) => {
-                            let _ = s.write_all(answer.lock().unwrap().as_bytes());
-                        }
-                        Err(_) => std::thread::sleep(ms(1)),
+                loop {
+                    let (mut s, _) = lock.accept().expect("the fake holder cannot accept");
+                    if stop.load(Ordering::SeqCst) {
+                        break;
                     }
+                    let _ = s.write_all(answer.lock().unwrap().as_bytes());
                 }
             })
         };
-        /// Stop the holder on panic so the scoped waiter can finish.
-        struct Stop(Arc<AtomicBool>);
+        /// Stop the holder even on panic so the scoped waiter can finish. Set the flag
+        /// before connecting to wake `accept`. A connection failure after shutdown is harmless.
+        struct Stop(Arc<AtomicBool>, std::os::unix::net::SocketAddr);
         impl Drop for Stop {
             fn drop(&mut self) {
-                self.0.store(true, Ordering::Relaxed);
+                self.0.store(true, Ordering::SeqCst);
+                let _ = std::os::unix::net::UnixStream::connect_addr(&self.1);
             }
         }
         let waiter = std::thread::scope(|scope| {
-            let stopping = Stop(stop);
+            let stopping = Stop(stop, addr);
             let waiter = scope.spawn(|| acquire("img", "build"));
             let waiting = |holder: Option<&str>| Activity::Waiting {
                 image: "img".into(),
