@@ -52,6 +52,11 @@ async fn start_jobs(dir: &std::path::Path, lost_after: Duration) -> (SocketAddr,
     serve_hub(db, dir, lost_after).await
 }
 
+/// Like [`start_jobs`], but only the test can trigger a dispatch pass.
+async fn start_undriven(dir: &std::path::Path, lost_after: Duration) -> (SocketAddr, Arc<Hub>) {
+    serve_undriven(Arc::new(Db::open_memory().unwrap()), dir, lost_after).await
+}
+
 /// A hub over `db`, as one restarted over the same database and output would be.
 async fn serve_hub(
     db: Arc<Db>,

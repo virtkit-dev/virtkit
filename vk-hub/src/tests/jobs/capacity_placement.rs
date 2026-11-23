@@ -120,7 +120,7 @@ async fn image_affinity_cannot_escape_a_lane_s_nodes() {
 #[tokio::test]
 async fn a_job_whose_project_is_delisted_is_held_saying_why() {
     let dir = scratch("placement-delisted");
-    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let (addr, hub) = start_undriven(&dir, Duration::from_secs(30)).await;
     let key = jobs_key(&hub);
     ready_relay(&hub, &key);
     // Submitted while listed, with no node to take it yet; then its lane drops the project.
@@ -133,7 +133,6 @@ async fn a_job_whose_project_is_delisted_is_held_saying_why() {
         Some("no longer allowed by its lane")
     );
     crate::jobs::testing::end_window_and_step(&hub, &job).await;
-    // Check the result without polling for another dispatch pass.
     let ended = job_view(addr, &key, &job).await;
     assert_eq!(ended.state, JobState::Finished, "{ended:?}");
     assert_eq!(
