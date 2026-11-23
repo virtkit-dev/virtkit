@@ -6,6 +6,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- If a `[registry]` or build cache CA file fails PEM parsing or contains no certificates,
+  vk refuses to send requests to that registry.
 - HTTP caches in front of `vk-registry` can now distinguish compressed and decoded
   responses for the same blob.
 

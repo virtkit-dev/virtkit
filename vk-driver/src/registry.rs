@@ -30,7 +30,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use oci_client::Reference as OciReference;
 use oci_client::RegistryOperation;
-use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientProtocol};
+use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::errors::{OciDistributionError, OciEnvelope, OciErrorCode};
 use oci_client::manifest::{OCI_IMAGE_MEDIA_TYPE, OciDescriptor, OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
@@ -51,7 +51,7 @@ const CDC_AVG: usize = 4 << 20;
 pub(crate) const CDC_MAX: usize = 16 << 20;
 
 mod chunks;
-use chunks::ChunkPool;
+use chunks::{ChunkPool, ChunkTransport};
 
 /// Maximum number of in-flight chunk operations per registry restore.
 const RESTORE_CONCURRENCY: usize = 16;
@@ -1867,22 +1867,20 @@ fn staging_tmp(bundle: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Build an oci-client `Client` + `RegistryAuth` from a `[registry]` section, the same
-/// construction `oci.rs` uses for the docker and launch paths (rustls, optional PEM CA,
-/// Basic vs Anonymous auth).
+/// Build the `[registry]` client with anonymous, Basic or Bearer auth. For rustls trust
+/// roots (including an optional PEM CA), HTTP timeouts and proxies, [`ChunkTransport`] uses the
+/// HTTP client oci-client would build from the same settings — the CA added
+/// to the system roots, no timeouts, proxies from the environment.
 pub(crate) fn client(rg: &Registry) -> Result<(oci_client::Client, RegistryAuth)> {
     let mut cfg = ClientConfig::default();
-    if let Some(ca) = &rg.ca_file {
-        let pem = std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?;
-        cfg.extra_root_certificates.push(Certificate {
-            encoding: CertificateEncoding::Pem,
-            data: pem,
-        });
-    }
     if rg.insecure {
         cfg.protocol = ClientProtocol::Http;
     }
-    let client = oci_client::Client::new(cfg);
+    // oci-client sets the user agent on each request.
+    let http = http_client_builder(rg)?
+        .build()
+        .context("building the registry HTTP client")?;
+    let client = oci_client::Client::new_with_transport(cfg, ChunkTransport(http));
     Ok((client, cred(rg)?.registry_auth()))
 }
 
@@ -2729,8 +2727,8 @@ fn mark_down(authority: String) {
 /// under its own digest or a manifest under its tag; an existence check is a HEAD. What
 /// gets retried is the connection not being made, timing out, or dying under the request
 /// or the response: on a lossy path a registry's send stalls in RTO backoff and reqwest's
-/// `TCP_USER_TIMEOUT` (30 s by default; `oci_client` offers no way to set it) has the
-/// kernel abort the socket mid-body, which a fresh connection a moment later serves fine.
+/// default 30 s `TCP_USER_TIMEOUT` can abort the socket mid-body. A fresh connection can
+/// complete the transfer.
 /// A registry turning requests away — answering 503 or 429, as vk-registry does past its
 /// per-client connection cap, or closing new connections — is retried for longer (see
 /// [`TRANSFER_BACKOFF`]). A registry not reached for a whole budget is not waited for again
@@ -3444,8 +3442,8 @@ async fn detect_transparent_zstd(rg: &Registry, image: &OciReference) -> bool {
     .unwrap_or(false)
 }
 
-/// A reqwest client honoring the registry's TLS settings (rustls + optional PEM CA),
-/// for the transparent-zstd blob push that needs a per-request `Content-Encoding`.
+/// Direct registry requests use rustls and the registry's optional PEM CA. The
+/// transparent-zstd blob push needs this client to set `Content-Encoding` per request.
 pub(crate) fn http_client(rg: &Registry) -> Result<reqwest::Client> {
     http_client_builder(rg)?
         .build()
@@ -3457,9 +3455,12 @@ pub(crate) fn http_client_builder(rg: &Registry) -> Result<reqwest::ClientBuilde
     let mut b = reqwest::Client::builder();
     if let Some(ca) = &rg.ca_file {
         let pem = std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?;
-        b = b.add_root_certificate(
-            reqwest::Certificate::from_pem(&pem).context("parsing the registry CA")?,
-        );
+        let certs = reqwest::Certificate::from_pem_bundle(&pem)
+            .with_context(|| format!("parsing the registry CA {}", ca.display()))?;
+        if certs.is_empty() {
+            bail!("the registry CA {} holds no certificate", ca.display());
+        }
+        b = b.tls_certs_merge(certs);
     }
     Ok(b)
 }
@@ -7543,6 +7544,36 @@ pub(crate) mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unusable CA must never silently fall back to the system roots.
+    #[test]
+    fn an_unusable_registry_ca_is_refused() {
+        install_crypto();
+        let dir = retry_tmpdir("bad-ca");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = dir.join("ca.pem");
+        for (pem, says) in [
+            (
+                "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n",
+                "parsing the registry CA",
+            ),
+            ("not a certificate\n", "holds no certificate"),
+        ] {
+            std::fs::write(&ca, pem).unwrap();
+            let rg = Registry::for_share(
+                "127.0.0.1:1/repo".into(),
+                false,
+                Some(ca.clone()),
+                String::new(),
+                None,
+                None,
+                None,
+            );
+            let err = client(&rg).err().unwrap();
+            assert!(format!("{err:#}").contains(says), "{err:#}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

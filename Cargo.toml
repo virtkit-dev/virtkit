@@ -194,13 +194,18 @@ toml = "1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+# Request and response types and the service trait for vk's oci-client transport.
+# Both dependencies are already in the tree via oci-client and reqwest.
+http = "1"
+tower-service = "0.3"
 # IMF-fixdate for the registry's WebDAV `Last-Modified`/`getlastmodified`; already in the tree
 # via hyper.
 httpdate = "1"
 bytes = "1.9"
 # direct HTTP client for the transparent-zstd blob push (oci-client can't set a
-# per-request Content-Encoding). rustls so the binary stays musl-static (matches
-# oci-client); already in the tree via oci-client.
+# per-request Content-Encoding), and the transport oci-client sends vk's registry requests
+# through. rustls so the binary stays musl-static (matches oci-client); already in the tree
+# via oci-client. No decompression feature: vk sees response bodies as sent.
 #
 # `rustls-no-provider` compiles rustls without a built-in crypto provider (the plain
 # `rustls` feature would force aws-lc-rs); main installs the ring provider as the

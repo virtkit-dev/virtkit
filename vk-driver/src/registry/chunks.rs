@@ -1,12 +1,17 @@
-//! The buffers a restore reuses: chunks as stored and as decoded, across its workers.
+//! The transport registry requests go through, and the buffers a restore reuses: chunks as
+//! stored and as decoded, across its workers.
 
+use std::future::Future;
 use std::io::Read;
 use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::Poll;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use oci_client::manifest::OciDescriptor;
+use oci_client::transport::{self, BoxError, EffectiveUrl};
 
 use super::{CDC_MAX, MAX_CHUNK_BLOB, RESTORE_CONCURRENCY};
 
@@ -183,4 +188,42 @@ pub(super) fn read_file(pool: &Arc<ChunkPool>, path: &std::path::Path) -> std::i
         ));
     }
     Ok(buf)
+}
+
+fn effective_url(resp: &mut transport::Response, url: &reqwest::Url) {
+    if let Ok(uri) = url.as_str().parse() {
+        resp.extensions_mut().insert(EffectiveUrl(uri));
+    }
+}
+
+/// The transport of [`super::client`]: `http` sends every request, as oci-client's own
+/// transport would.
+#[derive(Clone)]
+pub(super) struct ChunkTransport(pub(super) reqwest::Client);
+
+type Sent =
+    Pin<Box<dyn Future<Output = std::result::Result<transport::Response, BoxError>> + Send>>;
+
+impl tower_service::Service<transport::Request> for ChunkTransport {
+    type Response = transport::Response;
+    type Error = BoxError;
+    type Future = Sent;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> Poll<std::result::Result<(), BoxError>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: transport::Request) -> Sent {
+        let http = self.0.clone();
+        Box::pin(async move {
+            let resp = http.execute(reqwest::Request::try_from(req)?).await?;
+            let url = resp.url().clone();
+            let mut out = http::Response::from(resp).map(transport::Body::wrap);
+            effective_url(&mut out, &url);
+            Ok(out)
+        })
+    }
 }
