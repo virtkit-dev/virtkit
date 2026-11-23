@@ -94,6 +94,7 @@ All notable changes to virtkit will be documented in this file.
 - `vk-registry` refuses a push to an unknown upload without reading its body.
 - `vk-registry` no longer holds a pushed blob in memory and stays responsive while
   finishing a large one.
+- Image and build-cache pushes read and compress their data while uploading.
 
 ### Fixed
 

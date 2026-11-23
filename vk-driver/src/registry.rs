@@ -1586,11 +1586,49 @@ where
     }
 }
 
+/// [`block_on`] polls a push's uploads on one thread. Run CPU- and disk-bound chunk
+/// work on the blocking pool so other uploads can keep making progress.
+async fn on_blocking_pool<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .context("a chunk-preparation worker panicked")
+}
+
+type RegionChunker = fastcdc::v2020::StreamCDC<std::io::BufReader<Box<dyn std::io::Read + Send>>>;
+
+/// Yield `(is_zero, chunk)` in region order, flagging all-zero chunks. Reading,
+/// splitting and checking for zeros run on the blocking pool. The first error ends
+/// the stream.
+fn chunks_on_blocking_pool(
+    chunker: RegionChunker,
+) -> impl futures::Stream<Item = Result<(bool, fastcdc::v2020::ChunkData)>> + Send + 'static {
+    futures::stream::unfold(Some(chunker), |state: Option<RegionChunker>| async move {
+        let mut chunker = state?;
+        let read = on_blocking_pool(move || {
+            let next = chunker
+                .next()
+                .map(|c| c.map(|c| (c.data.iter().all(|&b| b == 0), c)));
+            (next, chunker)
+        })
+        .await;
+        match read {
+            Ok((Some(Ok(next)), chunker)) => Some((Ok(next), Some(chunker))),
+            // Asked again, the chunker reads again, without end on a persistent error.
+            Ok((Some(Err(e)), _)) => Some((Err(e.into()), None)),
+            Ok((None, _)) => None,
+            // The chunker went down with the worker that panicked.
+            Err(e) => Some((Err(e), None)),
+        }
+    })
+}
+
 /// Process one raw chunk for a push: dedup on its content (raw digest in transparent
 /// mode, else the chunkmap over the compressed-digest path), uploading the blob only if
 /// absent. Returns the layer descriptor (carrying `offset`/`length`) and whether a blob
-/// was uploaded. The single-chunk counterpart of `push_async`'s streaming loop, used by
-/// the diff push.
+/// was uploaded. Called per chunk by [`chunk_region`], and directly by the diff push for
+/// the chunks it regenerates.
 #[allow(clippy::too_many_arguments)]
 async fn put_raw_chunk(
     client: &oci_client::Client,
@@ -1604,14 +1642,18 @@ async fn put_raw_chunk(
     length: u64,
     force: bool,
 ) -> Result<(OciDescriptor, bool)> {
-    let raw_hex = sha256_hex_raw(&raw);
+    let (raw, raw_hex) = on_blocking_pool(move || {
+        let hex = sha256_hex_raw(&raw);
+        (raw, hex)
+    })
+    .await?;
     if transparent {
         let digest = format!("sha256:{raw_hex}");
         let size = raw.len() as i64;
         let uploaded = if !force && blob_exists(client, image, &digest).await? {
             false
         } else {
-            let frame = bytes::Bytes::from(zstd_with_size(&raw)?);
+            let frame = bytes::Bytes::from(on_blocking_pool(move || zstd_with_size(&raw)).await??);
             let http = http.expect("http client");
             // Restart the upload after an unanswered PUT: the registry may have
             // discarded the old session.
@@ -1637,8 +1679,13 @@ async fn put_raw_chunk(
             false,
         ));
     }
-    let compressed = zstd::encode_all(&raw[..], ZSTD_LEVEL).context("zstd-compressing a chunk")?;
-    let digest = sha256_hex(&compressed);
+    let (compressed, digest) = on_blocking_pool(move || -> Result<_> {
+        let compressed =
+            zstd::encode_all(&raw[..], ZSTD_LEVEL).context("zstd-compressing a chunk")?;
+        let digest = sha256_hex(&compressed);
+        Ok((compressed, digest))
+    })
+    .await??;
     let size = compressed.len() as i64;
     if let Some(dir) = chunkmap {
         chunkmap_put(dir, &raw_hex, &digest, size);
@@ -1741,23 +1788,15 @@ async fn chunk_region(
     force: bool,
 ) -> Result<Vec<(OciDescriptor, bool)>> {
     use futures::StreamExt;
+    // The chunk being read counts toward this limit. At capacity the next read waits,
+    // which also bounds parallel hashing and compression for this region.
     const CHUNK_CONCURRENCY: usize = 16;
-    let mut chunker =
+    let chunker =
         fastcdc::v2020::StreamCDC::new(std::io::BufReader::new(reader), CDC_MIN, CDC_AVG, CDC_MAX);
-    // Asked again, the chunker reads again, without end on a persistent error.
-    let mut failed = false;
-    let chunker = std::iter::from_fn(move || {
-        if failed {
-            return None;
-        }
-        let chunk = chunker.next()?;
-        failed = chunk.is_err();
-        Some(chunk)
-    });
-    let results: Vec<Result<Option<(OciDescriptor, bool)>>> = futures::stream::iter(chunker)
+    let results: Vec<Result<Option<(OciDescriptor, bool)>>> = chunks_on_blocking_pool(chunker)
         .map(|chunk| async move {
-            let chunk = chunk.with_context(|| format!("chunking {}", label.display()))?;
-            if chunk.data.iter().all(|&b| b == 0) {
+            let (zero, chunk) = chunk.with_context(|| format!("chunking {}", label.display()))?;
+            if zero {
                 return Ok(None); // hole — leave a gap, the pull fills it with zeros
             }
             let offset = start + chunk.offset;
@@ -5809,6 +5848,85 @@ pub(crate) mod tests {
         assert!(err.contains("chunking disk.ext4"), "{err}");
         assert!(err.contains("the disk is gone"), "{err}");
         assert!(server.seen().is_empty());
+    }
+
+    /// Reads run off the upload thread. Chunk contents, order and all-zero flags
+    /// match a synchronous pass over the region.
+    #[test]
+    fn a_streamed_region_yields_its_chunks_in_order() {
+        use futures::StreamExt;
+        use std::thread::ThreadId;
+        type Readers = Arc<std::sync::Mutex<std::collections::HashSet<ThreadId>>>;
+        struct Recorded(std::io::Cursor<Arc<[u8]>>, Option<Readers>);
+        impl Read for Recorded {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if let Some(readers) = &self.1 {
+                    readers.lock().unwrap().insert(std::thread::current().id());
+                }
+                self.0.read(buf)
+            }
+        }
+        let mut data = pseudo_random(6 << 20, 1);
+        data.resize(data.len() + (36 << 20), 0);
+        data.extend(pseudo_random(3 << 20, 2));
+        let data: Arc<[u8]> = data.into();
+        let chunker = |readers: Option<Readers>| -> RegionChunker {
+            let reader: Box<dyn Read + Send> =
+                Box::new(Recorded(std::io::Cursor::new(data.clone()), readers));
+            fastcdc::v2020::StreamCDC::new(
+                std::io::BufReader::new(reader),
+                CDC_MIN,
+                CDC_AVG,
+                CDC_MAX,
+            )
+        };
+        let expected: Vec<(u64, usize, bool)> = chunker(None)
+            .map(|c| {
+                let c = c.unwrap();
+                (c.offset, c.length, c.data.iter().all(|&b| b == 0))
+            })
+            .collect();
+        assert!(expected.iter().any(|c| c.2), "no all-zero chunk");
+        assert!(expected.iter().filter(|c| !c.2).count() > 1);
+        let readers = Readers::default();
+        let chunks = chunks_on_blocking_pool(chunker(Some(readers.clone())));
+        let (streamed, driver): (Vec<(u64, usize, bool)>, ThreadId) = block_on(async {
+            let streamed = chunks
+                .map(|c| {
+                    let (zero, c) = c.unwrap();
+                    assert_eq!(c.data, data[c.offset as usize..][..c.length]);
+                    (c.offset, c.length, zero)
+                })
+                .collect()
+                .await;
+            (streamed, std::thread::current().id())
+        });
+        assert_eq!(streamed, expected);
+        let readers = readers.lock().unwrap();
+        assert!(!readers.is_empty());
+        assert!(!readers.contains(&driver), "read on the upload thread");
+    }
+
+    /// The stream yields earlier chunks, reports the first read error once, then ends.
+    #[test]
+    fn a_streamed_region_ends_at_its_first_read_error() {
+        use futures::StreamExt;
+        // The chunker fills a CDC_MAX buffer before it cuts: one whole chunk, then the error.
+        let reader: Box<dyn Read + Send> = Box::new(FailsAfter {
+            left: CDC_MAX + CDC_MAX / 2,
+            failed: false,
+        });
+        let chunker = fastcdc::v2020::StreamCDC::new(
+            std::io::BufReader::new(reader),
+            CDC_MIN,
+            CDC_AVG,
+            CDC_MAX,
+        );
+        let items: Vec<_> = block_on(chunks_on_blocking_pool(chunker).collect());
+        let (last, before) = items.split_last().unwrap();
+        assert!(matches!(before, [Ok((true, _))]));
+        let err = format!("{:#}", last.as_ref().unwrap_err());
+        assert!(err.contains("the disk is gone"), "{err}");
     }
 
     /// Reject a complete blob with a digest mismatch without retrying.

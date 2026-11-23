@@ -27,8 +27,8 @@
 //! those for the life of the process. A build's work is deferred all the same: [`block_on`]
 //! runs the root future on a thread of the caller's own, which inherits the stage worker's
 //! priority (see [`crate::prio`]). Blocking-pool threads are the exception: tokio creates
-//! those inline from whichever caller needed one, so a build's `spawn_blocking` leaves one
-//! deferred until it is retired at the idle keep-alive.
+//! those inline on the requesting thread. Workers created for a build's cache push
+//! inherit its deferred priority until they retire after the idle keep-alive.
 //!
 //! - Construct runtime-bound futures inside the `async` block passed to [`block_on`]. Tokio's
 //!   timeout, sleep, and interval futures capture the current runtime when constructed, while
