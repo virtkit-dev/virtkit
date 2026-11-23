@@ -874,8 +874,9 @@ sharing images built from it.
 - An image that is not generalized carries its build's licensing: activated online during
   its build (e.g. in a `RUN --network=default` step), its 180 days run from then for every
   machine started from it. `vk build` records when that ends, or when the activation grace
-  of an image never activated does, and `vk run`, compose services and `FROM` the bundle
-  warn from 30 days before an evaluation ends, or 3 days before that grace does.
+  of an unactivated image ends. `vk build`, `vk run`, compose services and builds using
+  `FROM` the bundle warn when fewer than 30 days of evaluation or 3 days of grace remain,
+  and after either deadline passes.
 - `vk build --reinstall` installs each `FROM winiso:` stage again under new cache keys and
   rebuilds every step on it. The old install and its layers stay cached (tens of GB): bundles
   built on them keep working until they are rebuilt, except on a CI host: there they are

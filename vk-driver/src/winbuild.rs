@@ -483,6 +483,10 @@ fn build_with(opts: &Options) -> Result<Vec<crate::cachelock::Guard>> {
     let (cpus, mem) = guest_size(&stages[target], opts)?;
     let evaluation = read_evaluation(&cache.join("layers").join(&layer.key));
     write_bundle(&layer, cpus, &mem, evaluation, &opts.out)?;
+    // A cached layer keeps its original evaluation or activation deadline.
+    if let Some(warning) = evaluation.warning(crate::vms::unix_now()) {
+        eprintln!("virtkit: warning: {warning}");
+    }
     eprintln!(
         "virtkit: built {} in {}s",
         opts.out.display(),
