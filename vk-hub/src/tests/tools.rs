@@ -174,11 +174,14 @@ async fn a_tools_build_goes_only_to_a_node_speaking_version_4() {
         HubMsg::Welcome { .. }
     ));
     send(&mut ws, &applied(None)).await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(1500), receive(&mut ws))
-            .await
-            .is_err()
-    );
+    // The session steers on the report before it reads the ack behind it, and answers an
+    // ack for a command it never issued: a command sent for the report would come first.
+    let unknown = CommandAck {
+        id: "not-a-command".into(),
+        outcome: Outcome::Done,
+    };
+    send(&mut ws, &NodeMsg::Ack(unknown.clone())).await;
+    assert_eq!(receive(&mut ws).await, HubMsg::Recorded(unknown));
     let err = ops::tools(&hub, "uid 0", &node_id, Some(&sha)).unwrap_err();
     assert!(format!("{err:#}").contains("update its vk"), "{err:#}");
     ws.close(None).await.unwrap();

@@ -343,7 +343,18 @@ pub fn stream(
     slot: Slot,
     sign_in: &'static str,
 ) -> Response<Body> {
-    let (tx, rx) = mpsc::channel(4);
+    stream_through(hub, auth, source, slot, sign_in, mpsc::channel(4))
+}
+
+/// [`stream`], its frames queued through `channel`.
+fn stream_through(
+    hub: Arc<Hub>,
+    auth: &Auth,
+    source: Source,
+    slot: Slot,
+    sign_in: &'static str,
+    (tx, rx): (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>),
+) -> Response<Body> {
     let session = Session {
         changes: hub.subscribe_sessions(),
         hub,
@@ -705,23 +716,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stream_not_read_gives_up_its_connection() {
         let (hub, auth) = signed_in();
-        let n = Arc::new(Mutex::new(0u64));
-        // A new fragment at every refresh.
-        let render: Render = Arc::new(move || {
-            let mut n = lock(&n);
-            *n += 1;
-            Ok(n.to_string())
-        });
         let source = Source::Own {
             name: "t",
             changes: hub.subscribe(),
-            render,
+            render: Arc::new(|| Ok("t".to_string())),
         };
         let give_up = Arc::new(Notify::new());
         let slot = Streams::new().take("s").unwrap();
+        // A queue the browser has already left full: the opening frame finds no room.
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(Bytes::from_static(COMMENT)).unwrap();
         let resp = GIVE_UP
             .scope(give_up.clone(), async {
-                stream(hub, &auth, source, slot, "")
+                stream_through(hub, &auth, source, slot, "", (tx, rx))
             })
             .await;
         tokio::time::timeout(Duration::from_secs(30), give_up.notified())
