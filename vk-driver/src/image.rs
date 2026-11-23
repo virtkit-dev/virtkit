@@ -1702,7 +1702,7 @@ mod tests {
         // In a process of its own: a child another test forks keeps a copy of the lock's
         // socket until it execs, and nothing unbinds a socket before then.
         const CHILD: &str = "VK_TEST_PULL_LOCK_DIR";
-        let Some(dir) = std::env::var_os(CHILD).map(PathBuf::from) else {
+        let Some(dir) = crate::dev::testutil::child_marker(CHILD).map(PathBuf::from) else {
             let dir =
                 std::env::temp_dir().join(format!("virtkit-test-pull-lock-{}", std::process::id()));
             crate::dev::testutil::in_child(
@@ -2006,7 +2006,7 @@ mod tests {
     fn pull_lock_answers_holder_identity_then_releases() {
         // In a process of its own, for the reason `pull_lock_excludes_and_releases` gives.
         const CHILD: &str = "VK_TEST_PULL_HOLDER_DIR";
-        let Some(dir) = std::env::var_os(CHILD).map(PathBuf::from) else {
+        let Some(dir) = crate::dev::testutil::child_marker(CHILD).map(PathBuf::from) else {
             let dir =
                 std::env::temp_dir().join(format!("virtkit-test-holder-{}", std::process::id()));
             crate::dev::testutil::in_child(
@@ -2063,7 +2063,7 @@ mod tests {
         // Isolate the immediate post-release sweep from forks that could inherit the socket.
         // The variable selects the child branch. The child creates its own sweep root.
         const CHILD: &str = "VK_TEST_SWEEP_TMP_ROOT";
-        if std::env::var_os(CHILD).is_none() {
+        if crate::dev::testutil::child_marker(CHILD).is_none() {
             let t = crate::dev::testutil::scratch("sweep-tmp-parent");
             crate::dev::testutil::in_child(
                 "image::tests::sweep_orphaned_build_tmp_reclaims_only_dead_staging_dirs",

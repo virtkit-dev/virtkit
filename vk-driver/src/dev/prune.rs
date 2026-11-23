@@ -1078,7 +1078,7 @@ mod tests {
     #[test]
     fn stale_registry_entries_do_not_make_pruning_look_like_a_live_vm() {
         const CHILD: &str = "VK_TEST_PRUNE_STALE_REGISTRY";
-        if std::env::var_os(CHILD).is_some() {
+        if crate::dev::testutil::child_marker(CHILD).is_some() {
             let f = fixture("stale-registry");
             let mut registrations = Vec::new();
             for state_dir in [&f.plan.state_dir, &f.plan.state_dir.join("svc-db")] {
@@ -1121,17 +1121,17 @@ mod tests {
         }
         let _guard = super::super::testutil::env_guard();
         let tmp = super::super::testutil::scratch("prune-registry");
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "dev::prune::tests::stale_registry_entries_do_not_make_pruning_look_like_a_live_vm",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("XDG_DATA_HOME", &tmp.0)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
+        let output = crate::dev::testutil::child_test(
+            "dev::prune::tests::stale_registry_entries_do_not_make_pruning_look_like_a_live_vm",
+        )
+        .env(CHILD, "1")
+        .env("XDG_DATA_HOME", &tmp.0)
+        .output()
+        .unwrap();
+        crate::dev::testutil::ran_alone(
+            "dev::prune::tests::stale_registry_entries_do_not_make_pruning_look_like_a_live_vm",
+            &output,
+        );
     }
 
     #[test]
@@ -1327,7 +1327,7 @@ mod tests {
     #[test]
     fn prune_in_a_state_dir_goes_by_what_it_recorded() {
         const CHILD: &str = "VK_TEST_PRUNE_BY_NAME";
-        if std::env::var_os(CHILD).is_some() {
+        if crate::dev::testutil::child_marker(CHILD).is_some() {
             let dir = super::super::plan::dev_state_base()
                 .unwrap()
                 .join("proj-1a2b");
@@ -1367,17 +1367,17 @@ mod tests {
         }
         let _guard = super::super::testutil::env_guard();
         let tmp = super::super::testutil::scratch("prune-by-name");
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "dev::prune::tests::prune_in_a_state_dir_goes_by_what_it_recorded",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("XDG_STATE_HOME", &tmp.0)
-            .env("XDG_DATA_HOME", tmp.0.join("data"))
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
+        let output = crate::dev::testutil::child_test(
+            "dev::prune::tests::prune_in_a_state_dir_goes_by_what_it_recorded",
+        )
+        .env(CHILD, "1")
+        .env("XDG_STATE_HOME", &tmp.0)
+        .env("XDG_DATA_HOME", tmp.0.join("data"))
+        .output()
+        .unwrap();
+        crate::dev::testutil::ran_alone(
+            "dev::prune::tests::prune_in_a_state_dir_goes_by_what_it_recorded",
+            &output,
+        );
     }
 }

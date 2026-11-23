@@ -369,16 +369,143 @@ pub(crate) mod testutil {
         }
     }
 
+    /// Set by [`mark_child`] to `<pid>:<test>`: the process that spawned the child, and
+    /// the one test the child was spawned to run.
+    const CHILD_OF: &str = "VK_TEST_CHILD_OF";
+
+    /// Mark `cmd` for [`child_marker`]. The caller must pass `--exact` with `name`.
+    pub(crate) fn mark_child<'a>(
+        cmd: &'a mut std::process::Command,
+        name: &str,
+    ) -> &'a mut std::process::Command {
+        cmd.env(CHILD_OF, format!("{}:{name}", std::process::id()))
+    }
+
+    /// Prepare a marked child to run only `name`.
+    pub(crate) fn child_test(name: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", name, "--nocapture"]);
+        mark_child(&mut cmd, name);
+        cmd
+    }
+
+    /// Return `None` if `var` is unset. Otherwise require the parent PID and exact test
+    /// filter recorded by [`mark_child`] before returning its value. An inherited marker
+    /// could lower the shared harness's descriptor limit or trigger real garbage collection.
+    pub(crate) fn child_marker(var: &str) -> Option<std::ffi::OsString> {
+        let value = std::env::var_os(var)?;
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        // SAFETY: getppid has no preconditions and cannot fail.
+        let parent = unsafe { libc::getppid() };
+        let of = std::env::var(CHILD_OF).ok();
+        assert!(
+            marked(args.get(1..).unwrap_or_default(), of.as_deref(), parent),
+            "{var} is set, but this is not the child process a test spawned for it \
+             ({CHILD_OF}={of:?}, parent pid {parent}, args {args:?}): unset {var}"
+        );
+        Some(value)
+    }
+
+    /// Check the parent PID and test arguments against the `<pid>:<test>` marker.
+    fn marked(args: &[std::ffi::OsString], of: Option<&str>, parent: libc::pid_t) -> bool {
+        of.and_then(|of| of.split_once(':'))
+            .is_some_and(|(pid, name)| pid.parse() == Ok(parent) && runs_only(args, name))
+    }
+
+    /// Check the arguments after the executable for `--exact` and a single filter, `name`.
+    /// A separate option value counts as another filter.
+    pub(crate) fn runs_only(args: &[std::ffi::OsString], name: &str) -> bool {
+        let mut filters = args
+            .iter()
+            .filter(|a| !a.as_encoded_bytes().starts_with(b"-"));
+        args.iter().any(|a| a == "--exact")
+            && filters.next().is_some_and(|f| f == name)
+            && filters.next().is_none()
+    }
+
+    /// A harmless child branch, for [`an_inherited_or_shared_marker_is_refused`].
+    #[test]
+    fn marker_probe() {
+        if child_marker("VK_TEST_MARKER_PROBE").is_some() {
+            println!("probed");
+        }
+    }
+
+    #[test]
+    fn a_marked_child_runs_its_one_test_only() {
+        let args = |a: &[&str]| {
+            a.iter()
+                .map(Into::into)
+                .collect::<Vec<std::ffi::OsString>>()
+        };
+        let of = Some("7:m::t");
+        assert!(marked(&args(&["--exact", "m::t", "--nocapture"]), of, 7));
+        assert!(
+            !marked(&args(&["--exact", "m::t"]), of, 8),
+            "another parent"
+        );
+        assert!(!marked(&args(&["--exact", "m::t"]), None, 7), "no stamp");
+        assert!(!marked(&args(&["m::t"]), of, 7), "a prefix filter");
+        assert!(
+            !marked(&args(&["--exact", "m::t", "m::u"]), of, 7),
+            "a second filter"
+        );
+        assert!(!marked(&args(&["--exact", "m::u"]), of, 7), "another test");
+        assert!(!marked(&args(&["--exact", "m::t", "--skip", "m"]), of, 7));
+    }
+
+    #[test]
+    fn an_inherited_or_shared_marker_is_refused() {
+        const PROBE: &str = "dev::testutil::marker_probe";
+        let _guard = env_guard();
+        let output = child_test(PROBE)
+            .env("VK_TEST_MARKER_PROBE", "1")
+            .output()
+            .unwrap();
+        ran_alone(PROBE, &output);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("probed"));
+        let refused = |output: std::process::Output| {
+            assert!(!output.status.success(), "{output:?}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(!stdout.contains("probed"), "{output:?}");
+            // The panic message, on stderr under `--nocapture`.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("VK_TEST_MARKER_PROBE is set, but"),
+                "{output:?}"
+            );
+        };
+        refused(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", PROBE, "--nocapture"])
+                .env("VK_TEST_MARKER_PROBE", "1")
+                .env_remove(CHILD_OF)
+                .output()
+                .unwrap(),
+        );
+        refused(
+            child_test(PROBE)
+                .arg("dev::testutil::a_marked_child_runs_its_one_test_only")
+                .env("VK_TEST_MARKER_PROBE", "1")
+                .output()
+                .unwrap(),
+        );
+    }
+
     /// Rerun test `name` in its own process with `XDG_DATA_HOME` under `dir` and `var` set to
-    /// `dir`. Check both success and the test count: a name matching no test also exits 0.
+    /// `dir`, which the child reads with [`child_marker`].
     pub(crate) fn in_child(name: &str, var: &str, dir: &Path) {
         let _guard = env_guard();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name, "--nocapture"])
+        let output = child_test(name)
             .env(var, dir)
             .env("XDG_DATA_HOME", dir.join("data"))
             .output()
             .unwrap();
+        ran_alone(name, &output);
+    }
+
+    /// Require a successful run of one test. A filter matching no tests also exits 0.
+    pub(crate) fn ran_alone(name: &str, output: &std::process::Output) {
         assert!(output.status.success(), "{output:?}");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(

@@ -1392,7 +1392,8 @@ mod tests {
     #[test]
     fn readying_a_boot_names_this_process_in_the_marker() {
         const CHILD: &str = "VK_TEST_SESSION_BEGIN_READYING";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("begin-readying");
             crate::dev::testutil::in_child(
                 "dev::session::tests::readying_a_boot_names_this_process_in_the_marker",
@@ -1443,7 +1444,8 @@ mod tests {
     #[tokio::test]
     async fn a_claimed_environment_is_readied_even_without_the_childs_note() {
         const CHILD: &str = "VK_TEST_SESSION_CLAIM_WITHOUT_NOTE";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("claim-without-note");
             crate::dev::testutil::in_child(
                 "dev::session::tests::a_claimed_environment_is_readied_even_without_the_childs_note",
@@ -1540,7 +1542,8 @@ mod tests {
     #[test]
     fn running_vm_finds_a_vm_registered_under_a_symlinked_state_base() {
         const CHILD: &str = "VK_TEST_SESSION_SYMLINKED_STATE";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("session-symlinked-state");
             crate::dev::testutil::in_child(
                 "dev::session::tests::running_vm_finds_a_vm_registered_under_a_symlinked_state_base",

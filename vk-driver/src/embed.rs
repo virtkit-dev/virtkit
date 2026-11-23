@@ -900,7 +900,7 @@ mod tests {
     #[test]
     #[ignore = "run by an_assembled_binary_serves_its_payload"]
     fn assembled_child() {
-        if std::env::var_os("VK_EMBED_TEST_CHILD").is_none() {
+        if crate::dev::testutil::child_marker("VK_EMBED_TEST_CHILD").is_none() {
             return;
         }
         assert_eq!(
@@ -956,13 +956,9 @@ mod tests {
         assert!(status.success());
         // assemble.sh wrote and closed the file in another process, so no fd of ours is open
         // for writing on it (which would make the exec fail with ETXTBSY).
-        let child = std::process::Command::new(&out)
-            .args([
-                "--exact",
-                "embed::tests::assembled_child",
-                "--ignored",
-                "--nocapture",
-            ])
+        let name = "embed::tests::assembled_child";
+        let child = crate::dev::testutil::mark_child(&mut std::process::Command::new(&out), name)
+            .args(["--exact", name, "--ignored", "--nocapture"])
             .env("VK_EMBED_TEST_CHILD", "1")
             .output()
             .unwrap();

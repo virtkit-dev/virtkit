@@ -365,7 +365,7 @@ mod tests {
     #[test]
     #[ignore = "a stand-in process for the termclean tests, run by them"]
     fn stand_in() {
-        let Some(dir) = std::env::var_os(DIR_VAR).map(PathBuf::from) else {
+        let Some(dir) = crate::dev::testutil::child_marker(DIR_VAR).map(PathBuf::from) else {
             return;
         };
         let signal: libc::c_int = std::env::var(SIGNAL_VAR).unwrap().parse().unwrap();
@@ -429,8 +429,9 @@ mod tests {
     /// Configure the stand-in with `dir`, `mode`, and `signal`.
     fn stand_in_cmd(dir: &Path, mode: &str, signal: libc::c_int) -> std::process::Command {
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-        cmd.args(["--ignored", "--exact", "termclean::tests::stand_in"])
-            .env(DIR_VAR, dir)
+        let name = "termclean::tests::stand_in";
+        cmd.args(["--ignored", "--exact", name]).env(DIR_VAR, dir);
+        crate::dev::testutil::mark_child(&mut cmd, name)
             .env(SIGNAL_VAR, signal.to_string())
             .env(MODE_VAR, mode)
             .stdout(std::process::Stdio::null())

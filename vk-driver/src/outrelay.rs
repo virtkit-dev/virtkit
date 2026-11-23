@@ -327,7 +327,7 @@ mod tests {
     /// put them — alone in its process, since the relay repoints the process's own streams.
     #[test]
     fn relayed_child() {
-        let Some(mode) = std::env::var_os(CHILD) else {
+        let Some(mode) = crate::dev::testutil::child_marker(CHILD) else {
             return;
         };
         if mode == "closed" {
@@ -363,10 +363,8 @@ mod tests {
     }
 
     fn child(mode: &str, stdout: impl Into<std::process::Stdio>) -> std::process::Command {
-        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-        cmd.args(["--exact", "outrelay::tests::relayed_child", "--nocapture"])
-            .env(CHILD, mode)
-            .stdout(stdout);
+        let mut cmd = crate::dev::testutil::child_test("outrelay::tests::relayed_child");
+        cmd.env(CHILD, mode).stdout(stdout);
         cmd
     }
 

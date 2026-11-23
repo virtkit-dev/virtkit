@@ -817,25 +817,23 @@ mod tests {
     fn a_dry_run_changes_no_registration_name_or_record() {
         // Set the XDG homes on a child process so other test threads keep their environment.
         const CHILD: &str = "VK_TEST_GC_DRY_RUN_HOMES";
-        let Some(home) = std::env::var_os(CHILD).map(PathBuf::from) else {
+        const NAME: &str = "gc::tests::a_dry_run_changes_no_registration_name_or_record";
+        const HOMES: [&str; 3] = ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"];
+        let Some(home) = crate::dev::testutil::child_marker(CHILD).map(PathBuf::from) else {
             let _guard = crate::dev::testutil::env_guard();
             let tmp = crate::dev::testutil::scratch("gc-dry-run");
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "gc::tests::a_dry_run_changes_no_registration_name_or_record",
-                    "--nocapture",
-                ])
+            let output = crate::dev::testutil::child_test(NAME)
                 .env(CHILD, &tmp.0)
-                .envs(
-                    ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"]
-                        .map(|v| (v, tmp.0.join(v))),
-                )
+                .envs(HOMES.map(|v| (v, tmp.0.join(v))))
                 .output()
                 .unwrap();
-            assert!(output.status.success(), "{output:?}");
+            crate::dev::testutil::ran_alone(NAME, &output);
             return;
         };
+        // The test runs real garbage collection, so check all three homes first.
+        for var in HOMES {
+            assert_eq!(std::env::var_os(var), Some(home.join(var).into()), "{var}");
+        }
         let name = |state: &Path, name: &str| {
             crate::names::Index::open()
                 .unwrap()

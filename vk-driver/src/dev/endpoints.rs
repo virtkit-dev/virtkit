@@ -709,7 +709,7 @@ mod tests {
         // Isolate the listeners so a child forked by another test cannot keep a port
         // occupied after this test drops its listener.
         const CHILD: &str = "VK_TEST_ENDPOINTS_TAKEN";
-        if std::env::var_os(CHILD).is_none() {
+        if crate::dev::testutil::child_marker(CHILD).is_none() {
             let t = scratch("taken-parent");
             crate::dev::testutil::in_child(
                 "dev::endpoints::tests::a_taken_block_moves_unless_something_of_ours_is_live",
@@ -762,7 +762,7 @@ mod tests {
     fn a_probe_that_cannot_run_is_an_error() {
         // Isolate the process-wide descriptor limit from the other tests.
         const CHILD: &str = "VK_TEST_ENDPOINTS_EMFILE";
-        if std::env::var_os(CHILD).is_none() {
+        if crate::dev::testutil::child_marker(CHILD).is_none() {
             let t = scratch("emfile-parent");
             crate::dev::testutil::in_child(
                 "dev::endpoints::tests::a_probe_that_cannot_run_is_an_error",

@@ -2095,7 +2095,7 @@ mod tests {
     #[test]
     fn a_bare_list_follows_the_config_and_all_lists_the_host() {
         const CHILD: &str = "VK_TEST_DEV_LIST";
-        if std::env::var_os(CHILD).is_some() {
+        if crate::dev::testutil::child_marker(CHILD).is_some() {
             let cwd = std::env::current_dir().unwrap();
             let ws = std::fs::canonicalize(&cwd).unwrap();
             let state = |env: &str| plan::derived_state_dir(&ws, env).unwrap();
@@ -2223,26 +2223,26 @@ mod tests {
              [environments.e2e]\nbuild = { context = \"gone\" }\nworkspace = \"/w\"\n",
         )
         .unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "dev::cli::tests::a_bare_list_follows_the_config_and_all_lists_the_host",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("XDG_STATE_HOME", tmp.0.join("state"))
-            .env("XDG_DATA_HOME", tmp.0.join("data"))
-            .env_remove(config::WORKSPACE_ENV)
-            .current_dir(&cwd)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
+        let output = crate::dev::testutil::child_test(
+            "dev::cli::tests::a_bare_list_follows_the_config_and_all_lists_the_host",
+        )
+        .env(CHILD, "1")
+        .env("XDG_STATE_HOME", tmp.0.join("state"))
+        .env("XDG_DATA_HOME", tmp.0.join("data"))
+        .env_remove(config::WORKSPACE_ENV)
+        .current_dir(&cwd)
+        .output()
+        .unwrap();
+        crate::dev::testutil::ran_alone(
+            "dev::cli::tests::a_bare_list_follows_the_config_and_all_lists_the_host",
+            &output,
+        );
     }
 
     #[test]
     fn bare_gc_removes_this_workspaces_environment_and_a_named_gc_stays_in_it() {
         const CHILD: &str = "VK_TEST_BARE_GC";
-        if std::env::var_os(CHILD).is_some() {
+        if crate::dev::testutil::child_marker(CHILD).is_some() {
             let cwd = std::env::current_dir().unwrap();
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
@@ -2345,19 +2345,17 @@ mod tests {
             "schema = 1\n[dev]\nimage = \"x\"\nworkspace = \"/w\"\n",
         )
         .unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "dev::cli::tests::bare_gc_removes_this_workspaces_environment_and_a_named_gc_stays_in_it",
-                "--nocapture",
-            ])
+        let output = crate::dev::testutil::child_test("dev::cli::tests::bare_gc_removes_this_workspaces_environment_and_a_named_gc_stays_in_it")
             .env(CHILD, "1")
             .env("XDG_STATE_HOME", tmp.0.join("state"))
             .env("XDG_DATA_HOME", tmp.0.join("data"))
             .current_dir(&cwd)
             .output()
             .unwrap();
-        assert!(output.status.success(), "{output:?}");
+        crate::dev::testutil::ran_alone(
+            "dev::cli::tests::bare_gc_removes_this_workspaces_environment_and_a_named_gc_stays_in_it",
+            &output,
+        );
     }
 
     /// A named stop takes only this workspace's services and environments: a VM of another
@@ -2366,7 +2364,7 @@ mod tests {
     #[test]
     fn a_named_stop_stays_in_its_workspace() {
         const CHILD: &str = "VK_TEST_NAMED_STOP";
-        if std::env::var_os(CHILD).is_some() {
+        if crate::dev::testutil::child_marker(CHILD).is_some() {
             let cwd = std::env::current_dir().unwrap();
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
@@ -2414,20 +2412,20 @@ mod tests {
         booted(&base.join("elsewhere"), &tmp.0, "dev");
         std::os::unix::fs::symlink(base.join("known"), base.join("linked")).unwrap();
         std::fs::create_dir_all(state.join("virtkit/outside")).unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "dev::cli::tests::a_named_stop_stays_in_its_workspace",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("XDG_STATE_HOME", &state)
-            .env("XDG_DATA_HOME", tmp.0.join("data"))
-            .env_remove(config::WORKSPACE_ENV)
-            .current_dir(&cwd)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
+        let output = crate::dev::testutil::child_test(
+            "dev::cli::tests::a_named_stop_stays_in_its_workspace",
+        )
+        .env(CHILD, "1")
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_DATA_HOME", tmp.0.join("data"))
+        .env_remove(config::WORKSPACE_ENV)
+        .current_dir(&cwd)
+        .output()
+        .unwrap();
+        crate::dev::testutil::ran_alone(
+            "dev::cli::tests::a_named_stop_stays_in_its_workspace",
+            &output,
+        );
         assert!(base.join("known").is_dir());
     }
 

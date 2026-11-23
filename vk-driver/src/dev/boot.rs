@@ -2479,7 +2479,8 @@ mod tests {
     #[tokio::test]
     async fn a_start_that_cannot_boot_from_the_cache_keeps_the_last_boot() {
         const CHILD: &str = "VK_TEST_START_KEEPS_BOOT";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("start-keeps");
             crate::dev::testutil::in_child(
                 "dev::boot::tests::a_start_that_cannot_boot_from_the_cache_keeps_the_last_boot",
@@ -2584,7 +2585,8 @@ mod tests {
     #[tokio::test]
     async fn a_joiner_decides_on_what_it_waited_for_as_on_what_it_found() {
         const CHILD: &str = "VK_TEST_BOOT_JOIN_DECIDES";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("join-decides");
             crate::dev::testutil::in_child(
                 "dev::boot::tests::a_joiner_decides_on_what_it_waited_for_as_on_what_it_found",
@@ -2926,7 +2928,8 @@ mod tests {
     #[test]
     fn current_images_are_judged_on_the_vm_waited_for() {
         const CHILD: &str = "VK_TEST_BOOT_CURRENT_IMAGES";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("current-images");
             crate::dev::testutil::in_child(
                 "dev::boot::tests::current_images_are_judged_on_the_vm_waited_for",
@@ -2960,7 +2963,8 @@ mod tests {
     #[tokio::test]
     async fn a_waiter_reads_whether_the_vms_own_boot_readied_it() {
         const CHILD: &str = "VK_TEST_BOOT_JOIN_CLAIMED";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("join-claimed");
             crate::dev::testutil::in_child(
                 "dev::boot::tests::a_waiter_reads_whether_the_vms_own_boot_readied_it",
@@ -3032,7 +3036,8 @@ mod tests {
     #[tokio::test]
     async fn a_boot_whose_parent_went_before_readying_is_taken_over() {
         const CHILD: &str = "VK_TEST_BOOT_UNBEGUN";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("unbegun");
             crate::dev::testutil::in_child(
                 "dev::boot::tests::a_boot_whose_parent_went_before_readying_is_taken_over",
@@ -3149,7 +3154,8 @@ mod tests {
     #[test]
     fn a_delayed_recovery_leaves_what_came_since_alone() {
         const CHILD: &str = "VK_TEST_BOOT_UNBEGUN_DELAYED";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("unbegun-delayed");
             crate::dev::testutil::in_child(
                 "dev::boot::tests::a_delayed_recovery_leaves_what_came_since_alone",
@@ -3219,7 +3225,8 @@ mod tests {
     #[tokio::test]
     async fn a_joiner_given_the_gone_parents_pid_takes_its_boot_over() {
         const CHILD: &str = "VK_TEST_BOOT_UNBEGUN_SAME_PID";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("unbegun-same-pid");
             crate::dev::testutil::in_child(
                 "dev::boot::tests::a_joiner_given_the_gone_parents_pid_takes_its_boot_over",
@@ -3285,7 +3292,8 @@ mod tests {
     #[test]
     fn a_ready_boot_whose_note_cannot_be_published_fails() {
         const CHILD: &str = "VK_TEST_BOOT_NOTE_UNPUBLISHED";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("note-unpublished");
             crate::dev::testutil::in_child(
                 "dev::boot::tests::a_ready_boot_whose_note_cannot_be_published_fails",
@@ -3318,7 +3326,7 @@ mod tests {
     #[test]
     fn the_note_names_the_parent_as_it_was_at_the_fork() {
         const CHILD: &str = "VK_TEST_BOOT_NOTE_PARENT";
-        let Some(_tmp) = std::env::var_os(CHILD) else {
+        let Some(_tmp) = crate::dev::testutil::child_marker(CHILD) else {
             let tmp = scratch("note-parent");
             crate::dev::testutil::in_child(
                 "dev::boot::tests::the_note_names_the_parent_as_it_was_at_the_fork",
@@ -3343,7 +3351,8 @@ mod tests {
     #[tokio::test]
     async fn a_failed_setup_keeps_the_handoff_until_something_replaces_it() {
         const CHILD: &str = "VK_TEST_BOOT_SETUP_FAILS";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("setup-fails");
             crate::dev::testutil::in_child(
                 "dev::boot::tests::a_failed_setup_keeps_the_handoff_until_something_replaces_it",
@@ -3400,7 +3409,8 @@ mod tests {
     #[test]
     fn a_claim_names_the_joining_parent_as_it_was_at_the_fork() {
         const CHILD: &str = "VK_TEST_BOOT_CLAIM_PARENT";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("claim-parent");
             crate::dev::testutil::in_child(
                 "dev::boot::tests::a_claim_names_the_joining_parent_as_it_was_at_the_fork",
@@ -3554,7 +3564,8 @@ mod tests {
         }
 
         const CHILD: &str = "VK_TEST_BOOT_SWAP_REPLACED";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("swap-replaced");
             crate::dev::testutil::in_child(
                 "dev::boot::tests::swap_acts_on_the_vm_up_after_the_build",
@@ -3745,7 +3756,8 @@ mod tests {
     #[test]
     fn a_failed_readying_is_claimed_or_under_a_refresh_restarted() {
         const CHILD: &str = "VK_TEST_BOOT_TAKE_OVER";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("take-over");
             crate::dev::testutil::in_child(
                 "dev::boot::tests::a_failed_readying_is_claimed_or_under_a_refresh_restarted",

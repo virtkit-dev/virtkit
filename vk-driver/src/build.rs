@@ -4990,7 +4990,7 @@ mod tests {
     #[test]
     fn scratch_claim_holder() {
         use std::io::{Read, Write};
-        let Some(dir) = std::env::var_os("VK_TEST_SCRATCH_CLAIM") else {
+        let Some(dir) = crate::dev::testutil::child_marker("VK_TEST_SCRATCH_CLAIM") else {
             return;
         };
         let _owner = claim_scratch(Path::new(&dir)).unwrap();
@@ -5013,13 +5013,16 @@ mod tests {
         let claimed = root.join(format!("{SCRATCH_PREFIX}{}-0", dead_pid()));
 
         let mut holder = Reaped(
-            std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", SCRATCH_HOLDER])
-                .env("VK_TEST_SCRATCH_CLAIM", &claimed)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap(),
+            crate::dev::testutil::mark_child(
+                &mut std::process::Command::new(std::env::current_exe().unwrap()),
+                SCRATCH_HOLDER,
+            )
+            .args(["--exact", SCRATCH_HOLDER])
+            .env("VK_TEST_SCRATCH_CLAIM", &claimed)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
         );
         // Its claim is held once it says so, after libtest's own lines.
         let out = std::io::BufReader::new(holder.0.stdout.take().unwrap());

@@ -751,7 +751,8 @@ mod tests {
     #[test]
     fn a_not_ready_environment_is_compared_by_what_its_marker_records() {
         const CHILD: &str = "VK_TEST_STATUS_NOT_READY";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("status-marker");
             crate::dev::testutil::in_child(
                 "dev::status::tests::a_not_ready_environment_is_compared_by_what_its_marker_records",
@@ -807,7 +808,8 @@ mod tests {
     #[test]
     fn an_identity_without_compose_fingerprints_matches_its_config() {
         const CHILD: &str = "VK_TEST_STATUS_UNRECORDED_COMPOSE";
-        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(std::path::PathBuf::from)
+        else {
             let tmp = scratch("status-unrecorded-compose");
             crate::dev::testutil::in_child(
                 "dev::status::tests::an_identity_without_compose_fingerprints_matches_its_config",

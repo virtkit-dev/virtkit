@@ -1541,7 +1541,7 @@ mod tests {
     #[test]
     fn a_diff_against_an_identity_without_compose_fingerprints_names_its_digest() {
         const CHILD: &str = "VK_TEST_DIFF_UNRECORDED_COMPOSE";
-        let Some(tmp) = std::env::var_os(CHILD).map(PathBuf::from) else {
+        let Some(tmp) = crate::dev::testutil::child_marker(CHILD).map(PathBuf::from) else {
             let tmp = scratch("diff-unrecorded-compose");
             crate::dev::testutil::in_child(
                 "dev::identity::tests::\

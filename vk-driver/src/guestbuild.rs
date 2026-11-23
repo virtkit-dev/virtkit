@@ -1323,18 +1323,26 @@ mod tests {
         cmd
     }
 
-    /// [`reap`], run by [`a_killed_builds_context_is_reaped`] in a process of its own: its last
-    /// argument is the reaper's.
+    /// Run [`reap`] for [`a_killed_builds_context_is_reaped`]. Match the final argument
+    /// (the wrapper PID) against `AS_REAPER`. The test can kill the wrapper before the
+    /// reaper starts, so its current parent PID can differ.
     #[test]
     #[ignore = "a helper process of another test"]
     fn reaper_child() {
-        if std::env::var_os(AS_REAPER).is_none() {
+        let Some(wrapper) = std::env::var_os(AS_REAPER) else {
             return;
-        }
-        let args: Vec<OsString> = std::env::args_os().collect();
-        let [.., name] = args.as_slice() else {
-            panic!("no reaper arguments")
         };
+        let args: Vec<OsString> = std::env::args_os().collect();
+        let (name, layout) = match args.as_slice() {
+            [_, layout @ .., name] => (name, layout),
+            _ => panic!("no reaper arguments"),
+        };
+        assert!(
+            *name == wrapper
+                && crate::dev::testutil::runs_only(layout, "guestbuild::tests::reaper_child"),
+            "{AS_REAPER} is set, but this is not the reaper a wrapper started: unset it \
+             ({AS_REAPER}={wrapper:?}, args {args:?})"
+        );
         std::process::exit(if reap(name) == ExitCode::SUCCESS {
             0
         } else {
@@ -1347,7 +1355,7 @@ mod tests {
     #[test]
     #[ignore = "a helper process of another test"]
     fn wrapper_child() {
-        let Some(state) = std::env::var_os(AS_WRAPPER) else {
+        let Some(state) = crate::dev::testutil::child_marker(AS_WRAPPER) else {
             return;
         };
         let cfg = Config {
@@ -1358,7 +1366,8 @@ mod tests {
         let ctx = JobCtx::for_env(cfg, &env).unwrap();
         let lock = lock_now(&ctx.job_dir).unwrap();
         let mut cmd = this_test("guestbuild::tests::reaper_child");
-        cmd.env(AS_REAPER, "1");
+        // The wrapper PID names the build context and becomes the reaper's final argument.
+        cmd.env(AS_REAPER, std::process::id().to_string());
         let req = request(&argv(&["vk", "build", "--as", "runner"])).unwrap();
         let reaper = Some(Reaper { cmd, lock: &lock });
         // stdin never ends: the test kills this process while it reads.
@@ -1376,7 +1385,9 @@ mod tests {
         let dir = tmpdir("reap");
         let job_dir = dir.join("jobs/11");
         std::fs::create_dir_all(&job_dir).unwrap();
-        let mut wrapper = this_test("guestbuild::tests::wrapper_child")
+        let name = "guestbuild::tests::wrapper_child";
+        let mut cmd = this_test(name);
+        let mut wrapper = crate::dev::testutil::mark_child(&mut cmd, name)
             .env(AS_WRAPPER, &dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
