@@ -150,17 +150,11 @@ pub(super) async fn upload(
         + super::operations::UPLOAD_GRACE
         + Duration::from_secs(length / super::operations::MIN_RATE);
     let stream = http_body_util::BodyExt::into_data_stream(req.into_body());
-    let mut form = Multipart::new(
-        stream,
-        &boundary,
-        length,
-        deadline,
-        super::operations::UPLOAD_IDLE,
-    );
+    let mut form = Multipart::new(stream, &boundary, length, deadline, ui.upload_idle);
 
     let (csrf, version) = match read_fields(&mut form).await {
         Ok(fields) => fields,
-        Err(refusal) => return refuse(status_of(&refusal), &said_of(&refusal)),
+        Err(refusal) => return refuse(status_of(&refusal), &said_of(&refusal, ui.upload_idle)),
     };
     if !super::csrf_ok(csrf.or(header_token), &auth) {
         return refuse(StatusCode::FORBIDDEN, super::CSRF_REFUSED);
@@ -183,9 +177,9 @@ pub(super) async fn upload(
                 // What is left is at most the form's overhead: read, so the browser, still
                 // sending, hears why rather than a reset.
                 let rest = async { while let Ok(Some(_)) = form.next_part().await {} };
-                let _ = tokio::time::timeout(super::operations::UPLOAD_IDLE, rest).await;
+                let _ = tokio::time::timeout(ui.upload_idle, rest).await;
             }
-            return refuse(status_of(&refusal), &said_of(&refusal));
+            return refuse(status_of(&refusal), &said_of(&refusal, ui.upload_idle));
         }
     };
     if archive.is_empty() {
@@ -274,14 +268,14 @@ fn status_of(refusal: &Refusal) -> StatusCode {
     }
 }
 
-fn said_of(refusal: &Refusal) -> String {
+fn said_of(refusal: &Refusal, idle: Duration) -> String {
     match refusal {
         Refusal::TooLarge => too_large(),
         Refusal::Slow => format!(
             "Refused: the upload was too slow. It must arrive at {}/s or faster, and never \
              pause for {}.",
             pages::bytes(super::operations::MIN_RATE),
-            crate::human_duration(super::operations::UPLOAD_IDLE)
+            crate::human_duration(idle)
         ),
         Refusal::Malformed(why) => format!("Refused: this upload does not match the form: {why}."),
         Refusal::Broken => "The upload broke off.".to_string(),

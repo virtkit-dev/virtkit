@@ -149,6 +149,11 @@ pub struct Ui {
     /// Sign-in through an OIDC provider, besides the links; shared with the hub's update, which
     /// hands its sign-ins under way over.
     oidc: Option<Arc<OidcSignIn>>,
+    /// The longest an upload may go without a byte arriving.
+    upload_idle: Duration,
+    /// Notifies tests when a release upload stages a file or finishes cleanup.
+    #[cfg(test)]
+    uploads: tokio::sync::watch::Sender<operations::Uploads>,
 }
 
 /// What the pages show.
@@ -186,7 +191,16 @@ impl Ui {
             streams: sse::Streams::new(),
             site,
             oidc: None,
+            upload_idle: operations::UPLOAD_IDLE,
+            #[cfg(test)]
+            uploads: tokio::sync::watch::Sender::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_upload_idle(mut self, idle: Duration) -> Self {
+        self.upload_idle = idle;
+        self
     }
 
     /// The UI, also signing people in through `oidc`.

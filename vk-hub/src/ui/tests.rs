@@ -7490,6 +7490,14 @@ async fn without_oidc_the_users_page_only_lists_the_grants() {
 async fn start_fleet_releases(
     api: Option<&str>,
 ) -> (SocketAddr, Arc<Hub>, String, std::path::PathBuf) {
+    let (addr, hub, origin, dir, _) = start_fleet_releases_with(api, |ui| ui).await;
+    (addr, hub, origin, dir)
+}
+
+async fn start_fleet_releases_with(
+    api: Option<&str>,
+    tune: impl FnOnce(Ui) -> Ui,
+) -> (SocketAddr, Arc<Hub>, String, std::path::PathBuf, Arc<Ui>) {
     let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let origin = format!("http://{addr}");
@@ -7503,9 +7511,9 @@ async fn start_fleet_releases(
             .with_releases(dir.join("releases"))
             .with_release_source(api.map(crate::fetch::Source::at)),
     );
-    let ui = Arc::new(Ui::new(hub.clone(), &origin));
-    tokio::spawn(serve(listener, None, ui));
-    (addr, hub, origin, dir)
+    let ui = Arc::new(tune(Ui::new(hub.clone(), &origin)));
+    tokio::spawn(serve(listener, None, ui.clone()));
+    (addr, hub, origin, dir, ui)
 }
 
 /// What the releases directory holds that is not a release: nothing, once a request is over.
@@ -7850,8 +7858,10 @@ async fn upload_until(
         operations::UPLOAD_PATH,
         body.len()
     );
-    stream.write_all(head.as_bytes()).await.unwrap();
-    stream.write_all(&body[..cut]).await.unwrap();
+    // Send the headers and fields together to avoid a test-side pause before staging.
+    let mut sent = head.into_bytes();
+    sent.extend_from_slice(&body[..cut]);
+    stream.write_all(&sent).await.unwrap();
     (body, cut, stream)
 }
 
@@ -7876,17 +7886,21 @@ async fn trickle_upload(
     })
 }
 
-/// Waits for `dir`'s releases directory to hold a staged file, or for none, as `staged` says.
-async fn until_staged(dir: &std::path::Path, staged: bool) {
-    let started = std::time::Instant::now();
-    while staged_files(dir).is_empty() == staged {
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "staged: {:?}",
-            staged_files(dir)
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+async fn uploads_until(
+    uploads: &mut tokio::sync::watch::Receiver<operations::Uploads>,
+    done: impl FnMut(&operations::Uploads) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(10), uploads.wait_for(done))
+        .await
+        .expect("uploads did not get there")
+        .unwrap();
+}
+
+fn fleet_site(ui: &Ui) -> &fleet::FleetSite {
+    let Site::Fleet(site) = &ui.site else {
+        panic!("not a fleet UI")
+    };
+    site
 }
 
 /// Where a multipart body's file starts: what [`upload_until`] stops after to be inside it.
@@ -7896,7 +7910,9 @@ const FILE_START: &[u8] = b"application/octet-stream\r\n\r\n\x7fELF";
 /// arrives each leave nothing staged or held, and the next upload goes through.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upload_cut_short_leaves_nothing_behind() {
-    let (addr, hub, origin, dir) = start_fleet_releases(None).await;
+    // Keep the default timeout so a slow runner has time to revoke the session.
+    let (addr, hub, origin, dir, ui) = start_fleet_releases_with(None, |ui| ui).await;
+    let mut uploads = ui.uploads.subscribe();
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
     let bin = crate::fetch::tests::fake_vk("0.85.0");
     let form = [
@@ -7907,12 +7923,46 @@ async fn an_upload_cut_short_leaves_nothing_behind() {
 
     // The browser leaves.
     let (_, _, stream) = upload_until(addr, &origin, &operator, &form, FILE_START).await;
-    until_staged(&dir, true).await;
+    uploads_until(&mut uploads, |u| u.staged == 1).await;
     drop(stream);
-    until_staged(&dir, false).await;
+    uploads_until(&mut uploads, |u| u.ended == 1).await;
+    assert!(staged_files(&dir).is_empty(), "{:?}", staged_files(&dir));
     assert!(hub.db.releases().unwrap().is_empty());
 
-    // The upload stalls past the idle limit.
+    // The session ends while the file arrives.
+    let (body, cut, mut stream) = upload_until(addr, &origin, &operator, &form, FILE_START).await;
+    uploads_until(&mut uploads, |u| u.staged == 2).await;
+    hub.db
+        .end_ui_sessions(None, "uid 0", crate::now_secs())
+        .unwrap();
+    stream.write_all(&body[cut..]).await.unwrap();
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await.unwrap();
+    let resp = String::from_utf8_lossy(&resp);
+    assert!(resp.starts_with("HTTP/1.1 401"), "{resp}");
+    // Cleanup must finish before the client receives the 401.
+    assert_eq!(
+        *uploads.borrow(),
+        operations::Uploads {
+            staged: 2,
+            ended: 2
+        }
+    );
+    assert!(staged_files(&dir).is_empty(), "{:?}", staged_files(&dir));
+    assert!(hub.db.releases().unwrap().is_empty());
+    upload_goes_through(addr, &hub, &origin, &bin).await;
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // Shorten the timeout only for the stalled upload.
+    let (addr, hub, origin, dir, ui) =
+        start_fleet_releases_with(None, |ui| ui.with_upload_idle(Duration::from_secs(1))).await;
+    let uploads = ui.uploads.subscribe();
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let form = [
+        ("_csrf", csrf.as_bytes()),
+        ("version", b"0.85.0".as_slice()),
+        ("file", &bin),
+    ];
     let (_, _, mut stream) = upload_until(addr, &origin, &operator, &form, FILE_START).await;
     let mut resp = Vec::new();
     tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut resp))
@@ -7922,41 +7972,41 @@ async fn an_upload_cut_short_leaves_nothing_behind() {
     let resp = String::from_utf8_lossy(&resp);
     assert!(resp.starts_with("HTTP/1.1 408"), "{resp}");
     assert!(resp.contains("too slow"), "{resp}");
-    until_staged(&dir, false).await;
+    assert_eq!(
+        *uploads.borrow(),
+        operations::Uploads {
+            staged: 1,
+            ended: 1
+        }
+    );
+    assert!(staged_files(&dir).is_empty(), "{:?}", staged_files(&dir));
     assert!(hub.db.releases().unwrap().is_empty());
+    assert!(
+        fleet_site(&ui).uploading.take().is_some(),
+        "the slot is held"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
 
-    // The session ends while the file arrives.
-    let (body, cut, mut stream) = upload_until(addr, &origin, &operator, &form, FILE_START).await;
-    until_staged(&dir, true).await;
-    hub.db
-        .end_ui_sessions(None, "uid 0", crate::now_secs())
-        .unwrap();
-    stream.write_all(&body[cut..]).await.unwrap();
-    let mut resp = Vec::new();
-    stream.read_to_end(&mut resp).await.unwrap();
-    let resp = String::from_utf8_lossy(&resp);
-    assert!(resp.starts_with("HTTP/1.1 401"), "{resp}");
-    until_staged(&dir, false).await;
-    assert!(hub.db.releases().unwrap().is_empty());
-
-    // Nothing was left holding the upload slot.
-    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+/// A fresh operator can reuse the upload slot after revocation.
+async fn upload_goes_through(addr: SocketAddr, hub: &Hub, origin: &str, bin: &[u8]) {
+    let (operator, csrf) = sign_in(addr, hub, Role::Operator).await;
     let form = [
         ("_csrf", csrf.as_bytes()),
         ("version", b"0.85.0".as_slice()),
-        ("file", &bin),
+        ("file", bin),
     ];
-    let reply = post_upload(addr, &origin, &operator, &form, &[]).await;
+    let reply = post_upload(addr, origin, &operator, &form, &[]).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
     assert_eq!(hub.db.releases().unwrap().len(), 1);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// One upload at a time: a second one is refused while the first's file arrives, and goes
 /// through once it has ended. An upload still sending its fields holds nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn one_upload_at_a_time() {
-    let (addr, hub, origin, dir) = start_fleet_releases(None).await;
+    let (addr, hub, origin, dir, ui) = start_fleet_releases_with(None, |ui| ui).await;
+    let mut uploads = ui.uploads.subscribe();
     let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
     let bin = crate::fetch::tests::fake_vk("0.85.0");
     let form = [
@@ -7971,17 +8021,21 @@ async fn one_upload_at_a_time() {
     let reply = post_upload(addr, &origin, &operator, &form, &[]).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
     fields.abort();
+    // The trickle's request and the one that went through.
+    uploads_until(&mut uploads, |u| u.ended == 2).await;
 
     let file = trickle_upload(addr, &origin, &operator, &form, FILE_START).await;
-    until_staged(&dir, true).await;
+    uploads_until(&mut uploads, |u| u.staged == 2).await;
     let reply = post_upload(addr, &origin, &operator, &form, &[]).await;
     assert_eq!(reply.status, 409, "{}", reply.body);
     assert!(reply.body.contains("another upload"), "{}", reply.body);
     file.abort();
-    until_staged(&dir, false).await;
+    // The refused request and the trickle.
+    uploads_until(&mut uploads, |u| u.ended == 4).await;
+    assert!(staged_files(&dir).is_empty(), "{:?}", staged_files(&dir));
     let reply = post_upload(addr, &origin, &operator, &form, &[]).await;
     assert_eq!(reply.status, 303, "{}", reply.body);
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// An operator starts a rollout from `/updates` once they have answered the question that
