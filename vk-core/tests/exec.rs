@@ -169,11 +169,18 @@ async fn unix_exec_roundtrip() {
 #[tokio::test]
 async fn exec_ends_when_a_leftover_process_holds_the_pipes() {
     let addr = start_server("exec-leftover").await;
+    // keep the leftover blocked on the FIFO until the client gets ExecDone
+    let release = fifo("exec-leftover-fifo");
 
     let (mut stream, mut sink) = connect(&addr).await.unwrap();
     sink.send(Message::CmdExec(CmdExec {
         name: "sh".into(),
-        args: vec!["-c".into(), "sleep 5 & echo bye".into()],
+        args: vec![
+            "-c".into(),
+            "read _ < \"$1\" & echo bye".into(),
+            "sh".into(),
+            release.0.to_str().unwrap().into(),
+        ],
         env: vec![],
         clear_env: false,
         mode: RunMode::Interactive,
@@ -184,7 +191,6 @@ async fn exec_ends_when_a_leftover_process_holds_the_pipes() {
     .await
     .unwrap();
 
-    let started = Instant::now();
     let mut stdout = Vec::new();
     let code = timeout(Duration::from_secs(10), async {
         assert!(matches!(
@@ -203,13 +209,10 @@ async fn exec_ends_when_a_leftover_process_holds_the_pipes() {
         }
     })
     .await
-    .unwrap();
+    .expect("the session waited for the leftover");
 
     assert_eq!(code, Some(0));
     assert_eq!(stdout, b"bye\n");
-    // the session ends on the drain's grace period, not on the leftover's lifetime
-    let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
 }
 
 /// `CmdConnect` end to end at the protocol level: dial an echo server through the
@@ -987,16 +990,15 @@ async fn tty_exec_takes_the_client_terminal_modes() {
 #[tokio::test]
 async fn tty_exec_ends_when_a_leftover_process_holds_the_pty() {
     let addr = start_server("tty-leftover").await;
+    // keep the leftover blocked on the FIFO until the client gets ExecDone
+    let release = fifo("tty-leftover-fifo");
     // the trap has to be installed before the fork, not inside the background job: the
     // kernel hangs up the pty's process group when the session leader exits, and a
     // leftover that takes the SIGHUP closes the pty, hiding the case under test
-    let started = Instant::now();
-    let (stdout, code) = run_tty(&addr, "trap '' HUP; sleep 5 & echo bye", 24, 80).await;
+    let script = format!("trap '' HUP; read _ < '{}' & echo bye", release.0.display());
+    let (stdout, code) = run_tty(&addr, &script, 24, 80).await;
     assert_eq!(code, Some(0), "stdout: {stdout}");
     assert!(stdout.contains("bye\r\n"), "stdout: {stdout}");
-    // the session ends on the drain's grace period, not on the leftover's lifetime
-    let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
 }
 
 #[tokio::test]
@@ -1108,15 +1110,7 @@ async fn a_capped_channel_refuses_a_request_past_its_cap() {
     }
 
     // A background command blocks opening this fifo until the test opens its other end.
-    let fifo = scratch().join("capped-fifo");
-    {
-        use std::os::unix::ffi::OsStrExt as _;
-        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        // SAFETY: `c_path` is a NUL-terminated path.
-        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
-        assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
-    }
-    let release = ReleaseFifoReader(fifo);
+    let release = fifo("capped-fifo");
     assert!(matches!(
         first_reply_args(
             &addr,
@@ -1128,6 +1122,17 @@ async fn a_capped_channel_refuses_a_request_past_its_cap() {
         Message::StartOK
     ));
     refused(first_reply(&addr, "true", false).await);
+}
+
+/// Create a FIFO in [`scratch`] and release its reader when the guard drops.
+fn fifo(name: &str) -> ReleaseFifoReader {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = scratch().join(name);
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c_path` is a NUL-terminated path.
+    let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    ReleaseFifoReader(path)
 }
 
 /// Release the FIFO reader on drop without waiting for the command. Opening both ends
