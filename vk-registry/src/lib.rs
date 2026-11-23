@@ -67,6 +67,7 @@ pub(crate) mod tags;
 #[cfg(test)]
 mod testtmp;
 pub(crate) mod upload;
+mod zctx;
 
 pub use client::{ClientAuth, FailInfo, Held, LockClient};
 pub use config::{DEFAULT_ADDR, ServerConfig};
@@ -314,12 +315,7 @@ fn compress_beside(tmp: &Path, raw_len: u64) -> Result<Option<PathBuf>> {
     // The pledged size is what puts the decompressed length in the frame header, which is
     // how a HEAD answers with the canonical Content-Length without decompressing (see
     // `zstd_canonical_len`) — the same reason `zstd_with_size` sets it.
-    let mut enc =
-        zstd::stream::write::Encoder::new(dst, ZSTD_LEVEL).context("creating the encoder")?;
-    enc.set_pledged_src_size(Some(raw_len))
-        .context("setting the zstd pledged size")?;
-    enc.include_contentsize(true)
-        .context("enabling the zstd content size")?;
+    let mut enc = zctx::encoder(dst, raw_len).context("creating the encoder")?;
     let copied = std::io::copy(&mut src, &mut enc).context("zstd-compressing a blob");
     // With no input, zstd can finish an empty frame despite a nonzero pledge.
     let finished = copied.and_then(|n| {
@@ -327,7 +323,7 @@ fn compress_beside(tmp: &Path, raw_len: u64) -> Result<Option<PathBuf>> {
             n == raw_len,
             "the blob is {n} bytes, not the expected {raw_len}"
         );
-        enc.finish().context("finishing the zstd frame")
+        zctx::finish(enc).context("finishing the zstd frame")
     });
     let z_len = match finished {
         Ok(f) => f.metadata().context("stat of the compressed blob")?.len(),
@@ -352,14 +348,10 @@ fn compress_beside(tmp: &Path, raw_len: u64) -> Result<Option<PathBuf>> {
 /// push and this store's storage compression.
 pub fn zstd_with_size(raw: &[u8]) -> Result<Vec<u8>> {
     use std::io::Write;
-    let mut enc = zstd::stream::write::Encoder::new(Vec::new(), ZSTD_LEVEL)
-        .context("creating the zstd encoder")?;
-    enc.set_pledged_src_size(Some(raw.len() as u64))
-        .context("setting the zstd pledged size")?;
-    enc.include_contentsize(true)
-        .context("enabling the zstd content size")?;
+    let mut enc =
+        zctx::encoder(Vec::new(), raw.len() as u64).context("creating the zstd encoder")?;
     enc.write_all(raw).context("zstd-compressing")?;
-    enc.finish().context("finishing the zstd frame")
+    zctx::finish(enc).context("finishing the zstd frame")
 }
 
 /// The on-disk content-addressed store. Shared by the HTTP handlers below and the
@@ -954,7 +946,7 @@ impl Store {
         let file =
             std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
         let reader: Box<dyn std::io::Read + Send> = if is_zstd {
-            Box::new(zstd::stream::read::Decoder::new(file).context("decompressing a stored blob")?)
+            Box::new(zctx::decoder(file).context("decompressing a stored blob")?)
         } else {
             Box::new(file)
         };
@@ -1225,7 +1217,7 @@ impl Store {
         let mut bytes = Vec::new();
         let limit = cap as u64 + 1;
         if is_zstd {
-            zstd::stream::read::Decoder::new(file)
+            zctx::decoder(file)
                 .context("decompressing a stored blob")?
                 .take(limit)
                 .read_to_end(&mut bytes)
@@ -1244,7 +1236,7 @@ impl Store {
         let stored = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         if is_zstd {
             return Ok(Some(
-                zstd::decode_all(&stored[..]).context("decompressing a stored blob")?,
+                zctx::decode_all(&stored).context("decompressing a stored blob")?,
             ));
         }
         Ok(Some(stored))
@@ -5371,11 +5363,10 @@ pub(crate) fn serve_blob(
 
     // Streamed, never read whole: a layer can be gigabytes, and one buffered per
     // in-flight request is how a registry runs its host out of memory. The decode for a
-    // client that does not take zstd rides the same stream — `zstd::stream::read::Decoder`
-    // is just another reader, and it is decompressing on the blocking pool either way.
+    // client that does not accept zstd runs on the blocking pool as the body streams.
     let body = if decode {
         stream_body(
-            zstd::stream::read::Decoder::new(file).context("opening a stored blob")?,
+            zctx::decoder(file).context("opening a stored blob")?,
             digest,
         )
     } else {
@@ -5885,8 +5876,7 @@ fn hash_zstd_frame(path: &Path) -> Result<Option<(String, u64)>> {
 
     // Multi-frame, like the `decode_all` the read path serves with, so `total` counts what
     // a reader would actually get.
-    let mut dec = zstd::stream::read::Decoder::new(std::io::BufReader::new(f))
-        .context("starting a zstd decode")?;
+    let mut dec = zctx::decoder(f).context("starting a zstd decode")?;
     let mut hasher = Sha256::new();
     let mut chunk = chunks::CHUNKS.take();
     let mut total: u64 = 0;
@@ -5946,7 +5936,7 @@ fn zstd_canonical_len(f: &mut std::fs::File) -> Result<u64> {
         return Ok(len);
     }
     let counted = std::io::copy(
-        &mut zstd::stream::read::Decoder::new(&mut *f).context("decompressing a stored blob")?,
+        &mut zctx::decoder(&mut *f).context("decompressing a stored blob")?,
         &mut std::io::sink(),
     )
     .context("decompressing a stored blob")?;
