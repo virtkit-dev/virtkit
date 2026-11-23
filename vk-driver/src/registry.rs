@@ -1626,9 +1626,9 @@ fn chunks_on_blocking_pool(
 
 /// Process one raw chunk for a push: dedup on its content (raw digest in transparent
 /// mode, else the chunkmap over the compressed-digest path), uploading the blob only if
-/// absent. Returns the layer descriptor (carrying `offset`/`length`) and whether a blob
-/// was uploaded. Called per chunk by [`chunk_region`], and directly by the diff push for
-/// the chunks it regenerates.
+/// absent, or always with `force`. Returns the layer descriptor (carrying
+/// `offset`/`length`) and whether a blob was uploaded. Called per chunk by
+/// [`chunk_region`], and directly by the diff push for the chunks it regenerates.
 #[allow(clippy::too_many_arguments)]
 async fn put_raw_chunk(
     client: &oci_client::Client,
