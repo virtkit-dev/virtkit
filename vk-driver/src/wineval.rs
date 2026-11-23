@@ -120,10 +120,7 @@ pub(crate) fn query(ga: &mut Client) -> Option<Evaluation> {
 
 /// [`query`], failing when Windows does not tell.
 fn ask(ga: &mut Client) -> Result<Evaluation> {
-    let mut out = Bounded {
-        out: Vec::new(),
-        deadline: Instant::now() + QUERY_TIMEOUT,
-    };
+    let mut out = Bounded::within(QUERY_TIMEOUT);
     let code = crate::winexec::powershell_output(ga, QUERY_PS1, &mut out)?;
     let out = String::from_utf8_lossy(&out.out);
     if code != 0 {
@@ -139,21 +136,31 @@ fn ask(ga: &mut Client) -> Result<Evaluation> {
     ))
 }
 
-/// [`QUERY_PS1`]'s output, refused once `deadline` has passed: the command's output is flushed
-/// at each poll of it, so a query that hangs fails there.
+/// Buffers guest output until the deadline. Each poll calls `flush` to check
+/// the deadline, so even a silent command can time out.
 struct Bounded {
     out: Vec<u8>,
     deadline: Instant,
+    /// Original timeout for the error message.
+    timeout: Duration,
 }
 
 impl Bounded {
+    fn within(timeout: Duration) -> Bounded {
+        Bounded {
+            out: Vec::new(),
+            deadline: Instant::now() + timeout,
+            timeout,
+        }
+    }
+
     fn check(&self) -> std::io::Result<()> {
         if Instant::now() < self.deadline {
             Ok(())
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!("no answer within {}s", QUERY_TIMEOUT.as_secs()),
+                format!("no answer within {}s", self.timeout.as_secs()),
             ))
         }
     }
@@ -269,15 +276,13 @@ mod tests {
 
     #[test]
     fn the_query_output_refuses_writes_after_its_deadline() {
-        let mut out = Bounded {
-            out: Vec::new(),
-            deadline: Instant::now() + Duration::from_secs(60),
-        };
+        let mut out = Bounded::within(Duration::from_secs(60));
         out.write_all(b"1 0").unwrap();
         out.flush().unwrap();
         out.deadline = Instant::now();
         let e = out.flush().unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        assert!(e.to_string().contains("no answer within 60s"), "{e}");
         assert!(out.write_all(b"x").is_err());
         assert_eq!(out.out, b"1 0");
     }
