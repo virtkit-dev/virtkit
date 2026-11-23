@@ -41,13 +41,12 @@
 //!   digest:       [u8; 32] // raw sha256 of the *stored* blob; cache filename is its hex form
 //! ```
 //!
-//! `layout` picks how a chunk's digest maps to a path under `cache_dir`, matching vk-driver's
-//! two registry backends:
-//! - `flat` (remote registry): `cache_dir/<hex>` — one flat, homogeneously-compressed cache
-//!   (`state_dir/registry/chunks/`).
-//! - `store_root` (local registry, `vk_registry::Store`): `cache_dir/blobs/zstd/<hex>` or
-//!   `cache_dir/blobs/sha256/<hex>` depending on `codec` — `Store` adaptively picks whichever
-//!   form is smaller per blob, so the two live in sibling directories under one root.
+//! `layout` picks how a chunk's digest maps to a path under `cache_dir`:
+//! - `flat`: `cache_dir/<hex>` — the remote-registry chunk cache (`state_dir/registry/chunks/`)
+//!   as older vk-driver wrote it.
+//! - `store_root`: `cache_dir/blobs/zstd/<hex>` or `cache_dir/blobs/sha256/<hex>` depending on
+//!   `codec` — a local registry (`vk_registry::Store`, which picks whichever form is smaller per
+//!   blob), and the remote-registry chunk cache, which keeps each chunk in the form it arrived.
 
 use imago::file::File as ImagoFile;
 use imago::format::gate::ImplicitOpenGate;

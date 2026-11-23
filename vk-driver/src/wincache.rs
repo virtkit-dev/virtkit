@@ -661,11 +661,13 @@ fn sweep_chunks(root: &Path, idle: std::time::Duration, now: std::time::SystemTi
         }
     }
     let mut removed = 0usize;
-    for entry in std::fs::read_dir(registry.join("chunks"))
+    let entries = crate::registry::chunk_cache_dirs(&registry.join("chunks"))
         .into_iter()
-        .flatten()
-        .flatten()
-    {
+        .flat_map(|dir| std::fs::read_dir(dir).into_iter().flatten().flatten());
+    for entry in entries {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
         // A chunk is named by its hex digest; anything else is not one.
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
@@ -830,8 +832,11 @@ mod tests {
         assert_eq!(contents(&layer_disk(&pulled), tmp), contents(&step, tmp));
         if over_http {
             let chunks = host_b.join("registry").join("chunks");
+            let [zstd, raw, _] = crate::registry::chunk_cache_dirs(&chunks);
             assert!(
-                std::fs::read_dir(&chunks).is_ok_and(|mut d| d.next().is_some()),
+                [zstd, raw]
+                    .iter()
+                    .any(|d| std::fs::read_dir(d).is_ok_and(|mut d| d.next().is_some())),
                 "no chunk in {}",
                 chunks.display()
             );
@@ -881,28 +886,52 @@ mod tests {
         ] {
             std::fs::create_dir_all(&dir).unwrap();
         }
-        // A pulled layer reading one of two cached chunks.
+        // The view reads raw chunk 7 and zstd chunk 10. Chunk 7 also has a legacy flat link.
+        // A dead pull left a staging file in the zstd directory.
         let chunks = root.join("registry/chunks");
-        std::fs::create_dir_all(&chunks).unwrap();
+        let [zstd, raw, _] = crate::registry::chunk_cache_dirs(&chunks);
+        for dir in [&zstd, &raw] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
         for c in [key(7), key(8)] {
             std::fs::write(chunks.join(c), b"chunk").unwrap();
         }
+        std::fs::hard_link(chunks.join(key(7)), raw.join(key(7))).unwrap();
+        for (dir, c) in [(&zstd, key(10)), (&zstd, key(11)), (&raw, key(12))] {
+            std::fs::write(dir.join(c), b"chunk").unwrap();
+        }
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let dead_tmp = format!("{}.{dead}-0.tmp", key(13));
+        std::fs::write(zstd.join(&dead_tmp), b"chunk").unwrap();
         let pulled = layers.join(key(4));
         crate::registry::write_vk_ro_img(
             &pulled.join(PULLED_DISK),
-            4096,
-            crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+            8192,
+            crate::registry::VK_RO_IMG_LAYOUT_STORE_ROOT,
             &chunks,
-            &[crate::registry::LazyChunk {
-                offset: 0,
-                length: 4096,
-                codec: crate::registry::VK_RO_IMG_CODEC_RAW,
-                digest: [0x07; 32],
-            }],
+            &[
+                crate::registry::LazyChunk {
+                    offset: 0,
+                    length: 4096,
+                    codec: crate::registry::VK_RO_IMG_CODEC_RAW,
+                    digest: [0x07; 32],
+                },
+                crate::registry::LazyChunk {
+                    offset: 4096,
+                    length: 4096,
+                    codec: crate::registry::VK_RO_IMG_CODEC_ZSTD,
+                    digest: [0x0a; 32],
+                },
+            ],
         )
         .unwrap();
         let view = crate::qcow2::VkRoImg::open(&pulled.join(PULLED_DISK)).unwrap();
-        assert_eq!(view.digests().collect::<Vec<_>>(), [&[0x07; 32]]);
+        assert_eq!(
+            view.digests().collect::<Vec<_>>(),
+            [&[0x07; 32], &[0x0a; 32]]
+        );
 
         // Referenced before anything made its kind's directory, as a first install is.
         drop(reference(&root.join("winiso/media").join(key(5))).unwrap());
@@ -923,8 +952,13 @@ mod tests {
             !layers.join(key(2)).exists() && !root.join("winiso/settled").join(key(3)).exists()
         );
         assert!(layers.join(key(1)).exists() && pulled.exists());
-        assert!(chunks.join(key(7)).exists(), "a pulled layer's chunk stays");
-        assert!(!chunks.join(key(8)).exists(), "an unread chunk goes");
+        for c in [chunks.join(key(7)), raw.join(key(7)), zstd.join(key(10))] {
+            assert!(c.exists(), "a pulled layer's chunk stays: {}", c.display());
+        }
+        for c in [chunks.join(key(8)), zstd.join(key(11)), raw.join(key(12))] {
+            assert!(!c.exists(), "an unread chunk goes: {}", c.display());
+        }
+        assert!(!zstd.join(&dead_tmp).exists(), "a dead pull's staging goes");
 
         drop(held);
         gc(&root, idle);

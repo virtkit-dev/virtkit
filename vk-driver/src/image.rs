@@ -1596,15 +1596,17 @@ fn drop_unreferenced_chunks(registry_root: &Path) -> (usize, u64) {
     (dropped, bytes)
 }
 
-/// Find files in `<registry_root>/chunks/` unreferenced by bundles accepted by `counts`,
+/// List files in the `<registry_root>/chunks/` directories returned by
+/// [`crate::registry::chunk_cache_dirs`] that no bundle accepted by `counts` references,
 /// with the space each holds. These are what [`drop_unreferenced_chunks`] would remove
 /// if the other bundles were gone.
 fn dead_chunks(registry_root: &Path, counts: impl Fn(&Path) -> bool) -> Vec<(PathBuf, u64)> {
     use std::os::unix::fs::MetadataExt;
 
-    let Ok(entries) = std::fs::read_dir(registry_root.join("chunks")) else {
+    let cache = registry_root.join("chunks");
+    if !cache.is_dir() {
         return Vec::new();
-    };
+    }
     let mut live = std::collections::HashSet::new();
     for base in base_dirs(registry_root).into_iter().filter(|b| counts(b)) {
         if let Ok(list) = std::fs::read_to_string(base.join("chunks.list")) {
@@ -1617,13 +1619,22 @@ fn dead_chunks(registry_root: &Path, counts: impl Fn(&Path) -> bool) -> Vec<(Pat
         }
     }
     let mut dead = Vec::new();
-    for e in entries.flatten() {
+    // A legacy entry and its codec link share an inode. Charge its blocks to the last
+    // dead link only if the sweep accounts for every link.
+    let mut links = std::collections::HashMap::<(u64, u64), u64>::new();
+    let entries = crate::registry::chunk_cache_dirs(&cache)
+        .into_iter()
+        .flat_map(|dir| std::fs::read_dir(dir).into_iter().flatten().flatten());
+    for e in entries {
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
         let p = e.path();
         let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        // A chunk being staged into the store right now (`pull_chunk` writes
-        // `<hex>.<pid>-<seq>.tmp` then renames) is left alone; one whose writer is gone is
+        // A chunk being staged into the store right now (a pull writes `<hex>.<pid>-<seq>.tmp`
+        // beside its entry, then renames) is left alone; one whose writer is gone is
         // reclaimed, since nothing will ever rename it into place. An in-flight *bundle* is
         // instead kept live by its `chunks.list`, which `pull_into` writes into the staging
         // dir before fetching any chunk.
@@ -1635,12 +1646,15 @@ fn dead_chunks(registry_root: &Path, counts: impl Fn(&Path) -> bool) -> Vec<(Pat
         if !is_dead {
             continue;
         }
-        // Read before the unlink; a file with another link keeps its space.
-        let held = e
-            .metadata()
-            .ok()
-            .filter(|m| m.nlink() <= 1)
-            .map_or(0, |m| m.blocks().saturating_mul(512));
+        let held = e.metadata().ok().map_or(0, |m| {
+            let seen = links.entry((m.dev(), m.ino())).or_default();
+            *seen += 1;
+            if *seen >= m.nlink() {
+                m.blocks().saturating_mul(512)
+            } else {
+                0
+            }
+        });
         dead.push((p, held));
     }
     dead
@@ -2941,6 +2955,74 @@ mod tests {
             "a chunk no remaining bundle references is dropped"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same live set and staging rules cover both codec directories and the cache root.
+    /// Dry and real sweeps count a linked chunk's blocks once, at its last link.
+    #[test]
+    fn sweep_chunks_covers_every_chunk_location() {
+        use std::os::unix::fs::MetadataExt;
+        let root = std::env::temp_dir().join(format!("vk-sweep-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bundle = root.join("img").join("deadbeef");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("runner.ext4"), b"x").unwrap();
+        std::fs::write(bundle.join("chunks.list"), "aaa\nbbb\nccc\n").unwrap();
+        let chunks = root.join("chunks");
+        let [zstd, raw, _] = crate::registry::chunk_cache_dirs(&chunks);
+        for dir in [&zstd, &raw] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let live_tmp = staging_chunk_name("ddd");
+        let dead_tmp = format!("eee.{dead}-0.tmp");
+        for (dir, name) in [
+            (&zstd, "aaa"),
+            (&raw, "bbb"),
+            (&chunks, "ccc"),
+            (&zstd, "fff"),
+            (&raw, "ggg"),
+            (&chunks, "hhh"),
+            (&zstd, live_tmp.as_str()),
+            (&raw, dead_tmp.as_str()),
+        ] {
+            std::fs::write(dir.join(name), noise(8192)).unwrap();
+        }
+        std::fs::hard_link(chunks.join("ccc"), raw.join("ccc")).unwrap();
+        std::fs::hard_link(chunks.join("hhh"), zstd.join("hhh")).unwrap();
+
+        let (dry, dry_bytes) = collect_chunks(&root, true, &[]);
+        let (real, real_bytes) = collect_chunks(&root, false, &[]);
+        // fff, ggg, both links of hhh, and the dead pull's staging.
+        assert_eq!((dry, real), (5, 5));
+        assert_eq!(dry_bytes, real_bytes);
+        let each = std::fs::metadata(zstd.join("aaa")).unwrap().blocks() * 512;
+        assert_eq!(
+            real_bytes,
+            4 * each,
+            "a linked chunk's space is counted once"
+        );
+        for kept in [
+            zstd.join("aaa"),
+            raw.join("bbb"),
+            chunks.join("ccc"),
+            raw.join("ccc"),
+            zstd.join(&live_tmp),
+        ] {
+            assert!(kept.exists(), "{}", kept.display());
+        }
+        for gone in [
+            zstd.join("fff"),
+            raw.join("ggg"),
+            chunks.join("hhh"),
+            zstd.join("hhh"),
+            raw.join(&dead_tmp),
+        ] {
+            assert!(!gone.exists(), "{}", gone.display());
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

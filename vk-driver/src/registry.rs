@@ -80,6 +80,8 @@ pub(crate) const VK_RO_IMG_MAGIC: &[u8; 8] = b"VKROIMG1";
 pub(crate) const VK_RO_IMG_EXT: &str = "vk_ro_img";
 pub(crate) const VK_RO_IMG_CODEC_ZSTD: u8 = 0;
 pub(crate) const VK_RO_IMG_CODEC_RAW: u8 = 1;
+/// Legacy flat layout. New lazy views use the store-root layout.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const VK_RO_IMG_LAYOUT_FLAT: u8 = 0;
 pub(crate) const VK_RO_IMG_LAYOUT_STORE_ROOT: u8 = 1;
 
@@ -815,15 +817,11 @@ async fn try_pull_ext4_lazy_async(
                 let (offset, length) = chunk_bounds(&layer, total_size)?;
                 // Ensures the blob is in the local cache (network fetch on a miss) — the
                 // decompress-and-place step the eager path does next is what we skip.
-                pull_chunk(client, dref, &layer, chunks_cache, fetched, reused).await?;
+                let codec =
+                    ensure_chunk(client, dref, &layer, chunks_cache, fetched, reused).await?;
                 if let Some(m) = meter {
                     m.add(layer_size(&layer));
                 }
-                let codec = if layer.media_type == CHUNK_MEDIA_TYPE {
-                    VK_RO_IMG_CODEC_ZSTD
-                } else {
-                    VK_RO_IMG_CODEC_RAW
-                };
                 Ok(LazyChunk {
                     offset,
                     length: u32::try_from(length).context("chunk length")?,
@@ -841,7 +839,7 @@ async fn try_pull_ext4_lazy_async(
     write_vk_ro_img(
         dest,
         config.total_size,
-        VK_RO_IMG_LAYOUT_FLAT,
+        VK_RO_IMG_LAYOUT_STORE_ROOT,
         &chunks_cache,
         &chunks,
     )?;
@@ -2206,10 +2204,7 @@ async fn pull_into(
     // local cache), then decompresses + writes into its own disjoint slot on a blocking
     // thread. The per-chunk zstd decode is CPU-bound, so overlapping it with the other
     // fetches and decodes is the win. Writes use `pwrite`, so a shared `File` is safe.
-    // A chunk is either compressed-digest (blob = zstd, decode here) or raw
-    // (`transparent_zstd`: blob is the canonical raw bytes — the registry already
-    // served them decompressed, so write as-is). Self-describing via media type; other
-    // layers (kernel/initrd) are handled below.
+    // Decode cached zstd frames and write raw chunks directly. Kernel and initrd follow below.
     use futures::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     const RESTORE_CONCURRENCY: usize = 16;
@@ -2243,7 +2238,6 @@ async fn pull_into(
     let reused = AtomicUsize::new(0);
     let results: Vec<Result<()>> = futures::stream::iter(chunk_layers)
         .map(|layer| {
-            let compressed = layer.media_type == CHUNK_MEDIA_TYPE;
             let out = std::sync::Arc::clone(&out);
             let buffers = std::sync::Arc::clone(&buffers);
             let ext4 = ext4.clone();
@@ -2251,8 +2245,9 @@ async fn pull_into(
             async move {
                 // Refused before it is fetched or cached; `chunk_bytes` holds it to this.
                 chunk_bounds(&layer, total_size)?;
-                let bytes =
+                let (bytes, codec) =
                     pull_chunk(client, image, &layer, chunks_cache, fetched, reused).await?;
+                let compressed = codec == VK_RO_IMG_CODEC_ZSTD;
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     buffers.with_chunk(&layer, &bytes, compressed, total_size, |offset, raw| {
                         write_chunk_sparse(&out, offset, raw)
@@ -2318,6 +2313,10 @@ async fn pull_into(
 /// Content-addressed local chunk cache: `state_dir/registry/chunks/`. Shared across
 /// images so two bundles that share a chunk download it once. `dir` is the bundle's
 /// `state_dir/registry/<name>/<digest>/`, so the cache is two levels up.
+///
+/// Lazy views read this `.vk_ro_img` store root directly. The descriptor digest names each
+/// chunk under `blobs/zstd/` or `blobs/sha256/` according to its stored codec. Older `vk`
+/// stored chunks as received at the root. Pulls reuse those entries and sweeps reclaim them.
 fn chunks_cache_dir(dir: &Path) -> std::path::PathBuf {
     dir.parent()
         .and_then(Path::parent)
@@ -2325,35 +2324,84 @@ fn chunks_cache_dir(dir: &Path) -> std::path::PathBuf {
         .join("chunks")
 }
 
-/// Fetch one chunk, preferring the content-addressed local cache. A cache hit is
-/// trusted (the file name IS the verified digest); a miss pulls (oci-client
-/// verifies the blob against the descriptor digest) and stores it. A hit is not
-/// size-capped: the cache is filled only by an earlier, capped pull.
-async fn pull_chunk(
+fn chunk_codec_dir(cache: &Path, codec: u8) -> PathBuf {
+    cache.join(if codec == VK_RO_IMG_CODEC_ZSTD {
+        "blobs/zstd"
+    } else {
+        "blobs/sha256"
+    })
+}
+
+/// Both codec directories followed by the legacy flat cache.
+pub(crate) fn chunk_cache_dirs(cache: &Path) -> [PathBuf; 3] {
+    [
+        chunk_codec_dir(cache, VK_RO_IMG_CODEC_ZSTD),
+        chunk_codec_dir(cache, VK_RO_IMG_CODEC_RAW),
+        cache.to_path_buf(),
+    ]
+}
+
+/// Compressed-digest chunks arrive as zstd frames and raw-digest chunks as raw bytes.
+fn received_codec(layer: &OciDescriptor) -> u8 {
+    if layer.media_type == CHUNK_MEDIA_TYPE {
+        VK_RO_IMG_CODEC_ZSTD
+    } else {
+        VK_RO_IMG_CODEC_RAW
+    }
+}
+
+fn is_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file())
+}
+
+/// Return the stored codec without reading the chunk. Hard-link a legacy entry into the
+/// directory named by its media type. If linking fails, the caller fetches the chunk unless
+/// another pull already published the file there.
+///
+/// Hits need no timestamp refresh. Windows callers hold `wincache::hold_chunks` through view
+/// publication, excluding `wincache::sweep_chunks`. Linux pulls list live chunks in
+/// `chunks.list` before fetching them.
+fn find_cached_chunk(cache: &Path, hex: &str, layer: &OciDescriptor) -> Option<u8> {
+    for codec in [VK_RO_IMG_CODEC_ZSTD, VK_RO_IMG_CODEC_RAW] {
+        if is_file(&chunk_codec_dir(cache, codec).join(hex)) {
+            return Some(codec);
+        }
+    }
+    let legacy = cache.join(hex);
+    if !is_file(&legacy) {
+        return None;
+    }
+    let codec = received_codec(layer);
+    let dir = chunk_codec_dir(cache, codec);
+    std::fs::create_dir_all(&dir).ok()?;
+    match std::fs::hard_link(&legacy, dir.join(hex)) {
+        Ok(()) => Some(codec),
+        // Another pull published or linked it first.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            is_file(&dir.join(hex)).then_some(codec)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Return the bytes verified by oci-client against the descriptor digest and their codec.
+/// Cache publication is best-effort after the staging file is written.
+async fn fetch_chunk(
     client: &oci_client::Client,
     image: &OciReference,
     layer: &OciDescriptor,
     cache: &Path,
-    fetched: &std::sync::atomic::AtomicUsize,
-    reused: &std::sync::atomic::AtomicUsize,
-) -> Result<Vec<u8>> {
-    use std::sync::atomic::Ordering;
-    let hex = image::digest_hex(&layer.digest)?;
-    let cached = cache.join(hex);
-    // Hits are not re-dated: neither chunk sweep uses age alone. Windows sweeps only while no
-    // pull holds the store (`wincache::sweep_chunks`); callers hold `wincache::hold_chunks` until
-    // the view is published. Linux keeps chunks named in `chunks.list`, written before fetching.
-    if let Ok(bytes) = std::fs::read(&cached) {
-        reused.fetch_add(1, Ordering::Relaxed);
-        return Ok(bytes);
-    }
+    hex: &str,
+) -> Result<(Vec<u8>, u8)> {
     let bytes = pull_blob_bytes(client, image, layer, MAX_CHUNK_BLOB).await?;
-    std::fs::create_dir_all(cache).with_context(|| format!("creating {}", cache.display()))?;
+    let codec = received_codec(layer);
+    let dir = chunk_codec_dir(cache, codec);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     // atomic-ish: write to a tmp sibling then rename, so a killed pull never leaves a
     // truncated file under the digest name (which would then be trusted blindly). The staging
     // name is private to this writer — `image::staging_chunk_name` explains why two pulls of
     // one chunk must not share it — and `image::sweep_chunks` reclaims one a dead pid left.
-    let tmp = cache.join(image::staging_chunk_name(hex));
+    let tmp = dir.join(image::staging_chunk_name(hex));
     if let Err(e) = std::fs::write(&tmp, &bytes) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("writing {}", tmp.display()));
@@ -2361,11 +2409,63 @@ async fn pull_chunk(
     // Publishing is best-effort — the bytes are already in hand, so a failure costs only the
     // cache entry — but the staging file goes either way: nothing else would ever reuse a name
     // private to this writer, and the sweep can only reclaim it once this process is gone.
-    if std::fs::rename(&tmp, &cached).is_err() {
+    if std::fs::rename(&tmp, dir.join(hex)).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
+    Ok((bytes, codec))
+}
+
+/// Return the cached codec for the lazy view without reading a hit. On a miss, fetch the
+/// chunk and require its cache entry to exist.
+async fn ensure_chunk(
+    client: &oci_client::Client,
+    image: &OciReference,
+    layer: &OciDescriptor,
+    cache: &Path,
+    fetched: &std::sync::atomic::AtomicUsize,
+    reused: &std::sync::atomic::AtomicUsize,
+) -> Result<u8> {
+    use std::sync::atomic::Ordering;
+    let hex = image::digest_hex(&layer.digest)?;
+    if let Some(codec) = find_cached_chunk(cache, hex, layer) {
+        reused.fetch_add(1, Ordering::Relaxed);
+        return Ok(codec);
+    }
+    let (_, codec) = fetch_chunk(client, image, layer, cache, hex).await?;
+    // Publishing is best-effort for a fetch; a view reads only what is in the cache.
+    let stored = chunk_codec_dir(cache, codec).join(hex);
+    if !is_file(&stored) {
+        bail!(
+            "chunk {} could not be cached at {}",
+            layer.digest,
+            stored.display()
+        );
+    }
     fetched.fetch_add(1, Ordering::Relaxed);
-    Ok(bytes)
+    Ok(codec)
+}
+
+/// Return stored bytes and codec for eager restore. Fetch the chunk on a miss or read failure.
+/// Hits need no digest or size check because capped, digest-verified pulls fill the cache.
+async fn pull_chunk(
+    client: &oci_client::Client,
+    image: &OciReference,
+    layer: &OciDescriptor,
+    cache: &Path,
+    fetched: &std::sync::atomic::AtomicUsize,
+    reused: &std::sync::atomic::AtomicUsize,
+) -> Result<(Vec<u8>, u8)> {
+    use std::sync::atomic::Ordering;
+    let hex = image::digest_hex(&layer.digest)?;
+    if let Some(codec) = find_cached_chunk(cache, hex, layer)
+        && let Ok(bytes) = std::fs::read(chunk_codec_dir(cache, codec).join(hex))
+    {
+        reused.fetch_add(1, Ordering::Relaxed);
+        return Ok((bytes, codec));
+    }
+    let chunk = fetch_chunk(client, image, layer, cache, hex).await?;
+    fetched.fetch_add(1, Ordering::Relaxed);
+    Ok(chunk)
 }
 
 /// The most a bundle's config blob may be: a few hundred bytes of JSON in practice.
@@ -6884,10 +6984,11 @@ pub(crate) mod tests {
         let secret = vec![0x5a; 4096];
         let secret_digest = store.put_blob(&secret).unwrap();
         let secret_hex = secret_digest[7..].to_string();
-        std::fs::create_dir_all(state.join("chunks")).unwrap();
+        let cached = chunk_codec_dir(&state.join("chunks"), VK_RO_IMG_CODEC_RAW);
+        std::fs::create_dir_all(&cached).unwrap();
         std::fs::create_dir_all(&img).unwrap();
-        std::fs::write(state.join("chunks").join(&secret_hex), &secret).unwrap();
-        std::fs::write(state.join("outside"), &secret).unwrap();
+        std::fs::write(cached.join(&secret_hex), &secret).unwrap();
+        std::fs::write(cached.join("../outside"), &secret).unwrap();
         std::fs::write(root.join("blobs/outside"), &secret).unwrap();
         let config = BundleConfig {
             total_size: secret.len() as u64,
@@ -6982,6 +7083,198 @@ pub(crate) mod tests {
             assert_eq!(fetched.chunks[0].digest, secret_digest);
             std::fs::remove_file(&pulled).unwrap();
             std::fs::remove_file(&view).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A legacy entry needs a link in the directory selected by its media type to count as a hit.
+    #[test]
+    fn a_top_level_chunk_is_linked_or_missed() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = retry_tmpdir("legacy-chunk");
+        let cache = dir.join("chunks");
+        std::fs::create_dir_all(&cache).unwrap();
+        let layer = |media: &str, hex: &str| OciDescriptor {
+            media_type: media.to_string(),
+            digest: format!("sha256:{hex}"),
+            ..Default::default()
+        };
+        let (raw_hex, frame_hex) = ("ab".repeat(32), "cd".repeat(32));
+        for hex in [&raw_hex, &frame_hex] {
+            std::fs::write(cache.join(hex), b"chunk").unwrap();
+        }
+        let raw = layer(CHUNK_MEDIA_TYPE_RAW, &raw_hex);
+        let sha256 = chunk_codec_dir(&cache, VK_RO_IMG_CODEC_RAW);
+        std::fs::create_dir_all(&sha256).unwrap();
+        // SAFETY: geteuid(2) has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            let perms = std::fs::Permissions::from_mode;
+            std::fs::set_permissions(&sha256, perms(0o555)).unwrap();
+            assert_eq!(find_cached_chunk(&cache, &raw_hex, &raw), None);
+            std::fs::set_permissions(&sha256, perms(0o755)).unwrap();
+        }
+        assert_eq!(
+            find_cached_chunk(&cache, &raw_hex, &raw),
+            Some(VK_RO_IMG_CODEC_RAW)
+        );
+        let frame = layer(CHUNK_MEDIA_TYPE, &frame_hex);
+        assert_eq!(
+            find_cached_chunk(&cache, &frame_hex, &frame),
+            Some(VK_RO_IMG_CODEC_ZSTD)
+        );
+        for (codec, hex) in [
+            (VK_RO_IMG_CODEC_RAW, &raw_hex),
+            (VK_RO_IMG_CODEC_ZSTD, &frame_hex),
+        ] {
+            let linked = std::fs::metadata(chunk_codec_dir(&cache, codec).join(hex)).unwrap();
+            assert_eq!(
+                linked.ino(),
+                std::fs::metadata(cache.join(hex)).unwrap().ino()
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Lazy and eager HTTP restores share downloads in either order for both digest formats.
+    /// Each chunk lands under its received codec. Legacy flat entries supply the same chunks
+    /// through hard links and still serve their original view.
+    #[test]
+    fn restores_share_one_chunk_cache_with_older_vk() {
+        use std::os::unix::fs::MetadataExt;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = retry_tmpdir("chunk-cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Half incompressible, half runs: chunks the registry stores either way.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut data: Vec<u8> = (0..3 << 20)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        data.extend((0..3u32 << 20).map(|i| (i / 4096) as u8));
+        let ext4 = dir.join("runner.ext4");
+        std::fs::write(&ext4, &data).unwrap();
+
+        for transparent in [true, false] {
+            let root = dir.join(format!("store-{transparent}"));
+            let store = Arc::new(vk_registry::Store::new(root).unwrap());
+            let url = serve_store(store.clone(), vk_registry::auth::Auth::None);
+            let share = |url| {
+                Registry::for_share(
+                    url,
+                    true,
+                    None,
+                    String::new(),
+                    None,
+                    None,
+                    Some(transparent),
+                )
+            };
+            // Push directly because the recording proxy only forwards requests without bodies.
+            push_ext4(&share(url.clone()), "img", "t", &ext4, "generic-disk").unwrap();
+            let (proxy, requests) = recording_proxy(url);
+            let rg = share(proxy);
+            let bundle = fetch_bundle(&rg, "img", "t").unwrap().unwrap();
+            let media = if transparent {
+                CHUNK_MEDIA_TYPE_RAW
+            } else {
+                CHUNK_MEDIA_TYPE
+            };
+            assert!(bundle.chunks.iter().all(|c| c.media_type == media));
+            let hexes: Vec<&str> = bundle.chunks.iter().map(|c| &c.digest[7..]).collect();
+            let codec = received_codec(&bundle.chunks[0]);
+            // The chunk downloads since the last call.
+            let chunk_gets = || {
+                let mut log = requests.lock().unwrap();
+                let n = log
+                    .iter()
+                    .filter(|r| r.starts_with("GET ") && hexes.iter().any(|h| r.contains(h)))
+                    .count();
+                log.clear();
+                n
+            };
+            // A restore into `state/img/`, whose chunk cache is `state/chunks`.
+            let restore = |state: &Path, lazy: bool| {
+                let img = state.join("img");
+                std::fs::create_dir_all(&img).unwrap();
+                let out = img.join("restored.raw");
+                if lazy {
+                    let view = img.join("view.vk_ro_img");
+                    try_pull_ext4_lazy(&rg, "img", "t", &view, "img", None, None)
+                        .unwrap()
+                        .unwrap();
+                    crate::qcow2::materialize_to_raw(&view, &out).unwrap();
+                } else {
+                    try_pull_ext4(&rg, "img", "t", &out, "img")
+                        .unwrap()
+                        .unwrap();
+                }
+                assert!(std::fs::read(&out).unwrap() == data, "lazy: {lazy}");
+            };
+
+            for lazy_first in [true, false] {
+                let state = dir.join(format!("state-{transparent}-{lazy_first}"));
+                chunk_gets();
+                restore(&state, lazy_first);
+                assert_eq!(chunk_gets(), hexes.len());
+                restore(&state, !lazy_first);
+                assert_eq!(
+                    chunk_gets(),
+                    0,
+                    "the second restore reads the first's cache"
+                );
+                let cache = state.join("chunks");
+                for h in &hexes {
+                    assert!(chunk_codec_dir(&cache, codec).join(h).is_file());
+                    assert!(!cache.join(h).exists());
+                }
+            }
+
+            // Recreate an older flat view and its top-level chunks as received.
+            let state = dir.join(format!("state-{transparent}-older"));
+            let cache = state.join("chunks");
+            std::fs::create_dir_all(&cache).unwrap();
+            let mut chunks = Vec::new();
+            for c in &bundle.chunks {
+                let hex = &c.digest[7..];
+                std::fs::write(cache.join(hex), store.get_blob(hex).unwrap().unwrap()).unwrap();
+                let (offset, length) = chunk_bounds(c, bundle.total_size).unwrap();
+                chunks.push(LazyChunk {
+                    offset,
+                    length: u32::try_from(length).unwrap(),
+                    codec,
+                    digest: digest_bytes(&c.digest).unwrap(),
+                });
+            }
+            sort_lazy_chunks(&mut chunks).unwrap();
+            let older = state.join("img/older.vk_ro_img");
+            write_vk_ro_img(
+                &older,
+                bundle.total_size,
+                VK_RO_IMG_LAYOUT_FLAT,
+                &cache,
+                &chunks,
+            )
+            .unwrap();
+            chunk_gets();
+            restore(&state, true);
+            restore(&state, false);
+            assert_eq!(
+                chunk_gets(),
+                0,
+                "what an older vk cached is not downloaded again"
+            );
+            for h in &hexes {
+                let old = std::fs::metadata(cache.join(h)).unwrap();
+                let new = std::fs::metadata(chunk_codec_dir(&cache, codec).join(h)).unwrap();
+                assert_eq!((old.dev(), old.ino()), (new.dev(), new.ino()), "linked");
+            }
+            let out = state.join("img/older.raw");
+            crate::qcow2::materialize_to_raw(&older, &out).unwrap();
+            assert!(std::fs::read(&out).unwrap() == data);
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
