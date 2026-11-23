@@ -1050,7 +1050,7 @@ mod tests {
         let dir = crate::qga::tests::TempDir::new("relay-idle");
         let listener = vk_core::unixpath::bind(&dir.0.join("qga.sock")).unwrap();
         let (port, host) = UnixStream::pair().unwrap();
-        let (mut relay, mut client, moved) = one_request(&host, &port);
+        let (mut relay, _client, moved) = one_request(&host, &port);
 
         let timeout = REPLY_TIMEOUT.as_millis() as u64;
         assert_eq!(relay.poll_timeout() as u64, timeout);
@@ -1061,10 +1061,8 @@ mod tests {
         // With nothing else to wake it, the relay gives up on `a` in one step.
         relay.step(&listener, &mut [0u8; 1024]).unwrap();
         relay_sync(&port);
-        // Fail immediately if the relay kept the client open.
-        client.set_nonblocking(true).unwrap();
-        let mut gone = [0u8; 1];
-        assert_eq!(client.read(&mut gone).unwrap(), 0);
+        // A child forked by a parallel test can keep the relay's socket open and delay EOF.
+        assert!(relay.clients.is_empty());
     }
 
     /// Limit the relay's send buffer so a long request requires multiple writes.
@@ -1258,12 +1256,13 @@ mod tests {
         moved.store(REPLY_TIMEOUT.as_millis() as u64, Ordering::SeqCst);
         relay.step(&listener, &mut [0u8; 1024]).unwrap();
         relay_sync(&port);
+        assert!(relay.clients.is_empty());
+        // A forked child can delay EOF. Either way, no reply bytes should reach the client.
         client.set_nonblocking(true).unwrap();
-        let mut gone = [0u8; 1];
-        assert_eq!(
-            client.read(&mut gone).unwrap(),
-            0,
-            "the late answer went to the client"
-        );
+        match client.read(&mut [0u8; 1]) {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            read => panic!("the late answer went to the client: {read:?}"),
+        }
     }
 }
