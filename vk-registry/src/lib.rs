@@ -345,6 +345,31 @@ pub fn zstd_with_size(raw: &[u8]) -> Result<Vec<u8>> {
     zctx::finish(enc).context("finishing the zstd frame")
 }
 
+/// `zstd::encode_all` pledges the size of a source shorter than this, so only those
+/// frames record it.
+const ENCODE_ALL_PLEDGES_BELOW: usize = 128 << 10;
+
+/// zstd-compress `raw` into the frame `zstd::encode_all(raw, ZSTD_LEVEL)` writes, which
+/// a compressed-digest chunk is addressed by. The context comes from the pool
+/// [`zstd_with_size`] uses.
+pub fn zstd_frame(raw: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let mut enc = if raw.len() < ENCODE_ALL_PLEDGES_BELOW {
+        zctx::encoder(Vec::new(), raw.len() as u64)
+    } else {
+        zctx::encoder_unsized(Vec::new())
+    }
+    .context("creating the zstd encoder")?;
+    enc.write_all(raw).context("zstd-compressing")?;
+    zctx::finish(enc).context("finishing the zstd frame")
+}
+
+/// Read the zstd `frames` decompressed, as `zstd::stream::read::Decoder` does, on a
+/// context from the pool the store decodes with.
+pub fn zstd_reader(frames: &[u8]) -> std::io::Result<impl std::io::Read + '_> {
+    zctx::decoder_buffered(frames)
+}
+
 /// The on-disk content-addressed store. Shared by the HTTP handlers below and the
 /// in-process build-cache backend (`registry::local`), so both write identical
 /// on-disk state. Cheap to clone-share via `Arc`.

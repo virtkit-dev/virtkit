@@ -43,7 +43,7 @@ use crate::image::{self, Reference, ResolvedImage};
 // The content-addressed store lives in the standalone vk-registry crate; the client
 // paths here share its digest/compression conventions (ZSTD_LEVEL so re-pushed chunks
 // dedup, the transparent-zstd capability header, and the size-embedding zstd encoder).
-use vk_registry::{TRANSPARENT_ZSTD_HEADER, ZSTD_LEVEL, zstd_with_size};
+use vk_registry::{TRANSPARENT_ZSTD_HEADER, zstd_frame, zstd_reader, zstd_with_size};
 
 // CDC parameters for runner.ext4 (FastCDC v2020): min 1 MiB, avg 4 MiB, max 16 MiB.
 const CDC_MIN: usize = 1 << 20;
@@ -1676,8 +1676,7 @@ async fn put_raw_chunk(
         ));
     }
     let (compressed, digest) = off_runtime(move || -> Result<_> {
-        let compressed =
-            zstd::encode_all(&raw[..], ZSTD_LEVEL).context("zstd-compressing a chunk")?;
+        let compressed = zstd_frame(&raw).context("zstd-compressing a chunk")?;
         let digest = sha256_hex(&compressed);
         Ok((compressed, digest))
     })
@@ -2528,7 +2527,7 @@ fn chunk_bytes(
     let (offset, len) = chunk_bounds(layer, total_size)?;
     let raw = if compressed {
         let mut raw = Vec::with_capacity(len as usize);
-        zstd::stream::read::Decoder::new(&blob[..])
+        zstd_reader(&blob)
             .and_then(|d| d.take(len + 1).read_to_end(&mut raw))
             .with_context(|| format!("zstd-decompressing chunk {}", layer.digest))?;
         raw
@@ -5852,6 +5851,93 @@ pub(crate) mod tests {
         assert_eq!(seen[2].query, seen[4].query);
     }
 
+    /// Bytes that compress, but not to nothing.
+    fn compressible(len: usize, seed: u64) -> Vec<u8> {
+        let mut raw = pseudo_random(len, seed);
+        for (i, b) in raw.iter_mut().enumerate() {
+            if i % 7 >= 4 {
+                *b = (i % 13) as u8;
+            }
+        }
+        raw
+    }
+
+    /// A compressed-digest chunk is uploaded as the frame `zstd::encode_all` writes and
+    /// addressed by that frame's digest, whatever the pooled context compressed before.
+    #[test]
+    fn a_compressed_chunk_is_the_frame_a_new_context_writes() {
+        install_crypto();
+        for (len, seed) in [(300_000, 1), (7, 2), (1 << 20, 3)] {
+            let server = FakeServer::start(vec![
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                "HTTP/1.1 202 Accepted\r\nLocation: /upload/one\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                "HTTP/1.1 202 Accepted\r\nLocation: /upload/two\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                "HTTP/1.1 201 Created\r\nLocation: /done\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            ]);
+            let rg = fake_registry(&server);
+            let (client, _auth) = client(&rg).unwrap();
+            let image = make_ref(&rg, "repo", "tag").unwrap();
+            let raw = compressible(len, seed);
+            let frame = zstd::encode_all(&raw[..], vk_registry::ZSTD_LEVEL).unwrap();
+            // A sized frame first, so the pooled context comes back from another kind of use.
+            zstd_with_size(&raw).unwrap();
+            let (desc, uploaded) = block_on(put_raw_chunk(
+                &client, None, &rg, &image, false, None, raw, 0, len as u64, false,
+            ))
+            .unwrap();
+            assert!(uploaded);
+            assert_eq!(desc.digest, sha256_hex(&frame), "{len} bytes");
+            assert_eq!(desc.size, frame.len() as i64);
+            let seen = server.seen();
+            assert_eq!(
+                seen.iter().map(|r| r.method.as_str()).collect::<Vec<_>>(),
+                ["HEAD", "POST", "PATCH", "PUT"]
+            );
+            assert_eq!(seen[2].body, frame, "{len} bytes");
+        }
+    }
+
+    /// Workers sharing the context pool compress each chunk to the frame
+    /// `zstd::encode_all` writes and decode it back, also right after a frame that was
+    /// truncated, corrupt or longer than its descriptor claims.
+    #[test]
+    fn pooled_contexts_match_new_ones_across_threads() {
+        let desc = |len| chunk_descriptor(CHUNK_MEDIA_TYPE, "sha256:x", 1, 0, len);
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                s.spawn(move || {
+                    for (i, len) in [0, 1, 70_000, CDC_MAX, 300, 3 << 20]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let raw = compressible(len, t * 16 + i as u64);
+                        let frame = zstd_frame(&raw).unwrap();
+                        assert_eq!(
+                            frame,
+                            zstd::encode_all(&raw[..], vk_registry::ZSTD_LEVEL).unwrap(),
+                            "{len} bytes"
+                        );
+                        let total = CDC_MAX as u64;
+                        let decode = |frame: &[u8], len: usize| {
+                            chunk_bytes(&desc(len as u64), frame.to_vec(), true, total).ok()
+                        };
+                        assert_eq!(decode(&frame, len), Some((0, raw.clone())));
+                        if len > 300 {
+                            assert_eq!(decode(&frame[..frame.len() / 2], len), None);
+                            assert_eq!(decode(&frame, len - 1), None, "over its claim");
+                            let mut corrupt = frame.clone();
+                            let mid = corrupt.len() / 2;
+                            corrupt[mid..mid + 64].fill(0xff);
+                            assert_ne!(decode(&corrupt, len), Some((0, raw.clone())));
+                        }
+                        assert_eq!(decode(b"not a zstd frame", len), None);
+                        assert_eq!(decode(&frame, len), Some((0, raw)));
+                    }
+                });
+            }
+        });
+    }
+
     /// Retry a disconnected transparent-zstd probe before reporting lack of support.
     #[test]
     fn the_transparent_probe_recovers_after_a_disconnect() {
@@ -6401,7 +6487,7 @@ pub(crate) mod tests {
         // the exact streaming path push uses (StreamCDC over a reader).
         fastcdc::v2020::StreamCDC::new(std::io::Cursor::new(buf), CDC_MIN, CDC_AVG, CDC_MAX)
             .map(|c| {
-                let comp = zstd::encode_all(&c.unwrap().data[..], ZSTD_LEVEL).unwrap();
+                let comp = zstd::encode_all(&c.unwrap().data[..], vk_registry::ZSTD_LEVEL).unwrap();
                 sha256_hex(&comp)
             })
             .collect()
@@ -7626,7 +7712,7 @@ pub(crate) mod tests {
         {
             let chunk = chunk.unwrap();
             count += 1;
-            let comp = zstd::encode_all(&chunk.data[..], ZSTD_LEVEL).unwrap();
+            let comp = zstd::encode_all(&chunk.data[..], vk_registry::ZSTD_LEVEL).unwrap();
             let back = zstd::decode_all(&comp[..]).unwrap();
             write_chunk_sparse(&out, chunk.offset, &back).unwrap();
         }

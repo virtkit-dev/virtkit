@@ -101,6 +101,8 @@ All notable changes to virtkit will be documented in this file.
   request workers stay available to serve other requests while the registry finishes a blob.
 - When `vk build` streams chunks to a remote cache, it keeps uploading earlier
   chunks while it reads, hashes and compresses the next ones.
+- Image pushes, pulls and reads of lazily pulled images use less CPU on chunks because
+  `vk` reuses zstd's working memory between chunks.
 - `vk node`, `vk tune` and `vk-gitlab` can reuse their state directory as soon as the
   previous holder releases it.
 - `vk dev` keeps its `auto` endpoint address when a child inherits a port check or
