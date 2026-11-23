@@ -8,12 +8,11 @@
 # format. Revisit and drop this entry when imago releases a version off bincode.
 #
 # RUSTSEC-2026-0543 — `chrono` is unmaintained (informational, no vulnerability; no
-# patched version). No virtkit crate uses it: it enters through oci-client 0.18.0
-# (vk-driver) and russh-sftp 3.0.1 and russh-util 0.52.0 (vk-agent's russh), each the
-# latest release, so there is no upgrade that drops it. Revisit and drop this entry when
-# they move to jiff or time, the advisory's recommended alternatives.
+# patched version). Only vk-agent's SSH dependencies pull in chrono: russh-sftp
+# 3.0.1 and russh-util 0.52.0. russh-sftp 4 uses jiff, but russh-util still needs
+# chrono. Drop this entry when both paths are gone. The advisory recommends jiff or time.
 [advisories]
 ignore = [
     "RUSTSEC-2025-0141", # bincode: unmaintained (see above)
-    "RUSTSEC-2026-0543", # chrono: unmaintained, via oci-client and russh (see above)
+    "RUSTSEC-2026-0543", # chrono: unmaintained, via vk-agent's SSH dependencies
 ]

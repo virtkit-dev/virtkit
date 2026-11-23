@@ -119,12 +119,13 @@ tar = "0.4"
 # pull OCI images straight from a registry (no docker daemon); rustls so the
 # binary stays musl-static (no openssl). flate2 gunzips the layer tars.
 #
-# No tls feature: oci-client's `rustls-tls` would pin reqwest to the aws-lc-rs provider,
-# pulling the aws-lc-sys C blob alongside the ring backend russh already uses. We wire
-# reqwest (rustls + ring) directly below instead, so a single crypto backend is linked.
-# oci-client builds its reqwest client from whatever TLS reqwest compiled, so HTTPS
-# still works.
-oci-client = { version = "0.18", default-features = false }
+# Use a release once it supports custom HTTP transports. cargo-audit skips
+# this git pin because it only checks packages from crates.io.
+#
+# oci-client needs a TLS feature to honor `extra_root_certificates`. The
+# provider-less feature uses the ring provider installed in main and shared with
+# russh. `rustls-tls` would also pull in aws-lc-rs and its aws-lc-sys C library.
+oci-client = { git = "https://github.com/oras-project/rust-oci-client", rev = "0690d8d970e5ef5f36e79aecf11c786312cf7de0", default-features = false, features = ["rustls-tls-no-provider"] }
 flate2 = "1"
 # docker-hash: content hashing of a (Dockerfile, stage) for image-tag resolution
 sha2 = "0.11"
