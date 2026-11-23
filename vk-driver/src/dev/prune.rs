@@ -142,6 +142,27 @@ impl Selection {
         let root = self._locks.last().context("no state directory selected")?;
         Ok(root)
     }
+
+    /// Reject a live VM anywhere under the state root. Skip directories locked by
+    /// this selection because those locks make stale registrations look live.
+    fn none_started(&self, live: &[crate::vms::VmEntry]) -> Result<()> {
+        let held: Vec<PathBuf> = (self._locks.iter())
+            .map(|dir| std::fs::canonicalize(fd_path(dir)))
+            .collect::<std::io::Result<_>>()
+            .context("resolving the environment's state directories")?;
+        // Nothing is selected from a state dir that does not exist.
+        let Some(root) = held.last() else {
+            return Ok(());
+        };
+        let started = (live.iter())
+            .map(|vm| crate::vms::canonical(&vm.state_dir))
+            .any(|dir| dir.starts_with(root) && !held.contains(&dir));
+        ensure!(
+            !started,
+            "no selected files were removed. A VM has started inside the environment's state directory. Stop it first."
+        );
+        Ok(())
+    }
 }
 
 /// A descriptor of its own on the dir `dir` holds open: the same inode, through the descriptor's
@@ -470,7 +491,7 @@ fn has_create_hook(manifest: &serde_json::Value) -> bool {
 }
 
 /// Remove the boot images of the stopped environment whose state is `dir`, without asking: the
-/// selection `vk dev prune NAME --images` previews, under the same locks and running check,
+/// selection `vk dev prune NAME --images` previews, with the same locks and initial VM check,
 /// with `hooks.create` invalidated the same way. For `vk gc`, once no run has held the dir for
 /// `idle` — read again under its locks, so a run that took it since the caller looked keeps it.
 /// An environment whose storage was never recorded is left, and one whose config has a
@@ -659,7 +680,9 @@ fn run_env(env: &Env, opts: &Options, confirm: impl FnOnce() -> Result<bool>) ->
     // Stale registrations go with a confirmed prune only. Before the removal, for those on a
     // directory it takes, which could not be locked after; and once the selection's locks
     // are released, which make this environment's own look live.
-    crate::vms::running();
+    let live = crate::vms::running();
+    // A VM can start with its own nested state directory while confirmation is pending.
+    selected.none_started(&live)?;
     let report = selected.remove(env);
     drop(selected);
     crate::vms::running();
@@ -994,6 +1017,35 @@ mod tests {
                 "a confirmed prune drops stale registrations"
             );
         }
+    }
+
+    #[test]
+    fn a_vm_started_in_storage_during_the_prompt_keeps_its_state() {
+        let f = fixture("started");
+        let e = env(&f.plan);
+        let vm = f.plan.state_dir.join("editor/vm");
+        std::fs::create_dir(&vm).unwrap();
+        let run = std::cell::RefCell::new(None);
+        let all = Options {
+            all: true,
+            ..Default::default()
+        };
+        let refused = run_env(&e, &all, || {
+            // A run locks its state dir, then registers its VM.
+            let dir = LockFile::new(open_dir(&vm).unwrap());
+            lock(&dir).unwrap();
+            registration(&vm);
+            run.replace(Some(dir));
+            Ok(true)
+        })
+        .unwrap_err();
+        assert!(refused.to_string().contains("has started"), "{refused:#}");
+        for name in ["editor/vm", "editor/vscode-server/data", "root.qcow2"] {
+            assert!(f.plan.state_dir.join(name).exists(), "{name}");
+        }
+        drop(run);
+        run_env(&e, &all, || Ok(true)).unwrap();
+        assert!(!f.plan.state_dir.join("editor").exists());
     }
 
     #[test]

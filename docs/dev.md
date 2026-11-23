@@ -582,10 +582,11 @@ it from its workspace, or boot it once to record it.
 
 Every deletion previews its paths. The confirmation defaults to no; without a
 terminal, `--yes` is required. `--dry-run` removes nothing even with `--yes`.
-Refusing confirmation exits nonzero; an empty selection succeeds. Prune holds the
-environment's lock while selecting and removing data, so a concurrent start cannot
-use the selected files. The next start recreates the missing data and reruns the
-creation hook if one is configured.
+Refusing confirmation exits nonzero; an empty selection succeeds. Prune locks the
+environment and its service state directories through removal. Before deleting the
+selected files, it checks again for VMs with their own state directory anywhere
+under the environment. Such a VM can still start after this check. The next start
+recreates the missing data and reruns the creation hook if one is configured.
 
 `vk gc` does the images part on its own for environments stopped for 14 days
 (`[gc] dev_image_idle_days`; `0` turns it off), dated by when their VM last ran. It skips an

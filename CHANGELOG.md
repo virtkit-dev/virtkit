@@ -121,6 +121,8 @@ All notable changes to virtkit will be documented in this file.
   agent responds again.
 - A guest that stops reading its serial console input no longer keeps a new `vk console`
   from taking the console over.
+- `vk dev prune` and `vk reset` now check again before removal for VMs that started
+  under the environment's state directory.
 - A VM command frees its slot on a capped exec channel before the client receives its
   exit status.
 
