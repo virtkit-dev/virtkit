@@ -22,14 +22,55 @@ function Retry([int] $tries, [int] $sleep, [scriptblock] $step) {
 
 $domain = if ($env:LAB_DOMAIN) { $env:LAB_DOMAIN } else { 'corp.lab' }
 # An evaluation must be activated online: past its grace unactivated, Windows shuts down every
-# hour. Activate it first, before anything depends on the DC; a failure (no network, an expired
-# evaluation) is reported and the lab goes on, its exit code dropped so that it does not become
-# the script's.
-$unactivated = Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL" |
-    Where-Object { -not $_.LicenseIsAddon -and $_.LicenseStatus -ne 1 }
-if ($unactivated) {
-    cmd /c "cscript //nologo %SystemRoot%\System32\slmgr.vbs /ato 2>&1" | Out-Host
-    $global:LASTEXITCODE = 0
+# hour. Activate before the member needs the DC. Windows can start its own activation when
+# it connects to the Internet. Only an activation already in progress (0xC004E028) warrants
+# a retry. Report failures such as an unreachable network, an expired evaluation or an
+# unresponsive WMI provider, then continue provisioning.
+$windowsFilter = "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL"
+$clock = [Diagnostics.Stopwatch]::StartNew()
+$activated = $false
+$waiting = $false
+while ($true) {
+    try {
+        $unactivated = @(Get-CimInstance SoftwareLicensingProduct -Filter $windowsFilter -OperationTimeoutSec 60 |
+            Where-Object { -not $_.LicenseIsAddon -and $_.LicenseStatus -ne 1 })
+        if (-not $unactivated) {
+            if ($activated -or $waiting) { Write-Host 'Windows activated' }
+            break
+        }
+        if ($activated) {
+            Write-Host 'Windows is not activated: still unlicensed after a successful activation'
+            break
+        }
+        foreach ($product in $unactivated) {
+            $result = $product | Invoke-CimMethod -MethodName Activate -OperationTimeoutSec 120
+            if ($result.ReturnValue) { throw ('Activate returned 0x{0:X8}' -f $result.ReturnValue) }
+        }
+        $activated = $true
+        try {
+            Get-CimInstance SoftwareLicensingService -OperationTimeoutSec 60 |
+                Invoke-CimMethod -MethodName RefreshLicenseStatus -OperationTimeoutSec 60 | Out-Null
+        } catch {
+            Write-Host "Windows activation could not be confirmed: $("$($_.Exception.Message)".Trim())"
+            break
+        }
+        continue
+    } catch {
+        # A CIM error ID can contain an HRESULT missing from the message.
+        $why = "$($_.Exception.Message)".Trim()
+        if ("$($_.FullyQualifiedErrorId)" -match '0x[0-9A-F]{8}' -and $why -notmatch $Matches[0]) {
+            $why = "$($Matches[0]): $why"
+        }
+        if ($why -notmatch '0xC004E028' -or $clock.Elapsed.TotalSeconds -ge 300) {
+            Write-Host "Windows is not activated: $why"
+            break
+        }
+        if (-not $waiting) {
+            Write-Host 'Windows is already activating, waiting'
+            $waiting = $true
+        }
+    }
+    Start-Sleep -Seconds 10
 }
 $nic = (Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).ifIndex
 $dc = Resolve-DnsName $env:LAB_DC -Server $env:VK_GATEWAY -Type A -DnsOnly |
