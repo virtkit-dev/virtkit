@@ -900,14 +900,16 @@ impl Events {
     }
 }
 
-/// Collect events through the first containing `want`, within 30s. A count limit can fail
-/// after a slow stretch: streams render each heartbeat, and pages showing an age change each
-/// render, leaving an event per second ahead of the expected one.
+/// Collect events through the first containing `want` within 30 seconds. Pages showing an
+/// age can queue one event per second on heartbeat renders. A count limit could miss the
+/// expected event after a slow read.
 async fn events_until(events: &mut Events, want: &str) -> Vec<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut seen = Vec::new();
-    while tokio::time::Instant::now() < deadline {
-        let event = events.next().await.unwrap();
+    // A buffered event can return immediately even after the deadline.
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next_event(false)).await
+        && tokio::time::Instant::now() < deadline
+    {
         let found = event.contains(want);
         seen.push(event);
         if found {
