@@ -571,9 +571,8 @@ fn spawn_writer(
     // SAFETY: both descriptors are fresh and owned by nothing else.
     let (report_r, report_w) =
         unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    // SAFETY: the child calls only async-signal-safe functions (close_range, getrlimit, open,
-    // write, fchmod, fsync, close, _exit) on memory prepared before the fork, so a lock another
-    // thread held at the fork cannot be waited on in it.
+    // SAFETY: the child uses only async-signal-safe operations on inherited data and stack
+    // locals, so it cannot wait on a userspace lock held by another thread at fork.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(std::io::Error::last_os_error())
@@ -632,35 +631,115 @@ fn spawn_writer(
 
 /// Best-effort, async-signal-safe cleanup of descriptors above stdio, except `keep`.
 fn close_all_but(keep: libc::c_int) {
-    let close = |from: libc::c_int, to: libc::c_int| {
-        if from > to {
-            return;
-        }
+    close_all_but_with(keep, |from, to| {
         // SAFETY: close_range only closes descriptors of this process; the bounds are
         // non-negative, so the casts keep their values.
-        if unsafe { libc::syscall(libc::SYS_close_range, from as u32, to as u32, 0u32) } == 0 {
-            return;
-        }
-        // If close_range fails (including on kernels before Linux 5.9), scan through the
-        // soft fd limit, capped at 2^20. Fall back to 1024 if the limit is unavailable.
-        // SAFETY: getrlimit writes into a local; close acts on this process's descriptors.
+        unsafe { libc::syscall(libc::SYS_close_range, from as u32, to as u32, 0u32) == 0 }
+    });
+}
+
+/// [`close_all_but`] with an inclusive `close_range` callback that returns false on failure.
+fn close_all_but_with(keep: libc::c_int, close_range: fn(libc::c_int, libc::c_int) -> bool) {
+    let close_range = |from, to| from > to || close_range(from, to);
+    let closed = if keep < 3 {
+        close_range(3, libc::c_int::MAX)
+    } else {
+        close_range(3, keep - 1) && close_range(keep + 1, libc::c_int::MAX)
+    };
+    // close_range fails on kernels before Linux 5.9, and where a seccomp filter denies it.
+    if !closed && !close_listed_but(c"/proc/self/fd", keep) {
+        close_below_limit_but(keep);
+    }
+}
+
+/// Close descriptors listed in `/proc/self/fd`, preserving stdio and `keep`. The listing
+/// includes descriptors opened before a limit was lowered. Return false on a read error or
+/// if another filesystem masks the procfs directory, so the caller falls back to a scan.
+///
+/// Raw `getdents64` uses a stack buffer to avoid allocating after fork.
+fn close_listed_but(fds: &std::ffi::CStr, keep: libc::c_int) -> bool {
+    let open = || {
+        // SAFETY: a NUL-terminated path.
         unsafe {
-            let mut limit: libc::rlimit = std::mem::zeroed();
-            let top = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-                libc::c_int::try_from(limit.rlim_cur.min(1 << 20)).unwrap_or(1 << 20)
-            } else {
-                1024
+            libc::open(
+                fds.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        }
+    };
+    let mut dir = open();
+    if dir < 0 {
+        // Free a slot in case the descriptor table is full.
+        // SAFETY: closing a descriptor of this process, which nothing uses after.
+        unsafe { libc::close(if keep == 3 { 4 } else { 3 }) };
+        dir = open();
+    }
+    if dir < 0 {
+        return false;
+    }
+    // The types of `libc::PROC_SUPER_MAGIC` and `f_type` vary by target.
+    const PROC_SUPER_MAGIC: i64 = 0x9fa0;
+    // SAFETY: fstatfs writes into a local. The failure path closes dir before returning.
+    unsafe {
+        let mut fs: libc::statfs = std::mem::zeroed();
+        if libc::fstatfs(dir, &mut fs) != 0 || fs.f_type as i64 != PROC_SUPER_MAGIC {
+            libc::close(dir);
+            return false;
+        }
+    }
+    // The kernel's `linux_dirent64`: an inode and an offset of eight bytes each, the record's
+    // length in two, a type byte, then the NUL-terminated name.
+    const RECLEN: usize = 16;
+    const NAME: usize = 19;
+    let mut buf = [0u8; 2048];
+    let complete = loop {
+        // SAFETY: getdents64 writes at most `buf.len()` bytes into `buf`.
+        let n = unsafe { libc::syscall(libc::SYS_getdents64, dir, buf.as_mut_ptr(), buf.len()) };
+        let Some(mut records) = usize::try_from(n).ok().and_then(|n| buf.get(..n)) else {
+            break false;
+        };
+        if records.is_empty() {
+            break true;
+        }
+        // procfs iterates by descriptor number. Closing this batch cannot skip the next.
+        while let Some(&[low, high]) = records.get(RECLEN..RECLEN + 2) {
+            let len = usize::from(u16::from_ne_bytes([low, high]));
+            let Some(record) = records.get(..len).filter(|r| r.len() > NAME) else {
+                break;
             };
-            for fd in from..=to.min(top) {
-                libc::close(fd);
+            records = records.get(len..).unwrap_or_default();
+            let name = record.get(NAME..).unwrap_or_default();
+            let digits = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            // Skip `.` and `..` and numbers outside the `c_int` range.
+            let fd = name.iter().take(digits).try_fold(0, |fd: libc::c_int, &b| {
+                let digit = libc::c_int::from(b.checked_sub(b'0').filter(|d| *d <= 9)?);
+                fd.checked_mul(10)?.checked_add(digit)
+            });
+            if let Some(fd) = fd.filter(|&fd| digits > 0 && fd > 2 && fd != keep && fd != dir) {
+                // SAFETY: closing a descriptor of this process, which nothing uses after.
+                unsafe { libc::close(fd) };
             }
         }
     };
-    if keep < 3 {
-        close(3, libc::c_int::MAX);
-    } else {
-        close(3, keep - 1);
-        close(keep + 1, libc::c_int::MAX);
+    // SAFETY: `dir` was opened above and is not used after.
+    unsafe { libc::close(dir) };
+    complete
+}
+
+/// Preserve stdio and `keep`. Scan through the hard limit, capped at 2^20, or through
+/// 1024 if the limit is unavailable. Any open descriptor above the scan bound survives.
+fn close_below_limit_but(keep: libc::c_int) {
+    // SAFETY: getrlimit writes into a local; close acts on this process's descriptors.
+    unsafe {
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        let top = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+            libc::c_int::try_from(limit.rlim_max.min(1 << 20)).unwrap_or(1 << 20)
+        } else {
+            1024
+        };
+        for fd in (3..=top).filter(|&fd| fd != keep) {
+            libc::close(fd);
+        }
     }
 }
 
@@ -1785,6 +1864,99 @@ mod tests {
                 let _ = self.reap();
             }
         }
+    }
+
+    /// In a child, lower the soft limit to 16 (also the hard limit if `hard`) and fill
+    /// every slot below it. Cleanup must keep descriptors 2 and 20 and close 10 and 30.
+    fn closed_above_a_lowered_limit(close: fn(libc::c_int), hard: bool) {
+        const KEEP: libc::c_int = 20;
+        let source = std::fs::File::open("/dev/null").unwrap();
+        // SAFETY: the child calls only async-signal-safe functions, and `close`, which is
+        // written to run after a fork.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "{}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // SAFETY: descriptors of this process, which exits without running a destructor.
+            unsafe {
+                for fd in [2, 10, KEEP, 30] {
+                    if libc::dup2(source.as_raw_fd(), fd) != fd {
+                        libc::_exit(40);
+                    }
+                }
+                let mut limit: libc::rlimit = std::mem::zeroed();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                    libc::_exit(41);
+                }
+                limit.rlim_cur = 16;
+                if hard {
+                    limit.rlim_max = 16;
+                }
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    libc::_exit(42);
+                }
+                // Fill any slots left by the test harness.
+                while libc::dup(source.as_raw_fd()) >= 0 {}
+                close(KEEP);
+                for (fd, open) in [(2, true), (10, false), (KEEP, true), (30, false)] {
+                    if (libc::fcntl(fd, libc::F_GETFD) >= 0) != open {
+                        libc::_exit(fd);
+                    }
+                }
+                libc::_exit(0);
+            }
+        }
+        let mut status = 0;
+        // SAFETY: reaping the child forked above, into a local.
+        while unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
+            let e = std::io::Error::last_os_error();
+            assert_eq!(e.kind(), std::io::ErrorKind::Interrupted, "{e}");
+        }
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child status {status:#x}: it exits with the descriptor it found in the wrong state"
+        );
+    }
+
+    /// The procfs listing reaches above a lowered hard limit. The fallback scan reaches
+    /// above a lowered soft limit while the hard limit still covers the descriptor.
+    #[test]
+    fn a_descriptor_above_a_lowered_limit_is_closed_without_close_range() {
+        closed_above_a_lowered_limit(|keep| close_all_but_with(keep, |_, _| false), true);
+        closed_above_a_lowered_limit(close_below_limit_but, false);
+    }
+
+    /// Numeric names in a directory masking `/proc/self/fd` cannot identify open descriptors.
+    #[test]
+    fn a_directory_off_procfs_is_no_listing_of_descriptors() {
+        let dir = scratch("executable-masked-proc");
+        for fd in 0..64 {
+            std::fs::write(dir.join(fd.to_string()), b"").unwrap();
+        }
+        let masked = CString::new(dir.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the child calls only `close_listed_but`, written to run after a fork, and
+        // async-signal-safe functions.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "{}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let listed = close_listed_but(&masked, -1);
+            // SAFETY: stdio is this process's own, which exits without running a destructor.
+            unsafe {
+                // Stdio must survive even though the directory names descriptors 0, 1 and 2.
+                let closed = (0..3).any(|fd| libc::fcntl(fd, libc::F_GETFD) < 0);
+                libc::_exit(libc::c_int::from(listed) + 2 * libc::c_int::from(closed));
+            }
+        }
+        let mut status = 0;
+        // SAFETY: reaping the child forked above, into a local.
+        while unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
+            let e = std::io::Error::last_os_error();
+            assert_eq!(e.kind(), std::io::ErrorKind::Interrupted, "{e}");
+        }
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child status {status:#x}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A sibling holding the report pipe open cannot delay a successful write.
