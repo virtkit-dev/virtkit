@@ -99,6 +99,8 @@ All notable changes to virtkit will be documented in this file.
   operations, avoiding repeated trips to the kernel for large workspaces.
 - Large blob pushes use bounded memory in `vk-registry`. Uploads stream to disk, and
   request workers stay available to serve other requests while the registry finishes a blob.
+- When `vk build` streams chunks to a remote cache, it keeps uploading earlier
+  chunks while it reads, hashes and compresses the next ones.
 - `vk node`, `vk tune` and `vk-gitlab` can reuse their state directory as soon as the
   previous holder releases it.
 - `vk dev` keeps its `auto` endpoint address when a child inherits a port check or

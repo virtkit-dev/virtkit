@@ -1586,6 +1586,40 @@ where
     }
 }
 
+/// Run chunk reads, hashing and zstd compression on the blocking pool.
+/// [`block_on`] polls a push's uploads on one thread. Preparing a chunk there
+/// delays the next poll of every upload in flight.
+async fn off_runtime<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .context("joining a chunk-push worker")
+}
+
+type RegionChunker = fastcdc::v2020::StreamCDC<std::io::BufReader<Box<dyn std::io::Read + Send>>>;
+
+/// Stream the region's chunks in order, flagging those that contain only zeros.
+/// FastCDC targets 4 MiB chunks, so the blocking pool handles the disk reads
+/// and rolling hash while the push thread polls uploads.
+fn chunks_off_runtime(
+    chunker: RegionChunker,
+) -> impl futures::Stream<Item = Result<(bool, fastcdc::v2020::ChunkData)>> + Send + 'static {
+    futures::stream::unfold(Some(chunker), |state: Option<RegionChunker>| async move {
+        let mut chunker = state?;
+        let read = off_runtime(move || {
+            let next = chunker
+                .next()
+                .map(|c| c.map(|c| (c.data.iter().all(|&b| b == 0), c)));
+            (next, chunker)
+        })
+        .await;
+        match read {
+            Ok((Some(next), chunker)) => Some((next.map_err(anyhow::Error::from), Some(chunker))),
+            Ok((None, _)) => None,
+            Err(e) => Some((Err(e), None)),
+        }
+    })
+}
+
 /// Process one raw chunk for a push: dedup on its content (raw digest in transparent
 /// mode, else the chunkmap over the compressed-digest path), uploading the blob only if
 /// absent. Returns the layer descriptor (carrying `offset`/`length`) and whether a blob
@@ -1604,14 +1638,18 @@ async fn put_raw_chunk(
     length: u64,
     force: bool,
 ) -> Result<(OciDescriptor, bool)> {
-    let raw_hex = sha256_hex_raw(&raw);
+    let (raw, raw_hex) = off_runtime(move || {
+        let hex = sha256_hex_raw(&raw);
+        (raw, hex)
+    })
+    .await?;
     if transparent {
         let digest = format!("sha256:{raw_hex}");
         let size = raw.len() as i64;
         let uploaded = if !force && blob_exists(client, image, &digest).await? {
             false
         } else {
-            let frame = bytes::Bytes::from(zstd_with_size(&raw)?);
+            let frame = bytes::Bytes::from(off_runtime(move || zstd_with_size(&raw)).await??);
             let http = http.expect("http client");
             // Restart the upload after an unanswered PUT: the registry may have
             // discarded the old session.
@@ -1637,8 +1675,13 @@ async fn put_raw_chunk(
             false,
         ));
     }
-    let compressed = zstd::encode_all(&raw[..], ZSTD_LEVEL).context("zstd-compressing a chunk")?;
-    let digest = sha256_hex(&compressed);
+    let (compressed, digest) = off_runtime(move || -> Result<_> {
+        let compressed =
+            zstd::encode_all(&raw[..], ZSTD_LEVEL).context("zstd-compressing a chunk")?;
+        let digest = sha256_hex(&compressed);
+        Ok((compressed, digest))
+    })
+    .await??;
     let size = compressed.len() as i64;
     if let Some(dir) = chunkmap {
         chunkmap_put(dir, &raw_hex, &digest, size);
@@ -1744,10 +1787,10 @@ async fn chunk_region(
     const CHUNK_CONCURRENCY: usize = 16;
     let chunker =
         fastcdc::v2020::StreamCDC::new(std::io::BufReader::new(reader), CDC_MIN, CDC_AVG, CDC_MAX);
-    let results: Vec<Result<Option<(OciDescriptor, bool)>>> = futures::stream::iter(chunker)
+    let results: Vec<Result<Option<(OciDescriptor, bool)>>> = chunks_off_runtime(chunker)
         .map(|chunk| async move {
-            let chunk = chunk.with_context(|| format!("chunking {}", label.display()))?;
-            if chunk.data.iter().all(|&b| b == 0) {
+            let (zero, chunk) = chunk.with_context(|| format!("chunking {}", label.display()))?;
+            if zero {
                 return Ok(None); // hole — leave a gap, the pull fills it with zeros
             }
             let offset = start + chunk.offset;
