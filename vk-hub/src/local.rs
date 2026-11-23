@@ -1214,6 +1214,7 @@ fn open_page(link: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     #[test]
     fn a_name_is_drawn_for_each_start() {
@@ -1342,21 +1343,145 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A `vk` that is the shell script `body`.
+    /// Write a `vk` script with `$d` set to its own directory for files shared with the test.
     fn fake_vk(dir: &Path, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let vk = dir.join("vk");
-        // Written by `cp`, not here: a file this process holds open for writing, as a child
-        // another test forks meanwhile inherits it, cannot be run (ETXTBSY).
-        let source = vk.with_extension("sh");
-        std::fs::write(&source, format!("#!/bin/sh\n{body}\n")).unwrap();
-        let copied = std::process::Command::new("cp")
-            .arg(&source)
-            .arg(&vk)
-            .status();
-        assert!(copied.unwrap().success());
-        std::fs::set_permissions(&vk, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Write in a child so a concurrent fork cannot inherit a writable descriptor
+        // from the test process and cause ETXTBSY on exec.
+        vk_fs::write_executable(
+            &vk,
+            format!("#!/bin/sh\nd=${{0%/*}}\n{body}\n").as_bytes(),
+            0o755,
+        )
+        .unwrap();
         vk
+    }
+
+    /// Add a watchdog to [`fake_vk`] for scripts that leave processes running.
+    /// [`Local::run`] and [`Local::run_action`] give the script its own group, which the
+    /// watchdog kills when the test process exits. [`follow`] shares the test's group.
+    fn group_fake_vk(dir: &Path, body: &str) -> PathBuf {
+        static LIFELINE: std::sync::OnceLock<(OwnedFd, OwnedFd)> = std::sync::OnceLock::new();
+        // Keep the reader for future scripts and the writer until this process exits.
+        let (read, _write) = LIFELINE.get_or_init(inherited_pipe);
+        fake_vk(
+            dir,
+            &format!("{}\n{body}", group_watchdog_sh(read.as_raw_fd())),
+        )
+    }
+
+    /// Only the read end survives exec. Watchdogs see EOF when the last writer closes.
+    fn inherited_pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        // SAFETY: pipe2 writes two descriptors into a local of the right size.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: both descriptors are fresh and owned by nothing else.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        // SAFETY: F_SETFD on a descriptor `read` owns.
+        assert_eq!(
+            unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        (read, write)
+    }
+
+    /// Start a background watchdog that kills the script's group at EOF. Use only in a
+    /// separate group or `kill 0` will kill the test run. Open the inherited reader via
+    /// `/proc` to support descriptors above 9 in `sh`. The open does not need a live writer,
+    /// so the watchdog still sees EOF if the test process has already exited.
+    ///
+    /// The watchdog ignores the initial SIGTERM so it survives until escalation or EOF.
+    /// The script restores its own SIGTERM disposition after starting the watchdog.
+    fn group_watchdog_sh(read: std::os::fd::RawFd) -> String {
+        // Redirect watchdog output so readers see EOF when the script closes its output.
+        format!(
+            "trap '' TERM\n\
+             {{ read _ </proc/self/fd/{read}; kill -s KILL 0; }} >/dev/null 2>&1 &\n\
+             trap - TERM"
+        )
+    }
+
+    /// A process group leader, killed with its group as this is dropped.
+    struct Group(std::process::Child);
+
+    impl Drop for Group {
+        fn drop(&mut self) {
+            let pgid = i32::try_from(self.0.id()).unwrap();
+            // SAFETY: a plain syscall on a group this test started.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Run `body` in a new group watched through `read`. Return its stdout line by line.
+    fn watched(read: &OwnedFd, body: &str) -> (Group, std::sync::mpsc::Receiver<String>) {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{}\n{body}", group_watchdog_sh(read.as_raw_fd())))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { return };
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        (Group(child), rx)
+    }
+
+    /// Wait up to 30 seconds for the group leader and return its terminating signal, if any.
+    fn ended_by(group: &mut Group) -> Option<i32> {
+        use std::os::unix::process::ExitStatusExt;
+        let pid = group.0.id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut status = 0;
+            // SAFETY: waiting for this test's own child, into a local.
+            let waited = unsafe { libc::waitpid(i32::try_from(pid).unwrap(), &mut status, 0) };
+            let _ = tx.send((waited, status));
+        });
+        let (waited, status) = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the group outlived its watchdog's EOF");
+        assert_eq!(waited, i32::try_from(pid).unwrap());
+        std::process::ExitStatus::from_raw(status).signal()
+    }
+
+    #[test]
+    fn a_watchdog_ends_its_group_when_the_test_was_gone_before_it_read() {
+        let (read, write) = inherited_pipe();
+        drop(write);
+        let (mut group, _) = watched(&read, "sleep 600 & wait");
+        drop(read);
+        assert_eq!(ended_by(&mut group), Some(libc::SIGKILL));
+    }
+
+    /// Simulate the test process exiting between SIGTERM and escalation to SIGKILL.
+    #[test]
+    fn a_watchdog_outlives_sigterm_to_end_its_group() {
+        let (read, write) = inherited_pipe();
+        let (mut group, lines) = watched(
+            &read,
+            "trap 'echo termed' TERM\necho ready\nwhile :; do sleep 0.1; done",
+        );
+        drop(read);
+        let line = || lines.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(line(), "ready");
+        let pgid = i32::try_from(group.0.id()).unwrap();
+        // SAFETY: a plain syscall on a group this test started.
+        assert_eq!(unsafe { libc::kill(-pgid, libc::SIGTERM) }, 0);
+        assert_eq!(line(), "termed");
+        drop(write);
+        assert_eq!(ended_by(&mut group), Some(libc::SIGKILL));
     }
 
     /// Completes when `path` exists, letting a slow fake `vk` signal readiness before timeout.
@@ -1416,13 +1541,9 @@ mod tests {
     async fn a_command_past_its_time_is_killed_with_its_group() {
         let dir = scratch("group");
         let left = LeftBehind(dir.join("pid"));
-        let vk = fake_vk(
+        let vk = group_fake_vk(
             &dir,
-            &format!(
-                "sleep 600 & echo $! > '{}'\necho started\ntouch '{}'\nsleep 600",
-                left.0.display(),
-                dir.join("ready").display()
-            ),
+            "sleep 600 & echo $! > \"$d/pid\"\necho started\ntouch \"$d/ready\"\nsleep 600",
         );
         let local = Local::new(vk, dir.join("actions"));
         // Past its time once it has printed, however slowly it starts.
@@ -1454,25 +1575,31 @@ mod tests {
     async fn an_action_past_its_time_is_terminated_then_killed() {
         let dir = scratch("term");
         let left = LeftBehind(dir.join("pid"));
-        let vk = fake_vk(
+        let vk = group_fake_vk(
             &dir,
-            &format!(
-                // Captured first, then written: dash applies a simple command's redirection
-                // to its own descriptors, so `readlink /proc/$$/fd/1 > log` reads `log`.
-                "d='{}'\nlog=$(readlink /proc/$$/fd/1); mode=$(stat -L -c %a /proc/$$/fd/1)\n\
-                 echo \"$log\" > \"$d/log\"; echo \"$mode\" > \"$d/mode\"\n\
-                 trap 'echo term >> \"$d/termed\"' TERM\nsleep 600 & echo $! > '{}'\n\
-                 while :; do sleep 0.1; done",
-                dir.display(),
-                left.0.display()
-            ),
+            // Captured first, then written: dash applies a simple command's redirection to
+            // its own descriptors, so `readlink /proc/$$/fd/1 > log` reads `log`.
+            "log=$(readlink /proc/$$/fd/1); mode=$(stat -L -c %a /proc/$$/fd/1)\n\
+             echo \"$log\" > \"$d/log\"; echo \"$mode\" > \"$d/mode\"\n\
+             trap 'echo term >> \"$d/termed\"' TERM\nsleep 600 & echo $! > \"$d/pid\"\n\
+             touch \"$d/ready\"\nwhile :; do sleep 0.1; done",
         );
         let local = Local::new(vk, dir.join("actions"));
-        let began = Instant::now();
-        // Time enough for the script to set its trap and write what it reports on a loaded
-        // machine: a SIGTERM before that ends it at once, or its `$(…)` with nothing read.
-        let ran = local.run_action(&[], Duration::from_secs(3)).await.unwrap();
-        assert!(began.elapsed() >= Duration::from_secs(3) + TERM_GRACE);
+        // Trigger the timeout after the script writes its reports and installs its trap.
+        // An early SIGTERM could interrupt command substitution or kill the shell outright.
+        let ready = std::sync::OnceLock::new();
+        let ran = local
+            .run_action_until(
+                &[],
+                async {
+                    appears(dir.join("ready")).await;
+                    ready.set(Instant::now()).unwrap();
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        assert!(ready.get().unwrap().elapsed() >= TERM_GRACE);
         assert!(!ran.ok);
         assert_eq!(ran.status, "terminated after 3s, then killed 1s later");
         assert_eq!(
@@ -1495,12 +1622,9 @@ mod tests {
     #[tokio::test]
     async fn an_action_that_ends_on_sigterm_says_how() {
         let dir = scratch("termok");
-        let vk = fake_vk(
+        let vk = group_fake_vk(
             &dir,
-            &format!(
-                "trap 'echo tearing down; exit 4' TERM\ntouch '{}'\nwhile :; do sleep 0.1; done",
-                dir.join("ready").display()
-            ),
+            "trap 'echo tearing down; exit 4' TERM\ntouch \"$d/ready\"\nwhile :; do sleep 0.1; done",
         );
         // Past its time once its trap is set, however slowly it starts.
         let ran = Local::new(vk, dir.join("actions"))
@@ -1518,10 +1642,7 @@ mod tests {
     async fn an_action_s_background_process_outlives_it() {
         let dir = scratch("leave");
         let left = LeftBehind(dir.join("pid"));
-        let vk = fake_vk(
-            &dir,
-            &format!("sleep 600 & echo $! > '{}'\necho done", left.0.display()),
-        );
+        let vk = group_fake_vk(&dir, "sleep 600 & echo $! > \"$d/pid\"\necho done");
         let ran = Local::new(vk, dir.join("actions"))
             .run_action(&[], Duration::from_secs(30))
             .await
@@ -1701,10 +1822,7 @@ mod tests {
     async fn a_command_is_done_when_it_exits_not_when_its_pipes_close() {
         let dir = scratch("drain");
         let left = LeftBehind(dir.join("pid"));
-        let vk = fake_vk(
-            &dir,
-            &format!("sleep 600 & echo $! > '{}'\necho done", left.0.display()),
-        );
+        let vk = group_fake_vk(&dir, "sleep 600 & echo $! > \"$d/pid\"\necho done");
         let began = Instant::now();
         let out = Local::new(vk, dir.join("actions"))
             .run(&[], Duration::from_secs(60), Keep::Head)
