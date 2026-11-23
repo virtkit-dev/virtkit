@@ -825,47 +825,44 @@ async fn try_pull_ext4_lazy_async(
     let bundle = staging_bundle(dest, ".vkpull-");
     let chunks_cache = chunks_cache_dir(&bundle);
 
-    use futures::StreamExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let fetched = AtomicUsize::new(0);
-    let reused = AtomicUsize::new(0);
-    let results: Vec<Result<LazyChunk>> = futures::stream::iter(chunk_layers)
-        .map(|layer| {
-            let (fetched, reused, chunks_cache) = (&fetched, &reused, &chunks_cache);
-            let client = &client;
-            let dref = &dref;
-            async move {
-                // Bounded here as the eager path's reassembly is: the lazy view decodes each
-                // chunk to exactly this length later, on demand.
-                let (offset, length) = chunk_bounds(&layer, total_size)?;
-                // Ensures the blob is in the local cache (network fetch on a miss) — the
-                // decompress-and-place step the eager path does next is what we skip.
-                let codec = ensure_chunk(
-                    client,
-                    dref,
-                    &layer,
-                    length,
-                    chunks_cache,
-                    pool,
-                    fetched,
-                    reused,
-                )
-                .await?;
-                if let Some(m) = meter {
-                    m.add(layer_size(&layer));
-                }
-                Ok(LazyChunk {
-                    offset,
-                    length: u32::try_from(length).context("chunk length")?,
-                    codec,
-                    digest: digest_bytes(&layer.digest)?,
-                })
-            }
-        })
-        .buffer_unordered(RESTORE_CONCURRENCY)
-        .collect()
-        .await;
-    let mut chunks: Vec<LazyChunk> = results.into_iter().collect::<Result<_>>()?;
+    let source = Arc::new(ChunkSource {
+        client,
+        image: dref,
+        cache: chunks_cache.clone(),
+        pool: Arc::clone(pool),
+    });
+    let (mut fetched, mut reused) = (0usize, 0usize);
+    let mut chunks = Vec::with_capacity(chunk_layers.len());
+    let downloads = chunk_layers.into_iter().map(|layer| {
+        let source = Arc::clone(&source);
+        async move {
+            // Bounded here as the eager path's reassembly is: the lazy view decodes each
+            // chunk to exactly this length later, on demand.
+            let (offset, length) = chunk_bounds(&layer, total_size)?;
+            // Ensures the blob is in the local cache (network fetch on a miss) — the
+            // decompress-and-place step the eager path does next is what we skip.
+            let (codec, was_fetched) = ensure_chunk(&source, &layer, length).await?;
+            let chunk = LazyChunk {
+                offset,
+                length: u32::try_from(length).context("chunk length")?,
+                codec,
+                digest: digest_bytes(&layer.digest)?,
+            };
+            Ok((chunk, layer_size(&layer), was_fetched))
+        }
+    });
+    spawn_chunks(downloads, |(chunk, size, was_fetched)| {
+        if let Some(m) = meter {
+            m.add(size);
+        }
+        if was_fetched {
+            fetched += 1;
+        } else {
+            reused += 1;
+        }
+        chunks.push(chunk);
+    })
+    .await?;
     sort_lazy_chunks(&mut chunks).with_context(|| format!("{name}@{digest}"))?;
 
     write_vk_ro_img(
@@ -876,10 +873,6 @@ async fn try_pull_ext4_lazy_async(
         &chunks,
     )?;
 
-    let (fetched, reused) = (
-        fetched.load(Ordering::Relaxed),
-        reused.load(Ordering::Relaxed),
-    );
     crate::quiet::note!(
         "virtkit: registry: {label}: {} ext4 chunks ({fetched} fetched, {reused} cached, lazy restore)",
         fetched + reused
@@ -2235,12 +2228,9 @@ async fn pull_into(
     let total_size = config.total_size;
 
     // Reassemble the chunks concurrently: each in-flight chunk fetches (network or the
-    // local cache), then decompresses + writes into its own disjoint slot on a blocking
-    // thread. The per-chunk zstd decode is CPU-bound, so overlapping it with the other
-    // fetches and decodes is the win. Writes use `pwrite`, so a shared `File` is safe.
-    // Reuse bytes decoded for digest verification. Kernel and initrd follow below.
-    use futures::StreamExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    // local cache) on its own task. Blocking workers overlap CPU-bound zstd decoding with
+    // other fetches and decodes. They reuse bytes decoded for digest verification and use
+    // `pwrite` to fill disjoint ranges through a shared file. Kernel and initrd follow.
     let chunk_layers: Vec<OciDescriptor> = manifest
         .layers
         .iter()
@@ -2264,36 +2254,28 @@ async fn pull_into(
         .collect::<Result<Vec<_>>>()?;
     std::fs::write(tmp.join("chunks.list"), chunk_hexes.join("\n"))
         .context("writing the chunk manifest")?;
-    let chunks_cache = chunks_cache_dir(dir);
+    let source = Arc::new(ChunkSource {
+        client: client.clone(),
+        image: image.clone(),
+        cache: chunks_cache_dir(dir),
+        pool: Arc::clone(pool),
+    });
     let out = Arc::new(out);
-    let fetched = AtomicUsize::new(0);
-    let reused = AtomicUsize::new(0);
-    let results: Vec<Result<()>> = futures::stream::iter(chunk_layers)
-        .map(|layer| {
-            place_chunk(
-                client,
-                image,
-                layer,
-                total_size,
-                &chunks_cache,
-                pool,
-                &out,
-                &ext4,
-                &fetched,
-                &reused,
-            )
-        })
-        .buffer_unordered(RESTORE_CONCURRENCY)
-        .collect()
-        .await;
-    for r in results {
-        r?;
-    }
+    let ext4 = Arc::new(ext4);
+    let placements = chunk_layers.into_iter().map(|layer| {
+        let (source, out, ext4) = (Arc::clone(&source), Arc::clone(&out), Arc::clone(&ext4));
+        async move { place_chunk(&source, layer, total_size, out, ext4).await }
+    });
+    let (mut fetched, mut reused) = (0usize, 0usize);
+    spawn_chunks(placements, |was_fetched| {
+        if was_fetched {
+            fetched += 1;
+        } else {
+            reused += 1;
+        }
+    })
+    .await?;
     drop(out);
-    let (fetched, reused) = (
-        fetched.load(Ordering::Relaxed),
-        reused.load(Ordering::Relaxed),
-    );
     crate::quiet::note!(
         "virtkit: registry: {label}: {} ext4 chunks ({fetched} fetched, {reused} cached)",
         fetched + reused
@@ -2467,25 +2449,57 @@ fn publish_chunk(cache: &Path, hex: &str, codec: u8, wire: &[u8]) -> Result<()> 
     Ok(())
 }
 
-/// Return a lazy view's codec without reading a cache hit. On a miss, require the verified
-/// chunk to exist in the cache. Verify raw digests on decoded bytes and frame digests on the
-/// frame itself, unwrapping any outer zstd encoding.
-#[allow(clippy::too_many_arguments)]
-async fn ensure_chunk(
-    client: &oci_client::Client,
-    image: &OciReference,
-    layer: &OciDescriptor,
-    len: u64,
-    cache: &Path,
-    pool: &Arc<ChunkPool>,
-    fetched: &std::sync::atomic::AtomicUsize,
-    reused: &std::sync::atomic::AtomicUsize,
-) -> Result<u8> {
-    use std::sync::atomic::Ordering;
+/// Source and cache shared by one restore's chunk tasks.
+struct ChunkSource {
+    client: oci_client::Client,
+    image: OciReference,
+    /// The node's shared chunk cache.
+    cache: PathBuf,
+    pool: Arc<ChunkPool>,
+}
+
+/// Run up to [`RESTORE_CONCURRENCY`] chunk tasks on runtime workers so body reads and digest
+/// checks can run in parallel. Pass each success to `done` in completion order. On the
+/// first error, abort and join the remaining tasks before returning it.
+async fn spawn_chunks<T: Send + 'static>(
+    tasks: impl IntoIterator<Item = impl Future<Output = Result<T>> + Send + 'static>,
+    mut done: impl FnMut(T),
+) -> Result<()> {
+    let mut tasks = tasks.into_iter();
+    let mut running = tokio::task::JoinSet::new();
+    let failed = loop {
+        while running.len() < RESTORE_CONCURRENCY
+            && let Some(task) = tasks.next()
+        {
+            running.spawn(task);
+        }
+        let Some(joined) = running.join_next().await else {
+            return Ok(());
+        };
+        match joined.context("a chunk task panicked").and_then(|r| r) {
+            Ok(landed) => done(landed),
+            Err(e) => break e,
+        }
+    };
+    // Blocking work already underway, including decodes and writes, runs to completion.
+    running.abort_all();
+    while running.join_next().await.is_some() {}
+    Err(failed)
+}
+
+/// Return the lazy chunk's codec and whether it was downloaded. A cache hit needs no read.
+/// On a miss, require the verified chunk in the cache. Unwrap any outer zstd encoding and
+/// verify raw digests over decoded bytes and frame digests over the frame.
+async fn ensure_chunk(source: &ChunkSource, layer: &OciDescriptor, len: u64) -> Result<(u8, bool)> {
+    let ChunkSource {
+        client,
+        image,
+        cache,
+        pool,
+    } = source;
     let hex = image::digest_hex(&layer.digest)?;
     if let Some(codec) = find_cached_chunk(cache, hex, layer) {
-        reused.fetch_add(1, Ordering::Relaxed);
-        return Ok(codec);
+        return Ok((codec, false));
     }
     let received = receive_chunk(client, image, layer, len, pool).await?;
     let codec = stored_codec(layer, &received);
@@ -2502,26 +2516,25 @@ async fn ensure_chunk(
             stored.display()
         );
     }
-    fetched.fetch_add(1, Ordering::Relaxed);
-    Ok(codec)
+    Ok((codec, true))
 }
 
-/// Write the chunk at its offset in the image. Cache hits skip digest verification because
-/// publication follows a verified download. An unreadable entry triggers a fresh download.
-#[allow(clippy::too_many_arguments)]
+/// Write the chunk at its offset in the image, and return whether it was downloaded. Cache
+/// hits skip digest verification because publication follows a verified download. An
+/// unreadable entry triggers a fresh download.
 async fn place_chunk(
-    client: &oci_client::Client,
-    image: &OciReference,
+    source: &ChunkSource,
     layer: OciDescriptor,
     total_size: u64,
-    cache: &Path,
-    pool: &Arc<ChunkPool>,
-    out: &Arc<std::fs::File>,
-    ext4: &Path,
-    fetched: &std::sync::atomic::AtomicUsize,
-    reused: &std::sync::atomic::AtomicUsize,
-) -> Result<()> {
-    use std::sync::atomic::Ordering;
+    out: Arc<std::fs::File>,
+    ext4: Arc<PathBuf>,
+) -> Result<bool> {
+    let ChunkSource {
+        client,
+        image,
+        cache,
+        pool,
+    } = source;
     // Check image bounds before fetching or caching the chunk.
     let (_, len) = chunk_bounds(&layer, total_size)?;
     let hex = image::digest_hex(&layer.digest)?.to_string();
@@ -2535,14 +2548,11 @@ async fn place_chunk(
         }
         None => None,
     };
+    let fetched = cached.is_none();
     let (blob, compressed, keep) = match cached {
-        Some((codec, bytes)) => {
-            reused.fetch_add(1, Ordering::Relaxed);
-            (bytes.into_bytes(), codec == VK_RO_IMG_CODEC_ZSTD, None)
-        }
+        Some((codec, bytes)) => (bytes.into_bytes(), codec == VK_RO_IMG_CODEC_ZSTD, None),
         None => {
             let received = receive_chunk(client, image, &layer, len, pool).await?;
-            fetched.fetch_add(1, Ordering::Relaxed);
             let codec = stored_codec(&layer, &received);
             // Reuse the bytes verified against the raw digest, including any decoded frame.
             let (blob, compressed) = if layer.media_type == CHUNK_MEDIA_TYPE {
@@ -2553,12 +2563,7 @@ async fn place_chunk(
             (blob, compressed, Some((codec, received.wire)))
         }
     };
-    let (pool, out, cache, ext4) = (
-        Arc::clone(pool),
-        Arc::clone(out),
-        cache.to_path_buf(),
-        ext4.to_path_buf(),
-    );
+    let (pool, cache) = (Arc::clone(pool), cache.clone());
     tokio::task::spawn_blocking(move || -> Result<()> {
         if let Some((codec, wire)) = keep {
             publish_chunk(&cache, &hex, codec, &wire)?;
@@ -2569,7 +2574,8 @@ async fn place_chunk(
         })
     })
     .await
-    .context("a chunk-reassembly worker panicked")?
+    .context("a chunk-reassembly worker panicked")??;
+    Ok(fetched)
 }
 
 /// The most a bundle's config blob may be: a few hundred bytes of JSON in practice.
@@ -5988,6 +5994,50 @@ pub(crate) mod tests {
         assert_eq!(capacities().len(), 1);
     }
 
+    /// An error or panic cancels stalled downloads before returning. At most
+    /// [`RESTORE_CONCURRENCY`] tasks start in either case.
+    #[test]
+    fn the_first_chunk_failure_cancels_the_other_chunk_tasks() {
+        use std::sync::atomic::AtomicUsize;
+        struct Live(Arc<AtomicUsize>);
+        impl Drop for Live {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        for (how, says) in [("fails", "chunk 3 failed"), ("panics", "panicked")] {
+            let (started, live) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let tasks = (0..4 * RESTORE_CONCURRENCY).map(|i| {
+                let (started, live) = (Arc::clone(&started), Arc::clone(&live));
+                async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    live.fetch_add(1, Ordering::SeqCst);
+                    let _live = Live(live);
+                    if i != 3 {
+                        std::future::pending::<()>().await;
+                    }
+                    // Let the other downloads start before this task fails.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    match how {
+                        "fails" => bail!("chunk 3 failed"),
+                        _ => panic!("chunk 3"),
+                    }
+                }
+            });
+            let err = block_on(async {
+                tokio::time::timeout(Duration::from_secs(60), spawn_chunks(tasks, |()| {})).await
+            })
+            .expect("the restore does not wait for the stalled downloads")
+            .unwrap_err();
+            assert!(format!("{err:#}").contains(says), "{how}: {err:#}");
+            assert_eq!(live.load(Ordering::SeqCst), 0, "{how}: tasks left running");
+            assert!(
+                started.load(Ordering::SeqCst) <= RESTORE_CONCURRENCY,
+                "{how}"
+            );
+        }
+    }
+
     /// A lazy view's chunks are sorted by offset; touching chunks pass, overlapping ones don't.
     #[test]
     fn lazy_chunks_are_sorted_and_refused_when_they_overlap() {
@@ -7246,9 +7296,10 @@ pub(crate) mod tests {
     }
 
     /// A TCP proxy to `upstream` (`host:port`) logging the request line of each HTTP/1.1
-    /// request it forwards, before forwarding it: once a client call has returned, every
-    /// request it made is in the log. Forwards line by line, so it carries bodiless requests
-    /// only — the GETs and HEADs of a pull. Returns its `host:port` and the log.
+    /// request, with ` +zstd` appended when Accept-Encoding contains `zstd`. It logs the
+    /// request before forwarding the final blank line, so the log is complete when the
+    /// client call returns. Line-by-line forwarding supports only bodiless requests such
+    /// as pull GETs and HEADs. Returns the proxy's `host:port` and the log.
     fn recording_proxy(upstream: String) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{BufRead, Write};
         use std::net::Shutdown;
@@ -7271,11 +7322,21 @@ pub(crate) mod tests {
                 let (recorder, mut to_server) = (recorder.clone(), server);
                 std::thread::spawn(move || {
                     let mut requests = std::io::BufReader::new(client);
-                    let mut line = Vec::new();
+                    let (mut line, mut request) = (Vec::new(), None::<String>);
                     while matches!(requests.read_until(b'\n', &mut line), Ok(n) if n > 0) {
                         let text = String::from_utf8_lossy(&line);
+                        let header = text.to_ascii_lowercase();
                         if text.ends_with(" HTTP/1.1\r\n") {
-                            recorder.lock().unwrap().push(text.trim_end().to_string());
+                            request = Some(text.trim_end().to_string());
+                        } else if header.starts_with("accept-encoding:")
+                            && header.contains("zstd")
+                            && let Some(request) = &mut request
+                        {
+                            request.push_str(" +zstd");
+                        } else if text == "\r\n"
+                            && let Some(request) = request.take()
+                        {
+                            recorder.lock().unwrap().push(request);
                         }
                         if to_server.write_all(&line).is_err() {
                             break;
@@ -7604,15 +7665,15 @@ pub(crate) mod tests {
             } else {
                 assert_eq!(frames, hexes.len() as u64);
             }
-            // The chunk downloads since the last call.
+            // Count chunk GETs since the last call and check that each offered zstd.
             let chunk_gets = || {
                 let mut log = requests.lock().unwrap();
-                let n = log
-                    .iter()
+                let gets: Vec<_> = log
+                    .drain(..)
                     .filter(|r| r.starts_with("GET ") && hexes.iter().any(|h| r.contains(h)))
-                    .count();
-                log.clear();
-                n
+                    .collect();
+                assert!(gets.iter().all(|r| r.ends_with(" +zstd")), "{gets:?}");
+                gets.len()
             };
             // Count decodes and chunk reads for a restore into `state/img/` using `state/chunks`.
             let restore = |state: &Path, lazy: bool| {

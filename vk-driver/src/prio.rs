@@ -28,7 +28,8 @@
 //!
 //! What is deferred, then: the stage guests (a VMM subprocess, so its vCPU threads with it)
 //! and the switch serving them, and the parallel stage workers, whose own
-//! [`crate::blockrt`] calls — the image pulls and cache pushes — inherit it. What is not: the
+//! [`crate::blockrt`] calls — the image pulls and cache pushes — inherit it. Spawned tasks,
+//! including restore chunk downloads, run at the shared workers' priority. What is not: the
 //! driver's own orchestration, including the final ext4 export, which runs on the thread that
 //! drove the stages and goes on to boot a `vk run -f Dockerfile`'s guest; the threads those
 //! two shared facilities own; the VM of a `vk run` the user is waiting on; and a CI job's VM

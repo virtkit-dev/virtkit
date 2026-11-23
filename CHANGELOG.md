@@ -8,6 +8,8 @@ All notable changes to virtkit will be documented in this file.
 
 - Image restores download compressed chunks as the registry stores them and keep them
   compressed in the local cache.
+- Image restores from a registry can use multiple cores and cancel the remaining downloads
+  when a chunk fails.
 
 ### Fixed
 
