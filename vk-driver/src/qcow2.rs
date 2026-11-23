@@ -1119,7 +1119,7 @@ impl VkRoImg {
             // Capacity hint only: capped at the largest chunk, whatever the header claims.
             let mut data =
                 Vec::with_capacity((chunk.length as usize).min(crate::registry::CDC_MAX));
-            zstd::stream::read::Decoder::new(&raw[..])
+            vk_registry::zstd_reader(&raw)
                 .and_then(|d| d.take(u64::from(chunk.length) + 1).read_to_end(&mut data))
                 .with_context(|| format!("zstd-decompressing chunk {}", path.display()))?;
             data

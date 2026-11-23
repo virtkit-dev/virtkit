@@ -23,7 +23,7 @@ use zstd::zstd_safe::{self, CCtx, DCtx, ResetDirective};
 const MAX_IDLE: usize = 16;
 
 /// Per-context retention limit in bytes, several times the workspace for a store
-/// frame. A sender can choose a large decode window for a pushed frame.
+/// frame. A sender can choose a large decode window for a pushed or pulled frame.
 const MAX_KEPT: usize = 8 << 20;
 
 pub(crate) trait Context: Sized {
@@ -131,8 +131,8 @@ fn zstd_error(code: usize) -> io::Error {
     io::Error::other(zstd_safe::get_error_name(code))
 }
 
-/// Pooled equivalent of `zstd::stream::raw::Decoder` for the registry's read path,
-/// which never calls `flush`.
+/// Pooled equivalent of `zstd::stream::raw::Decoder` for the read paths, which never
+/// call `flush`.
 impl Operation for Pooled<DCtx<'static>> {
     fn run<C: WriteBuf + ?Sized>(
         &mut self,
@@ -238,22 +238,30 @@ pub(crate) fn decode_all(frames: &[u8]) -> io::Result<Vec<u8>> {
 /// The input length must match `raw_len`. Calling [`finish`] as the first operation
 /// overrides the pledge and writes an empty frame.
 pub(crate) fn encoder<W: Write>(writer: W, raw_len: u64) -> io::Result<Encoder<W>> {
-    encoder_from(&ENCODERS, writer, raw_len)
+    encoder_from(&ENCODERS, writer, Some(raw_len))
+}
+
+/// Write one frame to `writer` at [`crate::ZSTD_LEVEL`] with no pledged size. Its
+/// header carries no size unless the frame is empty.
+pub(crate) fn encoder_unsized<W: Write>(writer: W) -> io::Result<Encoder<W>> {
+    encoder_from(&ENCODERS, writer, None)
 }
 
 fn encoder_from<W: Write>(
     pool: &'static Pool<CCtx<'static>>,
     writer: W,
-    raw_len: u64,
+    raw_len: Option<u64>,
 ) -> io::Result<Encoder<W>> {
     let mut pooled = pool.take()?;
     let ctx = pooled.ctx()?;
     ctx.set_parameter(CParameter::CompressionLevel(crate::ZSTD_LEVEL))
         .map_err(zstd_error)?;
-    ctx.set_pledged_src_size(Some(raw_len))
-        .map_err(zstd_error)?;
-    ctx.set_parameter(CParameter::ContentSizeFlag(true))
-        .map_err(zstd_error)?;
+    if let Some(raw_len) = raw_len {
+        ctx.set_pledged_src_size(Some(raw_len))
+            .map_err(zstd_error)?;
+        ctx.set_parameter(CParameter::ContentSizeFlag(true))
+            .map_err(zstd_error)?;
+    }
     Ok(zio::Writer::new(writer, pooled))
 }
 
@@ -264,11 +272,11 @@ pub(crate) fn finish<W: Write>(mut encoder: Encoder<W>) -> io::Result<W> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Partly compressible test data with a repeatable mix of random and patterned bytes.
-    fn sample(len: usize, seed: u64) -> Vec<u8> {
+    pub(crate) fn sample(len: usize, seed: u64) -> Vec<u8> {
         let mut state = seed;
         (0..len)
             .map(|i| {
@@ -294,7 +302,13 @@ mod tests {
     }
 
     fn encode(pool: &'static Pool<CCtx<'static>>, raw: &[u8]) -> Vec<u8> {
-        let mut enc = encoder_from(pool, Vec::new(), raw.len() as u64).unwrap();
+        let mut enc = encoder_from(pool, Vec::new(), Some(raw.len() as u64)).unwrap();
+        enc.write_all(raw).unwrap();
+        finish(enc).unwrap()
+    }
+
+    fn encode_unsized(pool: &'static Pool<CCtx<'static>>, raw: &[u8]) -> Vec<u8> {
+        let mut enc = encoder_from(pool, Vec::new(), None).unwrap();
         enc.write_all(raw).unwrap();
         finish(enc).unwrap()
     }
@@ -347,27 +361,59 @@ mod tests {
         }
     }
 
+    /// Reused and fresh encoders must produce identical unsized frames after larger,
+    /// smaller or sized writes.
+    #[test]
+    fn a_reused_encoder_writes_the_unsized_frames_a_new_one_does() {
+        static POOL: Pool<CCtx<'static>> = Pool::new();
+        for (len, seed) in [
+            (0, 31),
+            (1, 32),
+            (100_000, 33),
+            (16 << 20, 34),
+            (300, 35),
+            (5 << 20, 36),
+            (70_000, 37),
+        ] {
+            let raw = sample(len, seed);
+            let mut fresh =
+                zstd::stream::write::Encoder::new(Vec::new(), crate::ZSTD_LEVEL).unwrap();
+            fresh.write_all(&raw).unwrap();
+            let frame = encode_unsized(&POOL, &raw);
+            assert_eq!(frame, fresh.finish().unwrap(), "{len} bytes");
+            // zstd knows the size of an empty frame when it ends it.
+            assert_eq!(
+                zstd_safe::get_frame_content_size(&frame).ok().flatten(),
+                (len == 0).then_some(0),
+                "{len} bytes"
+            );
+            assert_eq!(POOL.idle().len(), 1, "the context went back to the pool");
+            // A sized frame in between leaves neither its pledge nor its flag behind.
+            assert_eq!(encode(&POOL, &raw), reference_frame(&raw), "{len} bytes");
+        }
+    }
+
     /// An abandoned or failed frame leaves no state in the next encoding.
     #[test]
     fn an_abandoned_encoder_is_reset_before_reuse() {
         static POOL: Pool<CCtx<'static>> = Pool::new();
         let raw = sample(400_000, 8);
 
-        let mut enc = encoder_from(&POOL, Vec::new(), raw.len() as u64).unwrap();
+        let mut enc = encoder_from(&POOL, Vec::new(), Some(raw.len() as u64)).unwrap();
         enc.write_all(&raw[..raw.len() / 2]).unwrap();
         drop(enc);
         assert_eq!(POOL.idle().len(), 1);
         assert_eq!(encode(&POOL, &raw), reference_frame(&raw));
 
         // Finishing with fewer bytes than pledged fails.
-        let mut enc = encoder_from(&POOL, Vec::new(), raw.len() as u64).unwrap();
+        let mut enc = encoder_from(&POOL, Vec::new(), Some(raw.len() as u64)).unwrap();
         enc.write_all(&raw[..10]).unwrap();
         assert!(finish(enc).is_err(), "a short frame must not finish");
         assert_eq!(POOL.idle().len(), 1);
         assert_eq!(encode(&POOL, &raw), reference_frame(&raw));
 
         // Finishing immediately overrides the pledge.
-        let enc = encoder_from(&POOL, Vec::new(), raw.len() as u64).unwrap();
+        let enc = encoder_from(&POOL, Vec::new(), Some(raw.len() as u64)).unwrap();
         assert_eq!(finish(enc).unwrap(), reference_frame(&[]));
         assert_eq!(encode(&POOL, &raw), reference_frame(&raw));
     }

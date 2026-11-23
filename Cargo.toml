@@ -168,8 +168,10 @@ ecdsa = { version = "0.17", default-features = false, features = ["algorithm", "
 # Prepared compression dictionaries keep their parameters even for large inputs of
 # known size. Compression ratio, speed and memory use can change. Frames stay decodable.
 # The feature enables zstd-safe's `experimental` API. No workspace code calls it directly.
+# `encode_all` from zstd 0.14.4 defines the reference bytes for
+# `vk_registry::zstd_chunk_frame`. A test compares their output.
 fastcdc = "5"
-zstd = { version = "0.14.1", features = ["with-rust-allocator"] }
+zstd = { version = "0.14.4", features = ["with-rust-allocator"] }
 # .ko.xz kernel-module decompression for `vk run --kernel image` (fullvm): pure Rust,
 # so it needs no C liblzma and the binary stays musl-static (zstd/gz are covered by the
 # crates above).

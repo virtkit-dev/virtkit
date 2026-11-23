@@ -194,8 +194,8 @@ fn known_manifest_media_type(ctype: &str) -> Option<&'static str> {
 }
 
 /// Fixed zstd level: identical raw chunks must compress to identical bytes for a
-/// compressed-digest chunk to dedup. Shared by the client push path (registry.rs),
-/// the transparent-zstd upload, and this store's adaptive storage compression.
+/// compressed-digest chunk to dedup. Client chunk and sized frames share this level
+/// with the store's adaptive compression.
 pub const ZSTD_LEVEL: i32 = 1;
 
 /// The body every handler in this server returns.
@@ -352,6 +352,29 @@ pub fn zstd_with_size(raw: &[u8]) -> Result<Vec<u8>> {
         zctx::encoder(Vec::new(), raw.len() as u64).context("creating the zstd encoder")?;
     enc.write_all(raw).context("zstd-compressing")?;
     zctx::finish(enc).context("finishing the zstd frame")
+}
+
+/// Only shorter chunks record their size in the frame. Moving this threshold changes
+/// the digest of affected chunks and breaks deduplication with earlier pushes.
+const CHUNK_SIZE_RECORDED_BELOW: usize = 128 << 10;
+
+/// Encode a compressed-digest chunk using the same pool as [`zstd_with_size`].
+/// Its bytes must match `zstd::encode_all(raw, ZSTD_LEVEL)` from zstd 0.14.4.
+pub fn zstd_chunk_frame(raw: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let mut enc = if raw.len() < CHUNK_SIZE_RECORDED_BELOW {
+        zctx::encoder(Vec::new(), raw.len() as u64)
+    } else {
+        zctx::encoder_unsized(Vec::new())
+    }
+    .context("creating the zstd encoder")?;
+    enc.write_all(raw).context("zstd-compressing")?;
+    zctx::finish(enc).context("finishing the zstd frame")
+}
+
+/// Decode `frames` like `zstd::stream::read::Decoder` using the store's context pool.
+pub fn zstd_reader(frames: &[u8]) -> std::io::Result<impl std::io::Read + '_> {
+    zctx::decoder_buffered(frames)
 }
 
 /// The on-disk content-addressed store. Shared by the HTTP handlers below and the
@@ -12035,6 +12058,41 @@ mod tests {
         assert_eq!(zstd_frame_len(&frame), Some(50_000));
         assert_eq!(zstd::decode_all(&frame[..]).unwrap(), raw);
         assert_eq!(zstd_frame_len(&zstd_sizeless(&raw)), None);
+    }
+
+    /// Check `encode_all` compatibility across the size threshold after sized and unsized
+    /// writes. If a zstd upgrade breaks the comparison, preserve the existing chunk bytes
+    /// and use a reference encoder that reproduces them.
+    #[test]
+    fn a_chunk_frame_is_what_encode_all_writes() {
+        use std::io::Read;
+        let edge = CHUNK_SIZE_RECORDED_BELOW;
+        for (len, seed) in [
+            (0, 41),
+            (edge + 1, 42),
+            (1, 43),
+            (edge, 44),
+            (edge - 1, 45),
+            (16 << 20, 46),
+            (70_000, 47),
+            (5 << 20, 48),
+        ] {
+            let raw = zctx::tests::sample(len, seed);
+            let frame = zstd_chunk_frame(&raw).unwrap();
+            assert_eq!(
+                frame,
+                zstd::encode_all(&raw[..], ZSTD_LEVEL).unwrap(),
+                "{len} bytes"
+            );
+            assert_eq!(
+                zstd_frame_len(&frame),
+                (len < edge).then_some(len as u64),
+                "{len} bytes"
+            );
+            let mut back = Vec::new();
+            zstd_reader(&frame).unwrap().read_to_end(&mut back).unwrap();
+            assert_eq!(back, raw, "{len} bytes");
+        }
     }
 
     /// A zstd frame whose header declares no content size.
