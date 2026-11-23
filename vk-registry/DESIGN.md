@@ -44,7 +44,7 @@ Repository names and tags are metadata over that shared blob pool.
   repos/<name>/tags/<tag>       manifest digest referenced by the tag
   repos/<name>/manifests/<hex>  manifest media type and repository membership
   repos/<name>/blobs/<hex>      blob membership marker
-  uploads/<id>                  in-progress upload, or a WebDAV PUT being staged
+  uploads/<id>                  in-progress upload, or a request body being staged
   uploads/owners/<id>           repository that opened the upload
   accounts/accounts.db          account data, when accounts mode is enabled
 ```
@@ -95,6 +95,18 @@ An upload is bound to the repository that opened it. Finishing an upload recompu
 digest and rejects a mismatch, so a caller cannot claim content it did not send or finish
 an authorized upload in a different repository.
 
+Nonempty PATCH and PUT bodies stream to separate files under `uploads/`. An interrupted
+request leaves the session intact, so the client can resend the chunk. A nonempty PUT to
+an empty session uses the staged file directly and can reuse the digest computed during
+receipt for a raw body.
+
+The blocking pool handles appends, compression and any remaining hashing in bounded
+memory under the session lock. Garbage collection can sweep an idle session during this
+work. Before publishing, the handler takes the shared store lock, rechecks the repository
+binding, installs the blob if absent, records membership and cleans up the session.
+Hashing, compression and store-lock errors roll back the final chunk for retry. A failed
+rollback invalidates the session. A failed installation attempts to remove the staged files.
+
 A request for a session the repository does not have is refused before its body is read.
 
 Manifest uploads are limited to 16 MiB and 65,536 distinct digest references. At task-rs's
@@ -117,8 +129,8 @@ The frame must include its decompressed size. This lets the server answer `HEAD`
 canonical content length without decompressing the blob. The server stores the frame
 verbatim and either serves it to an aware client or decompresses it for an ordinary OCI
 client. Compression is adaptive: content that does not shrink is stored and uploaded in
-canonical form. Clients that do not see the capability header use standard identity
-uploads.
+canonical form. The server skips compression for raw uploads with gzip, zstd, xz or bzip2
+headers. Clients that do not see the capability header use standard identity uploads.
 
 Serving is symmetric. A blob `GET` reads the stored file a chunk at a time at the client's
 pace, decoding a stored frame on the way out for a client that cannot take zstd, so no

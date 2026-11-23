@@ -92,6 +92,8 @@ All notable changes to virtkit will be documented in this file.
 - `vk-registry` uses less CPU serving blobs.
 - `vk-registry` and the local `vk build` cache allocate less memory per blob.
 - `vk-registry` refuses a push to an unknown upload without reading its body.
+- `vk-registry` no longer holds a pushed blob in memory and stays responsive while
+  finishing a large one.
 
 ### Fixed
 
