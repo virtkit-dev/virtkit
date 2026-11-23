@@ -918,11 +918,7 @@ impl Store {
                 return Err(e);
             }
         };
-        if let Err(e) = self.promote_staged(sha256, staged) {
-            // Gone already when the rename happened; otherwise not left for gc to find.
-            let _ = std::fs::remove_file(staging);
-            return Err(e);
-        }
+        self.promote_staged(sha256, staged)?;
         let mut manifest = String::new();
         for (name, tag) in tags {
             manifest = self.put_raw_file_annotated(name, tag, sha256, size, title, annotations)?;
@@ -1189,11 +1185,17 @@ impl Store {
         } else {
             self.blob_path(hex)
         };
-        std::fs::create_dir_all(dest.parent().unwrap_or_else(|| Path::new(".")))
-            .context("creating the blob directory")?;
-        std::fs::rename(&install, &dest).with_context(|| format!("promoting the blob {hex}"))?;
+        let installed = std::fs::create_dir_all(dest.parent().unwrap_or_else(|| Path::new(".")))
+            .context("creating the blob directory")
+            .and_then(|()| {
+                std::fs::rename(&install, &dest)
+                    .with_context(|| format!("promoting the blob {hex}"))
+            });
+        if installed.is_err() {
+            let _ = std::fs::remove_file(&install);
+        }
         drop_discard();
-        Ok(())
+        installed
     }
 
     /// Return a blob's decompressed bytes, or `None` if absent or larger than `cap`.
@@ -9472,6 +9474,38 @@ mod tests {
             .put_staged_file(&tags, &staged, &other, 5, None, &none)
             .unwrap();
         assert!(store.open_file("files/blocked", "o").unwrap().is_some());
+
+        // Both file put paths must clean up after a failed rename.
+        let third = sha256_hex_raw(b"third");
+        std::fs::create_dir(store.blob_path(&third)).unwrap();
+        let tags = [("files/sha256", third.as_str())];
+        let staged = stage(b"third");
+        assert!(
+            store
+                .put_staged_file(&tags, &staged, &third, 5, None, &none)
+                .is_err()
+        );
+        let source = dir.join("third");
+        std::fs::write(&source, b"third").unwrap();
+        assert!(store.put_file(&tags, &source, &third, None, &none).is_err());
+        // A failed rename must also remove the compressed copy.
+        let zeros = vec![0u8; 4096];
+        let fourth = sha256_hex_raw(&zeros);
+        std::fs::create_dir(store.zstd_blob_path(&fourth)).unwrap();
+        std::fs::write(&source, &zeros).unwrap();
+        let tags = [("files/sha256", fourth.as_str())];
+        assert!(
+            store
+                .put_file(&tags, &source, &fourth, None, &none)
+                .is_err()
+        );
+        let left: Vec<_> = std::fs::read_dir(store.uploads_dir())
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_type().unwrap().is_file())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
