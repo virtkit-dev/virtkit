@@ -126,20 +126,47 @@ where
 /// refused request. The generic body allows tests with a small cap.
 pub(crate) async fn drain_into<B>(
     out: &mut (impl AsyncWrite + Unpin),
-    mut body: B,
+    body: B,
     cap: u64,
 ) -> std::result::Result<(u64, String), DrainError>
 where
     B: hyper::body::Body<Data = Bytes> + Unpin,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let mut buf: Vec<u8> = Vec::with_capacity(STREAM_CHUNK);
     let mut hasher = Sha256::new();
+    let total = drain(out, body, cap, Some(&mut hasher)).await?;
+    Ok((total, crate::hex_of(&hasher.finalize())))
+}
+
+/// Like [`drain_into`], but skips hashing and returns the number of bytes written.
+pub(crate) async fn copy_into<B>(
+    out: &mut (impl AsyncWrite + Unpin),
+    body: B,
+    cap: u64,
+) -> std::result::Result<u64, DrainError>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    drain(out, body, cap, None).await
+}
+
+async fn drain<B>(
+    out: &mut (impl AsyncWrite + Unpin),
+    mut body: B,
+    cap: u64,
+    mut hasher: Option<&mut Sha256>,
+) -> std::result::Result<u64, DrainError>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let mut buf: Vec<u8> = Vec::with_capacity(STREAM_CHUNK);
     let mut total: u64 = 0;
     let io = |e: std::io::Error| DrainError::Failed(anyhow::Error::from(e).context("writing"));
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|e| {
-            DrainError::Failed(anyhow::Error::from(e).context("reading a PUT body"))
+            DrainError::Failed(anyhow::Error::from(e).context("reading a request body"))
         })?;
         // Trailers carry no body data.
         let Ok(data) = frame.into_data() else {
@@ -149,7 +176,9 @@ where
         if total > cap {
             return Err(DrainError::OverCap);
         }
-        hasher.update(&data);
+        if let Some(hasher) = hasher.as_deref_mut() {
+            hasher.update(&data);
+        }
         // Large frames bypass an empty buffer; small frames are coalesced.
         if buf.is_empty() && data.len() >= STREAM_CHUNK {
             out.write_all(&data).await.map_err(io)?;
@@ -164,7 +193,7 @@ where
     if !buf.is_empty() {
         out.write_all(&buf).await.map_err(io)?;
     }
-    Ok((total, crate::hex_of(&hasher.finalize())))
+    Ok(total)
 }
 
 #[cfg(test)]

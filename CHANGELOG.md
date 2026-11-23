@@ -95,6 +95,8 @@ All notable changes to virtkit will be documented in this file.
   their memory back to the kernel and faulting it in again for every chunk.
 - `vk-registry` and the local `vk build` cache use less CPU compressing and decompressing
   stored blobs because they reuse zstd's working memory between blobs.
+- Large blob pushes use bounded memory in `vk-registry`. Uploads stream to disk, and
+  request workers stay available to serve other requests while the registry finishes a blob.
 - `vk node`, `vk tune` and `vk-gitlab` can reuse their state directory as soon as the
   previous holder releases it.
 - `vk dev` keeps its `auto` endpoint address when a child inherits a port check or

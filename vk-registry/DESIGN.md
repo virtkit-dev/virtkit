@@ -44,7 +44,7 @@ Repository names and tags are metadata over that shared blob pool.
   repos/<name>/tags/<tag>       manifest digest referenced by the tag
   repos/<name>/manifests/<hex>  manifest media type and repository membership
   repos/<name>/blobs/<hex>      blob membership marker
-  uploads/<id>                  in-progress upload, or a WebDAV PUT being staged
+  uploads/<id>                  in-progress upload, or a request body being staged
   uploads/owners/<id>           repository that opened the upload
   accounts/accounts.db          account data, when accounts mode is enabled
 ```
@@ -94,6 +94,16 @@ read.
 An upload is bound to the repository that opened it. Finishing an upload recomputes the
 digest and rejects a mismatch, so a caller cannot claim content it did not send or finish
 an authorized upload in a different repository.
+
+Each PATCH or PUT body streams to a separate file under `uploads/`. An interruption
+during receipt leaves the session intact, so the client can resend the chunk. A nonempty
+PUT to an empty session uses the staged file directly. For a whole raw PUT, the digest
+computed during receipt also saves a second hash pass.
+
+The blocking pool handles appends, file hashing and compression in bounded memory under
+the session lock. To publish a blob, the handler takes the shared store lock, rechecks
+the repository binding, installs the blob if absent, records membership and cleans up
+the session.
 
 Manifest uploads are limited to 16 MiB and 65,536 distinct digest references. At task-rs's
 1 MiB average chunk size, this allows cache snapshots of about 64 GiB uncompressed. The

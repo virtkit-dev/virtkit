@@ -1114,8 +1114,7 @@ impl Store {
         Ok(format!("sha256:{hex}"))
     }
 
-    /// [`Store::put_blob`] under an already-known digest hex — the HTTP push path, where
-    /// `finish_upload` has already hashed `raw` and checked it against `hex`.
+    /// [`Store::put_blob`] under an already-known digest hex.
     fn put_blob_at(&self, hex: &str, raw: &[u8]) -> Result<()> {
         if !self.has_blob(hex) {
             let z = zstd_with_size(raw)?;
@@ -4831,13 +4830,25 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
         }
         return match method {
             Method::POST => start_upload(&store, name),
+            // Stage the body as it arrives. Copying a chunk, hashing a file and compressing
+            // a blob take time proportional to the bytes processed, so use the blocking pool.
             Method::PATCH => {
-                let body = collect(req).await?;
-                patch_upload(&store, name, after, &body)
+                let body = stage_body(&store, req.into_body(), false).await?;
+                let (name, id) = (name.to_string(), after.to_string());
+                tokio::task::spawn_blocking(move || patch_upload(&store, &name, &id, body))
+                    .await
+                    .context("joining the upload append task")?
             }
             Method::PUT => {
-                let body = collect(req).await?;
-                finish_upload(&store, name, after, &query, &body, put_is_zstd)
+                // Hash raw bytes on receipt so a whole raw PUT needs no second hash pass.
+                // A zstd upload uses the digest of its decoded bytes.
+                let body = stage_body(&store, req.into_body(), !put_is_zstd).await?;
+                let (name, id) = (name.to_string(), after.to_string());
+                tokio::task::spawn_blocking(move || {
+                    finish_upload(&store, &name, &id, &query, body, put_is_zstd)
+                })
+                .await
+                .context("joining the upload finalization task")?
             }
             _ => Ok(error_response(
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -5042,10 +5053,8 @@ enum UploadSession {
 /// finalization go through, so a PATCH cannot change the bytes [`finish_upload`] is
 /// verifying or has just promoted.
 ///
-/// Never waits, because both callers run on the server's async workers: a request parked on
-/// the lock would hold a worker for as long as a finalization takes to hash a large blob,
-/// and a few of them would stall the server for everyone. Nothing is lost by refusing
-/// instead: a session's requests are sequential by protocol, so a second request finding
+/// Each waiting request would tie up a blocking thread while the holder hashes and
+/// compresses a large blob. The protocol orders requests within a session, so finding
 /// it locked is a client bug, not a queue.
 ///
 /// The lock is taken on the descriptor, and a descriptor outlives a rename: one opened
@@ -5129,9 +5138,114 @@ mod upload_hooks {
     }
 }
 
+/// A PATCH or PUT body staged on disk beside its session. An interruption during receipt
+/// leaves the session untouched, so retrying cannot duplicate part of a chunk. On drop,
+/// the staging guard attempts to remove the file.
+struct StagedBody {
+    staging: staging::Staging,
+    /// sha256 hex of the body, if it was hashed on the way in.
+    sha256: Option<String>,
+}
+
+/// Stream the body to disk, hashing it if `hash` is set. An empty body returns `None`,
+/// as when a PUT finishes an upload after the last PATCH. The client chooses the chunk
+/// size, up to the whole blob, so staging must use bounded memory.
+async fn stage_body<B>(store: &Store, body: B, hash: bool) -> Result<Option<StagedBody>>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    use tokio::io::AsyncWriteExt;
+
+    if body.is_end_stream() {
+        return Ok(None);
+    }
+    let (path, file) = store.stage_file()?;
+    let staging = staging::Staging::new(path);
+    let mut file = tokio::fs::File::from_std(file);
+    // Available disk space limits staging. Blob request bodies have no configured byte cap.
+    let drained = if hash {
+        staging::drain_into(&mut file, body, u64::MAX)
+            .await
+            .map(|(len, hex)| (len, Some(hex)))
+    } else {
+        staging::copy_into(&mut file, body, u64::MAX)
+            .await
+            .map(|len| (len, None))
+    };
+    // Flush even after a drain error so pending writes finish before cleanup.
+    let flushed = file.flush().await;
+    drop(file);
+    let (len, sha256) = match drained {
+        Ok(d) => d,
+        Err(staging::DrainError::Failed(e)) => return Err(e.context("receiving an upload")),
+        Err(staging::DrainError::OverCap) => {
+            bail!("unexpected size limit while receiving an uncapped upload")
+        }
+    };
+    flushed.context("flushing the upload staging file")?;
+    // A body of unknown length that yields no data also counts as empty.
+    Ok((len > 0).then_some(StagedBody { staging, sha256 }))
+}
+
+/// Append `src` while the caller holds the session lock. On failure, try to restore the
+/// original length so the client can resend the chunk. The lock excludes other writers
+/// through rollback.
+fn append_to_upload(session: &mut vk_fs::LockFile, src: &mut impl std::io::Read) -> Result<()> {
+    use std::io::Write;
+
+    let before = session
+        .metadata()
+        .context("reading the upload's size")?
+        .len();
+    let mut chunk = chunks::CHUNKS.take();
+    let appended = (|| {
+        while chunk.fill(src).context("reading the staged chunk")? > 0 {
+            session
+                .write_all(chunk.as_ref())
+                .context("appending to the upload")?;
+        }
+        Ok(())
+    })();
+    if appended.is_err() {
+        // Preserve the append error. Finalization still checks the digest if rollback fails.
+        let _ = session.set_len(before);
+    }
+    appended
+}
+
+/// [`append_to_upload`] from a staged body.
+fn append_staged(session: &mut vk_fs::LockFile, body: &StagedBody) -> Result<()> {
+    let path = body.staging.path();
+    let mut src =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    append_to_upload(session, &mut src)
+}
+
+/// sha256 hex of the file at `path`, streamed.
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut chunk = chunks::CHUNKS.take();
+    while chunk
+        .fill(&mut f)
+        .with_context(|| format!("reading {}", path.display()))?
+        > 0
+    {
+        hasher.update(&chunk);
+    }
+    Ok(hex_of(&hasher.finalize()))
+}
+
 /// PATCH /v2/<name>/blobs/uploads/<id> — append a chunk to the session file, under the
-/// session's lock ([`lock_upload`]).
-fn patch_upload(store: &Store, name: &str, id: &str, body: &[u8]) -> Result<Response<Body>> {
+/// session's lock ([`lock_upload`]). Runs on the blocking pool: the chunk is copied from
+/// its staging file.
+fn patch_upload(
+    store: &Store,
+    name: &str,
+    id: &str,
+    body: Option<StagedBody>,
+) -> Result<Response<Body>> {
     if !valid_upload_id(id) {
         return Ok(error_response(
             StatusCode::BAD_REQUEST,
@@ -5150,8 +5264,9 @@ fn patch_upload(store: &Store, name: &str, id: &str, body: &[u8]) -> Result<Resp
         UploadSession::Held(f) => f,
         refused => return Ok(upload_refused(refused, id)),
     };
-    use std::io::Write;
-    f.write_all(body).context("appending to the upload")?;
+    if let Some(body) = &body {
+        append_staged(&mut f, body)?;
+    }
     let size = f.metadata()?.len();
     accepted_upload(name, id, size)
 }
@@ -5164,12 +5279,17 @@ fn patch_upload(store: &Store, name: &str, id: &str, body: &[u8]) -> Result<Resp
 /// body is zstd'd and stored compressed when that's actually smaller (so an
 /// already-compressed blob — a compressed-digest chunk — is kept as-is). Either way
 /// the digest indexes the *canonical* (decompressed) bytes.
+///
+/// File hashing and compression stream under the session lock on the blocking pool.
+/// [`Store::lock_shared`] covers the binding recheck, final blob check and installation,
+/// membership write and session cleanup. This keeps `gc` from sweeping the blob between
+/// the final check and the write that records its membership.
 fn finish_upload(
     store: &Store,
     name: &str,
     id: &str,
     query: &str,
-    body: &[u8],
+    body: Option<StagedBody>,
     body_is_zstd: bool,
 ) -> Result<Response<Body>> {
     if !valid_upload_id(id) {
@@ -5193,55 +5313,64 @@ fn finish_upload(
             &digest,
         ));
     }
-    // shared store lock for the promotion (vs. an exclusive gc); see lock_shared.
-    let _lock = store.lock_shared()?;
+    let unknown = || error_response(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", id);
     if !upload_is_for(store, id, name) {
-        return Ok(error_response(
-            StatusCode::NOT_FOUND,
-            "BLOB_UPLOAD_UNKNOWN",
-            id,
-        ));
+        return Ok(unknown());
     }
     // Sealed from here: held until the session is promoted or dropped, so no PATCH writes
     // between the hash and the rename, nor through a descriptor into the promoted blob.
     // A busy session is refused, not waited for, as a PATCH is (see `lock_upload`): a second
-    // finalization of one session would otherwise park a worker for the whole of the first.
+    // finalization of one session would otherwise park a thread for the whole of the first.
     let mut session = match lock_upload(store, id)? {
         UploadSession::Held(f) => f,
         refused => return Ok(upload_refused(refused, id)),
     };
     let hex = digest.trim_start_matches("sha256:").to_string();
     let upload = store.upload_path(id);
-    if !body.is_empty() {
-        use std::io::Write;
-        session
-            .write_all(body)
-            .context("appending the final chunk")?;
-    }
+
+    // In an empty session, the staged body is the whole blob. Use it directly and reuse
+    // its digest if available. In a nonempty session, the body is the final chunk.
+    let mut hashed_already = None;
+    let whole = match &body {
+        Some(staged)
+            if session
+                .metadata()
+                .context("reading the upload's size")?
+                .len()
+                == 0 =>
+        {
+            hashed_already = staged.sha256.clone();
+            staged.staging.path().to_path_buf()
+        }
+        Some(staged) => {
+            append_staged(&mut session, staged).context("appending the final chunk")?;
+            upload.clone()
+        }
+        None => upload.clone(),
+    };
 
     // Check the digest against the canonical bytes before anything is promoted: the store
     // is content-addressed, so a blob filed under a digest it does not hash to is a lie
     // every later pull repeats. A zstd upload is hashed by streaming its decode
     // ([`hash_zstd_frame`]) rather than reading the canonical form into memory — the frame
     // is client-controlled and expands without bound, so materialising it is a one-request
-    // memory exhaustion. A raw upload *is* its canonical form, so it is read once and
-    // reused for the adaptive store below.
-    let mut raw: Option<Vec<u8>> = None;
+    // memory exhaustion. A raw upload *is* its canonical form.
     let hashed = if body_is_zstd {
-        hash_zstd_frame(&upload)?.map(|(hex, _)| hex)
+        hash_zstd_frame(&whole)?.map(|(hex, _)| hex)
+    } else if hashed_already.is_some() {
+        hashed_already
     } else {
-        let bytes =
-            std::fs::read(&upload).with_context(|| format!("reading {}", upload.display()))?;
-        let hex = sha256_hex_raw(&bytes);
-        raw = Some(bytes);
-        Some(hex)
+        Some(sha256_file(&whole)?)
+    };
+    let drop_session = || {
+        let _ = std::fs::remove_file(&upload);
+        let _ = std::fs::remove_file(store.upload_owner_path(id));
     };
     // A frame this server will not store, or bytes that hash to something else: either way
     // the client's request is wrong, not this server, so it is a 400 rather than a 500 —
     // and the session goes, so a retry cannot append onto a body already found bad.
     if hashed.as_deref() != Some(hex.as_str()) {
-        let _ = std::fs::remove_file(&upload);
-        let _ = std::fs::remove_file(store.upload_owner_path(id));
+        drop_session();
         return Ok(error_response(
             StatusCode::BAD_REQUEST,
             "DIGEST_INVALID",
@@ -5249,26 +5378,48 @@ fn finish_upload(
         ));
     }
 
-    // already stored (either form)? idempotent — drop the upload.
-    if store.has_blob(&hex) {
-        let _ = std::fs::remove_file(&upload);
-    } else if body_is_zstd {
-        // the upload is a zstd frame whose decompression hashes to the digest: store
-        // it verbatim in the zstd store (no re-compression).
-        std::fs::rename(&upload, store.zstd_blob_path(&hex))
-            .with_context(|| format!("promoting zstd upload {hex}"))?;
+    // Choose the storage form before taking the store lock. Keep a verified zstd frame
+    // verbatim. For raw bytes, skip compression on recognized formats, including
+    // compressed-digest chunks in those formats. Keep zstd output only if it saves space.
+    let staged = if body_is_zstd {
+        StagedBlob {
+            install: whole.clone(),
+            discard: None,
+            zstd: true,
+        }
     } else {
-        // raw canonical bytes: put_blob_at compresses adaptively (compressed form
-        // only if it actually shrinks — a compressed-digest chunk stays identity).
-        store.put_blob_at(&hex, raw.as_deref().unwrap_or_default())?;
-        let _ = std::fs::remove_file(&upload);
+        store.stage_promotion(&hex, &whole)?
+    };
+    {
+        // shared store lock for the promotion (vs. an exclusive gc); see lock_shared.
+        let _lock = match store.lock_shared() {
+            Ok(lock) => lock,
+            Err(e) => {
+                // Keep the session and clean up the compression sibling. If the session
+                // holds the whole blob, finish it with an empty PUT. Resending an already
+                // appended tail appends it twice and fails the digest check. A whole body
+                // staged beside an empty session must be sent again.
+                if staged.install != whole {
+                    let _ = std::fs::remove_file(&staged.install);
+                }
+                return Err(e);
+            }
+        };
+        // Recheck the binding under the store lock. An intervening idle-session sweep
+        // removes both the session and its binding.
+        if !upload_is_for(store, id, name) {
+            staged.discard();
+            return Ok(unknown());
+        }
+        // If either form already exists, promotion discards the staged files.
+        store.promote_staged(&hex, staged)?;
+        // Record the verified blob in the repository authorized for this upload. Promotion
+        // comes first so the membership record always names an installed blob.
+        store.record_blob(name, &hex)?;
+        drop_session();
     }
-    // The upload was authorized for, and bound to, this repository, and the bytes hashed
-    // to the digest above — so this is where the blob becomes readable through it. After
-    // the promotion, so a membership record never names a blob that is not there.
-    store.record_blob(name, &hex)?;
-    let _ = std::fs::remove_file(store.upload_owner_path(id));
     drop(session);
+    drop(body);
 
     Response::builder()
         .status(StatusCode::CREATED)
@@ -5750,12 +5901,6 @@ fn redirect_to_login(target: &str) -> Response<Body> {
         .header(hyper::header::CACHE_CONTROL, "no-store")
         .body(body_of(Bytes::new()))
         .expect("building a login redirect")
-}
-
-/// Collect a request body fully into memory. Bodies here are bounded by the
-/// client's chunk size (≤ one FastCDC chunk, ≤16 MiB) plus small manifests.
-async fn collect(req: Request<Incoming>) -> Result<Bytes> {
-    Ok(req.into_body().collect().await?.to_bytes())
 }
 
 /// Collect a body that has a small, known ceiling — a browser form or a manifest, not a
@@ -8098,6 +8243,288 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage test bytes like the handler, with `None` for an empty body and an optional hash.
+    fn staged_body(store: &Store, bytes: &[u8], hash: bool) -> Option<StagedBody> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let (path, mut file) = store.stage_file().unwrap();
+        std::io::Write::write_all(&mut file, bytes).unwrap();
+        Some(StagedBody {
+            staging: staging::Staging::new(path),
+            sha256: hash.then(|| sha256_hex_raw(bytes)),
+        })
+    }
+
+    /// Call [`super::patch_upload`] with a staged request body.
+    fn patch_upload(store: &Store, name: &str, id: &str, body: &[u8]) -> Result<Response<Body>> {
+        super::patch_upload(store, name, id, staged_body(store, body, false))
+    }
+
+    /// Call [`super::finish_upload`] with a staged request body.
+    fn finish_upload(
+        store: &Store,
+        name: &str,
+        id: &str,
+        query: &str,
+        body: &[u8],
+        zstd: bool,
+    ) -> Result<Response<Body>> {
+        super::finish_upload(
+            store,
+            name,
+            id,
+            query,
+            staged_body(store, body, !zstd),
+            zstd,
+        )
+    }
+
+    /// List session files, staged bodies and compression output directly in `uploads/`.
+    fn upload_files(store: &Store) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(store.uploads_dir())
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_type().unwrap().is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Ordered chunks and a whole PUT produce identical stored bytes and leave no upload
+    /// files. The chunked push assembles the session file. The whole PUT uses its staged body.
+    #[test]
+    fn a_chunked_and_a_whole_upload_store_the_same_blob() {
+        let dir = testtmp::root().join("chunked-and-whole");
+        let store = Store::new(dir.clone()).unwrap();
+        let raw: Vec<u8> = (0..3 * STREAM_CHUNK + 777)
+            .map(|i| (i % 13) as u8)
+            .collect();
+        let digest = format!("sha256:{}", sha256_hex_raw(&raw));
+        let query = format!("digest={digest}");
+        let stored = |store: &Store| {
+            let (path, is_zstd) = store.find_blob(&hex(&digest)).expect("stored");
+            assert!(is_zstd, "a compressible blob is stored compressed");
+            assert_eq!(store.get_blob(&hex(&digest)).unwrap().unwrap(), raw);
+            assert!(store.repo_has_blob("img", &hex(&digest)));
+            std::fs::read(path).unwrap()
+        };
+
+        // Three chunks and a tail with the finalization.
+        open_session(&store, "img", "aa-1");
+        let (mut sent, parts) = (0, [STREAM_CHUNK + 5, 1, STREAM_CHUNK]);
+        for len in parts {
+            let res = patch_upload(&store, "img", "aa-1", &raw[sent..sent + len]).unwrap();
+            sent += len;
+            assert_eq!(res.status(), StatusCode::ACCEPTED);
+            assert_eq!(res.headers()["Range"], format!("0-{}", sent - 1));
+        }
+        assert_eq!(upload_files(&store), ["aa-1"], "no staged chunk is left");
+        let res = finish_upload(&store, "img", "aa-1", &query, &raw[sent..], false).unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert!(
+            upload_files(&store).is_empty(),
+            "{:?}",
+            upload_files(&store)
+        );
+        assert!(!store.upload_owner_path("aa-1").exists());
+        let chunked = stored(&store);
+
+        // Repeat the push whole, then by PATCH with an empty PUT. Both reuse the stored blob.
+        open_session(&store, "img", "aa-2");
+        let res = finish_upload(&store, "img", "aa-2", &query, &raw, false).unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        open_session(&store, "img", "aa-3");
+        patch_upload(&store, "img", "aa-3", &raw).unwrap();
+        let res = finish_upload(&store, "img", "aa-3", &query, b"", false).unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert!(
+            upload_files(&store).is_empty(),
+            "{:?}",
+            upload_files(&store)
+        );
+        assert_eq!(stored(&store), chunked);
+
+        // Whole into a fresh store: the same stored bytes as the chunked push made.
+        let other = Store::new(dir.join("other")).unwrap();
+        open_session(&other, "img", "aa-4");
+        let res = finish_upload(&other, "img", "aa-4", &query, &raw, false).unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert!(
+            upload_files(&other).is_empty(),
+            "{:?}",
+            upload_files(&other)
+        );
+        assert_eq!(stored(&other), chunked);
+        assert_eq!(chunked, zstd_with_size(&raw).unwrap());
+    }
+
+    /// A digest mismatch rejects the blob and removes the session, binding and staged body,
+    /// whether the hash came from staging or from reading the assembled session.
+    #[test]
+    fn an_upload_that_does_not_match_its_digest_leaves_nothing() {
+        let dir = testtmp::root().join("digest-mismatch");
+        let store = Store::new(dir).unwrap();
+        let query = format!("digest=sha256:{}", sha256_hex_raw(b"what was promised"));
+
+        open_session(&store, "img", "aa-1");
+        let res = finish_upload(&store, "img", "aa-1", &query, b"something else", false).unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        open_session(&store, "img", "aa-2");
+        patch_upload(&store, "img", "aa-2", b"something ").unwrap();
+        let res = finish_upload(&store, "img", "aa-2", &query, b"else", false).unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        assert!(
+            upload_files(&store).is_empty(),
+            "{:?}",
+            upload_files(&store)
+        );
+        for id in ["aa-1", "aa-2"] {
+            assert!(!store.upload_owner_path(id).exists());
+        }
+        assert!(!store.has_blob(&sha256_hex_raw(b"what was promised")));
+    }
+
+    /// An interrupted body leaves no staged file and preserves the session. A partial
+    /// append rolls back in this test, and retrying appends the chunk exactly once.
+    #[tokio::test]
+    async fn a_chunk_that_fails_is_not_left_in_the_session() {
+        type Frames = Vec<std::result::Result<hyper::body::Frame<Bytes>, std::io::Error>>;
+        let body = |frames: Frames| StreamBody::new(futures::stream::iter(frames));
+        let data = |bytes: &'static [u8]| Ok(hyper::body::Frame::data(Bytes::from_static(bytes)));
+
+        let dir = testtmp::root().join("failed-chunk");
+        let store = Store::new(dir).unwrap();
+        let raw = b"first chunk, second chunk";
+        let query = format!("digest=sha256:{}", sha256_hex_raw(raw));
+        open_session(&store, "img", "aa-1");
+        patch_upload(&store, "img", "aa-1", b"first chunk, ").unwrap();
+
+        // The client goes away in the middle of the second chunk.
+        let cut = body(vec![
+            data(b"second "),
+            Err(std::io::Error::other("the client hung up")),
+        ]);
+        let err = stage_body(&store, cut, false)
+            .await
+            .err()
+            .expect("a cut body");
+        assert!(format!("{err:#}").contains("the client hung up"), "{err:#}");
+        assert_eq!(upload_files(&store), ["aa-1"], "the staged half is gone");
+        assert_eq!(
+            std::fs::read(store.upload_path("aa-1")).unwrap(),
+            b"first chunk, "
+        );
+
+        // Both an empty stream and an empty data frame yield no staged body.
+        assert!(
+            stage_body(&store, body(vec![]), true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            stage_body(&store, body(vec![data(b"")]), true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // An append that fails after writing some of the chunk.
+        struct Failing(usize);
+        impl std::io::Read for Failing {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::Error::other("the disk went away"));
+                }
+                let n = buf.len().min(self.0);
+                buf[..n].fill(b'x');
+                self.0 -= n;
+                Ok(n)
+            }
+        }
+        let UploadSession::Held(mut session) = lock_upload(&store, "aa-1").unwrap() else {
+            panic!("a live session");
+        };
+        let err = append_to_upload(&mut session, &mut Failing(2 * STREAM_CHUNK)).unwrap_err();
+        assert!(format!("{err:#}").contains("the disk went away"), "{err:#}");
+        drop(session);
+        assert_eq!(
+            std::fs::read(store.upload_path("aa-1")).unwrap(),
+            b"first chunk, "
+        );
+
+        // The retry hashes the complete chunk during staging and appends it once.
+        let again = body(vec![data(b"second "), data(b"chunk")]);
+        let staged = stage_body(&store, again, true)
+            .await
+            .unwrap()
+            .expect("a body");
+        assert_eq!(
+            staged.sha256.as_deref(),
+            Some(sha256_hex_raw(b"second chunk").as_str())
+        );
+        let res = super::finish_upload(&store, "img", "aa-1", &query, Some(staged), false).unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(store.get_blob(&sha256_hex_raw(raw)).unwrap().unwrap(), raw);
+        assert!(
+            upload_files(&store).is_empty(),
+            "{:?}",
+            upload_files(&store)
+        );
+    }
+
+    /// Concurrent raw and zstd pushes of the same blob all succeed. Verification and any
+    /// compression precede the store lock. A publisher that finds the blob reuses it.
+    /// Racing renames to the same path install the same canonical content.
+    #[test]
+    fn concurrent_uploads_of_one_blob_all_succeed() {
+        let dir = testtmp::root().join("concurrent-uploads");
+        let store = Store::new(dir).unwrap();
+        let raw: Vec<u8> = (0..2 * STREAM_CHUNK).map(|i| (i % 7) as u8).collect();
+        let frame = zstd_with_size(&raw).unwrap();
+        let digest = format!("sha256:{}", sha256_hex_raw(&raw));
+        let query = format!("digest={digest}");
+        let ids: Vec<String> = (0..8).map(|i| format!("aa-{i}")).collect();
+        for id in &ids {
+            open_session(&store, "img", id);
+        }
+        std::thread::scope(|scope| {
+            let racers: Vec<_> = ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    let (store, query, raw, frame) = (&store, &query, &raw, &frame);
+                    scope.spawn(move || match i % 3 {
+                        0 => finish_upload(store, "img", id, query, raw, false),
+                        1 => finish_upload(store, "img", id, query, frame, true),
+                        _ => {
+                            patch_upload(store, "img", id, &raw[..100]).unwrap();
+                            finish_upload(store, "img", id, query, &raw[100..], false)
+                        }
+                    })
+                })
+                .collect();
+            for racer in racers {
+                assert_eq!(racer.join().unwrap().unwrap().status(), StatusCode::CREATED);
+            }
+        });
+        assert_eq!(store.get_blob(&hex(&digest)).unwrap().unwrap(), raw);
+        assert_eq!(
+            std::fs::read(store.zstd_blob_path(&hex(&digest))).unwrap(),
+            frame
+        );
+        assert!(!store.blob_path(&hex(&digest)).exists());
+        assert!(
+            upload_files(&store).is_empty(),
+            "{:?}",
+            upload_files(&store)
+        );
     }
 
     /// An upload session opened for `name`, the way `start_upload` opens one: the binding
