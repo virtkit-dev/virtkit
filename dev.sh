@@ -23,7 +23,8 @@
 #
 # VK_DEV_CPUS / VK_DEV_MEM size the VM (default: host cpus, 8G). VK_DEV_IDLE_SECS sets how
 # long it survives with no cargo command or open shell (default: 1800, 0 = until
-# ./dev.sh stop). Starting a VM also deletes the stopped VMs, disks included, of this
+# ./dev.sh stop). VK_DEV_CMD_TIMEOUT caps each cargo command (default: 3600 s, 0 = no cap).
+# Starting a VM also deletes the stopped VMs, disks included, of this
 # repository's checkouts that no longer exist.
 #
 # The VM boots with nested virtualization when the host allows it and the vk on PATH can ask
@@ -63,7 +64,9 @@ it runs; that VM nests where the host allows it and the vk on PATH can ask for i
 the shell can boot vk's own microVMs rather than only compile them, keeping their images
 and boot scratch on the guest's disk. The first command boots a vk development VM; by
 default it powers off after 1800 seconds without a cargo command. Set VK_DEV_IDLE_SECS
-to change the window, or to 0 to keep the VM until ./dev.sh stop.
+to change the window, or to 0 to keep the VM until ./dev.sh stop. A cargo command is
+killed after VK_DEV_CMD_TIMEOUT seconds (default 3600, 0 = no limit), so a hung test or
+build fails instead of holding the VM.
 EOF
   exit 2
 }
@@ -271,6 +274,10 @@ idle_secs=${VK_DEV_IDLE_SECS:-1800}
 case "$idle_secs" in
   *[!0-9]*) reject "VK_DEV_IDLE_SECS must be a whole number of seconds (0 = no timeout)" ;;
 esac
+cmd_secs=${VK_DEV_CMD_TIMEOUT:-3600}
+case "$cmd_secs" in
+  *[!0-9]*) reject "VK_DEV_CMD_TIMEOUT must be a whole number of seconds (0 = no limit)" ;;
+esac
 
 commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 [ -n "$(git status --porcelain 2>/dev/null)" ] && commit="$commit (dirty)"
@@ -298,6 +305,25 @@ if [ "$MODE" = shell ]; then
   DEV_ENV+=(XDG_DATA_HOME=/var/tmp/vk/share XDG_CACHE_HOME=/var/tmp/vk/cache)
 else
   guest_cmd=(cargo "$MODE" ${args[@]+"${args[@]}"})
+  # The limit runs in the guest, on cargo's whole process group: killing the host's vk exec,
+  # or cargo alone, leaves rustc and test binaries running there. A signal the shell gets
+  # (Ctrl-C through -t, or a stop) is passed on to the group the same way.
+  if [ "$cmd_secs" -gt 0 ]; then
+    # shellcheck disable=SC2016 # expanded by the guest's sh
+    guest_cmd=(sh -c '
+      secs=$1; shift
+      setsid "$@" & group=$!
+      setsid sh -c "sleep $secs; kill -TERM -- -$group; sleep 60; kill -KILL -- -$group" \
+        </dev/null >/dev/null 2>&1 & timer=$!
+      trap "kill -INT -- -$group" INT
+      trap "kill -TERM -- -$group" TERM HUP
+      while :; do
+        wait "$group" && rc=0 || rc=$?
+        kill -0 "$group" 2>/dev/null || break
+      done
+      kill -TERM -- "-$timer" 2>/dev/null
+      exit "$rc"' sh "$cmd_secs" "${guest_cmd[@]}")
+  fi
   what="running cargo $MODE"
 fi
 
@@ -412,4 +438,12 @@ for entry in "${DEV_ENV[@]}"; do exec_args+=(--env "$entry"); done
 # from the host's tree. Root is needed, hence a separate exec without --user.
 "$VK" exec "$STATE_DIR" -- sh -c 'echo 3 >/proc/sys/vm/drop_caches'
 echo "dev.sh: $what in the development VM" >&2
-exec "$VK" exec "$STATE_DIR" "${exec_args[@]}" -- "${guest_cmd[@]}"
+if [ "$MODE" = shell ] || [ "$cmd_secs" -eq 0 ]; then
+  exec "$VK" exec "$STATE_DIR" "${exec_args[@]}" -- "${guest_cmd[@]}"
+fi
+rc=0 start=$SECONDS
+"$VK" exec "$STATE_DIR" "${exec_args[@]}" -- "${guest_cmd[@]}" || rc=$?
+if [ "$rc" -ne 0 ] && [ $((SECONDS - start)) -ge "$cmd_secs" ]; then
+  echo "dev.sh: cargo $MODE hit the ${cmd_secs}s limit and was killed (VK_DEV_CMD_TIMEOUT)" >&2
+fi
+exit "$rc"

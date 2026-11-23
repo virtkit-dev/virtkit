@@ -213,7 +213,8 @@ forgotten one stops holding memory; `./dev.sh stop` ends it immediately. Startin
 also deletes the stopped VMs of this repository's checkouts that no longer exist. A
 `vk` and a `flock` on `PATH` are required and there is deliberately no Docker fallback.
 `VK_DEV_CPUS` and `VK_DEV_MEM` size the VM, `VK_DEV_IDLE_SECS` sets that idle window
-(`0` keeps the VM until it is stopped). Use `./build.sh --fast` only when an executable
+(`0` keeps the VM until it is stopped), and `VK_DEV_CMD_TIMEOUT` caps each cargo command
+(default one hour, `0` for no limit). Use `./build.sh --fast` only when an executable
 is actually needed for runtime testing. `./dev.sh shell` opens an interactive shell in
 that VM (same user, directory and cargo environment) and holds the VM for as long as
 the shell runs, for the odd cargo or toolchain command the modes above refuse.
