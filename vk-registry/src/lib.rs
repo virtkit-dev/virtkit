@@ -321,7 +321,14 @@ fn compress_beside(tmp: &Path, raw_len: u64) -> Result<Option<PathBuf>> {
     enc.include_contentsize(true)
         .context("enabling the zstd content size")?;
     let copied = std::io::copy(&mut src, &mut enc).context("zstd-compressing a blob");
-    let finished = copied.and_then(|_| enc.finish().context("finishing the zstd frame"));
+    // With no input, zstd can finish an empty frame despite a nonzero pledge.
+    let finished = copied.and_then(|n| {
+        anyhow::ensure!(
+            n == raw_len,
+            "the blob is {n} bytes, not the expected {raw_len}"
+        );
+        enc.finish().context("finishing the zstd frame")
+    });
     let z_len = match finished {
         Ok(f) => f.metadata().context("stat of the compressed blob")?.len(),
         Err(e) => {
@@ -5924,8 +5931,8 @@ const ZSTD_HEADER_MAX: usize = 18;
 /// descriptor. Only the *first* frame's header is read, while a decoder consumes every
 /// concatenated frame; the two agree because every writer of `blobs/zstd` makes them —
 /// [`hash_zstd_frame`] refuses an upload whose declared size does not match what the whole
-/// decode produced, and `compress_beside`/[`zstd_with_size`] pledge the size to the
-/// encoder, which then fails the frame itself on a mismatch.
+/// decode produced, `compress_beside` checks the byte count against its pledge,
+/// and [`zstd_with_size`] pledges the slice length and writes the whole slice.
 fn zstd_canonical_len(f: &mut std::fs::File) -> Result<u64> {
     use std::io::{Read, Seek, SeekFrom};
     let mut head = Vec::with_capacity(ZSTD_HEADER_MAX);
@@ -7649,6 +7656,29 @@ mod tests {
         .unwrap();
         assert_eq!(ok.status(), StatusCode::CREATED);
         assert!(store.has_blob(&sha256_hex_raw(body)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Partial or complete truncation of a staged blob makes compression fail
+    /// without leaving a frame behind.
+    #[test]
+    fn a_blob_of_the_wrong_length_is_not_compressed() {
+        let dir = crate::testtmp::root().join("regserve-zlen");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("blob");
+        for len in [0, 1000] {
+            std::fs::write(&path, vec![0u8; len]).unwrap();
+            assert!(compress_beside(&path, 4096).is_err(), "{len} bytes");
+            assert!(!dir.join("blob.zst").exists(), "{len} bytes");
+        }
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        assert_eq!(
+            compress_beside(&path, 4096).unwrap(),
+            Some(dir.join("blob.zst"))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

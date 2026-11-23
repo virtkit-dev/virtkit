@@ -97,6 +97,8 @@ All notable changes to virtkit will be documented in this file.
   exits.
 - `vk-registry` no longer reports a blob upload as busy just because the previous chunk
   finished while a child process held the upload file open.
+- `vk-registry` no longer stores a blob compressed if its staged file changed length
+  while being stored.
 - `vk node`, `vk tune` and `vk-gitlab` can reuse their state directory as soon as the
   previous holder releases it.
 - `vk dev` keeps its `auto` endpoint address when a child inherits a port check or
