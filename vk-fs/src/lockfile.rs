@@ -84,6 +84,7 @@ impl Drop for LockFile {
 mod tests {
     use super::*;
     use std::io::ErrorKind;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     fn try_lock(f: &File) -> std::io::Result<()> {
@@ -110,7 +111,10 @@ mod tests {
         let made = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
         assert!(!made.is_null(), "{}", std::io::Error::last_os_error());
         template.pop();
-        PathBuf::from(std::ffi::OsString::from_vec(template))
+        let dir = PathBuf::from(std::ffi::OsString::from_vec(template));
+        // A umask such as `0200` strips owner bits `mkdtemp` asked for.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
     }
 
     /// A fresh lock file in a private directory, and an independent probe of it.
@@ -121,6 +125,8 @@ mod tests {
             .create_new(true)
             .append(true)
             .open(&path)
+            .unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .unwrap();
         // Writable: over NFS an exclusive flock needs write access.
         let probe = File::options().write(true).open(&path).unwrap();
@@ -138,6 +144,8 @@ mod tests {
         drop(held);
         try_lock(&probe).expect("released although a copy is open");
         drop(copy);
+        // Over NFS an open file is only renamed to `.nfs*`, and its directory stays.
+        drop(probe);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -154,6 +162,7 @@ mod tests {
         // A child forked by another test could still hold a copy, so unlock explicitly.
         drop(LockFile::new(child));
         try_lock(&probe).expect("held after the child let go");
+        drop(probe);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
