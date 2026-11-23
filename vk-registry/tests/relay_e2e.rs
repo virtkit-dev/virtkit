@@ -1807,6 +1807,72 @@ async fn a_blob_larger_than_one_chunk_streams_back_intact() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Registry GET and HEAD responses for a zstd-stored blob carry `Vary: Accept-Encoding`
+/// for both the frame and the canonical bytes so caches can distinguish them. Identity
+/// blobs have one representation and omit `Vary`.
+#[tokio::test]
+async fn a_zstd_stored_blob_varies_on_accept_encoding() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("vary");
+    let store = Store::new(dir.clone()).unwrap();
+    let packed = vec![b'v'; 64 * 1024];
+    // Chained SHA-256 digests resist compression, so the store keeps this blob as identity bytes.
+    let mut plain = Vec::with_capacity(64 * 1024);
+    let mut block = [0u8; 32];
+    while plain.len() < 64 * 1024 {
+        block = <sha2::Sha256 as sha2::Digest>::digest(block).into();
+        plain.extend_from_slice(&block);
+    }
+    let packed_digest = store.put_blob(&packed).unwrap();
+    let plain_digest = store.put_blob(&plain).unwrap();
+    let hex = |d: &str| d.trim_start_matches("sha256:").to_string();
+    assert!(
+        dir.join("blobs/zstd").join(hex(&packed_digest)).is_file()
+            && dir.join("blobs/sha256").join(hex(&plain_digest)).is_file(),
+        "this test needs one blob of each storage form"
+    );
+
+    let url = spawn(Arc::new(ServerState {
+        store: Arc::new(store),
+        upstreams: vec![],
+        locks: LockManager::new(),
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+        tls: None,
+        webdav: false,
+        tokens: Default::default(),
+        handover: Default::default(),
+    }));
+
+    // Reqwest's compression features are disabled, so only explicit Accept-Encoding headers are sent.
+    let client = reqwest::Client::new();
+    for (digest, vary) in [
+        (&packed_digest, Some("Accept-Encoding")),
+        (&plain_digest, None),
+    ] {
+        for method in [reqwest::Method::GET, reqwest::Method::HEAD] {
+            for accept in [None, Some("zstd")] {
+                let mut req =
+                    client.request(method.clone(), format!("{url}/v2/app/blobs/{digest}"));
+                if let Some(accept) = accept {
+                    req = req.header(reqwest::header::ACCEPT_ENCODING, accept);
+                }
+                let got = req.send().await.unwrap();
+                assert_eq!(got.status(), 200, "{method} {digest}, accepting {accept:?}");
+                assert_eq!(
+                    got.headers()
+                        .get(reqwest::header::VARY)
+                        .and_then(|v| v.to_str().ok()),
+                    vary,
+                    "{method} {digest}, accepting {accept:?}"
+                );
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A 500's body carries no error chain (upstream URL, store paths).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_server_side_failure_does_not_tell_the_client_why() {

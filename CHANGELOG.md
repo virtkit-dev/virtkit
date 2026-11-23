@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- HTTP caches in front of `vk-registry` can now distinguish compressed and decoded
+  responses for the same blob.
+
 ## [0.115.0] - 2026-11-23
 
 ### Added

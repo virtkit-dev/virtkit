@@ -332,7 +332,7 @@ fn get(
     }
     // A HEAD is opendal checking that something exists, so it refreshes nothing, the layer
     // blob included.
-    let mut resp = crate::serve_blob(store, &format!("sha256:{}", obj.layer), head, false, false)?;
+    let mut resp = crate::serve_blob(store, &format!("sha256:{}", obj.layer), head, None, false)?;
     if resp.status() == StatusCode::OK {
         // A GET served is a use, which is what keeps the tag from the gc's retention.
         // Refreshed only once idle, so a hot entry is not a metadata write per hit.

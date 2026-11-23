@@ -5554,23 +5554,26 @@ fn finish_upload(
 /// GET/HEAD /v2/<name>/blobs/<digest>. The digest names the *canonical* bytes. An
 /// identity blob is served verbatim. A zstd-stored blob is served verbatim (with
 /// `Content-Encoding: zstd`) when the client accepts zstd, else decompressed — so a
-/// plain OCI client always gets the canonical bytes and verifies the digest.
+/// plain OCI client always gets the canonical bytes and can verify the digest. Both forms
+/// carry `Vary: Accept-Encoding` so caches can distinguish them.
 pub(crate) fn get_blob(
     store: &Store,
     digest: &str,
     head: bool,
     accept_zstd: bool,
 ) -> Result<Response<Body>> {
-    serve_blob(store, digest, head, accept_zstd, head)
+    serve_blob(store, digest, head, Some(accept_zstd), head)
 }
 
 /// [`get_blob`], with whether a HEAD counts as a use of the blob left to the caller: a
 /// WebDAV `HEAD` is an existence check, not a pusher about to reference the blob.
+/// Pass `None` for `accept_zstd` to skip encoding negotiation and serve the canonical
+/// bytes without `Vary`.
 pub(crate) fn serve_blob(
     store: &Store,
     digest: &str,
     head: bool,
-    accept_zstd: bool,
+    accept_zstd: Option<bool>,
     record_use: bool,
 ) -> Result<Response<Body>> {
     let hex = digest.trim_start_matches("sha256:");
@@ -5597,10 +5600,15 @@ pub(crate) fn serve_blob(
     // verbatim when the client takes zstd, the canonical bytes otherwise. Both are known
     // without reading the blob — a zstd frame carries its decompressed size in the header
     // — so `Content-Length` is exact on a streamed response, as a HEAD needs it to be.
-    let serve_frame = is_zstd && accept_zstd;
+    let serve_frame = is_zstd && accept_zstd == Some(true);
     let decode = is_zstd && !serve_frame;
     let builder = if serve_frame {
         builder.header(hyper::header::CONTENT_ENCODING, "zstd")
+    } else {
+        builder
+    };
+    let builder = if is_zstd && accept_zstd.is_some() {
+        builder.header(hyper::header::VARY, "Accept-Encoding")
     } else {
         builder
     };
