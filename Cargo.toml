@@ -189,7 +189,7 @@ http-body-util = "0.1"
 # IMF-fixdate for the registry's WebDAV `Last-Modified`/`getlastmodified`; already in the tree
 # via hyper.
 httpdate = "1"
-bytes = "1"
+bytes = "1.9"
 # direct HTTP client for the transparent-zstd blob push (oci-client can't set a
 # per-request Content-Encoding). rustls so the binary stays musl-static (matches
 # oci-client); already in the tree via oci-client.

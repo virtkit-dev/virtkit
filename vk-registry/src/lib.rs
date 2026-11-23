@@ -48,6 +48,7 @@ pub mod admin;
 pub mod auth;
 pub(crate) mod browse;
 pub(crate) mod captions;
+pub(crate) mod chunks;
 pub mod client;
 pub mod config;
 pub(crate) mod dav;
@@ -216,11 +217,21 @@ pub(crate) fn body_of(bytes: Bytes) -> Body {
 
 /// How much of a streamed blob is read per chunk — a default, not a measured optimum:
 /// big enough that a multi-GB layer is not millions of wakeups, small enough that the
-/// peak per in-flight response is a rounding error next to the layer itself.
+/// peak per in-flight response is a rounding error next to the layer itself. Also the
+/// size of every pooled buffer ([`chunks`]).
 const STREAM_CHUNK: usize = 256 * 1024;
 
 /// A body that pulls from a blocking reader — a file, or a zstd decoder over one.
 fn stream_body(reader: impl std::io::Read + Send + Sync + 'static, what: &str) -> Body {
+    stream_body_with_pool(&chunks::CHUNKS, reader, what)
+}
+
+/// Tests supply a private pool to count idle buffers.
+fn stream_body_with_pool(
+    pool: &'static chunks::ChunkPool,
+    reader: impl std::io::Read + Send + Sync + 'static,
+    what: &str,
+) -> Body {
     // Refcounted, not re-allocated: the label outlives every chunk but is only read on the
     // error path.
     let what: std::sync::Arc<str> = what.into();
@@ -228,27 +239,15 @@ fn stream_body(reader: impl std::io::Read + Send + Sync + 'static, what: &str) -
         let what = what.clone();
         async move {
             let mut reader = state?;
-            // A fresh buffer per chunk: the `Bytes` handed out lives as long as the client
-            // takes to read it, so it cannot be one this reader keeps writing into.
+            // An earlier chunk can still be queued for the client, so each chunk takes its
+            // own buffer. The last `Bytes` releases it. An empty or failed read releases it
+            // here.
             let read = tokio::task::spawn_blocking(move || {
-                let mut buf = vec![0u8; STREAM_CHUNK];
-                let mut filled = 0;
-                // Filled rather than one `read`: `Read` may return short at any time (a
-                // zstd decoder returns as soon as one block is out), and `Interrupted` is
-                // a retry, not the end of the blob.
-                while filled < buf.len() {
-                    match reader.read(&mut buf[filled..]) {
-                        Ok(0) => break,
-                        Ok(n) => filled += n,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(e) => return Err(e),
-                    }
-                }
-                if filled == 0 {
+                let mut chunk = pool.take();
+                if chunk.fill(&mut reader)? == 0 {
                     return Ok(None);
                 }
-                buf.truncate(filled);
-                Ok(Some((Bytes::from(buf), reader)))
+                Ok(Some((chunk.into_bytes(), reader)))
             })
             .await;
             // A mid-response error reaches the log as the connection's, where a bad disk and a
@@ -5882,11 +5881,11 @@ fn hash_zstd_frame(path: &Path) -> Result<Option<(String, u64)>> {
     let mut dec = zstd::stream::read::Decoder::new(std::io::BufReader::new(f))
         .context("starting a zstd decode")?;
     let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut chunk = chunks::CHUNKS.take();
     let mut total: u64 = 0;
     loop {
         // A malformed frame is invalid client input, not a server fault: `None`, not `Err`.
-        let Ok(n) = dec.read(&mut buf) else {
+        let Ok(n) = chunk.fill(&mut dec) else {
             return Ok(None);
         };
         if n == 0 {
@@ -5896,7 +5895,7 @@ fn hash_zstd_frame(path: &Path) -> Result<Option<(String, u64)>> {
         if total > declared {
             return Ok(None);
         }
-        hasher.update(buf.get(..n).unwrap_or_default());
+        hasher.update(&chunk);
     }
     if total != declared {
         return Ok(None);
@@ -7650,6 +7649,24 @@ mod tests {
         .unwrap();
         assert_eq!(ok.status(), StatusCode::CREATED);
         assert!(store.has_blob(&sha256_hex_raw(body)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The final short read overwrites only the start of the full chunk's buffer.
+    #[test]
+    fn a_zstd_frame_longer_than_a_chunk_is_hashed_whole() {
+        let dir = crate::testtmp::root().join("regserve-zhash");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let raw: Vec<u8> = (0..STREAM_CHUNK + 10).map(|i| (i % 251) as u8).collect();
+        let path = dir.join("frame");
+        std::fs::write(&path, zstd_with_size(&raw).unwrap()).unwrap();
+        assert_eq!(
+            hash_zstd_frame(&path).unwrap(),
+            Some((sha256_hex_raw(&raw), raw.len() as u64))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10894,7 +10911,7 @@ mod tests {
 
     /// A read that fails part-way ends the body as an error, naming the blob — not as a
     /// short but successful one, which would hand a client a truncated blob under a
-    /// `Content-Length` that says otherwise.
+    /// `Content-Length` that says otherwise. The failed read returns its buffer.
     #[tokio::test]
     async fn a_stream_that_fails_part_way_ends_as_an_error() {
         /// Yields one full chunk, then fails.
@@ -10909,13 +10926,17 @@ mod tests {
             }
         }
 
-        let mut body = stream_body(Flaky(true), "sha256:beef");
+        static POOL: chunks::ChunkPool = chunks::ChunkPool::new();
+
+        let mut body = stream_body_with_pool(&POOL, Flaky(true), "sha256:beef");
         let first = body
             .frame()
             .await
             .expect("a frame")
-            .expect("the first chunk must arrive");
-        assert_eq!(first.into_data().unwrap().len(), STREAM_CHUNK);
+            .expect("the first chunk must arrive")
+            .into_data()
+            .unwrap();
+        assert_eq!(first.len(), STREAM_CHUNK);
 
         let err = body
             .frame()
@@ -10927,6 +10948,67 @@ mod tests {
             shown.contains("sha256:beef") && shown.contains("the disk went away"),
             "the error must name the blob and the cause, got {shown}"
         );
+        assert_eq!(POOL.idle_count(), 1, "the buffer of the failed read");
+        drop(first);
+        assert_eq!(POOL.idle_count(), 2);
+    }
+
+    /// Short reads and interruptions still produce full chunks until the final partial
+    /// chunk. The empty EOF read returns its buffer while the data chunks still hold
+    /// theirs. Dropping those chunks returns the rest. A second pass through the same
+    /// buffers exposes none of the first's bytes.
+    #[tokio::test]
+    async fn a_stream_of_short_reads_fills_whole_chunks_from_the_pool() {
+        /// Every third call returns `Interrupted`. Other calls read at most 1000 bytes.
+        struct Short(std::io::Cursor<Vec<u8>>, usize);
+        impl std::io::Read for Short {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.1 += 1;
+                if self.1.is_multiple_of(3) {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let n = buf.len().min(1000);
+                self.0.read(&mut buf[..n])
+            }
+        }
+        static POOL: chunks::ChunkPool = chunks::ChunkPool::new();
+
+        let bytes: Vec<u8> = (0..2 * STREAM_CHUNK + 4567)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        async fn read(bytes: &[u8]) -> Vec<Bytes> {
+            let reader = Short(std::io::Cursor::new(bytes.to_vec()), 0);
+            let mut body = stream_body_with_pool(&POOL, reader, "sha256:beef");
+            let mut chunks = Vec::new();
+            while let Some(frame) = body.frame().await {
+                chunks.push(frame.unwrap().into_data().unwrap());
+            }
+            chunks
+        }
+
+        let chunks = read(&bytes).await;
+        let sizes: Vec<usize> = chunks.iter().map(Bytes::len).collect();
+        assert_eq!(sizes, [STREAM_CHUNK, STREAM_CHUNK, 4567]);
+        assert_eq!(chunks.concat(), bytes);
+        assert_eq!(POOL.idle_count(), 1, "the buffer that met the end is back");
+        drop(chunks);
+        assert_eq!(POOL.idle_count(), 4);
+
+        let other: Vec<u8> = bytes
+            .iter()
+            .rev()
+            .take(STREAM_CHUNK + 10)
+            .copied()
+            .collect();
+        let chunks = read(&other).await;
+        assert_eq!(chunks.concat(), other);
+        assert_eq!(
+            POOL.idle_count(),
+            2,
+            "two of the four are out, none was added"
+        );
+        drop(chunks);
+        assert_eq!(POOL.idle_count(), 4);
     }
 
     /// A reader whose length is an exact multiple of the chunk ends on the empty read,
