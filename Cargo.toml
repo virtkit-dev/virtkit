@@ -162,9 +162,14 @@ ecdsa = { version = "0.17", default-features = false, features = ["algorithm", "
 # native OCI bundle store (registry.rs): content-defined chunking of runner.ext4 for
 # block-level dedup, each chunk zstd-compressed independently. fastcdc is pure Rust;
 # zstd vendors its C (gcc/musl-dev are in the build image), so the binary stays
-# musl-static.
+# musl-static. `with-rust-allocator` gives zstd contexts and prepared dictionaries
+# Rust's global allocator. On musl, jemalloc can reuse large workspaces that musl's
+# malloc would map and unmap individually.
+# Prepared compression dictionaries keep their parameters even for large inputs of
+# known size. Compression ratio, speed and memory use can change. Frames stay decodable.
+# The feature enables zstd-safe's `experimental` API. No workspace code calls it directly.
 fastcdc = "5"
-zstd = "0.14"
+zstd = { version = "0.14.1", features = ["with-rust-allocator"] }
 # .ko.xz kernel-module decompression for `vk run --kernel image` (fullvm): pure Rust,
 # so it needs no C liblzma and the binary stays musl-static (zstd/gz are covered by the
 # crates above).
