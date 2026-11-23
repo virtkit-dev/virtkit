@@ -52,6 +52,12 @@ async fn start_jobs(dir: &std::path::Path, lost_after: Duration) -> (SocketAddr,
     serve_hub(db, dir, lost_after).await
 }
 
+/// [`start_jobs`]'s hub with no placement loop: the test runs each dispatch pass itself, so
+/// none it did not run can act on a job between its steps.
+async fn start_undriven(dir: &std::path::Path, lost_after: Duration) -> (SocketAddr, Arc<Hub>) {
+    serve_undriven(Arc::new(Db::open_memory().unwrap()), dir, lost_after).await
+}
+
 /// A hub over `db`, as one restarted over the same database and output would be.
 async fn serve_hub(
     db: Arc<Db>,
@@ -2113,10 +2119,11 @@ async fn simultaneous_reservations_account_for_an_offer_before_selecting_again()
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reservation_goes_to_a_node_that_accepts_and_is_renewed_released_and_expires() {
     let dir = scratch("reserve");
-    // Keep the offer timeout longer than the test watchdogs.
+    // Keep the offer and renew timeouts longer than the test watchdogs.
     let db = Arc::new(Db::open_memory().unwrap());
     let (addr, hub) = serve_hub_with(db, &dir, Duration::from_secs(60), |hub| {
         hub.answering_offers_within(Duration::from_secs(120))
+            .answering_renewals_within(Duration::from_secs(120))
     })
     .await;
     let key = jobs_key(&hub);

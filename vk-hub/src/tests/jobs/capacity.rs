@@ -1114,7 +1114,7 @@ async fn an_entry_already_short_loses_no_more_room() {
 #[tokio::test]
 async fn a_job_kept_from_headroom_ends_saying_why() {
     let dir = scratch("capacity-headroom-job");
-    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let (addr, hub) = start_undriven(&dir, Duration::from_secs(30)).await;
     let key = jobs_key(&hub);
     ready_relay(&hub, &key);
     headroom(&hub, vec![(placement(), 2)]);
@@ -1135,7 +1135,7 @@ async fn a_job_kept_from_headroom_ends_saying_why() {
         Some("production headroom")
     );
     crate::jobs::testing::end_window_and_step(&hub, &id).await;
-    // Check the result without polling for another dispatch pass.
+    // No other pass runs: the one above ended the job.
     let view = job_view(addr, &key, &id).await;
     assert_eq!(view.state, JobState::Finished, "{view:?}");
     let result = view.result.unwrap();
@@ -1150,12 +1150,13 @@ async fn a_job_kept_from_headroom_ends_saying_why() {
 #[tokio::test]
 async fn a_job_whose_reservation_cannot_take_it_is_kept_from_headroom() {
     let dir = scratch("capacity-headroom-reserved");
-    let (addr, hub) = start_jobs(&dir, Duration::from_secs(30)).await;
+    let (addr, hub) = start_undriven(&dir, Duration::from_secs(30)).await;
     let key = jobs_key(&hub);
     ready_relay(&hub, &key);
     let mut reserved = ready_node(addr, &hub, 16384).await;
     let mut other = ready_node(addr, &hub, 8192).await;
     let ticket = queue(addr, &key, 1).await;
+    crate::jobs::testing::step(&hub).await;
     let grant = accept_ticket(addr, &key, &ticket, &mut reserved).await;
     take_job(addr, &key, &ticket, &grant).await;
     // Its node takes no work now; the other's room is all kept.
@@ -1172,7 +1173,7 @@ async fn a_job_whose_reservation_cannot_take_it_is_kept_from_headroom() {
         Some("production headroom")
     );
     crate::jobs::testing::end_window_and_step(&hub, &id).await;
-    // Check the result without polling for another dispatch pass.
+    // No other pass runs: the one above ended the job.
     let view = job_view(addr, &key, &id).await;
     assert_eq!(view.state, JobState::Finished, "{view:?}");
     assert_eq!(

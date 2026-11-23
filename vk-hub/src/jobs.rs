@@ -213,6 +213,8 @@ pub struct Dispatch {
     pub egress_write_every: Duration,
     /// How long a node has to answer an offer; defaults to [`OFFER_TIMEOUT`].
     pub offer_timeout: Duration,
+    /// How long a renew waits for the node's answer; defaults to [`RENEW_TIMEOUT`].
+    pub renew_timeout: Duration,
     /// Set by [`testing::end_request_waits`] for current and future reservation waits.
     #[cfg(test)]
     requests_ended: std::sync::atomic::AtomicBool,
@@ -823,6 +825,7 @@ impl Dispatch {
             affinity: Affinity::default(),
             egress_write_every: DEFAULT_EGRESS_WRITE_EVERY,
             offer_timeout: OFFER_TIMEOUT,
+            renew_timeout: RENEW_TIMEOUT,
             #[cfg(test)]
             requests_ended: std::sync::atomic::AtomicBool::new(false),
             state: Mutex::new(State {
@@ -3426,7 +3429,7 @@ pub async fn renew(
         }
         (r.leases, r.node.clone(), r.envelope)
     };
-    let deadline = Instant::now() + RENEW_TIMEOUT;
+    let deadline = Instant::now() + hub.dispatch.renew_timeout;
     loop {
         let mut changed = hub.dispatch.subscribe();
         {

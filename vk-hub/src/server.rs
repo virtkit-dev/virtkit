@@ -369,6 +369,14 @@ impl Hub {
         self
     }
 
+    /// Give a node `within` to answer a renew before the renew fails.
+    /// Call after [`Hub::with_jobs`], which sets the default.
+    #[cfg(test)]
+    pub fn answering_renewals_within(mut self, within: Duration) -> Self {
+        self.dispatch.renew_timeout = within;
+        self
+    }
+
     /// Write a running job's record for a newer egress report alone at most `every`.
     /// Call after [`Hub::with_jobs`], which sets the default.
     #[cfg(test)]
