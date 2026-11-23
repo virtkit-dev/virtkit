@@ -130,6 +130,7 @@ pub struct RelayConnection<B> {
 pub struct Requests<B> {
     sender: http2::SendRequest<B>,
     gate: Arc<Mutex<()>>,
+    ended: tokio::sync::watch::Receiver<()>,
 }
 
 impl<B> Clone for Requests<B> {
@@ -137,6 +138,7 @@ impl<B> Clone for Requests<B> {
         Self {
             sender: self.sender.clone(),
             gate: Arc::clone(&self.gate),
+            ended: self.ended.clone(),
         }
     }
 }
@@ -146,14 +148,24 @@ where
     B: hyper::body::Body + 'static,
 {
     /// Drives `conn` on a background task and returns its request sender.
-    pub fn spawn<C>(sender: http2::SendRequest<B>, conn: C) -> Self
+    ///
+    /// Takes hyper's connection itself rather than any future: a future wrapping it could
+    /// drop the dispatcher before the gate is taken.
+    pub fn spawn<T, E>(sender: http2::SendRequest<B>, conn: http2::Connection<T, B, E>) -> Self
     where
-        C: Future<Output = hyper::Result<()>> + Unpin + Send + 'static,
+        T: hyper::rt::Read + hyper::rt::Write + Unpin + 'static,
+        B: Unpin,
+        B::Data: Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        E: hyper::rt::bounds::Http2ClientConnExec<B, T> + Unpin + 'static,
+        http2::Connection<T, B, E>: Send,
     {
         let gate = Arc::new(Mutex::new(()));
+        let (ended_tx, ended) = tokio::sync::watch::channel(());
         let mut driven = Driven {
             conn: Some(conn),
             gate: Arc::clone(&gate),
+            _ended: ended_tx,
         };
         tokio::spawn(async move {
             if let Some(conn) = driven.conn.as_mut()
@@ -162,7 +174,11 @@ where
                 log::debug!("The connection to the hub ended: {e}");
             }
         });
-        Self { sender, gate }
+        Self {
+            sender,
+            gate,
+            ended,
+        }
     }
 
     /// Send `req` on the connection.
@@ -175,6 +191,8 @@ where
             .gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(test)]
+        tests::queueing(&self.gate);
         self.sender.clone().send_request(req)
     }
 
@@ -182,12 +200,22 @@ where
     pub fn is_closed(&self) -> bool {
         self.sender.is_closed()
     }
+
+    /// Resolves once the driving task has ended and dropped the connection's dispatcher.
+    pub fn ended(&self) -> impl Future<Output = ()> + Send + 'static + use<B> {
+        let mut ended = self.ended.clone();
+        // Never sent on: it only changes by closing, as its sender drops.
+        async move { while ended.changed().await.is_ok() {} }
+    }
 }
 
 /// Drops the dispatcher under the [`Requests`] gate even if its task is cancelled.
 struct Driven<C> {
     conn: Option<C>,
     gate: Arc<Mutex<()>>,
+    /// Closes [`Requests::ended`]: fields drop after [`Drop::drop`], so once the dispatcher is
+    /// gone.
+    _ended: tokio::sync::watch::Sender<()>,
 }
 
 impl<C> Drop for Driven<C> {
@@ -629,6 +657,90 @@ pub fn kind(msg: &HubMsg) -> &'static str {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    thread_local! {
+        /// How many requests this thread has queued through [`Requests::send_request`].
+        static QUEUED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Called by [`Requests::send_request`] as it queues: the gate must be held.
+    pub(super) fn queueing(gate: &Mutex<()>) {
+        assert!(
+            matches!(gate.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+            "a request was queued outside the gate"
+        );
+        QUEUED.set(QUEUED.get() + 1);
+    }
+
+    /// A request body that records, as it is dropped, whether the gate was held.
+    struct Probe {
+        gate: Arc<Mutex<()>>,
+        dropped: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl hyper::body::Body for Probe {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<bytes::Bytes>, Self::Error>>>
+        {
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let held = matches!(
+                self.gate.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            self.dropped.lock().unwrap().push(held);
+        }
+    }
+
+    /// Queueing and dispatcher teardown both hold the gate. A request still queued when the
+    /// driving task is dropped is failed, and its body dropped, inside that teardown.
+    #[test]
+    fn requests_are_queued_and_their_dispatcher_dropped_under_the_gate() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let (_hub, requests, response) = rt.block_on(async {
+            let (io, hub) = tokio::io::duplex(1 << 16);
+            let (sender, conn) = http2::Builder::new(TokioExecutor::new())
+                .handshake::<_, Probe>(TokioIo::new(io))
+                .await
+                .unwrap();
+            // Spawned, but this future returns without yielding to it again: the request
+            // below stays queued until the runtime drops the driving task.
+            let requests = Requests::spawn(sender, conn);
+            let before = QUEUED.get();
+            let req = hyper::Request::get("http://hub/")
+                .body(Probe {
+                    gate: Arc::clone(&requests.gate),
+                    dropped: Arc::clone(&dropped),
+                })
+                .unwrap();
+            let response = requests.send_request(req);
+            assert_eq!(QUEUED.get(), before + 1, "queued without the gate check");
+            (hub, requests, response)
+        });
+        assert!(
+            dropped.lock().unwrap().is_empty(),
+            "the request left the queue"
+        );
+        drop(rt);
+        assert_eq!(
+            *dropped.lock().unwrap(),
+            [true],
+            "the dispatcher was dropped outside the gate"
+        );
+        drop((requests, response));
+    }
 
     fn addr(last: u8) -> SocketAddr {
         SocketAddr::from(([192, 0, 2, last], 443))
