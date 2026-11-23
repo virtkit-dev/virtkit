@@ -8276,6 +8276,42 @@ RUN ship
         }
     }
 
+    /// A stage reports its outcome before joining so the test can enforce a shared
+    /// deadline. The day-long poll in [`ledger`] could otherwise mask a missed wakeup.
+    struct Stage<T> {
+        done: std::sync::mpsc::Receiver<T>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl<T: Send + 'static> Stage<T> {
+        fn spawn(f: impl FnOnce() -> T + Send + 'static) -> Self {
+            let (tx, done) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                // The test may have failed and dropped its receiver.
+                let _ = tx.send(f());
+            });
+            Stage { done, thread }
+        }
+
+        /// `what` names the event the stage missed if the deadline expires.
+        fn outcome(self, deadline: Instant, what: &str) -> T {
+            match self
+                .done
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(v) => {
+                    self.thread.join().unwrap();
+                    v
+                }
+                // Preserve the stage's panic.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    std::panic::resume_unwind(self.thread.join().unwrap_err())
+                }
+                Err(e) => panic!("{what}: {e}"),
+            }
+        }
+    }
+
     /// Wait for `ledger` to have `n` stages queued.
     fn queued(ledger: &MemLedger, n: usize) {
         let st = ledger.lock();
@@ -8368,6 +8404,7 @@ RUN ship
         // reservation must still go through (a build with nothing running has no way to make
         // room, and parking it forever would deadlock rather than throttle), and the second
         // must wait for that one to be released rather than pile on.
+        let deadline = Instant::now() + Duration::from_secs(60);
         let ledger = Arc::new(ledger());
         let (first, wait) = ledger.reserve(4096, None, |_| {});
         assert_eq!(
@@ -8381,21 +8418,26 @@ RUN ship
         let (tx, rx) = std::sync::mpsc::channel();
         let entered = Arc::new(AtomicUsize::new(0));
         let (l2, e2) = (Arc::clone(&ledger), Arc::clone(&entered));
-        let second = std::thread::spawn(move || {
+        let second = Stage::spawn(move || {
             let (_r, wait) = l2.reserve(4096, None, |short| tx.send(short).unwrap());
             e2.store(1, SeqCst);
             wait
         });
-        let short = rx.recv().unwrap();
+        let short = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("the second stage never reported its shortfall");
         assert!(short > 0, "a parked stage reports what it is short by");
         assert_eq!(
             entered.load(SeqCst),
             0,
             "a second stage must wait while the host has no room for it"
         );
+        // Releasing after the shortfall report but before the stage parks would let
+        // its own recheck admit it without the release notification.
+        parked(&ledger, 1);
         drop(first);
         assert_eq!(
-            second.join().unwrap(),
+            second.outcome(deadline, "the release never let the second stage in"),
             MemWait::Admitted,
             "and must report that it waited and was then let in"
         );
@@ -8413,9 +8455,9 @@ RUN ship
 
     #[test]
     fn the_ledger_admits_waiting_stages_oldest_first() {
-        // Mixed sizes on a host with no room: the big stage queued first must get the
-        // memory the release frees, even though the small one behind it would also fit.
-        // Without that, a large stage is overtaken by every small one and never runs.
+        // Both stages exceed host capacity, so only one can run at a time. Admit the
+        // older, larger stage first or a stream of small stages can starve it.
+        let deadline = Instant::now() + Duration::from_secs(60);
         let ledger = Arc::new(ledger());
         let (held, _) = ledger.reserve(1024, None, |_| {});
         // Queue depth, not the wait callback: only the oldest waiter measures the host and
@@ -8424,9 +8466,9 @@ RUN ship
         let mut waiters = Vec::new();
         for (i, (label, want)) in [("big", 8192u64), ("small", 512)].into_iter().enumerate() {
             let (l, o) = (Arc::clone(&ledger), Arc::clone(&order));
-            waiters.push(std::thread::spawn(move || {
+            waiters.push(Stage::spawn(move || {
                 let (_r, _) = l.reserve(want, None, |_| {});
-                // Record admission before releasing the only reservation that fits.
+                // Record admission while this stage still holds the sole reservation.
                 o.lock().unwrap().push(label);
             }));
             // Queue strictly: only once this one has a ticket does the next take one.
@@ -8434,7 +8476,7 @@ RUN ship
         }
         drop(held);
         for w in waiters {
-            w.join().unwrap();
+            w.outcome(deadline, "a queued stage was never let in");
         }
         assert_eq!(
             *order.lock().unwrap(),
@@ -8636,6 +8678,7 @@ RUN ship
         // Admission must wake the next head. Both reservations stay held and the poll
         // outlasts the test, so only that notification or a spurious wakeup can wake it.
         static WALK: Walk = Walk::new(1);
+        let deadline = Instant::now() + Duration::from_secs(60);
         // Room for two stages: the head is admitted beside `first`, and the stage behind it
         // then finds no room left.
         let ledger = Arc::new(MemLedger {
@@ -8648,7 +8691,7 @@ RUN ship
         // Keep the head's reservation until the next waiter reports a shortfall.
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let l = Arc::clone(&ledger);
-        let head = std::thread::spawn(move || {
+        let head = Stage::spawn(move || {
             let (_r, wait) = l.reserve(4096, None, |_| {});
             release_rx.recv().unwrap();
             wait
@@ -8657,22 +8700,28 @@ RUN ship
         // Only the queue head measures, so a shortfall proves the handoff occurred.
         let (noticed_tx, noticed_rx) = std::sync::mpsc::channel();
         let l = Arc::clone(&ledger);
-        let next = std::thread::spawn(move || {
+        let next = Stage::spawn(move || {
             let (_r, wait) = l.reserve(4096, None, |short| noticed_tx.send(short).unwrap());
             wait
         });
         parked(&ledger, 1);
         WALK.finish();
         let short = noticed_rx
-            .recv_timeout(Duration::from_secs(60))
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .expect("the new head was never woken to notice its turn");
         assert!(
             short > 0,
             "it found the head still holding what it was given"
         );
         release_tx.send(()).unwrap();
-        assert_eq!(head.join().unwrap(), MemWait::No);
-        assert_eq!(next.join().unwrap(), MemWait::Admitted);
+        assert_eq!(
+            head.outcome(deadline, "the head never finished"),
+            MemWait::No
+        );
+        assert_eq!(
+            next.outcome(deadline, "the head's release never let the next stage in"),
+            MemWait::Admitted
+        );
         drop(first);
     }
 
