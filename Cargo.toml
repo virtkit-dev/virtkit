@@ -205,7 +205,7 @@ bytes = "1.9"
 # direct HTTP client for the transparent-zstd blob push (oci-client can't set a
 # per-request Content-Encoding), and the transport oci-client sends vk's registry requests
 # through. rustls so the binary stays musl-static (matches oci-client); already in the tree
-# via oci-client. No decompression feature: vk sees response bodies as sent.
+# via oci-client. No decompression feature: chunk downloads must see the zstd frame.
 #
 # `rustls-no-provider` compiles rustls without a built-in crypto provider (the plain
 # `rustls` feature would force aws-lc-rs); main installs the ring provider as the

@@ -51,7 +51,7 @@ const CDC_AVG: usize = 4 << 20;
 pub(crate) const CDC_MAX: usize = 16 << 20;
 
 mod chunks;
-use chunks::{ChunkPool, ChunkTransport};
+use chunks::{ChunkGet, ChunkPool, ChunkTransport};
 
 /// Maximum number of in-flight chunk operations per registry restore.
 const RESTORE_CONCURRENCY: usize = 16;
@@ -96,7 +96,8 @@ pub(crate) struct LazyChunk {
     pub(crate) offset: u64,
     pub(crate) length: u32,
     pub(crate) codec: u8,
-    /// Raw sha256 bytes (not hex) of the *stored* blob — the cache filename is its hex form.
+    /// Descriptor SHA-256 in binary. Its hex form names the cache entry, even when the
+    /// digest covers decoded bytes and the entry holds a zstd frame.
     pub(crate) digest: [u8; 32],
 }
 
@@ -605,7 +606,14 @@ pub fn try_pull_ext4(
     if let Some(root) = rg.local_root() {
         return local::try_pull_ext4(&root, name, tag, dest);
     }
-    block_on(try_pull_ext4_async(rg, name, tag, dest, label))
+    block_on(try_pull_ext4_async(
+        rg,
+        name,
+        tag,
+        dest,
+        label,
+        &Arc::default(),
+    ))
 }
 
 async fn try_pull_ext4_async(
@@ -614,6 +622,7 @@ async fn try_pull_ext4_async(
     tag: &str,
     dest: &Path,
     label: &str,
+    pool: &Arc<ChunkPool>,
 ) -> Result<Option<String>> {
     let (client, auth) = client(rg)?;
     let image = make_ref(rg, name, tag)?;
@@ -629,7 +638,7 @@ async fn try_pull_ext4_async(
     // and be served as this pull's result.
     let _ = std::fs::remove_dir_all(&bundle);
     let dref = make_digest_ref(rg, name, &digest)?;
-    pull_into(&client, &auth, &dref, name, &digest, &bundle, label).await?;
+    pull_into(&client, &auth, &dref, name, &digest, &bundle, label, pool).await?;
     let runner = bundle.join("runner.ext4");
     let _ = std::fs::remove_file(dest);
     std::fs::rename(&runner, dest)
@@ -712,7 +721,15 @@ pub fn try_pull_ext4_lazy(
     if let Some(root) = rg.local_root() {
         return local::try_pull_ext4_lazy(&root, name, tag, dest, lease);
     }
-    let digest = block_on(try_pull_ext4_lazy_async(rg, name, tag, dest, label, meter))?;
+    let digest = block_on(try_pull_ext4_lazy_async(
+        rg,
+        name,
+        tag,
+        dest,
+        label,
+        meter,
+        &Arc::default(),
+    ))?;
     Ok(digest.map(|digest| LazyView {
         digest,
         protected: true,
@@ -757,6 +774,7 @@ async fn try_pull_ext4_lazy_async(
     dest: &Path,
     label: &str,
     meter: Option<&TransferMeter>,
+    pool: &Arc<ChunkPool>,
 ) -> Result<Option<String>> {
     let (client, auth) = client(rg)?;
     // A digest (`sha256:…`) pins content a tag may since have moved off, as in `fetch_bundle`.
@@ -822,8 +840,17 @@ async fn try_pull_ext4_lazy_async(
                 let (offset, length) = chunk_bounds(&layer, total_size)?;
                 // Ensures the blob is in the local cache (network fetch on a miss) — the
                 // decompress-and-place step the eager path does next is what we skip.
-                let codec =
-                    ensure_chunk(client, dref, &layer, chunks_cache, fetched, reused).await?;
+                let codec = ensure_chunk(
+                    client,
+                    dref,
+                    &layer,
+                    length,
+                    chunks_cache,
+                    pool,
+                    fetched,
+                    reused,
+                )
+                .await?;
                 if let Some(m) = meter {
                     m.add(layer_size(&layer));
                 }
@@ -1869,8 +1896,9 @@ fn staging_tmp(bundle: &Path) -> PathBuf {
 
 /// Build the `[registry]` client with anonymous, Basic or Bearer auth. For rustls trust
 /// roots (including an optional PEM CA), HTTP timeouts and proxies, [`ChunkTransport`] uses the
-/// HTTP client oci-client would build from the same settings — the CA added
-/// to the system roots, no timeouts, proxies from the environment.
+/// HTTP client oci-client would build from the same settings — the CA added to the system
+/// roots, no timeouts, proxies from the environment — so that chunk downloads can negotiate
+/// zstd.
 pub(crate) fn client(rg: &Registry) -> Result<(oci_client::Client, RegistryAuth)> {
     let mut cfg = ClientConfig::default();
     if rg.insecure {
@@ -2117,7 +2145,8 @@ async fn ensure_bundle_pulled(
                 .await
                 .with_context(|| format!("authenticating to {}", rg.repo))?;
         }
-        pull_into(client, auth, &image, name, &digest, &dir, name).await?;
+        let pool = Arc::default();
+        pull_into(client, auth, &image, name, &digest, &dir, name, &pool).await?;
         true
     };
     Ok((dir, digest, pulled))
@@ -2148,6 +2177,7 @@ async fn resolve_async(
 
 /// Pull the manifest + config + every blob into `dir`, under the shared pull lock,
 /// promoting a tmp sibling on success (a killed pull never leaves a half-bundle).
+#[allow(clippy::too_many_arguments)]
 async fn pull_into(
     client: &oci_client::Client,
     auth: &RegistryAuth,
@@ -2156,6 +2186,7 @@ async fn pull_into(
     digest: &str,
     dir: &Path,
     label: &str,
+    pool: &Arc<ChunkPool>,
 ) -> Result<()> {
     // `label` (a Dockerfile stage, a bundle name) is what the trace shows; the cache
     // repo is always `build-cache`, so `name@digest` alone is unreadable.
@@ -2207,7 +2238,7 @@ async fn pull_into(
     // local cache), then decompresses + writes into its own disjoint slot on a blocking
     // thread. The per-chunk zstd decode is CPU-bound, so overlapping it with the other
     // fetches and decodes is the win. Writes use `pwrite`, so a shared `File` is safe.
-    // Decode cached zstd frames and write raw chunks directly. Kernel and initrd follow below.
+    // Reuse bytes decoded for digest verification. Kernel and initrd follow below.
     use futures::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     let chunk_layers: Vec<OciDescriptor> = manifest
@@ -2234,31 +2265,23 @@ async fn pull_into(
     std::fs::write(tmp.join("chunks.list"), chunk_hexes.join("\n"))
         .context("writing the chunk manifest")?;
     let chunks_cache = chunks_cache_dir(dir);
-    let out = std::sync::Arc::new(out);
-    let pool = Arc::new(ChunkPool::default());
+    let out = Arc::new(out);
     let fetched = AtomicUsize::new(0);
     let reused = AtomicUsize::new(0);
     let results: Vec<Result<()>> = futures::stream::iter(chunk_layers)
         .map(|layer| {
-            let out = std::sync::Arc::clone(&out);
-            let pool = Arc::clone(&pool);
-            let ext4 = ext4.clone();
-            let (fetched, reused, chunks_cache) = (&fetched, &reused, &chunks_cache);
-            async move {
-                // Refused before it is fetched or cached; the placement holds it to this.
-                chunk_bounds(&layer, total_size)?;
-                let (bytes, codec) =
-                    pull_chunk(client, image, &layer, chunks_cache, fetched, reused).await?;
-                let compressed = codec == VK_RO_IMG_CODEC_ZSTD;
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    pool.place(&layer, &bytes, compressed, total_size, |offset, raw| {
-                        write_chunk_sparse(&out, offset, raw)
-                            .with_context(|| format!("writing a chunk into {}", ext4.display()))
-                    })
-                })
-                .await
-                .context("a chunk-reassembly worker panicked")?
-            }
+            place_chunk(
+                client,
+                image,
+                layer,
+                total_size,
+                &chunks_cache,
+                pool,
+                &out,
+                &ext4,
+                &fetched,
+                &reused,
+            )
         })
         .buffer_unordered(RESTORE_CONCURRENCY)
         .collect()
@@ -2267,7 +2290,6 @@ async fn pull_into(
         r?;
     }
     drop(out);
-    drop(pool);
     let (fetched, reused) = (
         fetched.load(Ordering::Relaxed),
         reused.load(Ordering::Relaxed),
@@ -2343,7 +2365,8 @@ pub(crate) fn chunk_cache_dirs(cache: &Path) -> [PathBuf; 3] {
     ]
 }
 
-/// Compressed-digest chunks arrive as zstd frames and raw-digest chunks as raw bytes.
+/// The codec of a chunk received unencoded, and of a legacy flat entry: a frame for a
+/// compressed-digest chunk, raw bytes otherwise.
 fn received_codec(layer: &OciDescriptor) -> u8 {
     if layer.media_type == CHUNK_MEDIA_TYPE {
         VK_RO_IMG_CODEC_ZSTD
@@ -2386,44 +2409,75 @@ fn find_cached_chunk(cache: &Path, hex: &str, layer: &OciDescriptor) -> Option<u
     }
 }
 
-/// Return the bytes verified by oci-client against the descriptor digest and their codec.
-/// Cache publication is best-effort after the staging file is written.
-async fn fetch_chunk(
+/// Request zstd and verify the descriptor digest. For raw-digest chunks, check the decoded
+/// length against the descriptor annotation. For frame digests, unwrap any transfer encoding
+/// to recover the named frame. Each retry starts at byte zero.
+async fn receive_chunk(
     client: &oci_client::Client,
     image: &OciReference,
     layer: &OciDescriptor,
-    cache: &Path,
-    hex: &str,
-) -> Result<(Vec<u8>, u8)> {
-    let bytes = pull_blob_bytes(client, image, layer, MAX_CHUNK_BLOB).await?;
-    let codec = received_codec(layer);
+    len: u64,
+    pool: &Arc<ChunkPool>,
+) -> Result<chunks::Received> {
+    use futures::TryStreamExt;
+    check_blob_size(layer, MAX_CHUNK_BLOB)?;
+    let frame_digest = layer.media_type == CHUNK_MEDIA_TYPE;
+    let what = format!("pulling blob {}", layer.digest);
+    with_transfer_retry(&what, || async move {
+        let get = Arc::new(ChunkGet::new(layer, frame_digest, len, pool));
+        get.scope(async {
+            let mut verified = client.pull_blob_stream(image, layer).await?;
+            // Drain the stream so oci-client checks the digest before publication.
+            while verified.try_next().await?.is_some() {}
+            anyhow::Ok(())
+        })
+        .await?;
+        get.take()
+            .context("the registry's answer bypassed the chunk transport")
+    })
+    .await
+    .with_context(|| what.clone())
+}
+
+/// The codec of the cache directory a received chunk is kept in.
+fn stored_codec(layer: &OciDescriptor, received: &chunks::Received) -> u8 {
+    if received.zstd {
+        VK_RO_IMG_CODEC_ZSTD
+    } else {
+        received_codec(layer)
+    }
+}
+
+/// Publish verified bytes in the codec directory by renaming a private staging file.
+/// Readers trust the digest filename, so a partial write must never appear there.
+/// Each writer needs its own staging name (see `image::staging_chunk_name`). A failed
+/// rename costs only the cache entry because the caller already holds the bytes.
+fn publish_chunk(cache: &Path, hex: &str, codec: u8, wire: &[u8]) -> Result<()> {
     let dir = chunk_codec_dir(cache, codec);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    // atomic-ish: write to a tmp sibling then rename, so a killed pull never leaves a
-    // truncated file under the digest name (which would then be trusted blindly). The staging
-    // name is private to this writer — `image::staging_chunk_name` explains why two pulls of
-    // one chunk must not share it — and `image::sweep_chunks` reclaims one a dead pid left.
     let tmp = dir.join(image::staging_chunk_name(hex));
-    if let Err(e) = std::fs::write(&tmp, &bytes) {
+    if let Err(e) = std::fs::write(&tmp, wire) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("writing {}", tmp.display()));
     }
-    // Publishing is best-effort — the bytes are already in hand, so a failure costs only the
-    // cache entry — but the staging file goes either way: nothing else would ever reuse a name
-    // private to this writer, and the sweep can only reclaim it once this process is gone.
+    // No other writer reuses this name. `image::sweep_chunks` can reclaim it only after exit.
     if std::fs::rename(&tmp, dir.join(hex)).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    Ok((bytes, codec))
+    Ok(())
 }
 
-/// Return the cached codec for the lazy view without reading a hit. On a miss, fetch the
-/// chunk and require its cache entry to exist.
+/// Return a lazy view's codec without reading a cache hit. On a miss, require the verified
+/// chunk to exist in the cache. Verify raw digests on decoded bytes and frame digests on the
+/// frame itself, unwrapping any outer zstd encoding.
+#[allow(clippy::too_many_arguments)]
 async fn ensure_chunk(
     client: &oci_client::Client,
     image: &OciReference,
     layer: &OciDescriptor,
+    len: u64,
     cache: &Path,
+    pool: &Arc<ChunkPool>,
     fetched: &std::sync::atomic::AtomicUsize,
     reused: &std::sync::atomic::AtomicUsize,
 ) -> Result<u8> {
@@ -2433,7 +2487,12 @@ async fn ensure_chunk(
         reused.fetch_add(1, Ordering::Relaxed);
         return Ok(codec);
     }
-    let (_, codec) = fetch_chunk(client, image, layer, cache, hex).await?;
+    let received = receive_chunk(client, image, layer, len, pool).await?;
+    let codec = stored_codec(layer, &received);
+    let (dir, name) = (cache.to_path_buf(), hex.to_string());
+    tokio::task::spawn_blocking(move || publish_chunk(&dir, &name, codec, &received.wire))
+        .await
+        .context("a chunk-caching worker panicked")??;
     // Publishing is best-effort for a fetch; a view reads only what is in the cache.
     let stored = chunk_codec_dir(cache, codec).join(hex);
     if !is_file(&stored) {
@@ -2447,27 +2506,70 @@ async fn ensure_chunk(
     Ok(codec)
 }
 
-/// Return stored bytes and codec for eager restore. Fetch the chunk on a miss or read failure.
-/// Hits need no digest or size check because capped, digest-verified pulls fill the cache.
-async fn pull_chunk(
+/// Write the chunk at its offset in the image. Cache hits skip digest verification because
+/// publication follows a verified download. An unreadable entry triggers a fresh download.
+#[allow(clippy::too_many_arguments)]
+async fn place_chunk(
     client: &oci_client::Client,
     image: &OciReference,
-    layer: &OciDescriptor,
+    layer: OciDescriptor,
+    total_size: u64,
     cache: &Path,
+    pool: &Arc<ChunkPool>,
+    out: &Arc<std::fs::File>,
+    ext4: &Path,
     fetched: &std::sync::atomic::AtomicUsize,
     reused: &std::sync::atomic::AtomicUsize,
-) -> Result<(Vec<u8>, u8)> {
+) -> Result<()> {
     use std::sync::atomic::Ordering;
-    let hex = image::digest_hex(&layer.digest)?;
-    if let Some(codec) = find_cached_chunk(cache, hex, layer)
-        && let Ok(bytes) = std::fs::read(chunk_codec_dir(cache, codec).join(hex))
-    {
-        reused.fetch_add(1, Ordering::Relaxed);
-        return Ok((bytes, codec));
-    }
-    let chunk = fetch_chunk(client, image, layer, cache, hex).await?;
-    fetched.fetch_add(1, Ordering::Relaxed);
-    Ok(chunk)
+    // Check image bounds before fetching or caching the chunk.
+    let (_, len) = chunk_bounds(&layer, total_size)?;
+    let hex = image::digest_hex(&layer.digest)?.to_string();
+    let cached = match find_cached_chunk(cache, &hex, &layer) {
+        Some(codec) => {
+            let (pool, path) = (Arc::clone(pool), chunk_codec_dir(cache, codec).join(&hex));
+            tokio::task::spawn_blocking(move || chunks::read_file(&pool, &path).ok())
+                .await
+                .context("a chunk-reading worker panicked")?
+                .map(|bytes| (codec, bytes))
+        }
+        None => None,
+    };
+    let (blob, compressed, keep) = match cached {
+        Some((codec, bytes)) => {
+            reused.fetch_add(1, Ordering::Relaxed);
+            (bytes.into_bytes(), codec == VK_RO_IMG_CODEC_ZSTD, None)
+        }
+        None => {
+            let received = receive_chunk(client, image, &layer, len, pool).await?;
+            fetched.fetch_add(1, Ordering::Relaxed);
+            let codec = stored_codec(&layer, &received);
+            // Reuse the bytes verified against the raw digest, including any decoded frame.
+            let (blob, compressed) = if layer.media_type == CHUNK_MEDIA_TYPE {
+                (received.wire.clone(), true)
+            } else {
+                (received.canonical, false)
+            };
+            (blob, compressed, Some((codec, received.wire)))
+        }
+    };
+    let (pool, out, cache, ext4) = (
+        Arc::clone(pool),
+        Arc::clone(out),
+        cache.to_path_buf(),
+        ext4.to_path_buf(),
+    );
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        if let Some((codec, wire)) = keep {
+            publish_chunk(&cache, &hex, codec, &wire)?;
+        }
+        pool.place(&layer, &blob, compressed, total_size, |offset, raw| {
+            write_chunk_sparse(&out, offset, raw)
+                .with_context(|| format!("writing a chunk into {}", ext4.display()))
+        })
+    })
+    .await
+    .context("a chunk-reassembly worker panicked")?
 }
 
 /// The most a bundle's config blob may be: a few hundred bytes of JSON in practice.
@@ -5006,6 +5108,7 @@ pub(crate) mod tests {
         /// Raw query string.
         query: String,
         authorization: Option<String>,
+        accept_encoding: Option<String>,
         body: Vec<u8>,
     }
 
@@ -5019,6 +5122,11 @@ pub(crate) mod tests {
 
     impl FakeServer {
         fn start(responses: Vec<String>) -> Self {
+            Self::start_raw(responses.into_iter().map(String::into_bytes).collect())
+        }
+
+        /// [`FakeServer::start`] with responses that need not be text.
+        fn start_raw(responses: Vec<Vec<u8>>) -> Self {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -5034,7 +5142,7 @@ pub(crate) mod tests {
                     recorder.lock().unwrap().push(request);
                     // Best-effort: the client may disconnect after a parse error.
                     let mut stream = stream;
-                    let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+                    let _ = std::io::Write::write_all(&mut stream, &response);
                     let _ = std::io::Write::flush(&mut stream);
                 }
             });
@@ -5072,7 +5180,7 @@ pub(crate) mod tests {
             Some((p, q)) => (p.to_string(), q.to_string()),
             None => (target, String::new()),
         };
-        let (mut length, mut authorization) = (0, None);
+        let (mut length, mut authorization, mut accept_encoding) = (0, None, None);
         loop {
             let mut h = String::new();
             if reader.read_line(&mut h).ok()? == 0 || h.trim().is_empty() {
@@ -5083,6 +5191,8 @@ pub(crate) mod tests {
                     length = value.trim().parse().ok()?;
                 } else if name.eq_ignore_ascii_case("authorization") {
                     authorization = Some(value.trim().to_string());
+                } else if name.eq_ignore_ascii_case("accept-encoding") {
+                    accept_encoding = Some(value.trim().to_string());
                 }
             }
         }
@@ -5093,6 +5203,7 @@ pub(crate) mod tests {
             path,
             query,
             authorization,
+            accept_encoding,
             body,
         })
     }
@@ -5970,6 +6081,254 @@ pub(crate) mod tests {
         let seen = server.seen();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].path, seen[1].path);
+    }
+
+    /// A 200 carrying `body`, after `headers` (each ending in CRLF).
+    fn blob_reply(headers: &str, body: &[u8]) -> Vec<u8> {
+        let mut reply = format!(
+            "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        reply.extend_from_slice(body);
+        reply
+    }
+
+    const ZSTD_BODY: &str = "Content-Encoding: zstd\r\n";
+
+    /// A raw-digest chunk descriptor for `raw`, `len` bytes long by its annotation.
+    fn raw_chunk(raw: &[u8], len: usize) -> OciDescriptor {
+        chunk_descriptor(
+            CHUNK_MEDIA_TYPE_RAW,
+            &sha256_hex(raw),
+            raw.len() as i64,
+            0,
+            len as u64,
+        )
+    }
+
+    /// Cache codec, verified bytes, and whether the wire bytes encode a raw-digest chunk.
+    type Kept = (u8, bytes::Bytes, bool);
+
+    /// Download `layer` from a fake registry answering `replies`, then keep it in a cache.
+    /// Returns what arrived (or why not), the registry's requests, the pool's decodes and
+    /// the cache directory.
+    fn fetch_from(
+        replies: Vec<Vec<u8>>,
+        layer: &OciDescriptor,
+        tag: &str,
+    ) -> (Result<Kept>, Vec<Seen>, u64, PathBuf) {
+        install_crypto();
+        let server = FakeServer::start_raw(replies);
+        let rg = fake_registry(&server);
+        let (client, _auth) = client(&rg).unwrap();
+        let image = make_ref(&rg, "repo", "tag").unwrap();
+        let pool = Arc::new(ChunkPool::default());
+        let cache = retry_tmpdir(tag);
+        let (_, len) = chunk_placement(layer).unwrap();
+        let got = block_on(async {
+            let received = receive_chunk(&client, &image, layer, len, &pool).await?;
+            let codec = stored_codec(layer, &received);
+            let hex = image::digest_hex(&layer.digest)?;
+            publish_chunk(&cache, hex, codec, &received.wire)?;
+            anyhow::Ok((codec, received.canonical, received.zstd))
+        });
+        (got, server.seen(), pool.decodes(), cache)
+    }
+
+    /// A raw-digest GET offers zstd and verifies the raw bytes. Cache only the frame if the
+    /// registry honors the offer, or only the raw bytes if it sends them unencoded.
+    #[test]
+    fn a_chunk_is_kept_as_received_and_verified_on_its_bytes() {
+        let raw = compressible(70_000, 7);
+        let frame = zstd_with_size(&raw).unwrap();
+        let layer = raw_chunk(&raw, raw.len());
+        let hex = &layer.digest[7..];
+
+        let (got, seen, decodes, cache) =
+            fetch_from(vec![blob_reply(ZSTD_BODY, &frame)], &layer, "chunk-zstd");
+        let (codec, canonical, zstd) = got.unwrap();
+        assert_eq!((codec, zstd, decodes), (VK_RO_IMG_CODEC_ZSTD, true, 1));
+        assert!(canonical == raw);
+        assert_eq!(seen[0].accept_encoding.as_deref(), Some("zstd"));
+        let kept = std::fs::read(chunk_codec_dir(&cache, VK_RO_IMG_CODEC_ZSTD).join(hex));
+        assert!(kept.unwrap() == frame);
+        assert!(!chunk_codec_dir(&cache, VK_RO_IMG_CODEC_RAW).exists());
+        std::fs::remove_dir_all(cache).unwrap();
+
+        let (got, seen, decodes, cache) =
+            fetch_from(vec![blob_reply("", &raw)], &layer, "chunk-identity");
+        let (codec, canonical, zstd) = got.unwrap();
+        assert_eq!((codec, zstd, decodes), (VK_RO_IMG_CODEC_RAW, false, 0));
+        assert!(canonical == raw);
+        assert_eq!(seen[0].accept_encoding.as_deref(), Some("zstd"));
+        let kept = std::fs::read(chunk_codec_dir(&cache, VK_RO_IMG_CODEC_RAW).join(hex));
+        assert!(kept.unwrap() == raw);
+        std::fs::remove_dir_all(cache).unwrap();
+
+        // A frame digest names the inner frame. Decode only an outer zstd encoding.
+        let size = frame.len() as i64;
+        let layer = chunk_descriptor(CHUNK_MEDIA_TYPE, &sha256_hex(&frame), size, 0, 70_000);
+        let hex = &layer.digest[7..];
+        let again = zstd_with_size(&frame).unwrap();
+        for (reply, decoded) in [
+            (blob_reply("", &frame), 0),
+            (blob_reply(ZSTD_BODY, &again), 1),
+        ] {
+            let (got, seen, decodes, cache) = fetch_from(vec![reply], &layer, "chunk-frame");
+            let (codec, canonical, zstd) = got.unwrap();
+            assert_eq!(
+                (codec, zstd, decodes),
+                (VK_RO_IMG_CODEC_ZSTD, false, decoded)
+            );
+            assert!(canonical == frame);
+            assert_eq!(seen[0].accept_encoding.as_deref(), Some("zstd"));
+            let kept = std::fs::read(chunk_codec_dir(&cache, VK_RO_IMG_CODEC_ZSTD).join(hex));
+            assert!(kept.unwrap() == frame);
+            std::fs::remove_dir_all(cache).unwrap();
+        }
+    }
+
+    /// Reject wrong bytes at the right length, a conflicting frame length before decode,
+    /// unsupported or stacked encodings, partial responses, and bodies over their size cap.
+    /// Retry a truncated transfer.
+    #[test]
+    fn a_chunk_download_refuses_what_it_cannot_verify() {
+        let raw = compressible(70_000, 8);
+        let frame = zstd_with_size(&raw).unwrap();
+        let layer = raw_chunk(&raw, raw.len());
+        let mut other = raw.clone();
+        other[100] ^= 1;
+        let partial = |body: &[u8]| {
+            let mut reply = blob_reply("", body);
+            reply[9..15].copy_from_slice(b"206 OK");
+            reply
+        };
+        let longer = raw_chunk(&raw, raw.len() + 1);
+        let huge = vec![0u8; MAX_CHUNK_BLOB as usize + 1];
+        let cases: [(&str, &OciDescriptor, Vec<u8>, &str, u64); 7] = [
+            (
+                "other bytes",
+                &layer,
+                blob_reply(ZSTD_BODY, &zstd_with_size(&other).unwrap()),
+                "digest",
+                1,
+            ),
+            (
+                "declared length",
+                &longer,
+                blob_reply(ZSTD_BODY, &frame),
+                "declares 70000 bytes, not 70001",
+                0,
+            ),
+            (
+                "gzip",
+                &layer,
+                blob_reply("Content-Encoding: gzip\r\n", &raw),
+                "unsupported Content-Encoding",
+                0,
+            ),
+            (
+                "stacked encodings",
+                &layer,
+                blob_reply(&format!("{ZSTD_BODY}Content-Encoding: gzip\r\n"), &frame),
+                "unsupported Content-Encoding",
+                0,
+            ),
+            ("partial", &layer, partial(&raw), "206", 0),
+            (
+                "longer",
+                &layer,
+                blob_reply("", &[&raw[..], b"x"].concat()),
+                "over 70000 bytes",
+                0,
+            ),
+            (
+                "huge",
+                &layer,
+                blob_reply(ZSTD_BODY, &huge),
+                "over 33554432 bytes",
+                0,
+            ),
+        ];
+        for (what, layer, reply, says, decoded) in cases {
+            let (got, seen, decodes, _) = fetch_from(vec![reply], layer, "chunk-refused");
+            let err = format!("{:#}", got.err().unwrap());
+            assert!(err.contains(says), "{what}: {err}");
+            assert_eq!((seen.len(), decodes), (1, decoded), "{what}");
+        }
+
+        let mut cut = blob_reply(ZSTD_BODY, &frame);
+        cut.truncate(cut.len() - frame.len() / 2);
+        let (got, seen, decodes, cache) = fetch_from(
+            vec![cut, blob_reply(ZSTD_BODY, &frame)],
+            &layer,
+            "chunk-cut",
+        );
+        assert!(got.unwrap().1 == raw);
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen.iter()
+                .all(|r| r.accept_encoding.as_deref() == Some("zstd"))
+        );
+        assert_eq!(decodes, 1, "the cut body is not decoded");
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    /// Behind a token challenge, the chunk GET carries the token and the offer; the token
+    /// request carries neither. An alternate URL the descriptor names gets the offer but no
+    /// registry credential.
+    #[test]
+    fn a_chunk_download_negotiates_behind_a_token_and_at_an_alternate_url() {
+        install_crypto();
+        let raw = compressible(70_000, 9);
+        let frame = zstd_with_size(&raw).unwrap();
+        let alternate = FakeServer::start_raw(vec![blob_reply(ZSTD_BODY, &frame)]);
+        let mut layer = raw_chunk(&raw, raw.len());
+        layer.urls = Some(vec![format!(
+            "http://{}/mirror/chunk",
+            alternate.authority()
+        )]);
+        let token =
+            FakeServer::start_raw(vec![FakeServer::reply(200, r#"{"token":"tok"}"#).into()]);
+        let registry = FakeServer::start_raw(vec![
+            format!(
+                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"http://{}/token\",\
+                 service=\"vk\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                token.authority()
+            )
+            .into_bytes(),
+            FakeServer::reply(404, r#"{"errors":[{"code":"BLOB_UNKNOWN","message":""}]}"#)
+                .into_bytes(),
+        ]);
+        let rg = fake_registry(&registry);
+        let (client, auth) = client(&rg).unwrap();
+        let image = make_ref(&rg, "repo", "tag").unwrap();
+        let pool = Arc::new(ChunkPool::default());
+        let received = block_on(async {
+            authenticate(&client, &image, &auth, &[RegistryOperation::Pull]).await?;
+            receive_chunk(&client, &image, &layer, raw.len() as u64, &pool).await
+        })
+        .unwrap();
+        assert!(received.zstd && received.wire == frame && received.canonical == raw);
+        let seen = token.seen();
+        assert_eq!(
+            (seen[0].path.as_str(), seen[0].accept_encoding.as_deref()),
+            ("/token", None)
+        );
+        let seen = registry.seen();
+        let paths: Vec<_> = seen.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["/v2/", &format!("/v2/repo/repo/blobs/{}", layer.digest)]
+        );
+        assert_eq!(seen[0].accept_encoding, None);
+        assert_eq!(seen[1].accept_encoding.as_deref(), Some("zstd"));
+        assert_eq!(seen[1].authorization.as_deref(), Some("Bearer tok"));
+        let seen = alternate.seen();
+        assert_eq!(seen[0].path, "/mirror/chunk");
+        assert_eq!(seen[0].accept_encoding.as_deref(), Some("zstd"));
+        assert_eq!(seen[0].authorization, None);
     }
 
     /// Supplies zeros before the injected read error. A retry panics so the test cannot spin.
@@ -6856,7 +7215,14 @@ pub(crate) mod tests {
         let image = make_digest_ref(&remote, "legacy", &digest).unwrap();
         let dest = dir.join("pulled");
         let err = block_on(pull_into(
-            &client, &auth, &image, "legacy", &digest, &dest, "legacy",
+            &client,
+            &auth,
+            &image,
+            "legacy",
+            &digest,
+            &dest,
+            "legacy",
+            &Arc::default(),
         ))
         .unwrap_err();
         assert!(err.to_string().contains("unsupported boot.kind"), "{err:#}");
@@ -7002,7 +7368,14 @@ pub(crate) mod tests {
             let dest = img.join(&digest[7..]);
             refused(
                 block_on(pull_into(
-                    &client, &auth, &image, "img", &digest, &dest, "img",
+                    &client,
+                    &auth,
+                    &image,
+                    "img",
+                    &digest,
+                    &dest,
+                    "img",
+                    &Arc::default(),
                 ))
                 .unwrap_err(),
             );
@@ -7028,7 +7401,14 @@ pub(crate) mod tests {
         let image = make_digest_ref(&remote, "img", &digest).unwrap();
         let dest = img.join(&digest[7..]);
         block_on(pull_into(
-            &client, &auth, &image, "img", &digest, &dest, "img",
+            &client,
+            &auth,
+            &image,
+            "img",
+            &digest,
+            &dest,
+            "img",
+            &Arc::default(),
         ))
         .unwrap();
         assert_eq!(std::fs::read(dest.join("runner.ext4")).unwrap(), secret);
@@ -7146,17 +7526,19 @@ pub(crate) mod tests {
     }
 
     /// Lazy and eager HTTP restores share downloads in either order for both digest formats.
-    /// Each chunk lands under its received codec. Legacy flat entries supply the same chunks
-    /// through hard links and still serve their original view.
+    /// The cache preserves each chunk byte for byte from blobs/zstd or blobs/sha256 in the
+    /// registry. Eager restores decode each stored frame once. Cold lazy restores decode only
+    /// frames named by their raw digest. Warm lazy restores read no chunk files. Legacy flat
+    /// entries supply the same chunks through hard links and still serve their original view.
     #[test]
     fn restores_share_one_chunk_cache_with_older_vk() {
         use std::os::unix::fs::MetadataExt;
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = retry_tmpdir("chunk-cache");
         std::fs::create_dir_all(&dir).unwrap();
-        // Half incompressible, half runs: chunks the registry stores either way.
+        // Incompressible, then runs: chunks the registry stores either way.
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-        let mut data: Vec<u8> = (0..3 << 20)
+        let mut data: Vec<u8> = (0..10 << 20)
             .map(|_| {
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
@@ -7164,13 +7546,13 @@ pub(crate) mod tests {
                 seed as u8
             })
             .collect();
-        data.extend((0..3u32 << 20).map(|i| (i / 4096) as u8));
+        data.extend((0..6u32 << 20).map(|i| (i / 4096) as u8));
         let ext4 = dir.join("runner.ext4");
         std::fs::write(&ext4, &data).unwrap();
 
         for transparent in [true, false] {
             let root = dir.join(format!("store-{transparent}"));
-            let store = Arc::new(vk_registry::Store::new(root).unwrap());
+            let store = Arc::new(vk_registry::Store::new(root.clone()).unwrap());
             let url = serve_store(store.clone(), vk_registry::auth::Auth::None);
             let share = |url| {
                 Registry::for_share(
@@ -7184,7 +7566,14 @@ pub(crate) mod tests {
                 )
             };
             // Push directly because the recording proxy only forwards requests without bodies.
-            push_ext4(&share(url.clone()), "img", "t", &ext4, "generic-disk").unwrap();
+            // A transparent push uploads frames, which the registry keeps whatever their size;
+            // the store itself keeps an incompressible chunk raw.
+            let pusher = if transparent {
+                local_registry(&root)
+            } else {
+                share(url.clone())
+            };
+            push_ext4(&pusher, "img", "t", &ext4, "generic-disk").unwrap();
             let (proxy, requests) = recording_proxy(url);
             let rg = share(proxy);
             let bundle = fetch_bundle(&rg, "img", "t").unwrap().unwrap();
@@ -7195,7 +7584,26 @@ pub(crate) mod tests {
             };
             assert!(bundle.chunks.iter().all(|c| c.media_type == media));
             let hexes: Vec<&str> = bundle.chunks.iter().map(|c| &c.digest[7..]).collect();
-            let codec = received_codec(&bundle.chunks[0]);
+            // Each chunk as the registry stores it, and the cache directory it belongs in.
+            let stored: Vec<(u8, Vec<u8>)> = hexes
+                .iter()
+                .map(|h| match std::fs::read(root.join("blobs/zstd").join(h)) {
+                    Ok(frame) => (VK_RO_IMG_CODEC_ZSTD, frame),
+                    Err(_) => {
+                        let blob = std::fs::read(root.join("blobs/sha256").join(h)).unwrap();
+                        (received_codec(&bundle.chunks[0]), blob)
+                    }
+                })
+                .collect();
+            let frames = stored
+                .iter()
+                .filter(|(codec, _)| *codec == VK_RO_IMG_CODEC_ZSTD)
+                .count() as u64;
+            if transparent {
+                assert!(0 < frames && frames < hexes.len() as u64, "{frames}");
+            } else {
+                assert_eq!(frames, hexes.len() as u64);
+            }
             // The chunk downloads since the last call.
             let chunk_gets = || {
                 let mut log = requests.lock().unwrap();
@@ -7206,44 +7614,66 @@ pub(crate) mod tests {
                 log.clear();
                 n
             };
-            // A restore into `state/img/`, whose chunk cache is `state/chunks`.
+            // Count decodes and chunk reads for a restore into `state/img/` using `state/chunks`.
             let restore = |state: &Path, lazy: bool| {
                 let img = state.join("img");
                 std::fs::create_dir_all(&img).unwrap();
                 let out = img.join("restored.raw");
+                let pool = Arc::new(ChunkPool::default());
                 if lazy {
                     let view = img.join("view.vk_ro_img");
-                    try_pull_ext4_lazy(&rg, "img", "t", &view, "img", None, None)
-                        .unwrap()
-                        .unwrap();
+                    block_on(try_pull_ext4_lazy_async(
+                        &rg, "img", "t", &view, "img", None, &pool,
+                    ))
+                    .unwrap()
+                    .unwrap();
                     crate::qcow2::materialize_to_raw(&view, &out).unwrap();
                 } else {
-                    try_pull_ext4(&rg, "img", "t", &out, "img")
+                    block_on(try_pull_ext4_async(&rg, "img", "t", &out, "img", &pool))
                         .unwrap()
                         .unwrap();
                 }
                 assert!(std::fs::read(&out).unwrap() == data, "lazy: {lazy}");
+                (pool.decodes(), pool.reads())
             };
+            let n = hexes.len() as u64;
 
             for lazy_first in [true, false] {
                 let state = dir.join(format!("state-{transparent}-{lazy_first}"));
                 chunk_gets();
-                restore(&state, lazy_first);
+                let cold = restore(&state, lazy_first);
                 assert_eq!(chunk_gets(), hexes.len());
-                restore(&state, !lazy_first);
+                let warm = restore(&state, !lazy_first);
                 assert_eq!(
                     chunk_gets(),
                     0,
                     "the second restore reads the first's cache"
                 );
+                let (lazy, eager) = if lazy_first {
+                    (cold, warm)
+                } else {
+                    (warm, cold)
+                };
+                // A cold lazy restore decodes a frame only to verify it.
+                let lazy_decodes = if lazy_first && transparent { frames } else { 0 };
+                assert_eq!(lazy, (lazy_decodes, 0), "lazy, first: {lazy_first}");
+                let eager_reads = if lazy_first { n } else { 0 };
+                assert_eq!(eager, (frames, eager_reads), "eager, first: {lazy_first}");
                 let cache = state.join("chunks");
-                for h in &hexes {
-                    assert!(chunk_codec_dir(&cache, codec).join(h).is_file());
+                for (h, (codec, blob)) in hexes.iter().zip(&stored) {
+                    let kept = std::fs::read(chunk_codec_dir(&cache, *codec).join(h)).unwrap();
+                    assert!(kept == *blob, "kept as the registry stores it");
                     assert!(!cache.join(h).exists());
+                    if *codec == VK_RO_IMG_CODEC_ZSTD {
+                        let raw = chunk_codec_dir(&cache, VK_RO_IMG_CODEC_RAW).join(h);
+                        assert!(!raw.exists(), "a frame is never kept decoded");
+                    }
                 }
             }
 
-            // Recreate an older flat view and its top-level chunks as received.
+            // Recreate an older flat view and its top-level chunks as an older vk received
+            // them: decoded unless the digest names the frame.
+            let codec = received_codec(&bundle.chunks[0]);
             let state = dir.join(format!("state-{transparent}-older"));
             let cache = state.join("chunks");
             std::fs::create_dir_all(&cache).unwrap();

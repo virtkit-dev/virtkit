@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Image restores download compressed chunks as the registry stores them and keep them
+  compressed in the local cache.
+
 ### Fixed
 
 - If a `[registry]` or build cache CA file fails PEM parsing or contains no certificates,

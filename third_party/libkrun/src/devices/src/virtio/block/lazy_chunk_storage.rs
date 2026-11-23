@@ -38,7 +38,8 @@
 //!   offset:       u64 LE   // position in the reassembled image
 //!   length:       u32 LE   // decompressed length
 //!   codec:        u8       // 0 = zstd, 1 = raw (stored blob already uncompressed)
-//!   digest:       [u8; 32] // raw sha256 of the *stored* blob; cache filename is its hex form
+//!   digest:       [u8; 32] // raw sha256 naming the chunk (of its stored or its decoded
+//!                          // bytes); cache filename is its hex form
 //! ```
 //!
 //! `layout` picks how a chunk's digest maps to a path under `cache_dir`:

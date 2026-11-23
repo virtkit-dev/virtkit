@@ -286,11 +286,11 @@ Scoping decides what a job can *find*; it need not decide where bytes live. A no
 content once, by digest, and each scope an index of keys to digests:
 
 - **Chunk store.** `<state>/cas/chunks/<hex>`, the stored blob as the registry served it
-  (zstd, or raw for a `transparent_zstd` chunk), its name its verified digest, written by
-  tmp sibling and rename. Every pull from a remote registry goes through it: `pull_into`,
-  `try_pull_ext4` and its lazy form, and `wincache::pull`. The per-entry and per-root chunk
-  directories go. A view names the store by path, so the roots need not share a filesystem
-  with it; temporary files are siblings of where they are published.
+  (a zstd frame or raw bytes), named by its verified descriptor digest. All remote pulls
+  use it, including `pull_into`, eager and lazy `try_pull_ext4`, and `wincache::pull`.
+  It replaces the per-entry and per-root chunk directories. Views use the store's path, so
+  roots can use another filesystem. Temporary files are published by renaming a sibling
+  of the destination.
 - **Canonical digests only.** Every digest from a manifest is parsed once, as
   `sha256:<64 lowercase hex>`, before any lookup, path, lease or view uses it; anything else
   fails the pull, and vk-registry refuses a pushed manifest naming one (0.106.1, step 8).
@@ -345,7 +345,7 @@ content once, by digest, and each scope an index of keys to digests:
     roots holding views (pulled tier, build tier, every Windows root) are registered with
     the store, and a collection that cannot read one stops without removing anything;
   - a chunk is published before any view names it: a failed rename fails the pull, unlike
-    `pull_chunk`'s best-effort publish today;
+    an eager restore's best-effort publish today;
   - the collector takes the lock, computes the live set, and removes the rest.
 
   Entries go by idle time as now; chunks then go when nothing names them. `vk gc --dry-run`
