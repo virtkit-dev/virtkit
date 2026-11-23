@@ -588,7 +588,7 @@ impl Store {
     }
     /// Locate a blob by digest hex: `(path, stored_as_zstd)`. Checks the zstd store
     /// then the identity store.
-    fn find_blob(&self, hex: &str) -> Option<(PathBuf, bool)> {
+    pub fn find_blob(&self, hex: &str) -> Option<(PathBuf, bool)> {
         // The public readers (`get_blob`, `has_blob`) take a hex their caller may have read
         // out of a manifest: anything else is no blob, rather than a path to follow.
         if !is_blob_hex(hex) {

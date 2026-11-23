@@ -43,12 +43,18 @@ use crate::image::{self, Reference, ResolvedImage};
 // The content-addressed store lives in the standalone vk-registry crate; the client
 // uses the store's zstd pools, transparent-zstd capability header and sized encoder.
 // Repeated pushes of the same chunk need identical frame bytes to deduplicate.
-use vk_registry::{TRANSPARENT_ZSTD_HEADER, zstd_chunk_frame, zstd_reader, zstd_with_size};
+use vk_registry::{TRANSPARENT_ZSTD_HEADER, zstd_chunk_frame, zstd_with_size};
 
 // CDC parameters for runner.ext4 (FastCDC v2020): min 1 MiB, avg 4 MiB, max 16 MiB.
 const CDC_MIN: usize = 1 << 20;
 const CDC_AVG: usize = 4 << 20;
 pub(crate) const CDC_MAX: usize = 16 << 20;
+
+mod chunks;
+use chunks::ChunkPool;
+
+/// Maximum number of in-flight chunk operations per registry restore.
+const RESTORE_CONCURRENCY: usize = 16;
 
 // Media types for the bundle artifact.
 const ARTIFACT_TYPE: &str = "application/vnd.wallix.microvm.bundle";
@@ -803,7 +809,6 @@ async fn try_pull_ext4_lazy_async(
 
     use futures::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    const RESTORE_CONCURRENCY: usize = 16;
     let fetched = AtomicUsize::new(0);
     let reused = AtomicUsize::new(0);
     let results: Vec<Result<LazyChunk>> = futures::stream::iter(chunk_layers)
@@ -2207,7 +2212,6 @@ async fn pull_into(
     // Decode cached zstd frames and write raw chunks directly. Kernel and initrd follow below.
     use futures::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    const RESTORE_CONCURRENCY: usize = 16;
     let chunk_layers: Vec<OciDescriptor> = manifest
         .layers
         .iter()
@@ -2233,23 +2237,23 @@ async fn pull_into(
         .context("writing the chunk manifest")?;
     let chunks_cache = chunks_cache_dir(dir);
     let out = std::sync::Arc::new(out);
-    let buffers = std::sync::Arc::new(ChunkBuffers::default());
+    let pool = Arc::new(ChunkPool::default());
     let fetched = AtomicUsize::new(0);
     let reused = AtomicUsize::new(0);
     let results: Vec<Result<()>> = futures::stream::iter(chunk_layers)
         .map(|layer| {
             let out = std::sync::Arc::clone(&out);
-            let buffers = std::sync::Arc::clone(&buffers);
+            let pool = Arc::clone(&pool);
             let ext4 = ext4.clone();
             let (fetched, reused, chunks_cache) = (&fetched, &reused, &chunks_cache);
             async move {
-                // Refused before it is fetched or cached; `chunk_bytes` holds it to this.
+                // Refused before it is fetched or cached; the placement holds it to this.
                 chunk_bounds(&layer, total_size)?;
                 let (bytes, codec) =
                     pull_chunk(client, image, &layer, chunks_cache, fetched, reused).await?;
                 let compressed = codec == VK_RO_IMG_CODEC_ZSTD;
                 tokio::task::spawn_blocking(move || -> Result<()> {
-                    buffers.with_chunk(&layer, &bytes, compressed, total_size, |offset, raw| {
+                    pool.place(&layer, &bytes, compressed, total_size, |offset, raw| {
                         write_chunk_sparse(&out, offset, raw)
                             .with_context(|| format!("writing a chunk into {}", ext4.display()))
                     })
@@ -2265,7 +2269,7 @@ async fn pull_into(
         r?;
     }
     drop(out);
-    drop(buffers);
+    drop(pool);
     let (fetched, reused) = (
         fetched.load(Ordering::Relaxed),
         reused.load(Ordering::Relaxed),
@@ -2622,73 +2626,6 @@ fn sort_lazy_chunks(chunks: &mut [LazyChunk]) -> Result<()> {
         bail!("chunks at {} and {} overlap", w[0].offset, w[1].offset);
     }
     Ok(())
-}
-
-/// Workers reuse decompression buffers within one image reassembly. The pool retains at most
-/// one buffer per concurrent worker, each capped at [`CDC_MAX`] plus one byte to detect an
-/// overlong frame.
-#[derive(Default)]
-struct ChunkBuffers(std::sync::Mutex<Vec<Vec<u8>>>);
-
-impl ChunkBuffers {
-    /// Pass the image offset and raw bytes validated by [`chunk_bytes`] to `place`.
-    fn with_chunk<T>(
-        &self,
-        layer: &OciDescriptor,
-        blob: &[u8],
-        compressed: bool,
-        total_size: u64,
-        place: impl FnOnce(u64, &[u8]) -> Result<T>,
-    ) -> Result<T> {
-        let mut decoded = if compressed {
-            self.0.lock().unwrap().pop().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let placed = chunk_bytes(layer, blob, compressed, total_size, &mut decoded)
-            .and_then(|(offset, raw)| place(offset, raw));
-        // Raw chunks and early validation failures can leave capacity at zero. Discard any
-        // allocation above the read limit.
-        if (1..=CDC_MAX + 1).contains(&decoded.capacity()) {
-            self.0.lock().unwrap().push(decoded);
-        }
-        placed
-    }
-}
-
-/// A chunk's offset in the image and its raw bytes, held to what its descriptor claims:
-/// exactly its annotated length — at most [`CDC_MAX`] — once decompressed, and placed inside
-/// the `total_size` image. The registry writes both the descriptor and the blob, so a frame
-/// that decompresses past its length is cut off a byte past it rather than inflated in memory.
-/// Compressed chunks overwrite `decoded`. Raw chunks borrow `blob` and leave `decoded`
-/// untouched.
-fn chunk_bytes<'a>(
-    layer: &OciDescriptor,
-    blob: &'a [u8],
-    compressed: bool,
-    total_size: u64,
-    decoded: &'a mut Vec<u8>,
-) -> Result<(u64, &'a [u8])> {
-    let (offset, len) = chunk_bounds(layer, total_size)?;
-    let raw = if compressed {
-        decoded.clear();
-        // Reserve the extra byte so detecting an overlong frame needs no reallocation.
-        decoded.reserve_exact(len as usize + 1);
-        zstd_reader(blob)
-            .and_then(|d| d.take(len + 1).read_to_end(decoded))
-            .with_context(|| format!("zstd-decompressing chunk {}", layer.digest))?;
-        &decoded[..]
-    } else {
-        blob
-    };
-    if raw.len() as u64 != len {
-        bail!(
-            "chunk {} holds {} bytes, not the {len} it claims",
-            layer.digest,
-            raw.len()
-        );
-    }
-    Ok((offset, raw))
 }
 
 /// How a failed registry request is retried; see [`with_transfer_retry`].
@@ -4150,26 +4087,49 @@ mod local {
             .with_context(|| format!("creating {}", tmp.display()))?;
         out.set_len(config.total_size)
             .with_context(|| format!("sizing {}", tmp.display()))?;
-        let buffers = ChunkBuffers::default();
+        let pool = Arc::new(ChunkPool::default());
         reassemble_parallel(&manifest.layers, |layer| {
             // self-describing via media type: a raw-digest chunk's canonical bytes ARE
             // the data; a compressed-digest chunk's canonical bytes are a zstd frame.
-            let compressed = match layer.media_type.as_str() {
+            let frame_digest = match layer.media_type.as_str() {
                 CHUNK_MEDIA_TYPE => true,
                 CHUNK_MEDIA_TYPE_RAW => false,
                 _ => return Ok(()),
             };
             let hex = image::digest_hex(&layer.digest)?;
-            let bytes = store.get_blob(hex)?.with_context(|| {
+            let missing = || {
                 format!(
                     "cached chunk {} missing from {}",
                     layer.digest,
                     root.display()
                 )
+            };
+            // The store can wrap either chunk type in a zstd frame.
+            let (path, stored_zstd) = store.find_blob(hex).with_context(missing)?;
+            let stored = chunks::read_file(&pool, &path).with_context(|| {
+                format!(
+                    "reading cached chunk {} from {}",
+                    layer.digest,
+                    root.display()
+                )
             })?;
-            buffers.with_chunk(
+            let (blob, compressed) = match (stored_zstd, frame_digest) {
+                // A raw-digest chunk stored as a frame: one decode gives its bytes.
+                (true, false) => (stored.into_bytes(), true),
+                // A frame the store compressed again: undo the store's encoding first.
+                (true, true) => {
+                    check_blob_size(layer, MAX_CHUNK_BLOB)?;
+                    let mut frame = pool.lend(chunks::Class::Wire);
+                    pool.decode(&stored, layer.size as u64, &mut frame)
+                        .with_context(|| format!("decoding the stored blob {}", layer.digest))?;
+                    drop(stored);
+                    (frame.into_bytes(), true)
+                }
+                (false, _) => (stored.into_bytes(), frame_digest),
+            };
+            pool.place(
                 layer,
-                &bytes,
+                &blob,
                 compressed,
                 config.total_size,
                 |offset, raw| {
@@ -5834,9 +5794,9 @@ pub(crate) mod tests {
         let raw = vec![5u8; 4096];
         let frame = zstd::encode_all(&raw[..], 3).unwrap();
         let desc = |offset, len| chunk_descriptor(CHUNK_MEDIA_TYPE, "sha256:x", 1, offset, len);
-        let buffers = ChunkBuffers::default();
+        let pool = Arc::new(ChunkPool::default());
         let chunk = |layer: &OciDescriptor, blob: &[u8], compressed, total| {
-            buffers.with_chunk(layer, blob, compressed, total, |offset, raw| {
+            pool.place(layer, blob, compressed, total, |offset, raw| {
                 Ok((offset, raw.to_vec()))
             })
         };
@@ -5860,6 +5820,13 @@ pub(crate) mod tests {
             (0, other.clone())
         );
         assert!(chunk(&desc(0, 4095), &raw, false, 1 << 20).is_err());
+        // A frame declaring another length is refused before it is decoded.
+        let sized = zstd_with_size(&raw).unwrap();
+        let err = chunk(&desc(0, 4097), &sized, true, 1 << 20).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("declares 4096 bytes"),
+            "{err:#}"
+        );
         // A rejected frame leaves no bytes in the next decoded chunk.
         let longer = zstd::encode_all(&[7u8; 8192][..], 3).unwrap();
         assert!(chunk(&desc(0, 4096), &longer, true, 1 << 20).is_err());
@@ -5872,16 +5839,13 @@ pub(crate) mod tests {
     /// Successive compressed chunks reuse one buffer capped at `CDC_MAX + 1` bytes. Raw
     /// chunks bypass the pool.
     #[test]
-    fn chunk_buffers_are_reused_within_a_chunks_size() {
+    fn chunk_pool_reuses_buffers_within_a_chunks_size() {
         let desc = |len| chunk_descriptor(CHUNK_MEDIA_TYPE, "sha256:x", 1, 0, len);
-        let buffers = ChunkBuffers::default();
-        let capacities = || -> Vec<usize> {
-            let held = buffers.0.lock().unwrap();
-            held.iter().map(Vec::capacity).collect()
-        };
+        let pool = Arc::new(ChunkPool::default());
+        let capacities = || pool.idle_capacities(chunks::Class::Decoded);
         let total = CDC_MAX as u64;
         let decode = |blob: &[u8], compressed, len: usize| {
-            buffers.with_chunk(&desc(len as u64), blob, compressed, total, |_, raw| {
+            pool.place(&desc(len as u64), blob, compressed, total, |_, raw| {
                 Ok(raw.to_vec())
             })
         };
@@ -6247,7 +6211,7 @@ pub(crate) mod tests {
     #[test]
     fn chunk_decoding_recovers_on_shared_contexts() {
         let desc = |len| chunk_descriptor(CHUNK_MEDIA_TYPE, "sha256:x", 1, 0, len);
-        let buffers = &ChunkBuffers::default();
+        let pool = &Arc::new(ChunkPool::default());
         std::thread::scope(|s| {
             for t in 0..4u64 {
                 s.spawn(move || {
@@ -6259,11 +6223,10 @@ pub(crate) mod tests {
                         let frame = zstd_chunk_frame(&raw).unwrap();
                         let total = CDC_MAX as u64;
                         let decode = |frame: &[u8], len: usize| {
-                            buffers
-                                .with_chunk(&desc(len as u64), frame, true, total, |at, raw| {
-                                    Ok((at, raw.to_vec()))
-                                })
-                                .ok()
+                            pool.place(&desc(len as u64), frame, true, total, |at, raw| {
+                                Ok((at, raw.to_vec()))
+                            })
+                            .ok()
                         };
                         assert_eq!(decode(&frame, len), Some((0, raw.clone())));
                         if len > 300 {
@@ -6281,7 +6244,7 @@ pub(crate) mod tests {
                 });
             }
         });
-        assert!(buffers.0.lock().unwrap().len() <= 4);
+        assert!(pool.idle_capacities(chunks::Class::Decoded).len() <= 4);
     }
 
     /// Retry a disconnected transparent-zstd probe before reporting lack of support.
@@ -7084,6 +7047,52 @@ pub(crate) mod tests {
             std::fs::remove_file(&pulled).unwrap();
             std::fs::remove_file(&view).unwrap();
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A local restore unwraps the store's encoding before decoding a compressed-digest chunk.
+    #[test]
+    fn a_local_restore_undoes_the_stores_encoding_of_a_frame() {
+        let dir = retry_tmpdir("local-frame-again");
+        let root = dir.join("store");
+        let store = vk_registry::Store::new(root.clone()).unwrap();
+        let raw = compressible(70_000, 11);
+        let frame = zstd_chunk_frame(&raw).unwrap();
+        let frame_digest = sha256_hex(&frame);
+        std::fs::write(
+            root.join("blobs/zstd").join(&frame_digest[7..]),
+            zstd_with_size(&frame).unwrap(),
+        )
+        .unwrap();
+        let config = serde_json::to_vec(&BundleConfig {
+            total_size: raw.len() as u64,
+            chunk_count: 1,
+            boot_kind: "generic-disk".to_string(),
+            compression: "zstd".to_string(),
+            has_kernel: false,
+            has_initrd: false,
+            run_config: None,
+            meta: None,
+        })
+        .unwrap();
+        let config_digest = store.put_blob(&config).unwrap();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_MEDIA_TYPE,
+            "config": {"mediaType": CONFIG_MEDIA_TYPE, "digest": config_digest, "size": config.len()},
+            "layers": [{
+                "mediaType": CHUNK_MEDIA_TYPE,
+                "digest": frame_digest,
+                "size": frame.len(),
+                "annotations": {ANN_OFFSET: "0", ANN_LENGTH: raw.len().to_string()},
+            }],
+        });
+        plant_manifest(&root, "img", "t", &serde_json::to_vec(&manifest).unwrap());
+        let out = dir.join("out.raw");
+        try_pull_ext4(&local_registry(&root), "img", "t", &out, "img")
+            .unwrap()
+            .unwrap();
+        assert!(std::fs::read(&out).unwrap() == raw);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
