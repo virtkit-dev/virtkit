@@ -800,14 +800,14 @@ where
     }
 }
 
-fn said_of(refusal: &Refusal) -> String {
+fn said_of(refusal: &Refusal, idle: Duration) -> String {
     match refusal {
         Refusal::TooLarge => "Refused: the upload is longer than it said.".to_string(),
         Refusal::Slow => format!(
             "Refused: the upload was too slow. It must arrive at {}/s or faster, and never \
              pause for {}.",
             pages::bytes(super::operations::MIN_RATE),
-            crate::human_duration(super::operations::UPLOAD_IDLE)
+            crate::human_duration(idle)
         ),
         Refusal::Malformed(why) => format!("Refused: this upload does not match the form: {why}."),
         Refusal::Broken => "The upload broke off.".to_string(),
@@ -970,7 +970,7 @@ where
 /// `POST /media/upload`: a medium streamed on to the registry, answered with its page once it
 /// is recorded, or a page saying why not.
 pub(super) async fn upload(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
-    use super::operations::{MIN_RATE, UPLOAD_GRACE, UPLOAD_IDLE, status_of};
+    use super::operations::{MIN_RATE, UPLOAD_GRACE, status_of};
     let refuse = |status: StatusCode, text: &str| Ok(actions::refused(false, status, text));
     let started = tokio::time::Instant::now();
     // Kept to check the session again once the file is in: an upload can outlast it.
@@ -1001,11 +1001,11 @@ pub(super) async fn upload(req: Request<Incoming>, ui: &Ui) -> Result<Response<B
         &boundary,
         length,
         started + UPLOAD_GRACE + Duration::from_secs(FORM_OVERHEAD / MIN_RATE),
-        UPLOAD_IDLE,
+        ui.upload_idle,
     );
     let (fields, filename) = match read_fields(&mut form).await {
         Ok(read) => read,
-        Err(refusal) => return refuse(status_of(&refusal), &said_of(&refusal)),
+        Err(refusal) => return refuse(status_of(&refusal), &said_of(&refusal, ui.upload_idle)),
     };
     let get = |k: &str| super::field(&fields, k).map(str::to_string);
     if !super::csrf_ok(get("_csrf").or(header_token), &auth) {
@@ -1088,7 +1088,7 @@ pub(super) async fn upload(req: Request<Incoming>, ui: &Ui) -> Result<Response<B
     // What the label tells goes into the annotations, as from the CLI.
     let head = match Head::read(&mut form).await {
         Ok(head) => head,
-        Err(refusal) => return refuse(status_of(&refusal), &said_of(&refusal)),
+        Err(refusal) => return refuse(status_of(&refusal), &said_of(&refusal, ui.upload_idle)),
     };
     if let Some(label) = head.volume_label() {
         request.edit = crate::media::guessed(&request.edit, crate::media::from_label(&label));
@@ -1106,7 +1106,9 @@ pub(super) async fn upload(req: Request<Incoming>, ui: &Ui) -> Result<Response<B
     .await
     {
         Ok(sent) => sent,
-        Err(Failed::Browser(refusal)) => return refuse(status_of(&refusal), &said_of(&refusal)),
+        Err(Failed::Browser(refusal)) => {
+            return refuse(status_of(&refusal), &said_of(&refusal, ui.upload_idle));
+        }
         Err(Failed::Registry(e)) => return Ok(not_sent(&e)),
     };
     // The session may have ended, or lost its role, while the file arrived.

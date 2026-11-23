@@ -149,6 +149,8 @@ pub struct Ui {
     /// Sign-in through an OIDC provider, besides the links; shared with the hub's update, which
     /// hands its sign-ins under way over.
     oidc: Option<Arc<OidcSignIn>>,
+    /// The longest an upload may go without a byte arriving.
+    upload_idle: Duration,
 }
 
 /// What the pages show.
@@ -186,7 +188,15 @@ impl Ui {
             streams: sse::Streams::new(),
             site,
             oidc: None,
+            upload_idle: operations::UPLOAD_IDLE,
         }
+    }
+
+    /// The UI, cutting off an upload that goes `idle` without a byte arriving.
+    #[cfg(test)]
+    pub(crate) fn with_upload_idle(mut self, idle: Duration) -> Self {
+        self.upload_idle = idle;
+        self
     }
 
     /// The UI, also signing people in through `oidc`.

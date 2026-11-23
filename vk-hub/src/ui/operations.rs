@@ -58,11 +58,8 @@ pub(super) const MIN_RATE: u64 = 256 * 1024;
 /// What an upload has on top of its length at [`MIN_RATE`]: a slow start, a TLS handshake.
 pub(super) const UPLOAD_GRACE: Duration = Duration::from_secs(60);
 
-/// The longest an upload may go without a byte arriving.
-#[cfg(not(test))]
+/// The longest an upload may go without a byte arriving: [`Ui`](super::Ui)'s default.
 pub(super) const UPLOAD_IDLE: Duration = Duration::from_secs(30);
-#[cfg(test)]
-pub(super) const UPLOAD_IDLE: Duration = Duration::from_secs(1);
 
 /// The longest a field of the upload form may be: a signature, base64.
 const MAX_FIELD: usize = 4096;
@@ -126,11 +123,11 @@ pub(super) async fn upload(
     let deadline =
         tokio::time::Instant::now() + UPLOAD_GRACE + Duration::from_secs(length / MIN_RATE);
     let stream = http_body_util::BodyExt::into_data_stream(req.into_body());
-    let mut form = Multipart::new(stream, &boundary, length, deadline, UPLOAD_IDLE);
+    let mut form = Multipart::new(stream, &boundary, length, deadline, ui.upload_idle);
 
     let fields = match read_fields(&mut form).await {
         Ok(fields) => fields,
-        Err(refusal) => return refuse(status_of(&refusal), &said_of(&refusal)),
+        Err(refusal) => return refuse(status_of(&refusal), &said_of(&refusal, ui.upload_idle)),
     };
     if !super::csrf_ok(fields.csrf.or(header_token), &auth) {
         return refuse(StatusCode::FORBIDDEN, super::CSRF_REFUSED);
@@ -170,9 +167,9 @@ pub(super) async fn upload(
                 // What is left is at most the form's overhead: read, so the browser, still
                 // sending, hears why rather than a reset.
                 let rest = async { while let Ok(Some(_)) = form.next_part().await {} };
-                let _ = tokio::time::timeout(UPLOAD_IDLE, rest).await;
+                let _ = tokio::time::timeout(ui.upload_idle, rest).await;
             }
-            return refuse(status_of(&refusal), &said_of(&refusal));
+            return refuse(status_of(&refusal), &said_of(&refusal, ui.upload_idle));
         }
     };
     if size == 0 {
@@ -274,14 +271,14 @@ pub(super) fn status_of(refusal: &Refusal) -> StatusCode {
     }
 }
 
-fn said_of(refusal: &Refusal) -> String {
+fn said_of(refusal: &Refusal, idle: Duration) -> String {
     match refusal {
         Refusal::TooLarge => too_large(),
         Refusal::Slow => format!(
             "Refused: the upload was too slow. It must arrive at {}/s or faster, and never \
              pause for {}.",
             pages::bytes(MIN_RATE),
-            crate::human_duration(UPLOAD_IDLE)
+            crate::human_duration(idle)
         ),
         Refusal::Malformed(why) => format!("Refused: this upload does not match the form: {why}."),
         Refusal::Broken => "The upload broke off.".to_string(),
