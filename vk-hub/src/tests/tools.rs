@@ -151,8 +151,8 @@ async fn a_definition_is_served_only_to_a_node_building_it_that_signs_for_it() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A tools build goes to a node only in a session at version 4: one at version 3 is sent
-/// nothing, and the hub refuses to issue another to it once it has connected so.
+/// A version-3 session skips the queued tools build and prevents the hub from issuing
+/// another. A version-4 session receives the queued build.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tools_build_goes_only_to_a_node_speaking_version_4() {
     let (dir, addr, hub) = start_releases("tools-session", None).await;
@@ -174,11 +174,20 @@ async fn a_tools_build_goes_only_to_a_node_speaking_version_4() {
         HubMsg::Welcome { .. }
     ));
     send(&mut ws, &applied(None)).await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(1500), receive(&mut ws))
-            .await
-            .is_err()
-    );
+    // The hub processes the report before the ack, so any tools command would arrive
+    // before Recorded. Change one digit to get a well-formed, unknown command ID.
+    let mut id = command.id.clone();
+    let first = if id.starts_with('0') { "1" } else { "0" };
+    id.replace_range(..1, first);
+    let unknown = CommandAck {
+        id,
+        outcome: Outcome::Done,
+    };
+    send(&mut ws, &NodeMsg::Ack(unknown.clone())).await;
+    let next = tokio::time::timeout(Duration::from_secs(30), receive(&mut ws))
+        .await
+        .expect("the unknown ack was not answered");
+    assert_eq!(next, HubMsg::Recorded(unknown));
     let err = ops::tools(&hub, "uid 0", &node_id, Some(&sha)).unwrap_err();
     assert!(format!("{err:#}").contains("update its vk"), "{err:#}");
     ws.close(None).await.unwrap();
