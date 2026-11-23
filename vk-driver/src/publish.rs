@@ -1297,10 +1297,8 @@ mod tests {
     fn a_publisher_that_cannot_be_confirmed_is_listed_but_never_signalled() {
         let t = state("unconfirmed");
         // Use a real unrelated pid to prove the unconfirmed record cannot signal it.
-        let mut victim = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut victim =
+            crate::testchild::Kept::spawn(std::process::Command::new("sleep").arg("30"));
         let lock = fake_publisher(
             &t.0,
             "opaque",
@@ -1339,10 +1337,7 @@ mod tests {
     #[test]
     fn stopping_a_vm_stops_the_publishers_recorded_for_it() {
         let t = state("teardown");
-        let victim = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let victim = crate::testchild::Kept::spawn(std::process::Command::new("sleep").arg("30"));
         let lock = fake_publisher(
             &t.0,
             "web",

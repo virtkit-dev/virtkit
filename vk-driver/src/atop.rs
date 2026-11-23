@@ -1240,12 +1240,13 @@ mod tests {
         };
         // A stand-in supervisor: a live process whose command line names its job dir, which is
         // what `vm::live_supervisor_pid_in` goes by.
-        let mut supervisor = std::process::Command::new("sh")
-            // Not a lone `sleep`, which a shell may exec in its own place, dropping the argument.
-            .args(["-c", "sleep 30; :", "sh"])
-            .arg(jobs.join("running"))
-            .spawn()
-            .unwrap();
+        let mut supervisor = crate::testchild::Kept::spawn(
+            std::process::Command::new("sh")
+                // Not a lone `sleep`, which a shell may exec in its own place, dropping the
+                // argument.
+                .args(["-c", "sleep 30; :", "sh"])
+                .arg(jobs.join("running")),
+        );
         let running = job("running", supervisor.id());
         // This test's own pid: alive, but not the supervisor of that job.
         let gone = job("gone", std::process::id());

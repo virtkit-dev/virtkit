@@ -1164,7 +1164,7 @@ mod tests {
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
         placement.apply(&mut cmd);
-        let mut child = cmd.spawn().unwrap();
+        let mut child = crate::testchild::Kept::spawn(&mut cmd);
         let pid = child.id();
 
         // The hook runs after the fork, so the mask may not be set the instant spawn returns.

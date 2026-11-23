@@ -3543,10 +3543,8 @@ mod tests {
             state_dir: &Path,
             then: impl FnOnce() -> T + Send + 'static,
         ) -> std::thread::JoinHandle<T> {
-            let mut victim = std::process::Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .unwrap();
+            let mut victim =
+                crate::testchild::Kept::spawn(std::process::Command::new("sleep").arg("30"));
             let lock = crate::publish::fake_publisher(
                 state_dir,
                 "web",

@@ -903,17 +903,14 @@ mod tests {
             "s=$(head -c {} /dev/zero | tr '\\0' x); while true; do sleep 1; done",
             mib * 1024 * 1024
         );
-        Reap::running_sh(
-            std::process::Command::new("sh")
-                .args(["-c", &script])
-                .spawn()
-                .expect("spawning a memory-holding child"),
-        )
+        Reap::running_sh(crate::testchild::Kept::spawn(
+            std::process::Command::new("sh").args(["-c", &script]),
+        ))
     }
 
-    /// A spawned child, killed however the test ends. These children loop forever, so an
-    /// assert firing mid-poll would otherwise leave one holding its memory on the runner.
-    struct Reap(std::process::Child);
+    /// These fixtures loop forever. Killing their group on drop or test process death
+    /// releases the memory they hold on the runner.
+    struct Reap(crate::testchild::Kept);
 
     impl Reap {
         /// `child`, once its `/proc/<pid>/cmdline` is `sh`'s. `spawn` goes through a
@@ -922,7 +919,7 @@ mod tests {
         /// installed: read in between, the child's `VmHWM` and `VmRSS` are this test binary's,
         /// which after a run of sibling tests is far above any threshold a test waits for — so
         /// the wait would end on a figure not the child's.
-        fn running_sh(child: std::process::Child) -> Self {
+        fn running_sh(child: crate::testchild::Kept) -> Self {
             let mut reap = Reap(child);
             let started = Instant::now();
             while !std::fs::read(format!("/proc/{}/cmdline", reap.pid()))
@@ -942,13 +939,6 @@ mod tests {
 
         fn pid(&self) -> i32 {
             self.0.id() as i32
-        }
-    }
-
-    impl Drop for Reap {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
         }
     }
 
@@ -1049,12 +1039,9 @@ mod tests {
         let me = std::process::id() as i32;
         // `sleep` under a shell that waits on it: the shell is the child, the sleep the
         // grandchild, and both outlive the assertions.
-        let child = Reap(
-            std::process::Command::new("sh")
-                .args(["-c", "sleep 30 & wait"])
-                .spawn()
-                .expect("spawning a child"),
-        );
+        let child = Reap(crate::testchild::Kept::spawn(
+            std::process::Command::new("sh").args(["-c", "sleep 30 & wait"]),
+        ));
         let pid = child.pid();
 
         if kernel_lists_children() {
@@ -1088,9 +1075,6 @@ mod tests {
         );
         // Skipping the child prunes what is under it, so the grandchild goes too.
         assert!(!descendants(me, &HashSet::from([pid])).contains(&grandchild));
-        // Reap only kills the shell, and SIGKILL leaves it no chance to take its own child
-        // with it: without this the grandchild lingers on the runner, reparented to init.
-        unsafe { libc::kill(grandchild, libc::SIGKILL) };
 
         // pid 0 is never a process: nothing to walk.
         assert!(descendants(0, &HashSet::new()).is_empty());
@@ -1307,18 +1291,14 @@ mod tests {
         // the sweep would pass without ever descending. Only a live one puts them where
         // nothing but the walk can find them.
         let (blob, done) = (dir.join("blob"), dir.join("done"));
-        let child = Reap(
-            std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!(
-                    "dd if=/dev/zero of={} bs=1M count=32 conv=fsync 2>/dev/null; \
-                     : > {}; while true; do sleep 1; done",
-                    blob.display(),
-                    done.display()
-                ))
-                .spawn()
-                .expect("spawning a writing child"),
-        );
+        let child = Reap(crate::testchild::Kept::spawn(
+            std::process::Command::new("sh").arg("-c").arg(format!(
+                "dd if=/dev/zero of={} bs=1M count=32 conv=fsync 2>/dev/null; \
+                 : > {}; while true; do sleep 1; done",
+                blob.display(),
+                done.display()
+            )),
+        ));
         let started = std::time::Instant::now();
         while !done.exists() {
             assert!(
@@ -1560,25 +1540,7 @@ mod tests {
     /// A shell that holds nothing itself and waits on children that each hold `mib`.
     /// This dedicated root excludes sibling tests' children, whose arrivals and exits
     /// would change a reading rooted at the test process.
-    struct NestedHog(Reap);
-
-    impl NestedHog {
-        fn pid(&self) -> i32 {
-            self.0.pid()
-        }
-    }
-
-    impl Drop for NestedHog {
-        fn drop(&mut self) {
-            // The child owns a dedicated process group; kill its descendants too.
-            // Reap then waits for the direct child.
-            unsafe { libc::kill(-self.pid(), libc::SIGKILL) };
-        }
-    }
-
-    fn nested_hogs(count: usize, mib: usize) -> NestedHog {
-        use std::os::unix::process::CommandExt;
-
+    fn nested_hogs(count: usize, mib: usize) -> Reap {
         // Once its string is held, each child starts one `sleep` and waits on it; the tree
         // then stops forking. Starting `sleep` every second would fork a child temporarily
         // resident as the parent's whole string.
@@ -1586,15 +1548,11 @@ mod tests {
             "s=$(head -c {} /dev/zero | tr \"\\0\" x); sleep 100000 & wait",
             mib * 1024 * 1024
         );
-        NestedHog(Reap::running_sh(
-            std::process::Command::new("sh")
-                .args([
-                    "-c",
-                    &format!("{}wait", format!("sh -c '{inner}' & ").repeat(count)),
-                ])
-                .process_group(0)
-                .spawn()
-                .expect("spawning a shell whose children hold memory"),
+        Reap::running_sh(crate::testchild::Kept::spawn(
+            std::process::Command::new("sh").args([
+                "-c",
+                &format!("{}wait", format!("sh -c '{inner}' & ").repeat(count)),
+            ]),
         ))
     }
 

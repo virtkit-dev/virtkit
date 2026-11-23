@@ -262,11 +262,11 @@ mod tests {
     }
 
     /// A sleeping child, killed and reaped when the assertions on it are done.
-    fn sleeper(prio: Prio) -> std::process::Child {
+    fn sleeper(prio: Prio) -> crate::testchild::Kept {
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
         prio.apply(&mut cmd);
-        cmd.spawn().expect("spawning sleep")
+        crate::testchild::Kept::spawn(&mut cmd)
     }
 
     fn reap(mut child: std::process::Child) {
@@ -296,7 +296,7 @@ mod tests {
                     assert_eq!(io >> IOPRIO_CLASS_SHIFT, IOPRIO_CLASS_IDLE);
                 }
             }
-            reap(child);
+            drop(child);
         }
     }
 
@@ -309,7 +309,7 @@ mod tests {
         let ours = nice_of(0);
         let child = sleeper(Prio::Build);
         assert_eq!(nice_of(child.id()), ours);
-        reap(child);
+        drop(child);
     }
 
     /// A build worker thread defers itself, and the threads it spawns inherit that — which is

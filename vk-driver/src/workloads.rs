@@ -723,12 +723,12 @@ mod tests {
         // A process whose arguments name the job dir, as a supervisor's do.
         let live = tmp.0.join("3");
         std::fs::create_dir_all(&live).unwrap();
-        let mut child = std::process::Command::new("sh")
-            // Not a lone command, which a shell may exec in its own place, argv and all.
-            .args(["-c", "sleep 30; :"])
-            .arg(&live)
-            .spawn()
-            .unwrap();
+        let mut child = crate::testchild::Kept::spawn(
+            std::process::Command::new("sh")
+                // Not a lone command, which a shell may exec in its own place, argv and all.
+                .args(["-c", "sleep 30; :"])
+                .arg(&live),
+        );
         std::fs::write(live.join("supervisor.pid"), child.id().to_string()).unwrap();
         // Until the child has exec'd, its argv is still this process's.
         let mut found = jobs(&tmp.0).unwrap();
@@ -1042,10 +1042,8 @@ mod tests {
     /// Wired to the process tree: a live child is measured, a dead root is not.
     #[test]
     fn a_live_process_tree_is_measured() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut child =
+            crate::testchild::Kept::spawn(std::process::Command::new("sleep").arg("30"));
         let mut w = vm(1, WorkloadKind::Run);
         w.1 = i32::try_from(child.id()).ok();
         let mut gone = vm(2, WorkloadKind::Run);

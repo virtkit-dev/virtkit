@@ -458,11 +458,11 @@ mod tests {
         record(&ctx, std::process::id());
         // A stand-in supervisor: a live process whose command line names the job dir. Not a
         // lone `sleep`, which a shell may exec in its own place, dropping the argument.
-        let mut supervisor = std::process::Command::new("sh")
-            .args(["-c", "sleep 30; :", "sh"])
-            .arg(&ctx.job_dir)
-            .spawn()
-            .unwrap();
+        let mut supervisor = crate::testchild::Kept::spawn(
+            std::process::Command::new("sh")
+                .args(["-c", "sleep 30; :", "sh"])
+                .arg(&ctx.job_dir),
+        );
         std::fs::write(
             JobCtx::supervisor_pidfile_in(&ctx.job_dir),
             supervisor.id().to_string(),

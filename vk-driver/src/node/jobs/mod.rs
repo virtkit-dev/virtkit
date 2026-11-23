@@ -1916,10 +1916,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_node_side_cleanup_is_stopped_at_its_bound() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut child =
+            crate::testchild::Kept::spawn(std::process::Command::new("sleep").arg("30"));
         let started = Instant::now();
         wait_bounded(&mut child, Duration::from_millis(200));
         assert!(started.elapsed() < Duration::from_secs(5));

@@ -307,17 +307,14 @@ pub(crate) mod testutil {
     }
 
     /// Stand-in for a registered VM's `vk run`, keeping stop signals out of the test process.
-    /// Killed on drop so a failed assertion leaves nothing running.
-    pub(crate) struct StandIn(std::process::Child);
+    /// Its process group is killed on drop or test process death.
+    pub(crate) struct StandIn(crate::testchild::Kept);
 
     impl StandIn {
         pub(crate) fn spawn() -> Self {
-            Self(
-                std::process::Command::new("sleep")
-                    .arg("600")
-                    .spawn()
-                    .unwrap(),
-            )
+            Self(crate::testchild::Kept::spawn(
+                std::process::Command::new("sleep").arg("600"),
+            ))
         }
 
         /// A stand-in holding `dir`'s lock for as long as it runs; one that `ignores_term`
@@ -344,7 +341,7 @@ pub(crate) mod testutil {
                     Ok(())
                 });
             }
-            Self(cmd.spawn().unwrap())
+            Self(crate::testchild::Kept::spawn(&mut cmd))
         }
 
         pub(crate) fn id(&self) -> u32 {
@@ -358,14 +355,6 @@ pub(crate) mod testutil {
 
         pub(crate) fn alive(&mut self) -> bool {
             self.try_wait().is_none()
-        }
-    }
-
-    impl Drop for StandIn {
-        fn drop(&mut self) {
-            // Best effort: a stand-in that already exited has nothing left to end.
-            let _ = self.0.kill();
-            let _ = self.0.wait();
         }
     }
 

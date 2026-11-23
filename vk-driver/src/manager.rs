@@ -1276,9 +1276,10 @@ mod tests {
             }
             st.boots = boots;
         };
+        // The manager owns the child handles, so the test guards their group separately.
+        let line = crate::testchild::Lifeline::new();
         let sleeper = || {
-            std::process::Command::new("sleep")
-                .arg("30")
+            line.join(std::process::Command::new("sleep").arg("30"))
                 .spawn()
                 .unwrap()
         };
@@ -1298,12 +1299,12 @@ mod tests {
     async fn a_unit_whose_agent_never_answers_times_out_and_is_left_running() {
         let mgr = manager_over_two_units_within(std::time::Duration::ZERO);
         // A live child stands in for the VMM; the unit's dir holds no exec socket.
+        let line = crate::testchild::Lifeline::new();
         let dir = {
             let mut u = mgr.units_guard();
             let st = u.get_mut("cache").unwrap();
             st.child = Some(
-                std::process::Command::new("sleep")
-                    .arg("30")
+                line.join(std::process::Command::new("sleep").arg("30"))
                     .spawn()
                     .unwrap(),
             );
@@ -1335,9 +1336,9 @@ mod tests {
             panic!("a unit's exec address is vsock-auto");
         };
         let agent = SocketAddr::Unix(vk_core::net::hybrid_socket(&path, port));
+        let line = crate::testchild::Lifeline::new();
         mgr.units_guard().get_mut("cache").unwrap().child = Some(
-            std::process::Command::new("sleep")
-                .arg("30")
+            line.join(std::process::Command::new("sleep").arg("30"))
                 .spawn()
                 .unwrap(),
         );

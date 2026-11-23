@@ -103,6 +103,8 @@ mod task;
 mod term;
 mod termclean;
 #[cfg(test)]
+mod testchild;
+#[cfg(test)]
 mod testtmp;
 mod tidy;
 mod timing;

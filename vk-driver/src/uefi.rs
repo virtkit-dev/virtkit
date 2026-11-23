@@ -1648,10 +1648,7 @@ mod tests {
         let work = std::env::temp_dir().join(format!("vk-force-off-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work).unwrap();
-        let mut ch = std::process::Command::new("sleep")
-            .arg("600")
-            .spawn()
-            .unwrap();
+        let mut ch = crate::testchild::Kept::spawn(std::process::Command::new("sleep").arg("600"));
         let start = Instant::now();
         force_off_blocking(&mut ch, &work);
         assert!(start.elapsed() < QUIT_GRACE);

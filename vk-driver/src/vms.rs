@@ -4228,16 +4228,16 @@ PUBLISHED     -
     }
 
     /// A shell that holds the state-directory lock while running `script`. With
-    /// `ignores_term`, the shell and its children inherit an ignored SIGTERM.
-    struct FakeRun(std::process::Child);
+    /// `ignores_term`, the shell and its children inherit an ignored SIGTERM. Its group is
+    /// killed on drop or test process death.
+    struct FakeRun(crate::testchild::Kept);
 
     impl FakeRun {
         fn spawn(dir: &Path, script: &str, ignores_term: bool) -> Self {
             use std::os::unix::process::CommandExt;
             let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
             let mut cmd = std::process::Command::new("sh");
-            // Keep the children in one process group for cleanup.
-            cmd.args(["-c", script]).process_group(0);
+            cmd.args(["-c", script]);
             // SAFETY: only `signal`, `open` and `flock` run between fork and exec, all
             // async-signal-safe; the locked descriptor is left open across the exec.
             unsafe {
@@ -4252,7 +4252,7 @@ PUBLISHED     -
                     Ok(())
                 });
             }
-            FakeRun(cmd.spawn().unwrap())
+            FakeRun(crate::testchild::Kept::spawn(&mut cmd))
         }
 
         fn pid(&self) -> i32 {
@@ -4284,16 +4284,6 @@ PUBLISHED     -
             e.pid = self.0.id();
             e.pid_start_ticks = crate::usage::proc_starttime(self.pid());
             e
-        }
-    }
-
-    impl Drop for FakeRun {
-        fn drop(&mut self) {
-            // Kill the group, including reparented children. The unreaped leader reserves the
-            // group ID. Members that have already exited need no cleanup.
-            // SAFETY: kill only delivers a signal.
-            unsafe { libc::kill(-self.pid(), libc::SIGKILL) };
-            let _ = self.0.wait();
         }
     }
 

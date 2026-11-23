@@ -576,8 +576,8 @@ mod tests {
         );
     }
 
-    fn spawn(cmd: &str, args: &[&str]) -> Child {
-        std::process::Command::new(cmd).args(args).spawn().unwrap()
+    fn spawn(cmd: &str, args: &[&str]) -> crate::testchild::Kept {
+        crate::testchild::Kept::spawn(std::process::Command::new(cmd).args(args))
     }
 
     #[test]

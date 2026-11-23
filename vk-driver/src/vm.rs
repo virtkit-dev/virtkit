@@ -6219,11 +6219,11 @@ mod tests {
         // `420`) is another job's, not this one's. A stand-in supervisor shows it; not a lone
         // `sleep`, which a shell may exec in its own place, dropping the argument.
         let other = ctx.job_dir.with_file_name("420");
-        let mut stand_in = Command::new("sh")
-            .args(["-c", "sleep 30; :", "sh"])
-            .arg(&other)
-            .spawn()
-            .unwrap();
+        let mut stand_in = crate::testchild::Kept::spawn(
+            Command::new("sh")
+                .args(["-c", "sleep 30; :", "sh"])
+                .arg(&other),
+        );
         let pid = stand_in.id() as i32;
         // /proc/<pid>/cmdline reads empty until the new image's argv is set up.
         let deadline = Instant::now() + Duration::from_secs(5);

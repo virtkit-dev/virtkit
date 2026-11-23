@@ -7772,9 +7772,8 @@ mod tests {
         );
 
         // Report the configured deadline when a live VMM never serves SSH.
-        let mut alive = Command::new("sleep").arg("60").spawn().unwrap();
+        let mut alive = crate::testchild::Kept::spawn(Command::new("sleep").arg("60"));
         let waited = wait_ssh_serving(&mut alive, &addr, &console, Instant::now(), 120).await;
-        // Reap before asserting so failure does not leak the child.
         let _ = alive.kill();
         let _ = alive.wait();
         let err = waited.unwrap_err();

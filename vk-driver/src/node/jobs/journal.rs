@@ -291,11 +291,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let canonical = dir.canonicalize().unwrap();
         // A process whose command line names the canonical dir, as the driver's does.
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "sleep 30; :", "driver"])
-            .arg(&canonical)
-            .spawn()
-            .unwrap();
+        let mut child = crate::testchild::Kept::spawn(
+            std::process::Command::new("sh")
+                .args(["-c", "sleep 30; :", "driver"])
+                .arg(&canonical),
+        );
         std::fs::write(dir.join(PID), child.id().to_string()).unwrap();
         let other_spelling = base.join("jobs/../jobs/./j");
         // Its command line can read empty right after the spawn.

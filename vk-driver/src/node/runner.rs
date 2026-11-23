@@ -202,6 +202,9 @@ fn command(spec: &Spec) -> tokio::process::Command {
             Ok(())
         });
     }
+    // A test's stub runner kills its own group once the test process is gone (see `stub`).
+    #[cfg(test)]
+    crate::testchild::inherit_lifeline(cmd.as_std_mut());
     cmd
 }
 
@@ -336,13 +339,15 @@ pub fn stub(tag: &str) -> Spec {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("gitlab-runner");
+    // Resolve `starts` and `go` relative to `$0`. `command` gives the stub its own group,
+    // so the watchdog can kill the loop if the test process dies.
     vk_fs::write_executable(
         &script,
         format!(
-            "#!/bin/sh\ntrap 'until [ -e {go} ]; do sleep 0.05; done; exit 0' QUIT\n\
-             echo \"$$ $*\" >> {starts}\nwhile true; do sleep 0.05; done\n",
-            starts = dir.join("starts").display(),
-            go = dir.join("go").display(),
+            "#!/bin/sh\n{}d=${{0%/*}}\n\
+             trap 'until [ -e \"$d/go\" ]; do sleep 0.05; done; exit 0' QUIT\n\
+             echo \"$$ $*\" >> \"$d/starts\"\nwhile true; do sleep 0.05; done\n",
+            crate::testchild::GROUP_WATCHDOG_SH,
         )
         .as_bytes(),
         0o755,
