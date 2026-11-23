@@ -213,7 +213,9 @@ fn select_target(root: &File, relative: &Path, category: &'static str) -> Result
     }))
 }
 
-fn select(env: &Env, opts: &Options) -> Result<Selection> {
+/// Select prune targets. Refuse if `live` contains a VM whose state directory is at or
+/// below the environment root.
+fn select(env: &Env, opts: &Options, live: &[crate::vms::VmEntry]) -> Result<Selection> {
     let root = match open_dir(&env.state_dir) {
         Ok(dir) => LockFile::new(dir),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -226,17 +228,12 @@ fn select(env: &Env, opts: &Options) -> Result<Selection> {
         }
         Err(e) => return Err(e).context("opening environment state for pruning"),
     };
-    // Check liveness before locking: our lock would make a stale entry look live.
-    // The locks below exclude concurrent starts. A dry run preserves stale registrations.
-    let running = if opts.dry_run {
-        crate::vms::registered().0
-    } else {
-        crate::vms::running()
-    };
+    // Read liveness before locking the environment root and service state directories.
+    // Each lock excludes starts in that state directory and makes its registration look live.
     lock(&root)?;
     let canonical = std::fs::canonicalize(fd_path(&root))?;
     ensure!(
-        !running
+        !live
             .iter()
             .any(|vm| { crate::vms::canonical(&vm.state_dir).starts_with(&canonical) }),
         "environment or one of its services is running; `vk dev stop` first"
@@ -496,10 +493,15 @@ pub(crate) fn reclaim_images(
     }
     let opts = Options {
         images: true,
-        dry_run,
         ..Options::default()
     };
-    let selected = select(&env, &opts)?;
+    // Preserve stale registrations during a dry run.
+    let live = if dry_run {
+        crate::vms::registered().0
+    } else {
+        crate::vms::running()
+    };
+    let selected = select(&env, &opts, &live)?;
     let now = std::time::SystemTime::now();
     let quiet = crate::run::last_active(dir)
         .is_some_and(|t| now.duration_since(t).unwrap_or_default() >= idle);
@@ -641,7 +643,8 @@ fn default_confirm() -> Result<bool> {
 }
 
 fn run_env(env: &Env, opts: &Options, confirm: impl FnOnce() -> Result<bool>) -> Result<String> {
-    let selected = select(env, opts)?;
+    // Preserve stale registrations until removal is confirmed.
+    let selected = select(env, opts, &crate::vms::registered().0)?;
     let preview = selected.preview(env);
     if selected.targets.is_empty() {
         return Ok(format!("{preview}nothing to remove\n"));
@@ -653,7 +656,14 @@ fn run_env(env: &Env, opts: &Options, confirm: impl FnOnce() -> Result<bool>) ->
     if !opts.yes && !confirm()? {
         bail!("nothing was removed");
     }
-    selected.remove(env)
+    // Stale registrations go with a confirmed prune only. Before the removal, for those on a
+    // directory it takes, which could not be locked after; and once the selection's locks
+    // are released, which make this environment's own look live.
+    crate::vms::running();
+    let report = selected.remove(env);
+    drop(selected);
+    crate::vms::running();
+    report
 }
 
 #[cfg(test)]
@@ -790,6 +800,7 @@ mod tests {
                 storage: true,
                 ..Default::default()
             },
+            &[],
         )
         .unwrap();
         assert!(selected.preview(&e).contains("keep [external storage]"));
@@ -829,6 +840,7 @@ mod tests {
                 storage: true,
                 ..Default::default()
             },
+            &[],
         )
         .unwrap();
         assert_eq!(selected.external, [f.plan.workspace.join("external.qcow2")]);
@@ -919,6 +931,23 @@ mod tests {
         assert!(!f.plan.state_dir.join("roots").exists()); // fixed storage gone
     }
 
+    /// Register `dir` in the fixture's registry. Its record is stale unless `dir` is locked.
+    fn registration(dir: &Path) -> PathBuf {
+        let registry = crate::vms::registry_dir().unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
+        let dir = crate::vms::canonical(dir);
+        let record = registry.join(format!("{}.json", crate::vms::slug(&dir)));
+        let entry = serde_json::json!({
+            "state_dir": dir,
+            "pid": std::process::id(),
+            "label": "test",
+            "exec_addr": "unused",
+            "created_secs": 0
+        });
+        std::fs::write(&record, serde_json::to_vec(&entry).unwrap()).unwrap();
+        record
+    }
+
     #[test]
     fn dry_run_overrides_yes_and_refusal_preserves_everything() {
         let f = fixture("consent");
@@ -929,16 +958,42 @@ mod tests {
             ..Default::default()
         };
         let e = env(&f.plan);
+        // Simulate killed VMs with unlocked state directories, one inside the selected storage.
+        let records = [f.dir.join("other-vm"), f.plan.state_dir.join("editor/vm")].map(|dir| {
+            std::fs::create_dir(&dir).unwrap();
+            registration(&dir)
+        });
+        assert_eq!(crate::vms::registered().1.len(), 2);
+        let kept = |when: &str| {
+            for record in &records {
+                assert!(record.exists(), "{when} keeps stale registrations");
+            }
+        };
+
+        let all = || Options {
+            all: true,
+            ..Default::default()
+        };
         let report = run_env(&e, &opts, || panic!("dry run must not ask")).unwrap();
         assert!(report.contains("dry run: nothing was removed"));
         assert!(report.contains("persistent storage contents will be lost"));
-        assert!(run_env(&e, &Options::default(), || Ok(false)).is_err());
-        assert!(run_env(&e, &Options::default(), || bail!("no terminal")).is_err());
+        kept("a dry run");
+        assert!(run_env(&e, &all(), || Ok(false)).is_err());
+        kept("a declined prune");
+        assert!(run_env(&e, &all(), || bail!("no terminal")).is_err());
+        kept("an unasked prune");
         for name in ["root.qcow2", "data.qcow2", "lifecycle/create", "dev.json"] {
             assert!(f.plan.state_dir.join(name).exists(), "{name}");
         }
-        run_env(&e, &Options::default(), || Ok(true)).unwrap();
+        run_env(&e, &all(), || Ok(true)).unwrap();
         assert!(!f.plan.state_dir.join("root.qcow2").exists());
+        assert!(!f.plan.state_dir.join("editor").exists());
+        for record in &records {
+            assert!(
+                !record.exists(),
+                "a confirmed prune drops stale registrations"
+            );
+        }
     }
 
     #[test]
@@ -1066,7 +1121,7 @@ mod tests {
     fn changed_selection_fails_before_removing_anything() {
         let f = fixture("changed");
         let e = env(&f.plan);
-        let selected = select(&e, &Options::default()).unwrap();
+        let selected = select(&e, &Options::default(), &[]).unwrap();
         let path = f.plan.state_dir.join("root.qcow2");
         std::fs::rename(&path, path.with_extension("old")).unwrap();
         std::fs::write(&path, b"replacement").unwrap();

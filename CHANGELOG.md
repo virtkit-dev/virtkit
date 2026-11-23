@@ -114,6 +114,8 @@ All notable changes to virtkit will be documented in this file.
   when the last running stage finishes during a memory check.
 - `vk gc --dry-run`, `vk reset --dry-run` and `vk dev prune --dry-run` no longer remove
   stale VM records.
+- `vk dev prune` and `vk reset` no longer remove other VMs' stale records when the
+  prompt is declined or there is no terminal to ask on.
 - A VM command frees its slot on a capped exec channel before the client receives its
   exit status.
 
