@@ -2246,9 +2246,10 @@ async fn pull_into(
                 let bytes =
                     pull_chunk(client, image, &layer, chunks_cache, fetched, reused).await?;
                 tokio::task::spawn_blocking(move || -> Result<()> {
-                    let (offset, raw) = chunk_bytes(&layer, bytes, compressed, total_size)?;
-                    write_chunk_sparse(&out, offset, &raw)
-                        .with_context(|| format!("writing a chunk into {}", ext4.display()))
+                    with_chunk_bytes(&layer, &bytes, compressed, total_size, |offset, raw| {
+                        write_chunk_sparse(&out, offset, raw)
+                            .with_context(|| format!("writing a chunk into {}", ext4.display()))
+                    })
                 })
                 .await
                 .context("a chunk-reassembly worker panicked")?
@@ -2514,23 +2515,48 @@ fn sort_lazy_chunks(chunks: &mut [LazyChunk]) -> Result<()> {
     Ok(())
 }
 
+thread_local! {
+    /// The chunk this thread last decompressed. Reassembly workers decode one chunk
+    /// after another, so each reuses its buffer, of at most twice [`CDC_MAX`], where a
+    /// buffer per chunk was allocated and freed.
+    static DECODED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `place` on a chunk's offset in the image and its raw bytes, as [`chunk_bytes`]
+/// checks them, decompressing into this thread's reused buffer.
+fn with_chunk_bytes<T>(
+    layer: &OciDescriptor,
+    blob: &[u8],
+    compressed: bool,
+    total_size: u64,
+    place: impl FnOnce(u64, &[u8]) -> Result<T>,
+) -> Result<T> {
+    DECODED.with_borrow_mut(|decoded| {
+        let (offset, raw) = chunk_bytes(layer, blob, compressed, total_size, decoded)?;
+        place(offset, raw)
+    })
+}
+
 /// A chunk's offset in the image and its raw bytes, held to what its descriptor claims:
 /// exactly its annotated length — at most [`CDC_MAX`] — once decompressed, and placed inside
 /// the `total_size` image. The registry writes both the descriptor and the blob, so a frame
 /// that decompresses past its length is cut off there rather than inflated in memory.
-fn chunk_bytes(
+/// A compressed chunk is decompressed into `decoded`, in place of what it held.
+fn chunk_bytes<'a>(
     layer: &OciDescriptor,
-    blob: Vec<u8>,
+    blob: &'a [u8],
     compressed: bool,
     total_size: u64,
-) -> Result<(u64, Vec<u8>)> {
+    decoded: &'a mut Vec<u8>,
+) -> Result<(u64, &'a [u8])> {
     let (offset, len) = chunk_bounds(layer, total_size)?;
     let raw = if compressed {
-        let mut raw = Vec::with_capacity(len as usize);
-        zstd_reader(&blob)
-            .and_then(|d| d.take(len + 1).read_to_end(&mut raw))
+        decoded.clear();
+        decoded.reserve(len as usize);
+        zstd_reader(blob)
+            .and_then(|d| d.take(len + 1).read_to_end(decoded))
             .with_context(|| format!("zstd-decompressing chunk {}", layer.digest))?;
-        raw
+        &decoded[..]
     } else {
         blob
     };
@@ -4019,9 +4045,16 @@ mod local {
                     root.display()
                 )
             })?;
-            let (offset, raw) = chunk_bytes(layer, bytes, compressed, config.total_size)?;
-            write_chunk_sparse(&out, offset, &raw)
-                .with_context(|| format!("writing a chunk into {}", tmp.display()))
+            with_chunk_bytes(
+                layer,
+                &bytes,
+                compressed,
+                config.total_size,
+                |offset, raw| {
+                    write_chunk_sparse(&out, offset, raw)
+                        .with_context(|| format!("writing a chunk into {}", tmp.display()))
+                },
+            )
         })?;
         drop(out);
         let _ = std::fs::remove_file(dest);
@@ -5678,22 +5711,37 @@ pub(crate) mod tests {
         let raw = vec![5u8; 4096];
         let frame = zstd::encode_all(&raw[..], 3).unwrap();
         let desc = |offset, len| chunk_descriptor(CHUNK_MEDIA_TYPE, "sha256:x", 1, offset, len);
+        // Every call decodes into the buffer the one before it left.
+        let chunk = |layer: &OciDescriptor, blob: &[u8], compressed, total| {
+            with_chunk_bytes(layer, blob, compressed, total, |offset, raw| {
+                Ok((offset, raw.to_vec()))
+            })
+        };
         assert_eq!(
-            chunk_bytes(&desc(8192, 4096), frame.clone(), true, 1 << 20).unwrap(),
+            chunk(&desc(8192, 4096), &frame, true, 1 << 20).unwrap(),
             (8192, raw.clone())
         );
         // Inflates past its length (a bomb, as far as this reader can tell): refused.
-        assert!(chunk_bytes(&desc(0, 100), frame.clone(), true, 1 << 20).is_err());
+        assert!(chunk(&desc(0, 100), &frame, true, 1 << 20).is_err());
         // Short of it: refused.
-        assert!(chunk_bytes(&desc(0, 8192), frame.clone(), true, 1 << 20).is_err());
+        assert!(chunk(&desc(0, 8192), &frame, true, 1 << 20).is_err());
         // Outside the image, or larger than any chunk: refused.
-        assert!(chunk_bytes(&desc((1 << 20) - 10, 4096), frame.clone(), true, 1 << 20).is_err());
-        assert!(chunk_bytes(&desc(u64::MAX - 1, 4096), frame, true, u64::MAX).is_err());
+        assert!(chunk(&desc((1 << 20) - 10, 4096), &frame, true, 1 << 20).is_err());
+        assert!(chunk(&desc(u64::MAX - 1, 4096), &frame, true, u64::MAX).is_err());
         let huge = CDC_MAX as u64 + 1;
-        assert!(chunk_bytes(&desc(0, huge), vec![0; 1], false, u64::MAX).is_err());
-        // A raw chunk is its own length.
-        assert!(chunk_bytes(&desc(0, 4096), raw.clone(), false, 1 << 20).is_ok());
-        assert!(chunk_bytes(&desc(0, 4095), raw, false, 1 << 20).is_err());
+        assert!(chunk(&desc(0, huge), &[0; 1], false, u64::MAX).is_err());
+        // A raw chunk is its own length, and not what the buffer last held.
+        let other = vec![6u8; 4096];
+        assert_eq!(
+            chunk(&desc(0, 4096), &other, false, 1 << 20).unwrap(),
+            (0, other.clone())
+        );
+        // A chunk decoded after the refused ones holds nothing of them.
+        assert_eq!(
+            chunk(&desc(0, 4096), &frame, true, 1 << 20).unwrap(),
+            (0, raw.clone())
+        );
+        assert!(chunk(&desc(0, 4095), &raw, false, 1 << 20).is_err());
     }
 
     /// A lazy view's chunks are sorted by offset; touching chunks pass, overlapping ones don't.
@@ -5919,7 +5967,10 @@ pub(crate) mod tests {
                         );
                         let total = CDC_MAX as u64;
                         let decode = |frame: &[u8], len: usize| {
-                            chunk_bytes(&desc(len as u64), frame.to_vec(), true, total).ok()
+                            with_chunk_bytes(&desc(len as u64), frame, true, total, |at, raw| {
+                                Ok((at, raw.to_vec()))
+                            })
+                            .ok()
                         };
                         assert_eq!(decode(&frame, len), Some((0, raw.clone())));
                         if len > 300 {
