@@ -159,6 +159,31 @@ impl Backoff {
 /// stream of small ones that each fit. Erring the other way, a small job can queue behind a
 /// big one it would have fit alongside — predictable beats optimal here.
 pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result<Reservation> {
+    acquire_with(dir, job_id, ask, timeout, |step| {
+        if step == Step::Refused {
+            std::thread::sleep(POLL);
+        }
+    })
+}
+
+/// Points in the admission loop exposed to tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// Before the first write, with the directory lock still held.
+    Writing,
+    /// After unlocking the directory, with the job's entry in the ledger.
+    Created,
+    /// Before retrying a refused pass. [`acquire`] sleeps for [`POLL`] here.
+    Refused,
+}
+
+fn acquire_with(
+    dir: &Path,
+    job_id: &str,
+    ask: &Ask,
+    timeout: Duration,
+    mut at: impl FnMut(Step),
+) -> Result<Reservation> {
     if let Some(MemAsk {
         want_mib,
         budget_mib,
@@ -245,10 +270,14 @@ pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result
             // still empty parses as nothing, so a scan catching it in that state would report a
             // ledger anomaly against a job that is merely starting up — and leave its request
             // out of the queue order for that pass.
-            None => entry.write(&file, &path)?,
+            None => {
+                at(Step::Writing);
+                entry.write(&file, &path)?;
+            }
         }
         file
     };
+    at(Step::Created);
     let deadline = Instant::now() + timeout;
     let mut waited_since = None;
     // What held the job back on the last pass that did, which is what it ended up waiting for.
@@ -352,7 +381,7 @@ pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result
             let _ = std::fs::remove_file(&path);
             bail!("{}", pass.refusal(timeout));
         }
-        std::thread::sleep(POLL);
+        at(Step::Refused);
     }
 }
 
@@ -2157,6 +2186,17 @@ mod tests {
     }
 
     /// Memory admission alone, as every test not about disk asks for.
+    fn mem_ask(want_mib: u64, budget_mib: u64) -> Ask<'static> {
+        Ask {
+            mem: Some(MemAsk {
+                want_mib,
+                budget_mib,
+            }),
+            disk: None,
+            cpus: None,
+        }
+    }
+
     fn acquire_mem(
         dir: &Path,
         job: &str,
@@ -2164,20 +2204,7 @@ mod tests {
         budget_mib: u64,
         timeout: Duration,
     ) -> Result<Reservation> {
-        let mem = Some(MemAsk {
-            want_mib,
-            budget_mib,
-        });
-        acquire(
-            dir,
-            job,
-            &Ask {
-                mem,
-                disk: None,
-                cpus: None,
-            },
-            timeout,
-        )
+        acquire(dir, job, &mem_ask(want_mib, budget_mib), timeout)
     }
 
     /// A reservation held by this test, as another job's would be.
@@ -2277,28 +2304,30 @@ mod tests {
         let resv = try_acquire(&dir, "resv", &ask(2)).unwrap().unwrap();
         let resv = resv.rename(&dir, "job").unwrap();
         // The job turns out to need the whole budget: it waits for the running one to end.
-        let waiter = std::thread::spawn({
-            let dir = dir.clone();
-            move || {
-                let got = acquire(&dir, "job", &ask(8), Duration::from_secs(30));
-                drop(resv);
-                got.map(drop)
+        let mut running = Some(running);
+        let got = acquire_with(&dir, "job", &ask(8), Duration::from_secs(120), |step| {
+            if step != Step::Refused {
+                return;
             }
+            let running = running
+                .take()
+                .expect("refused again after the room was made");
+            let said = std::fs::read_to_string(dir.join("job")).unwrap();
+            assert!(
+                said.trim_end().ends_with(" more"),
+                "the job never said it waits: {said:?}"
+            );
+            // 4 of 8 vCPUs are free and the offer asks 2, but the job asked first.
+            assert!(matches!(
+                try_acquire(&dir, "offer", &ask(2)).unwrap(),
+                Err(Short::Queue)
+            ));
+            assert!(!dir.join("offer").exists());
+            drop(running);
         });
-        let entry = dir.join("job");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !std::fs::read_to_string(&entry).is_ok_and(|t| t.trim_end().ends_with(" more")) {
-            assert!(Instant::now() < deadline, "the job never said it waits");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        // 4 of 8 vCPUs are free and the offer asks 2, but the job asked first.
-        assert!(matches!(
-            try_acquire(&dir, "offer", &ask(2)).unwrap(),
-            Err(Short::Queue)
-        ));
-        assert!(!dir.join("offer").exists());
-        drop(running);
-        waiter.join().unwrap().unwrap();
+        assert!(running.is_none(), "admitted without ever waiting");
+        drop(resv);
+        got.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2374,28 +2403,21 @@ mod tests {
     #[test]
     fn a_waiting_job_is_admitted_once_there_is_room() {
         let dir = tmpdir("waits");
-        let blocker = held(&dir, "running", 8192, 1, true);
-
-        let freed = std::thread::spawn({
-            let dir = dir.clone();
-            move || {
-                // Only once the waiter has registered, so admission really does come from a
-                // later pass of the loop and not from the first one.
-                let deadline = Instant::now() + Duration::from_secs(30);
-                while !dir.join("waiter").exists() {
-                    assert!(Instant::now() < deadline, "the waiter never registered");
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                std::thread::sleep(POLL);
-                drop(blocker);
+        // Hold the blocker through the first refusal so only a retry can admit the job.
+        let mut blocker = Some(held(&dir, "running", 8192, 1, true));
+        let ask = mem_ask(8192, 8192);
+        let res = acquire_with(&dir, "waiter", &ask, Duration::from_secs(120), |step| {
+            if step == Step::Refused {
+                drop(
+                    blocker
+                        .take()
+                        .expect("refused again after the room was made"),
+                );
                 release(&dir, "running");
             }
         });
-
-        let asked_at = Instant::now();
-        let res = acquire_mem(&dir, "waiter", 8192, 8192, Duration::from_secs(120)).unwrap();
-        assert!(asked_at.elapsed() >= POLL, "admitted without ever waiting");
-        freed.join().unwrap();
+        assert!(blocker.is_none(), "admitted without ever waiting");
+        let res = res.unwrap();
 
         drop(res);
         release(&dir, "waiter");
@@ -3251,62 +3273,36 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
     /// report a ledger anomaly against a job that is merely starting up, and leave that job's
     /// request out of the queue order for the pass.
     ///
-    /// The watcher scans in every round of nonblocking admissions.
+    /// Check the lock before the write, then scan after unlock and before the first pass.
     #[test]
     fn a_scan_never_observes_a_half_written_entry() {
-        const ROUNDS: usize = 200;
-        const SCANS: usize = 4;
         let dir = tmpdir("half-written");
-        // Start each round together and wait for its scans before starting the next.
-        // If either side panics, its channels disconnect.
-        let (start, started) = std::sync::mpsc::sync_channel::<()>(0);
-        let (done, finished) = std::sync::mpsc::sync_channel::<()>(0);
-        let watcher = std::thread::spawn({
-            let dir = dir.clone();
-            move || {
-                let mut odd = 0;
-                while started.recv().is_ok() {
-                    for _ in 0..SCANS {
-                        odd += live(&dir).1 as u64;
-                    }
-                    if done.send(()).is_err() {
-                        break;
-                    }
+        let mut steps = Vec::new();
+        let res = acquire_with(&dir, "job", &mem_ask(512, 8192), Duration::ZERO, |step| {
+            steps.push(step);
+            match step {
+                Step::Writing => assert!(
+                    try_lock_dir(&dir).unwrap().is_none(),
+                    "the entry is written outside the lock that created it"
+                ),
+                Step::Created => {
+                    let (held, anomalies) = try_committed(&dir)
+                        .unwrap()
+                        .expect("creation still holds the directory lock");
+                    assert!(
+                        anomalies.is_empty(),
+                        "a scan could not parse an entry — it is not written where it is \
+                         created: {anomalies:?}"
+                    );
+                    assert_eq!(held.ahead, 1, "the new request is in the queue order");
                 }
-                odd
+                Step::Refused => panic!("an ask that fits never waits"),
             }
-        });
-
-        // Four jobs that all fit together, so every acquire is granted on its first pass and
-        // the churn is pure create-and-release.
-        for _ in 0..ROUNDS {
-            if start.send(()).is_err() {
-                break; // the watcher failed: its join below says how
-            }
-            let held: Vec<_> = (0..4)
-                .map(|i| {
-                    let job = format!("job{i}");
-                    (
-                        acquire_mem(&dir, &job, 512, 8192, Duration::from_secs(0)).unwrap(),
-                        job,
-                    )
-                })
-                .collect();
-            for (res, job) in held {
-                drop(res);
-                release(&dir, &job);
-            }
-            if finished.recv().is_err() {
-                break;
-            }
-        }
-        drop(start);
-        let odd = watcher.join().unwrap();
-
-        assert_eq!(
-            odd, 0,
-            "a scan could not parse an entry — it is not written where it is created"
-        );
+        })
+        .unwrap();
+        assert_eq!(steps, [Step::Writing, Step::Created]);
+        drop(res);
+        release(&dir, "job");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
