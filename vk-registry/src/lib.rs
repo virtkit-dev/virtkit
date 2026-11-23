@@ -4842,11 +4842,19 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
         }
         return match method {
             Method::POST => start_upload(&store, name),
+            // A request refused whatever it holds is answered with its body unread, as the
+            // refusals above are.
             Method::PATCH => {
+                if let Some(refusal) = upload_unknown(&store, name, after) {
+                    return Ok(refusal);
+                }
                 let body = collect(req).await?;
                 patch_upload(&store, name, after, &body)
             }
             Method::PUT => {
+                if let Err(refusal) = upload_to_finish(&store, name, after, &query) {
+                    return Ok(*refusal);
+                }
                 let body = collect(req).await?;
                 finish_upload(&store, name, after, &query, &body, put_is_zstd)
             }
@@ -5140,22 +5148,66 @@ mod upload_hooks {
     }
 }
 
-/// PATCH /v2/<name>/blobs/uploads/<id> — append a chunk to the session file, under the
-/// session's lock ([`lock_upload`]).
-fn patch_upload(store: &Store, name: &str, id: &str, body: &[u8]) -> Result<Response<Body>> {
+/// The refusal for a PATCH or PUT naming an upload `name` has no session `id` for. It
+/// needs nothing from the request body, so [`route`] answers with it before reading one.
+fn upload_unknown(store: &Store, name: &str, id: &str) -> Option<Response<Body>> {
     if !valid_upload_id(id) {
-        return Ok(error_response(
+        return Some(error_response(
             StatusCode::BAD_REQUEST,
             "BLOB_UPLOAD_INVALID",
             id,
         ));
     }
     if !upload_is_for(store, id, name) {
-        return Ok(error_response(
+        return Some(error_response(
             StatusCode::NOT_FOUND,
             "BLOB_UPLOAD_UNKNOWN",
             id,
         ));
+    }
+    None
+}
+
+/// Return the finalization digest or reject a malformed ID, a missing or malformed
+/// query digest, or an ID unbound to the repository.
+fn upload_to_finish(
+    store: &Store,
+    name: &str,
+    id: &str,
+    query: &str,
+) -> std::result::Result<String, Box<Response<Body>>> {
+    if !valid_upload_id(id) {
+        return Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            "BLOB_UPLOAD_INVALID",
+            id,
+        )));
+    }
+    let Some(digest) = query_param(query, "digest") else {
+        return Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            "missing digest",
+        )));
+    };
+    if !valid_digest(&digest) {
+        return Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            &digest,
+        )));
+    }
+    match upload_unknown(store, name, id) {
+        Some(refusal) => Err(Box::new(refusal)),
+        None => Ok(digest),
+    }
+}
+
+/// PATCH /v2/<name>/blobs/uploads/<id> — append a chunk to the session file, under the
+/// session's lock ([`lock_upload`]).
+fn patch_upload(store: &Store, name: &str, id: &str, body: &[u8]) -> Result<Response<Body>> {
+    if let Some(refusal) = upload_unknown(store, name, id) {
+        return Ok(refusal);
     }
     let mut f = match lock_upload(store, id)? {
         UploadSession::Held(f) => f,
@@ -5183,29 +5235,14 @@ fn finish_upload(
     body: &[u8],
     body_is_zstd: bool,
 ) -> Result<Response<Body>> {
-    if !valid_upload_id(id) {
-        return Ok(error_response(
-            StatusCode::BAD_REQUEST,
-            "BLOB_UPLOAD_INVALID",
-            id,
-        ));
-    }
-    let Some(digest) = query_param(query, "digest") else {
-        return Ok(error_response(
-            StatusCode::BAD_REQUEST,
-            "DIGEST_INVALID",
-            "missing digest",
-        ));
+    let digest = match upload_to_finish(store, name, id, query) {
+        Ok(digest) => digest,
+        Err(refusal) => return Ok(*refusal),
     };
-    if !valid_digest(&digest) {
-        return Ok(error_response(
-            StatusCode::BAD_REQUEST,
-            "DIGEST_INVALID",
-            &digest,
-        ));
-    }
     // shared store lock for the promotion (vs. an exclusive gc); see lock_shared.
     let _lock = store.lock_shared()?;
+    // Checked again under the store lock: a gc in between sweeps an idle session with
+    // its binding.
     if !upload_is_for(store, id, name) {
         return Ok(error_response(
             StatusCode::NOT_FOUND,
