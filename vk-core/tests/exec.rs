@@ -177,9 +177,9 @@ async fn exec_ends_when_a_leftover_process_holds_the_pipes() {
         name: "sh".into(),
         args: vec![
             "-c".into(),
-            "read _ < \"$1\" & echo bye".into(),
+            format!("{{ {HOLD_FIFO}; }} & echo bye"),
             "sh".into(),
-            release.0.to_str().unwrap().into(),
+            release.path.to_str().unwrap().into(),
         ],
         env: vec![],
         clear_env: false,
@@ -884,13 +884,14 @@ async fn disconnect_hangs_up_a_tty_exec() {
 
 /// Drive a tty exec and return (stdout, exit code).
 async fn run_tty(addr: &SocketAddr, script: &str, rows: u16, cols: u16) -> (String, Option<i32>) {
-    run_tty_as(addr, script, rows, cols, AMBIENT_USER, vec![]).await
+    run_tty_as(addr, script, &[], rows, cols, AMBIENT_USER, vec![]).await
 }
 
-/// [`run_tty`] as `user`.
+/// Runs [`run_tty`] as `user` with `args` starting at shell argument `$1`.
 async fn run_tty_as(
     addr: &SocketAddr,
     script: &str,
+    args: &[&str],
     rows: u16,
     cols: u16,
     user: Option<String>,
@@ -899,7 +900,11 @@ async fn run_tty_as(
     let (mut stream, mut sink) = connect(addr).await.unwrap();
     sink.send(Message::CmdExec(CmdExec {
         name: "sh".into(),
-        args: vec!["-c".into(), script.into()],
+        args: ["-c", script, "sh"]
+            .iter()
+            .chain(args)
+            .map(|arg| (*arg).into())
+            .collect(),
         env: vec![],
         clear_env: false,
         mode: RunMode::Interactive,
@@ -965,7 +970,7 @@ async fn tty_exec_terminal_reopens_as_its_user() {
     }
     let addr = start_server("tty-owner").await;
     let script = r#"t=$(tty) && exec 3<>"$t" && echo OK"#;
-    let (stdout, code) = run_tty_as(&addr, script, 24, 80, Some("65534".into()), vec![]).await;
+    let (stdout, code) = run_tty_as(&addr, script, &[], 24, 80, Some("65534".into()), vec![]).await;
     assert_eq!(code, Some(0), "stdout: {stdout}");
     assert!(stdout.contains("OK\r\n"), "stdout: {stdout}");
 }
@@ -976,7 +981,7 @@ async fn tty_exec_terminal_reopens_as_its_user() {
 async fn tty_exec_takes_the_client_terminal_modes() {
     let addr = start_server("tty-modes").await;
     let modes = vec![(1, 2), (53, 0), (42, 1)];
-    let (stdout, code) = run_tty_as(&addr, "stty -a", 24, 80, AMBIENT_USER, modes).await;
+    let (stdout, code) = run_tty_as(&addr, "stty -a", &[], 24, 80, AMBIENT_USER, modes).await;
     assert_eq!(code, Some(0), "stdout: {stdout}");
     assert!(stdout.contains("intr = ^B;"), "stdout: {stdout}");
     let words: Vec<&str> = stdout.split_whitespace().collect();
@@ -995,8 +1000,9 @@ async fn tty_exec_ends_when_a_leftover_process_holds_the_pty() {
     // the trap has to be installed before the fork, not inside the background job: the
     // kernel hangs up the pty's process group when the session leader exits, and a
     // leftover that takes the SIGHUP closes the pty, hiding the case under test
-    let script = format!("trap '' HUP; read _ < '{}' & echo bye", release.0.display());
-    let (stdout, code) = run_tty(&addr, &script, 24, 80).await;
+    let script = format!("trap '' HUP; {{ {HOLD_FIFO}; }} & echo bye");
+    let path = release.path.to_str().unwrap();
+    let (stdout, code) = run_tty_as(&addr, &script, &[path], 24, 80, AMBIENT_USER, vec![]).await;
     assert_eq!(code, Some(0), "stdout: {stdout}");
     assert!(stdout.contains("bye\r\n"), "stdout: {stdout}");
 }
@@ -1109,22 +1115,22 @@ async fn a_capped_channel_refuses_a_request_past_its_cap() {
         assert_eq!(code, Some(0));
     }
 
-    // A background command blocks opening this fifo until the test opens its other end.
+    // Keep the background command in the only available slot.
     let release = fifo("capped-fifo");
     assert!(matches!(
-        first_reply_args(
-            &addr,
-            "read _ < \"$1\"",
-            &[release.0.to_str().unwrap()],
-            true
-        )
-        .await,
+        first_reply_args(&addr, HOLD_FIFO, &[release.path.to_str().unwrap()], true).await,
         Message::StartOK
     ));
     refused(first_reply(&addr, "true", false).await);
 }
 
-/// Create a FIFO in [`scratch`] and release its reader when the guard drops.
+/// Wait for EOF on the FIFO at `$1`. A read-only open would block forever if the test
+/// died before the shell opened the FIFO. Open it read-write to avoid that wait, reopen
+/// it read-only through `/proc`, then close the shell's writer. A late reader sees EOF
+/// immediately when no writer remains.
+const HOLD_FIFO: &str = r#"exec 3<>"$1" 4</proc/self/fd/3 3<&- || exit; read _ <&4"#;
+
+/// Create a FIFO in [`scratch`] and keep its writer open for [`HOLD_FIFO`].
 fn fifo(name: &str) -> ReleaseFifoReader {
     use std::os::unix::ffi::OsStrExt as _;
     let path = scratch().join(name);
@@ -1132,24 +1138,80 @@ fn fifo(name: &str) -> ReleaseFifoReader {
     // SAFETY: `c_path` is a NUL-terminated path.
     let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
     assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
-    ReleaseFifoReader(path)
+    // Opening read-write needs no reader. A forked child keeps a copy of the writer
+    // until exec closes its CLOEXEC descriptor.
+    let writer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    ReleaseFifoReader {
+        path,
+        _writer: writer,
+    }
 }
 
-/// Release the FIFO reader on drop without waiting for the command. Opening both ends
-/// unblocks a waiting reader. Unlinking prevents a late open, and closing sends EOF.
-struct ReleaseFifoReader(std::path::PathBuf);
+/// Holds the writer until guard drop or process exit. Cleanup never waits for [`HOLD_FIFO`].
+struct ReleaseFifoReader {
+    path: std::path::PathBuf,
+    _writer: std::fs::File,
+}
 
 impl Drop for ReleaseFifoReader {
     fn drop(&mut self) {
-        let opened = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.0);
-        let removed = std::fs::remove_file(&self.0);
-        if let Err(err) = removed.and(opened.map(drop)) {
-            eprintln!("cannot release the reader of {}: {err}", self.0.display());
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            eprintln!("cannot remove {}: {err}", self.path.display());
         }
     }
+}
+
+/// A late [`HOLD_FIFO`] exits even when SIGKILL leaves the FIFO name in place.
+#[test]
+fn a_fifo_holder_late_to_its_fifo_ends_once_the_writer_is_gone() {
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
+    let path = scratch().join("late-fifo");
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: `c_path` is a NUL-terminated path.
+    let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    // Parent-owned stdin pipes release both helpers if the test exits.
+    let mut writer = Command::new("sh")
+        .args(["-c", r#"exec 5<>"$1"; echo held; read _"#, "sh"])
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut held = String::new();
+    std::io::BufReader::new(writer.stdout.take().unwrap())
+        .read_line(&mut held)
+        .unwrap();
+    assert_eq!(held, "held\n");
+    let mut holder = Command::new("sh")
+        .args(["-c", &format!("read _; {HOLD_FIFO}"), "sh"])
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writer.kill().unwrap();
+    writer.wait().unwrap();
+    // Release the reader only after the writer exits.
+    drop(holder.stdin.take());
+    let (done, ended) = std::sync::mpsc::channel();
+    let pid = holder.id();
+    std::thread::spawn(move || done.send(holder.wait()));
+    let status = ended
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| {
+            // SAFETY: `kill` takes an integer PID and signal, with no pointer arguments.
+            unsafe { libc::kill(i32::try_from(pid).unwrap(), libc::SIGKILL) };
+            panic!("the holder blocked on a FIFO with no writer left")
+        })
+        .unwrap();
+    // The shell exits with the status of `read` at EOF.
+    assert_eq!(status.code(), Some(1), "{status}");
+    std::fs::remove_file(&path).unwrap();
 }
 
 /// A server that does not allow background commands refuses one, before running anything.
