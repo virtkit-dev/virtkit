@@ -2238,12 +2238,14 @@ async fn pull_into(
         .context("writing the chunk manifest")?;
     let chunks_cache = chunks_cache_dir(dir);
     let out = std::sync::Arc::new(out);
+    let buffers = std::sync::Arc::new(ChunkBuffers::default());
     let fetched = AtomicUsize::new(0);
     let reused = AtomicUsize::new(0);
     let results: Vec<Result<()>> = futures::stream::iter(chunk_layers)
         .map(|layer| {
             let compressed = layer.media_type == CHUNK_MEDIA_TYPE;
             let out = std::sync::Arc::clone(&out);
+            let buffers = std::sync::Arc::clone(&buffers);
             let ext4 = ext4.clone();
             let (fetched, reused, chunks_cache) = (&fetched, &reused, &chunks_cache);
             async move {
@@ -2252,9 +2254,10 @@ async fn pull_into(
                 let bytes =
                     pull_chunk(client, image, &layer, chunks_cache, fetched, reused).await?;
                 tokio::task::spawn_blocking(move || -> Result<()> {
-                    let (offset, raw) = chunk_bytes(&layer, bytes, compressed, total_size)?;
-                    write_chunk_sparse(&out, offset, &raw)
-                        .with_context(|| format!("writing a chunk into {}", ext4.display()))
+                    buffers.with_chunk(&layer, &bytes, compressed, total_size, |offset, raw| {
+                        write_chunk_sparse(&out, offset, raw)
+                            .with_context(|| format!("writing a chunk into {}", ext4.display()))
+                    })
                 })
                 .await
                 .context("a chunk-reassembly worker panicked")?
@@ -2267,6 +2270,7 @@ async fn pull_into(
         r?;
     }
     drop(out);
+    drop(buffers);
     let (fetched, reused) = (
         fetched.load(Ordering::Relaxed),
         reused.load(Ordering::Relaxed),
@@ -2520,23 +2524,60 @@ fn sort_lazy_chunks(chunks: &mut [LazyChunk]) -> Result<()> {
     Ok(())
 }
 
+/// Workers reuse decompression buffers within one image reassembly. The pool retains at most
+/// one buffer per concurrent worker, each capped at [`CDC_MAX`] plus one byte to detect an
+/// overlong frame.
+#[derive(Default)]
+struct ChunkBuffers(std::sync::Mutex<Vec<Vec<u8>>>);
+
+impl ChunkBuffers {
+    /// Pass the image offset and raw bytes validated by [`chunk_bytes`] to `place`.
+    fn with_chunk<T>(
+        &self,
+        layer: &OciDescriptor,
+        blob: &[u8],
+        compressed: bool,
+        total_size: u64,
+        place: impl FnOnce(u64, &[u8]) -> Result<T>,
+    ) -> Result<T> {
+        let mut decoded = if compressed {
+            self.0.lock().unwrap().pop().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let placed = chunk_bytes(layer, blob, compressed, total_size, &mut decoded)
+            .and_then(|(offset, raw)| place(offset, raw));
+        // Raw chunks and early validation failures can leave capacity at zero. Discard any
+        // allocation above the read limit.
+        if (1..=CDC_MAX + 1).contains(&decoded.capacity()) {
+            self.0.lock().unwrap().push(decoded);
+        }
+        placed
+    }
+}
+
 /// A chunk's offset in the image and its raw bytes, held to what its descriptor claims:
 /// exactly its annotated length — at most [`CDC_MAX`] — once decompressed, and placed inside
 /// the `total_size` image. The registry writes both the descriptor and the blob, so a frame
-/// that decompresses past its length is cut off there rather than inflated in memory.
-fn chunk_bytes(
+/// that decompresses past its length is cut off a byte past it rather than inflated in memory.
+/// Compressed chunks overwrite `decoded`. Raw chunks borrow `blob` and leave `decoded`
+/// untouched.
+fn chunk_bytes<'a>(
     layer: &OciDescriptor,
-    blob: Vec<u8>,
+    blob: &'a [u8],
     compressed: bool,
     total_size: u64,
-) -> Result<(u64, Vec<u8>)> {
+    decoded: &'a mut Vec<u8>,
+) -> Result<(u64, &'a [u8])> {
     let (offset, len) = chunk_bounds(layer, total_size)?;
     let raw = if compressed {
-        let mut raw = Vec::with_capacity(len as usize);
-        zstd_reader(&blob)
-            .and_then(|d| d.take(len + 1).read_to_end(&mut raw))
+        decoded.clear();
+        // Reserve the extra byte so detecting an overlong frame needs no reallocation.
+        decoded.reserve_exact(len as usize + 1);
+        zstd_reader(blob)
+            .and_then(|d| d.take(len + 1).read_to_end(decoded))
             .with_context(|| format!("zstd-decompressing chunk {}", layer.digest))?;
-        raw
+        &decoded[..]
     } else {
         blob
     };
@@ -4009,6 +4050,7 @@ mod local {
             .with_context(|| format!("creating {}", tmp.display()))?;
         out.set_len(config.total_size)
             .with_context(|| format!("sizing {}", tmp.display()))?;
+        let buffers = ChunkBuffers::default();
         reassemble_parallel(&manifest.layers, |layer| {
             // self-describing via media type: a raw-digest chunk's canonical bytes ARE
             // the data; a compressed-digest chunk's canonical bytes are a zstd frame.
@@ -4025,9 +4067,16 @@ mod local {
                     root.display()
                 )
             })?;
-            let (offset, raw) = chunk_bytes(layer, bytes, compressed, config.total_size)?;
-            write_chunk_sparse(&out, offset, &raw)
-                .with_context(|| format!("writing a chunk into {}", tmp.display()))
+            buffers.with_chunk(
+                layer,
+                &bytes,
+                compressed,
+                config.total_size,
+                |offset, raw| {
+                    write_chunk_sparse(&out, offset, raw)
+                        .with_context(|| format!("writing a chunk into {}", tmp.display()))
+                },
+            )
         })?;
         drop(out);
         let _ = std::fs::remove_file(dest);
@@ -5685,22 +5734,82 @@ pub(crate) mod tests {
         let raw = vec![5u8; 4096];
         let frame = zstd::encode_all(&raw[..], 3).unwrap();
         let desc = |offset, len| chunk_descriptor(CHUNK_MEDIA_TYPE, "sha256:x", 1, offset, len);
+        let buffers = ChunkBuffers::default();
+        let chunk = |layer: &OciDescriptor, blob: &[u8], compressed, total| {
+            buffers.with_chunk(layer, blob, compressed, total, |offset, raw| {
+                Ok((offset, raw.to_vec()))
+            })
+        };
         assert_eq!(
-            chunk_bytes(&desc(8192, 4096), frame.clone(), true, 1 << 20).unwrap(),
+            chunk(&desc(8192, 4096), &frame, true, 1 << 20).unwrap(),
             (8192, raw.clone())
         );
         // Inflates past its length (a bomb, as far as this reader can tell): refused.
-        assert!(chunk_bytes(&desc(0, 100), frame.clone(), true, 1 << 20).is_err());
+        assert!(chunk(&desc(0, 100), &frame, true, 1 << 20).is_err());
         // Short of it: refused.
-        assert!(chunk_bytes(&desc(0, 8192), frame.clone(), true, 1 << 20).is_err());
+        assert!(chunk(&desc(0, 8192), &frame, true, 1 << 20).is_err());
         // Outside the image, or larger than any chunk: refused.
-        assert!(chunk_bytes(&desc((1 << 20) - 10, 4096), frame.clone(), true, 1 << 20).is_err());
-        assert!(chunk_bytes(&desc(u64::MAX - 1, 4096), frame, true, u64::MAX).is_err());
+        assert!(chunk(&desc((1 << 20) - 10, 4096), &frame, true, 1 << 20).is_err());
+        assert!(chunk(&desc(u64::MAX - 1, 4096), &frame, true, u64::MAX).is_err());
         let huge = CDC_MAX as u64 + 1;
-        assert!(chunk_bytes(&desc(0, huge), vec![0; 1], false, u64::MAX).is_err());
-        // A raw chunk is its own length.
-        assert!(chunk_bytes(&desc(0, 4096), raw.clone(), false, 1 << 20).is_ok());
-        assert!(chunk_bytes(&desc(0, 4095), raw, false, 1 << 20).is_err());
+        assert!(chunk(&desc(0, huge), &[0; 1], false, u64::MAX).is_err());
+        // A raw chunk supplies its own bytes and must match its declared length.
+        let other = vec![6u8; 4096];
+        assert_eq!(
+            chunk(&desc(0, 4096), &other, false, 1 << 20).unwrap(),
+            (0, other.clone())
+        );
+        assert!(chunk(&desc(0, 4095), &raw, false, 1 << 20).is_err());
+        // A rejected frame leaves no bytes in the next decoded chunk.
+        let longer = zstd::encode_all(&[7u8; 8192][..], 3).unwrap();
+        assert!(chunk(&desc(0, 4096), &longer, true, 1 << 20).is_err());
+        assert_eq!(
+            chunk(&desc(0, 4096), &frame, true, 1 << 20).unwrap(),
+            (0, raw.clone())
+        );
+    }
+
+    /// Successive compressed chunks reuse one buffer capped at `CDC_MAX + 1` bytes. Raw
+    /// chunks bypass the pool.
+    #[test]
+    fn chunk_buffers_are_reused_within_a_chunks_size() {
+        let desc = |len| chunk_descriptor(CHUNK_MEDIA_TYPE, "sha256:x", 1, 0, len);
+        let buffers = ChunkBuffers::default();
+        let capacities = || -> Vec<usize> {
+            let held = buffers.0.lock().unwrap();
+            held.iter().map(Vec::capacity).collect()
+        };
+        let total = CDC_MAX as u64;
+        let decode = |blob: &[u8], compressed, len: usize| {
+            buffers.with_chunk(&desc(len as u64), blob, compressed, total, |_, raw| {
+                Ok(raw.to_vec())
+            })
+        };
+        let raw = compressible(70_000, 1);
+        assert_eq!(decode(&raw, false, raw.len()).unwrap(), raw);
+        assert_eq!(capacities(), [0usize; 0]);
+        let frame = zstd_chunk_frame(&raw).unwrap();
+        assert_eq!(decode(&frame, true, raw.len()).unwrap(), raw);
+        let held = capacities();
+        assert_eq!(held.len(), 1);
+        assert!((raw.len()..=CDC_MAX + 1).contains(&held[0]));
+        // A smaller compressed chunk and a raw chunk leave capacity unchanged.
+        let small = compressible(300, 2);
+        let small_frame = zstd_chunk_frame(&small).unwrap();
+        assert_eq!(decode(&small_frame, true, small.len()).unwrap(), small);
+        assert_eq!(decode(&small, false, small.len()).unwrap(), small);
+        assert_eq!(capacities(), held);
+        // The pool retains the buffer after both a one-byte overrun and a valid full-size
+        // chunk.
+        let full = compressible(CDC_MAX, 3);
+        let full_frame = zstd_chunk_frame(&full).unwrap();
+        assert!(decode(&full_frame, true, CDC_MAX - 1).is_err());
+        // A buffer that had grown further would not have been kept.
+        let held = capacities();
+        assert_eq!(held.len(), 1);
+        assert!((CDC_MAX..=CDC_MAX + 1).contains(&held[0]));
+        assert_eq!(decode(&full_frame, true, CDC_MAX).unwrap(), full);
+        assert_eq!(capacities().len(), 1);
     }
 
     /// A lazy view's chunks are sorted by offset; touching chunks pass, overlapping ones don't.
@@ -6033,11 +6142,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// Concurrent workers sharing the pool must decode valid chunks after truncated or
-    /// corrupt frames, or frames that expand beyond their descriptor's length.
+    /// Workers sharing decoder contexts and buffers must recover after truncated, corrupt, or
+    /// overlong frames.
     #[test]
     fn chunk_decoding_recovers_on_shared_contexts() {
         let desc = |len| chunk_descriptor(CHUNK_MEDIA_TYPE, "sha256:x", 1, 0, len);
+        let buffers = &ChunkBuffers::default();
         std::thread::scope(|s| {
             for t in 0..4u64 {
                 s.spawn(move || {
@@ -6049,7 +6159,11 @@ pub(crate) mod tests {
                         let frame = zstd_chunk_frame(&raw).unwrap();
                         let total = CDC_MAX as u64;
                         let decode = |frame: &[u8], len: usize| {
-                            chunk_bytes(&desc(len as u64), frame.to_vec(), true, total).ok()
+                            buffers
+                                .with_chunk(&desc(len as u64), frame, true, total, |at, raw| {
+                                    Ok((at, raw.to_vec()))
+                                })
+                                .ok()
                         };
                         assert_eq!(decode(&frame, len), Some((0, raw.clone())));
                         if len > 300 {
@@ -6067,6 +6181,7 @@ pub(crate) mod tests {
                 });
             }
         });
+        assert!(buffers.0.lock().unwrap().len() <= 4);
     }
 
     /// Retry a disconnected transparent-zstd probe before reporting lack of support.
