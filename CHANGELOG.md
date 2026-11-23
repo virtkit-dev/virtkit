@@ -93,6 +93,8 @@ All notable changes to virtkit will be documented in this file.
   finished while a child process held the upload file open.
 - `vk-registry` uses much less CPU serving blobs. Reusing chunk buffers avoids handing
   their memory back to the kernel and faulting it in again for every chunk.
+- `vk-registry` and the local `vk build` cache use less CPU compressing and decompressing
+  stored blobs because they reuse zstd's working memory between blobs.
 - `vk node`, `vk tune` and `vk-gitlab` can reuse their state directory as soon as the
   previous holder releases it.
 - `vk dev` keeps its `auto` endpoint address when a child inherits a port check or
