@@ -41,10 +41,10 @@ jobs:
   fleet-e2e:
     needs: [quality, build]
     runs-on: ubuntu-26.04
-    # Above the scripts' caps and cleanups combined (4 × (900 + 120 + 70)s), so the loop
-    # always ends and reports. The mixed-version and update tests skip here without older or
-    # newer binaries.
-    timeout-minutes: 75
+    # The suite usually finishes within 15 minutes. Several scripts reaching their
+    # 900 s limits can exhaust the job timeout before cleanup. The mixed-version
+    # test skips without protocol-v1 vk and vk-hub, the update test without VK_NEXT.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
