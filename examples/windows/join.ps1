@@ -25,7 +25,8 @@ $domain = if ($env:LAB_DOMAIN) { $env:LAB_DOMAIN } else { 'corp.lab' }
 # hour. Activate before the member needs the DC. Windows can start its own activation when
 # it connects to the Internet. Only an activation already in progress (0xC004E028) warrants
 # a retry. Report failures such as an unreachable network, an expired evaluation or an
-# unresponsive WMI provider, then continue provisioning.
+# unresponsive WMI provider, then continue provisioning. Keep the activation and status
+# checks consistent with ACTIVATE_PS1 in vk-driver/src/wineval.rs.
 $windowsFilter = "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL"
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $activated = $false

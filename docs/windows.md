@@ -86,7 +86,7 @@ its rationale and test. For Windows they add:
 | `winexec` | Commands through qemu-ga: a script staged in the guest, its output streamed back, its exit code; file copies. |
 | `winsvc` | A Windows compose service: secrets, provisioning with restarts, stop. |
 | `wintap` | A guest on a host tap: its static address and the run's names, set over qemu-ga. |
-| `wineval` | How long an image built from evaluation media keeps working, as Windows reports it. |
+| `wineval` | Online activation and the evaluation lifetime Windows reports for an image. |
 | `snapshot` | `vk snapshot` of a machine or a run, and the snapshot bundle. |
 | `vmmctl` | The run's `vmm.sock`: pause, resume, snapshot, quit. |
 | `console` | `vk console` on the serial console. |

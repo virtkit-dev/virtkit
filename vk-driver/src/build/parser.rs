@@ -77,7 +77,7 @@ pub struct GuestHint {
     /// Guest vCPUs.
     pub cpus: Option<u32>,
     /// A Windows stage's directives (`disk`, `firmware`, `tpm`, `hyperv`, `generalize`,
-    /// `warm`, `qga`), raw: the Windows build refuses each until it acts on it.
+    /// `activate`, `warm`, `qga`) as written. The Windows build rejects unsupported directives.
     pub windows: Vec<(String, String)>,
     /// The egress this stage's RUN steps declare they need (`allow-ip=`, `allow-name=`);
     /// `None` where the stage declares none.
@@ -97,12 +97,13 @@ pub struct StageEgress {
 }
 
 /// The `# vk:` keys only a Windows stage reads.
-const WINDOWS_HINTS: [&str; 7] = [
+const WINDOWS_HINTS: [&str; 8] = [
     "disk",
     "firmware",
     "tpm",
     "hyperv",
     "generalize",
+    "activate",
     "warm",
     "qga",
 ];
@@ -750,6 +751,14 @@ mod tests {
                 ("disk".to_string(), "60G".to_string()),
                 ("generalize".to_string(), "on".to_string())
             ]
+        );
+        let df = parse("# vk: activate=online\nFROM base\n").unwrap();
+        let Instruction::From(f) = &df.instructions[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            f.guest.windows,
+            vec![("activate".to_string(), "online".to_string())]
         );
         assert!(parse("# vk: disk=1G disk=2G\nFROM x\n").is_err());
         assert!(parse("# vk: colour=blue\nFROM x\n").is_err());

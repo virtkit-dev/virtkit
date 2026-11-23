@@ -8,6 +8,9 @@ All notable changes to virtkit will be documented in this file.
 
 - `vk build` now warns when a Windows image's evaluation or activation grace period is
   close to expiring or has expired.
+- `# vk: activate=online` activates Windows at the start of a build stage and waits if
+  Windows is already activating. On subsequent builds, the stage can renew a Windows
+  Server evaluation on the same install every 30 days without `--reinstall`.
 - `vk dev list` shows stable workspace-based names. `vk run --name` sets an explicit
   name. Runs with `--state-dir` or `--detach` get a name from what they boot.
   Services-only compose runs stay unnamed. `vk stop` and the other VM commands take a

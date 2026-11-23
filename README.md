@@ -849,9 +849,10 @@ vk build -f Dockerfile --out ./web-out    # a bundle: vm.json, disks, admin-pass
   cache registry server, hosts share both ([how](docs/windows.md#sharing-builds-between-hosts)),
   and `vk registry put` keeps the ISOs there for hosts that lack them.
 - `# vk:` directives: `disk=<size>` sizes the install (default 40G), `generalize=on` ends
-  the stage with sysprep (each copy gets its own name and SID), `firmware=uefi-secboot`
-  enrolls Microsoft's Secure Boot keys, `tpm=on` gives each machine a TPM 2.0, and
-  `cpus`/`mem` size the build's guests and the bundle's machine.
+  the stage with sysprep (each copy gets its own name and SID), `activate=online` starts
+  the stage by activating Windows online, `firmware=uefi-secboot` enrolls Microsoft's Secure
+  Boot keys, `tpm=on` gives each machine a TPM 2.0, and `cpus`/`mem` size the build's guests
+  and the bundle's machine.
 - `RUN` has no network unless it says `--network=default`, and then reaches what
   `--build-allow-ip`/`--build-allow-name` allow (everything without them; `--build-net none`
   refuses it). Under an allowlist Windows' own connectivity check fails, so it reports no
@@ -872,11 +873,26 @@ sharing images built from it.
   must activate online within 10 days of its start (e.g. `slmgr /ato` in its `CMD`, with a
   network), or Windows shuts down periodically.
 - An image that is not generalized carries its build's licensing: activated online during
-  its build (e.g. in a `RUN --network=default` step), its 180 days run from then for every
-  machine started from it. `vk build` records when that ends, or when the activation grace
-  of an unactivated image ends. `vk build`, `vk run`, compose services and builds using
-  `FROM` the bundle warn when fewer than 30 days of evaluation or 3 days of grace remain,
-  and after either deadline passes.
+  its build, a Server evaluation runs for 180 days from activation on every machine started
+  from it. Put `# vk: activate=online` on the `FROM winiso:` stage or the first stage after
+  it to activate before the stage's first instruction. Windows can also activate during a
+  networked step. If an earlier step or base image already activated the evaluation, its
+  clock keeps running. The build warns when it detects that earlier activation.
+
+  Windows may already be activating when the stage starts. The build retries that error
+  for five minutes and other caught errors for one minute. `--build-net none` forbids
+  online activation. With `--build-allow-ip` or `--build-allow-name`, allow access to
+  Microsoft's activation servers. `generalize=on` conflicts with `activate=online` in the
+  same stage. Generalizing an activated image in a later stage discards its activation.
+
+  Builds reuse the activation for up to 30 days, then activate from the same parent and
+  rebuild subsequent layers. Hosts sharing a build cache can reuse one host's renewal.
+  If renewal fails, the build warns and uses the newest cached activation from the previous
+  two periods, if available. Otherwise the build fails with the reason.
+
+  `vk build` records when the evaluation or activation grace expires. `vk build`, `vk run`,
+  compose services and stages built `FROM` the bundle warn with less than 30 days left on
+  an evaluation or less than 3 days left to activate.
 - `vk build --reinstall` installs each `FROM winiso:` stage again under new cache keys and
   rebuilds every step on it. The old install and its layers stay cached (tens of GB): bundles
   built on them keep working until they are rebuilt, except on a CI host: there they are

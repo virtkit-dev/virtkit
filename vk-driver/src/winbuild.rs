@@ -3,7 +3,8 @@
 //! qcow2 overlay over the one before, cached by its parent and the instruction — made by booting
 //! the guest on it, acting through qemu-ga ([`crate::winexec`]) and powering it off cleanly.
 //! `ENV`, `WORKDIR` and `SHELL` shape the `RUN` steps after them. `# vk: disk=` sizes a
-//! `winiso:` stage's install, `# vk: generalize=on` ends the stage with sysprep, and
+//! `winiso:` stage's install, `# vk: generalize=on` ends the stage with sysprep,
+//! `# vk: activate=online` starts it by activating Windows, and
 //! `# vk: firmware=uefi-secboot` enrolls Microsoft's Secure Boot keys. The result
 //! is a bundle `vk run` boots, which records its layer so another Dockerfile can build `FROM` it
 //! against the same build cache: the record names the layer, and only the cache that made it
@@ -506,6 +507,7 @@ fn check_stage(stage: &Stage, context: &Path, no_network: bool) -> Result<()> {
     }
     let winiso =
         crate::winiso::Source::of_stage(&from.image, &from.extra_flags, context)?.is_some();
+    let generalize = stage.directive("generalize") == Some("on");
     for (key, value) in &from.guest.windows {
         match key.as_str() {
             "disk" if !winiso => bail!("`# vk: disk` sizes a winiso: stage's install only"),
@@ -516,6 +518,17 @@ fn check_stage(stage: &Stage, context: &Path, no_network: bool) -> Result<()> {
                 bail!("`# vk: generalize={value}`: expected on or off")
             }
             "generalize" => {}
+            "activate" if !matches!(value.as_str(), "online" | "off") => {
+                bail!("`# vk: activate={value}`: expected online or off")
+            }
+            "activate" if value == "online" && no_network => {
+                bail!("`# vk: activate=online`: --build-net none forbids it")
+            }
+            // Sysprep would discard the activation it follows.
+            "activate" if value == "online" && generalize => {
+                bail!("`# vk: activate=online` does not apply to a stage that says generalize=on")
+            }
+            "activate" => {}
             "firmware" if !matches!(value.as_str(), "uefi" | "uefi-secboot") => {
                 bail!("`# vk: firmware={value}`: expected uefi or uefi-secboot")
             }
@@ -767,6 +780,25 @@ fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> R
     // A generalized image carries no clock of its own: each machine starts a new grace.
     let generalized = stage.directive("generalize") == Some("on");
     let last = (target && !generalized).then(|| last_step(&stage.body));
+    if stage.directive("activate") == Some("online") {
+        eprintln!("virtkit: [{label}] activate (online)");
+        // Record licensing here in case a later stage adds no layer of its own.
+        let steps = &Steps {
+            evaluation: true,
+            ..steps
+        };
+        activate_step(
+            &mut layer,
+            steps,
+            crate::vms::unix_now(),
+            |layer, material| {
+                step(layer, material, steps, true, |ga, _, _| {
+                    let allowlist = !matches!(steps.net, crate::build::BuildNet::All);
+                    crate::wineval::activate(ga, allowlist)
+                })
+            },
+        )?;
+    }
     for (n, instruction) in stage.body.iter().enumerate() {
         let what = format!("[{label} {}/{}]", n + 1, stage.body.len());
         let steps = &Steps {
@@ -820,6 +852,65 @@ fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> R
     }
     b.built.insert(index, layer.clone());
     Ok(layer)
+}
+
+/// Builds that first activate an evaluation here restart its clock and invalidate later layers
+/// at each new period.
+const ACTIVATE_PERIOD: u64 = 30 * 24 * 60 * 60;
+
+/// Two prior periods cover a full period of failed renewals. A 180-day Server evaluation
+/// first activated in either period still has more than 90 days left.
+const ACTIVATE_FALLBACK_PERIODS: u64 = 2;
+
+/// Cache material for the activation step in the current [`ACTIVATE_PERIOD`]. The parent key
+/// staggers renewals across installs and gives hosts building the same parent the same phase.
+fn activate_material(parent: &str, now: u64) -> String {
+    // Use the first eight hex digits of the SHA-256 layer key, or zero if they cannot be read.
+    let phase = parent
+        .get(..8)
+        .and_then(|head| u64::from_str_radix(head, 16).ok())
+        .unwrap_or(0)
+        % ACTIVATE_PERIOD;
+    format!("ACTIVATE\0online\0{}", (now + phase) / ACTIVATE_PERIOD)
+}
+
+/// Try the current activation layer first on every build. If making it fails, even at guest
+/// boot, warn with the cause and try the newest cached activation from the previous
+/// [`ACTIVATE_FALLBACK_PERIODS`] periods. This lets builds continue through activation outages.
+fn activate_step(
+    layer: &mut Layer,
+    steps: &Steps,
+    now: u64,
+    attempt: impl FnOnce(&mut Layer, &str) -> Result<()>,
+) -> Result<()> {
+    let Err(e) = attempt(layer, &activate_material(&layer.key, now)) else {
+        return Ok(());
+    };
+    let Some(previous) = (1..=ACTIVATE_FALLBACK_PERIODS)
+        .map(|back| activate_material(&layer.key, now.saturating_sub(back * ACTIVATE_PERIOD)))
+        .find(|material| has_step(layer, material, steps))
+    else {
+        return Err(e);
+    };
+    eprintln!("virtkit: warning: {e:#}; building on a previous activation instead");
+    step(layer, &previous, steps, true, |_, _, _| {
+        bail!("the previous activation is gone from the cache")
+    })
+}
+
+/// Look for the step on `layer` locally and, when pulls are enabled, in the shared cache.
+fn has_step(layer: &Layer, material: &str, steps: &Steps) -> bool {
+    let key = step_key(layer, material);
+    steps
+        .cache
+        .join("layers")
+        .join(&key)
+        .join("complete")
+        .exists()
+        || steps.pull
+            && steps
+                .registry
+                .is_some_and(|rg| matches!(remote_step(rg, &key), Lookup::Found(_)))
 }
 
 /// Which of `body`'s instructions makes a stage's last layer: its last `RUN` or `COPY`, or
@@ -1986,6 +2077,11 @@ mod tests {
             ("hyperv=on", "`# vk: hyperv` is not supported yet"),
             ("tpm=yes", "expected on or off"),
             ("generalize=yes", "expected on or off"),
+            ("activate=on", "expected online or off"),
+            (
+                "activate=online generalize=on",
+                "does not apply to a stage that says generalize=on",
+            ),
             ("firmware=bios", "expected uefi or uefi-secboot"),
             ("disk=10G", "at least 20G"),
             ("disk=lots", "at least 20G"),
@@ -2029,6 +2125,15 @@ mod tests {
         let networked = parsed(&format!("{WINISO}RUN --network=default a\n"));
         check_stage(&networked[0], Path::new("/ctx"), false).unwrap();
         let err = check_stage(&networked[0], Path::new("/ctx"), true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("--build-net none forbids it"),
+            "{err:#}"
+        );
+        let unactivated = parsed(&format!("# vk: activate=off generalize=on\n{WINISO}"));
+        check_stage(&unactivated[0], Path::new("/ctx"), true).unwrap();
+        let activated = parsed(&format!("# vk: activate=online\n{WINISO}"));
+        check_stage(&activated[0], Path::new("/ctx"), false).unwrap();
+        let err = check_stage(&activated[0], Path::new("/ctx"), true).unwrap_err();
         assert!(
             format!("{err:#}").contains("--build-net none forbids it"),
             "{err:#}"
@@ -2337,6 +2442,140 @@ mod tests {
         assert_eq!(last("FROM b\nRUN a\nWORKDIR C:/w\n"), 2);
         assert_eq!(last("FROM b\nENV A=1\n"), 1);
         assert_eq!(last("FROM b\nCMD c\n"), 1);
+    }
+
+    #[test]
+    fn a_stage_activates_anew_each_period_and_falls_back_on_the_previous_activation() {
+        let period = ACTIVATE_PERIOD;
+        let plain = "0".repeat(64);
+        assert_eq!(
+            activate_material(&plain, 5 * period),
+            activate_material(&plain, 6 * period - 1)
+        );
+        assert_ne!(
+            activate_material(&plain, 6 * period - 1),
+            activate_material(&plain, 6 * period)
+        );
+        // Another parent renews at another time: this one an hour (0xe10 seconds) earlier.
+        let shifted = format!("00000e10{}", "0".repeat(56));
+        assert_eq!(
+            activate_material(&shifted, 6 * period - 3600),
+            activate_material(&plain, 6 * period)
+        );
+        assert_ne!(
+            activate_material(&shifted, 6 * period - 3601),
+            activate_material(&shifted, 6 * period - 3600)
+        );
+
+        let root = scratch("activate");
+        let cache = root.join("cache");
+        let mut parent = layer();
+        parent.key = plain.clone();
+        let parent_dir = cache.join("layers").join(&parent.key);
+        parent.disk = parent_dir.join("disk.qcow2");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        std::fs::write(&parent.disk, vec![0; 1 << 20]).unwrap();
+        std::fs::write(parent_dir.join("complete"), "").unwrap();
+        let seed = |now: u64| {
+            let key = step_key(&parent, &activate_material(&parent.key, now));
+            let dir = cache.join("layers").join(&key);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("disk.qcow2"), vec![0; 1 << 20]).unwrap();
+            std::fs::write(dir.join("complete"), "").unwrap();
+            std::fs::write(dir.join(EVALUATION), "{}").unwrap();
+            key
+        };
+        let refs = Refs::default();
+        let steps = Steps {
+            cpus: 2,
+            mem: "4G",
+            cache: &cache,
+            registry: None,
+            pull: true,
+            net: &crate::build::BuildNet::All,
+            refs: &refs,
+            evaluation: true,
+        };
+        let now = 10 * period;
+        let unreachable = |_: &mut Layer, _: &str| -> Result<()> { bail!("no servers") };
+
+        // With no cached activation, return the renewal error.
+        let mut built = parent.clone();
+        let err = activate_step(&mut built, &steps, now, unreachable).unwrap_err();
+        assert!(format!("{err:#}").contains("no servers"), "{err:#}");
+        // An activation three periods old is too old to build on.
+        seed(now - 3 * period);
+        assert!(activate_step(&mut built, &steps, now, unreachable).is_err());
+        assert_eq!(built.key, parent.key);
+        // Two periods cover a full period of failed renewals.
+        let older = seed(now - 2 * period);
+        activate_step(&mut built, &steps, now, unreachable).unwrap();
+        assert_eq!(built.key, older);
+        // Prefer the newer fallback.
+        let mut built = parent.clone();
+        let previous = seed(now - period);
+        activate_step(&mut built, &steps, now, unreachable).unwrap();
+        assert_eq!(built.key, previous);
+        // A current cache hit needs no fallback.
+        let current = seed(now);
+        assert_ne!(current, previous);
+        let mut built = parent.clone();
+        activate_step(&mut built, &steps, now, |layer, material| {
+            step(layer, material, &steps, true, |_, _, _| bail!("not cached"))
+        })
+        .unwrap();
+        assert_eq!(built.key, current);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn has_step_finds_a_layer_the_build_cache_holds() {
+        let root = scratch("has-step");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(cache.join("layers")).unwrap();
+        let rg = crate::config::Registry::for_share(
+            root.join("store").display().to_string(),
+            false,
+            None,
+            String::new(),
+            None,
+            None,
+            None,
+        );
+        let mut parent = layer();
+        parent.key = "0".repeat(64);
+        let refs = Refs::default();
+        let mut steps = Steps {
+            cpus: 2,
+            mem: "4G",
+            cache: &cache,
+            registry: Some(&rg),
+            pull: true,
+            net: &crate::build::BuildNet::All,
+            refs: &refs,
+            evaluation: true,
+        };
+        let material = activate_material(&parent.key, 0);
+        assert!(!has_step(&parent, &material, &steps));
+
+        let raw = root.join("base.raw");
+        std::fs::write(&raw, vec![0; 1 << 20]).unwrap();
+        let disk = root.join("disk.qcow2");
+        crate::qcow2::create_overlay(&disk, &raw).unwrap();
+        let key = step_key(&parent, &material);
+        crate::wincache::push(
+            &rg,
+            &key,
+            &disk,
+            None,
+            serde_json::json!({"password": "pa"}),
+        )
+        .unwrap();
+        assert!(has_step(&parent, &material, &steps));
+        // A build that does not pull layers cannot build on it.
+        steps.pull = false;
+        assert!(!has_step(&parent, &material, &steps));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -20,8 +20,9 @@ inherits its build's licensing. `vk build`, `vk run` and compose warn when its e
 or activation grace period is close to expiring or has expired.
 Unactivated past its grace, an evaluation that is not generalized shuts down every hour: a lab
 member's provisioning (`join.ps1`) activates Windows, if it is not, at every start when the lab
-reaches the Internet. The domain controllers and standalone servers do not run it; activate
-them by hand (`slmgr /ato`) for a lab that outlives their grace.
+reaches the Internet. For domain controllers and standalone servers, which do not run
+`join.ps1`, put `# vk: activate=online` above the stage's `FROM` if the lab will outlive
+its grace period. Subsequent builds can renew activation every 30 days. Alternatively,
 `vk build --reinstall` (with the same `-f` and `--target`) installs Windows again under new
 cache keys and rebuilds the image; bundles built on the old install keep working until they
 are rebuilt.
