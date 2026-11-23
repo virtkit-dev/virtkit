@@ -119,6 +119,8 @@ All notable changes to virtkit will be documented in this file.
 - A request to a UEFI guest's QEMU guest agent now times out when the guest stops reading
   it, instead of blocking every later request for good. Later requests go through once the
   agent responds again.
+- A guest that stops reading its serial console input no longer keeps a new `vk console`
+  from taking the console over.
 - A VM command frees its slot on a capped exec channel before the client receives its
   exit status.
 

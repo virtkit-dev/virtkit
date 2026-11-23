@@ -17,6 +17,10 @@ use anyhow::{Context, Result};
 /// One client at a time; the newest wins. A new connection drops the previous client so a
 /// hung or abandoned client cannot lock the channel. A client that stops reading is dropped
 /// after [`CLIENT_WRITE_TIMEOUT`]. Guest output with no connected client is dropped.
+///
+/// Guest writes are nonblocking. The relay buffers one client read and drains it in order
+/// before reading from any client again. Buffered input survives a client disconnect.
+/// Dropping a client discards its unread input.
 pub fn serve_socket(path: &Path, guest: UnixStream, thread: &str) -> Result<()> {
     let _ = std::fs::remove_file(path);
     let listener =
@@ -33,6 +37,7 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn relay(listener: &UnixListener, guest: &UnixStream) {
     let mut client: Option<UnixStream> = None;
+    let mut to_guest: Vec<u8> = Vec::new();
     let mut buf = [0u8; 16 * 1024];
     let poll_in = |fd: i32| libc::pollfd {
         fd,
@@ -43,8 +48,13 @@ fn relay(listener: &UnixListener, guest: &UnixStream) {
         |fd: &libc::pollfd| fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
     loop {
         let mut fds = vec![poll_in(listener.as_raw_fd()), poll_in(guest.as_raw_fd())];
-        if let Some(c) = &client {
-            fds.push(poll_in(c.as_raw_fd()));
+        if to_guest.is_empty() {
+            if let Some(c) = &client {
+                fds.push(poll_in(c.as_raw_fd()));
+            }
+        } else {
+            // Resume client reads when the guest socket accepts the buffered input.
+            fds[1].events |= libc::POLLOUT;
         }
         // SAFETY: valid pollfds on fds borrowed for the call.
         if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
@@ -55,8 +65,14 @@ fn relay(listener: &UnixListener, guest: &UnixStream) {
         }
         if fds.get(2).is_some_and(ready)
             && let Some(c) = &client
-            && !copy(c, guest, &mut buf)
         {
+            match (&*c).read(&mut buf) {
+                Ok(0) | Err(_) => client = None,
+                Ok(n) => to_guest.extend_from_slice(&buf[..n]),
+            }
+        }
+        if send_ready(guest, &mut to_guest).is_err() {
+            to_guest.clear();
             client = None;
         }
         if ready(&fds[1]) {
@@ -671,6 +687,60 @@ mod tests {
         assert_eq!(&reply, b"reply\n");
         drop(stuck);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_guest_that_stops_reading_input_does_not_hold_the_console() {
+        let dir = crate::qga::tests::TempDir::new("relay-console-full");
+        let sock = dir.0.join("relay.sock");
+        let (mut port, host) = small_port();
+        serve_socket(&sock, host, "vk-relay-test").unwrap();
+        // A bound on the relay's progress, not a wait for it.
+        let bound = Some(Duration::from_secs(10));
+        port.set_read_timeout(bound).unwrap();
+
+        // Each write fits in the client socket but exceeds both the guest port's capacity
+        // and one relay read.
+        let input: Vec<u8> = (0..32 << 10).map(|i| (i % 251) as u8).collect();
+        let mut typing = vk_core::unixpath::connect(&sock).unwrap();
+        typing.set_read_timeout(bound).unwrap();
+        typing.set_write_timeout(bound).unwrap();
+        typing.write_all(&input).unwrap();
+        // Peek to confirm the relay forwarded input without freeing space in the port.
+        let port_fd = port.as_raw_fd();
+        let input_arrives = move || {
+            let mut byte = [0u8; 1];
+            // SAFETY: peeks one byte into a local, on an open socket.
+            let peeked =
+                unsafe { libc::recv(port_fd, byte.as_mut_ptr().cast(), 1, libc::MSG_PEEK) };
+            assert_eq!(peeked, 1, "{}", std::io::Error::last_os_error());
+        };
+        input_arrives();
+        // Output must still reach the client while guest input is backed up.
+        port.write_all(b"output\n").unwrap();
+        let mut output = [0u8; 7];
+        typing.read_exact(&mut output).unwrap();
+        assert_eq!(&output, b"output\n");
+
+        let mut got = vec![0u8; input.len()];
+        port.read_exact(&mut got).unwrap();
+        assert!(got == input, "the guest read other than what was typed");
+
+        // Fill the port again before the second client connects.
+        typing.write_all(&input).unwrap();
+        input_arrives();
+        let mut byte = [0u8; 1];
+        let mut client = vk_core::unixpath::connect(&sock).unwrap();
+        client.set_read_timeout(bound).unwrap();
+        // Wait for the first client to disconnect. Earlier output could still go to it.
+        match typing.read(&mut byte) {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("the relay kept the first client: {other:?}"),
+        }
+        port.write_all(b"output\n").unwrap();
+        client.read_exact(&mut output).unwrap();
+        assert_eq!(&output, b"output\n");
     }
 
     /// A frozen clock and its offset in milliseconds.
