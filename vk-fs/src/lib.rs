@@ -1638,10 +1638,21 @@ fn list_dir(dir: &OwnedFd) -> std::io::Result<Vec<std::ffi::OsString>> {
 mod tests {
     use super::*;
 
+    /// Bind tests need a private parent to check staging cleanup under umask `0002`.
+    /// Request `0700` at creation, then restore any masked owner bits through the
+    /// new directory's descriptor, as [`publish_into`] does.
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("vk-fs-{name}-{}", std::process::id()));
+        let tmp = std::env::temp_dir();
+        let leaf = format!("vk-fs-{name}-{}", std::process::id());
+        let dir = tmp.join(&leaf);
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let made =
+            create_dir_in(open_dir(&tmp).unwrap().as_fd(), OsStr::new(&leaf), 0o700).unwrap();
+        std::fs::set_permissions(
+            format!("/proc/self/fd/{}", made.as_raw_fd()),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         dir
     }
 
