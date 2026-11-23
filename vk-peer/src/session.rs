@@ -130,6 +130,7 @@ pub struct RelayConnection<B> {
 pub struct Requests<B> {
     sender: http2::SendRequest<B>,
     gate: Arc<Mutex<()>>,
+    ended: tokio::sync::watch::Receiver<()>,
 }
 
 impl<B> Clone for Requests<B> {
@@ -137,6 +138,7 @@ impl<B> Clone for Requests<B> {
         Self {
             sender: self.sender.clone(),
             gate: Arc::clone(&self.gate),
+            ended: self.ended.clone(),
         }
     }
 }
@@ -146,15 +148,18 @@ where
     B: hyper::body::Body + 'static,
 {
     /// Drives `conn` on a background task and returns its request sender.
-    pub fn spawn<C>(sender: http2::SendRequest<B>, conn: C) -> Self
+    ///
+    /// A wrapper future could drop the dispatcher before the guard acquires the gate.
+    pub fn spawn<T, E>(sender: http2::SendRequest<B>, conn: http2::Connection<T, B, E>) -> Self
     where
-        C: Future<Output = hyper::Result<()>> + Unpin + Send + 'static,
+        T: hyper::rt::Read + hyper::rt::Write + Unpin + 'static,
+        B: Unpin,
+        B::Data: Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        E: hyper::rt::bounds::Http2ClientConnExec<B, T> + Unpin + 'static,
+        http2::Connection<T, B, E>: Send,
     {
-        let gate = Arc::new(Mutex::new(()));
-        let mut driven = Driven {
-            conn: Some(conn),
-            gate: Arc::clone(&gate),
-        };
+        let (requests, mut driven) = Self::new(sender, conn);
         tokio::spawn(async move {
             if let Some(conn) = driven.conn.as_mut()
                 && let Err(e) = conn.await
@@ -162,7 +167,24 @@ where
                 log::debug!("The connection to the hub ended: {e}");
             }
         });
-        Self { sender, gate }
+        requests
+    }
+
+    /// Pairs the sender and connection guard under the same gate.
+    fn new<C>(sender: http2::SendRequest<B>, conn: C) -> (Self, Driven<C>) {
+        let gate = Arc::new(Mutex::new(()));
+        let (ended_tx, ended) = tokio::sync::watch::channel(());
+        let driven = Driven {
+            conn: Some(conn),
+            gate: Arc::clone(&gate),
+            _ended: ended_tx,
+        };
+        let requests = Self {
+            sender,
+            gate,
+            ended,
+        };
+        (requests, driven)
     }
 
     /// Send `req` on the connection.
@@ -182,12 +204,21 @@ where
     pub fn is_closed(&self) -> bool {
         self.sender.is_closed()
     }
+
+    /// Resolves after the driving task drops the connection's dispatcher.
+    pub fn ended(&self) -> impl Future<Output = ()> + Send + 'static + use<B> {
+        let mut ended = self.ended.clone();
+        // The sender signals teardown by closing the channel.
+        async move { while ended.changed().await.is_ok() {} }
+    }
 }
 
 /// Drops the dispatcher under the [`Requests`] gate even if its task is cancelled.
 struct Driven<C> {
     conn: Option<C>,
     gate: Arc<Mutex<()>>,
+    /// Signals [`Requests::ended`] after [`Drop::drop`] destroys the dispatcher.
+    _ended: tokio::sync::watch::Sender<()>,
 }
 
 impl<C> Drop for Driven<C> {
@@ -629,6 +660,113 @@ pub fn kind(msg: &HubMsg) -> &'static str {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Records whether the gate is held when the request body drops.
+    struct Probe {
+        gate: Arc<Mutex<()>>,
+        dropped: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl hyper::body::Body for Probe {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<bytes::Bytes>, Self::Error>>>
+        {
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let held = matches!(
+                self.gate.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            self.dropped.lock().unwrap().push(held);
+        }
+    }
+
+    /// Records whether the gate is held at each wake.
+    struct WakeProbe {
+        gate: Arc<Mutex<()>>,
+        woken: Mutex<Vec<bool>>,
+    }
+
+    impl std::task::Wake for WakeProbe {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let held = matches!(
+                self.gate.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            self.woken.lock().unwrap().push(held);
+        }
+    }
+
+    /// Enqueue wakes the idle dispatcher synchronously. Teardown fails a queued request
+    /// and drops its body. Both probes can therefore observe the gate while it is held.
+    #[test]
+    fn requests_are_queued_and_their_dispatcher_dropped_under_the_gate() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (io, _hub) = tokio::io::duplex(1 << 16);
+            let (sender, conn) = http2::Builder::new(TokioExecutor::new())
+                .handshake::<_, Probe>(TokioIo::new(io))
+                .await
+                .unwrap();
+            let (requests, mut driven) = Requests::new(sender, conn);
+            let waker = Arc::new(WakeProbe {
+                gate: Arc::clone(&requests.gate),
+                woken: Mutex::new(Vec::new()),
+            });
+            // Register the probe as the idle dispatcher's waker.
+            let conn = driven.conn.as_mut().unwrap();
+            let polled = std::pin::Pin::new(conn).poll(&mut std::task::Context::from_waker(
+                &Arc::clone(&waker).into(),
+            ));
+            assert!(polled.is_pending(), "{polled:?}");
+            assert!(waker.woken.lock().unwrap().is_empty());
+
+            let dropped = Arc::new(Mutex::new(Vec::new()));
+            let req = hyper::Request::get("http://hub/")
+                .body(Probe {
+                    gate: Arc::clone(&requests.gate),
+                    dropped: Arc::clone(&dropped),
+                })
+                .unwrap();
+            let response = requests.send_request(req);
+            assert_eq!(
+                *waker.woken.lock().unwrap(),
+                [true],
+                "the request was queued outside the gate"
+            );
+
+            // Leave the dispatcher unpolled to keep the request queued.
+            assert!(
+                dropped.lock().unwrap().is_empty(),
+                "the request left the queue"
+            );
+            drop(driven);
+            assert_eq!(
+                *dropped.lock().unwrap(),
+                [true],
+                "the dispatcher was dropped outside the gate"
+            );
+            // Teardown must fail the request while a sender is still alive.
+            let failed = futures::FutureExt::now_or_never(response);
+            assert!(matches!(failed, Some(Err(_))), "{failed:?}");
+            drop(requests);
+        });
+    }
 
     fn addr(last: u8) -> SocketAddr {
         SocketAddr::from(([192, 0, 2, last], 443))

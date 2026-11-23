@@ -1126,6 +1126,13 @@ mod queue_tests {
         })
     }
 
+    fn outcome(sent: &Result<Answer, DispatchError>) -> String {
+        match sent {
+            Ok(answer) => format!("answered {}", answer.status),
+            Err(e) => format!("failed: {e}"),
+        }
+    }
+
     /// Abrupt disconnect must produce a transport error before the request timeout.
     #[tokio::test]
     async fn a_request_fails_once_its_connection_ends_unanswered() {
@@ -1149,13 +1156,14 @@ mod queue_tests {
         let client = HubClient::new(link.clone(), HubRetry::default());
         let body = Bytes::new();
         let send = client.send(&Method::GET, "/v1/capacity", &body, None);
+        tokio::pin!(send);
         // Abort after the service receives the request.
-        let hang_up = async {
-            taken.recv().await.unwrap();
-            hub.abort();
-        };
-        let (sent, ()) = tokio::join!(send, hang_up);
-        let Err(e) = sent else {
+        tokio::select! {
+            sent = &mut send => panic!("ended before the hub took it: {}", outcome(&sent)),
+            taken = taken.recv() => taken.unwrap(),
+        }
+        hub.abort();
+        let Err(e) = send.await else {
             panic!("answered by a hub that never answers")
         };
         assert_eq!(e.kind, ErrorKind::Transport);
@@ -1190,15 +1198,10 @@ mod queue_tests {
             .handshake::<_, Full<Bytes>>(hyper_util::rt::TokioIo::new(tcp.unwrap()))
             .await
             .unwrap();
-        // Signal when hyper's connection future completes.
-        let (stopped_tx, stopped) = tokio::sync::oneshot::channel();
-        let conn = Box::pin(async move {
-            let out = conn.await;
-            stopped_tx.send(()).unwrap();
-            out
-        });
+        let requests = Requests::spawn(sender, conn);
+        let ended = requests.ended();
         let link = Link::new();
-        let _up = link.up(Requests::spawn(sender, conn), format!("http://{addr}"));
+        let _up = link.up(requests, format!("http://{addr}"));
         let client = HubClient::new(link.clone(), HubRetry::default());
         let body = Bytes::new();
         // The first response confirms the relay has read the one-stream limit in SETTINGS.
@@ -1208,22 +1211,29 @@ mod queue_tests {
             .unwrap();
         assert_eq!(now.status, StatusCode::OK);
         let held = client.send(&Method::GET, "/held", &body, None);
-        let drain = async {
-            taken.recv().await.unwrap();
-            // `/held` occupies the only stream. `/after` wakes the dispatcher so it observes
-            // GOAWAY whether the request was queued before or after shutdown began.
-            let after = client.send(&Method::GET, "/after", &body, None);
-            shut_down.send(()).unwrap();
-            let (after, stopped) = tokio::join!(after, stopped);
-            stopped.unwrap();
-            let Err(e) = after else {
-                panic!("answered on a connection the hub shut down")
-            };
-            assert_eq!(e.kind, ErrorKind::Transport);
-            release.notify_one();
+        tokio::pin!(held);
+        tokio::select! {
+            sent = &mut held => panic!("ended before the hub took it: {}", outcome(&sent)),
+            taken = taken.recv() => taken.unwrap(),
+        }
+        // `/held` occupies the only stream. `/after` wakes the dispatcher so it observes
+        // GOAWAY whether the request was queued before or after shutdown began.
+        let after = client.send(&Method::GET, "/after", &body, None);
+        shut_down.send(()).unwrap();
+        // `/held` must survive teardown, including the wait for `/after` to fail.
+        let teardown = async { tokio::join!(after, ended).0 };
+        let after = tokio::select! {
+            sent = &mut held => panic!("ended before its release: {}", outcome(&sent)),
+            after = teardown => after,
         };
-        let (held, ()) = tokio::join!(held, drain);
-        assert_eq!(held.unwrap().status, StatusCode::OK);
+        let Err(e) = after else {
+            panic!("answered on a connection the hub shut down")
+        };
+        assert_eq!(e.kind, ErrorKind::Transport);
+        assert!(!e.to_string().contains("did not answer within"), "{e}");
+        // An accepted stream can still receive its response after dispatcher teardown.
+        release.notify_one();
+        assert_eq!(held.await.unwrap().status, StatusCode::OK);
     }
 
     #[test]
