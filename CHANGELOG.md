@@ -10,6 +10,8 @@ All notable changes to virtkit will be documented in this file.
   compressed in the local cache.
 - Image restores from a registry can use multiple cores and cancel the remaining downloads
   when a chunk fails.
+- An image restore downloads each repeated chunk only once, and concurrent restores in one
+  process no longer download a shared chunk twice.
 
 ### Fixed
 

@@ -833,34 +833,35 @@ async fn try_pull_ext4_lazy_async(
     });
     let (mut fetched, mut reused) = (0usize, 0usize);
     let mut chunks = Vec::with_capacity(chunk_layers.len());
-    let downloads = chunk_layers.into_iter().map(|layer| {
+    let downloads = group_chunks(chunk_layers).into_iter().map(|places| {
         let source = Arc::clone(&source);
         async move {
             // Bounded here as the eager path's reassembly is: the lazy view decodes each
             // chunk to exactly this length later, on demand.
-            let (offset, length) = chunk_bounds(&layer, total_size)?;
+            let length = same_length(&places, total_size)?;
             // Ensures the blob is in the local cache (network fetch on a miss) — the
             // decompress-and-place step the eager path does next is what we skip.
-            let (codec, was_fetched) = ensure_chunk(&source, &layer, length).await?;
-            let chunk = LazyChunk {
-                offset,
-                length: u32::try_from(length).context("chunk length")?,
-                codec,
-                digest: digest_bytes(&layer.digest)?,
-            };
-            Ok((chunk, layer_size(&layer), was_fetched))
+            let (codec, was_fetched) = ensure_chunk(&source, &places[0], length).await?;
+            let mut chunks = Vec::with_capacity(places.len());
+            for layer in &places {
+                chunks.push(LazyChunk {
+                    offset: chunk_bounds(layer, total_size)?.0,
+                    length: u32::try_from(length).context("chunk length")?,
+                    codec,
+                    digest: digest_bytes(&layer.digest)?,
+                });
+            }
+            let size = places.iter().map(layer_size).sum::<u64>();
+            Ok((chunks, size, was_fetched))
         }
     });
-    spawn_chunks(downloads, |(chunk, size, was_fetched)| {
+    spawn_chunks(downloads, |(landed, size, was_fetched)| {
         if let Some(m) = meter {
             m.add(size);
         }
-        if was_fetched {
-            fetched += 1;
-        } else {
-            reused += 1;
-        }
-        chunks.push(chunk);
+        fetched += usize::from(was_fetched);
+        reused += landed.len() - usize::from(was_fetched);
+        chunks.extend(landed);
     })
     .await?;
     sort_lazy_chunks(&mut chunks).with_context(|| format!("{name}@{digest}"))?;
@@ -2262,17 +2263,20 @@ async fn pull_into(
     });
     let out = Arc::new(out);
     let ext4 = Arc::new(ext4);
-    let placements = chunk_layers.into_iter().map(|layer| {
+    let placements = group_chunks(chunk_layers).into_iter().map(|places| {
         let (source, out, ext4) = (Arc::clone(&source), Arc::clone(&out), Arc::clone(&ext4));
-        async move { place_chunk(&source, layer, total_size, out, ext4).await }
+        async move {
+            let n = places.len();
+            Ok((
+                place_chunk(&source, places, total_size, out, ext4).await?,
+                n,
+            ))
+        }
     });
     let (mut fetched, mut reused) = (0usize, 0usize);
-    spawn_chunks(placements, |was_fetched| {
-        if was_fetched {
-            fetched += 1;
-        } else {
-            reused += 1;
-        }
+    spawn_chunks(placements, |(was_fetched, n)| {
+        fetched += usize::from(was_fetched);
+        reused += n - usize::from(was_fetched);
     })
     .await?;
     drop(out);
@@ -2458,6 +2462,84 @@ struct ChunkSource {
     pool: Arc<ChunkPool>,
 }
 
+/// Group placements by digest and media type so they share a fetch on a cache miss.
+/// Groups and their placements retain manifest order.
+fn group_chunks(layers: Vec<OciDescriptor>) -> Vec<Vec<OciDescriptor>> {
+    let mut groups: Vec<Vec<OciDescriptor>> = Vec::new();
+    let mut index = std::collections::HashMap::<_, usize>::new();
+    for layer in layers {
+        let key = (layer.digest.clone(), layer.media_type.clone());
+        match index.get(&key) {
+            Some(&i) => groups[i].push(layer),
+            None => {
+                index.insert(key, groups.len());
+                groups.push(vec![layer]);
+            }
+        }
+    }
+    groups
+}
+
+/// Check that every placement fits in the image and declares the same chunk length.
+fn same_length(places: &[OciDescriptor], total_size: u64) -> Result<u64> {
+    let mut lengths = places
+        .iter()
+        .map(|l| chunk_bounds(l, total_size).map(|(_, len)| len));
+    let first = lengths.next().context("a chunk with no place")??;
+    for len in lengths {
+        if len? != first {
+            bail!("chunk {} is annotated with two lengths", places[0].digest);
+        }
+    }
+    Ok(first)
+}
+
+/// Per-process download locks keyed by cache path and digest, with a count of holders and
+/// waiters. The lock covers retries and cache publication. Waiters recheck the cache.
+/// Paths that compare unequal get separate locks even when they name the same directory.
+static FETCHING: std::sync::Mutex<BTreeMap<PathBuf, (Turn, usize)>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+type Turn = Arc<tokio::sync::Mutex<()>>;
+
+/// One holder or waiter counted in [`FETCHING`].
+struct Fetching {
+    key: PathBuf,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Fetching {
+    async fn wait(key: PathBuf) -> Fetching {
+        let turn = {
+            let mut fetching = FETCHING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (turn, users) = fetching.entry(key.clone()).or_default();
+            *users += 1;
+            Arc::clone(turn)
+        };
+        // Register the guard before awaiting so cancellation releases this task's count.
+        let mut fetching = Fetching { key, held: None };
+        fetching.held = Some(turn.lock_owned().await);
+        fetching
+    }
+}
+
+impl Drop for Fetching {
+    fn drop(&mut self) {
+        self.held = None;
+        let mut fetching = FETCHING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, users)) = fetching.get_mut(&self.key) {
+            *users -= 1;
+            if *users == 0 {
+                fetching.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// Run up to [`RESTORE_CONCURRENCY`] chunk tasks on runtime workers so body reads and digest
 /// checks can run in parallel. Pass each success to `done` in completion order. On the
 /// first error, abort and join the remaining tasks before returning it.
@@ -2501,13 +2583,21 @@ async fn ensure_chunk(source: &ChunkSource, layer: &OciDescriptor, len: u64) -> 
     if let Some(codec) = find_cached_chunk(cache, hex, layer) {
         return Ok((codec, false));
     }
+    let turn = Fetching::wait(cache.join(hex)).await;
+    if let Some(codec) = find_cached_chunk(cache, hex, layer) {
+        return Ok((codec, false));
+    }
     let received = receive_chunk(client, image, layer, len, pool).await?;
     let codec = stored_codec(layer, &received);
     let (dir, name) = (cache.to_path_buf(), hex.to_string());
-    tokio::task::spawn_blocking(move || publish_chunk(&dir, &name, codec, &received.wire))
-        .await
-        .context("a chunk-caching worker panicked")??;
-    // Publishing is best-effort for a fetch; a view reads only what is in the cache.
+    tokio::task::spawn_blocking(move || {
+        let published = publish_chunk(&dir, &name, codec, &received.wire);
+        drop(turn);
+        published
+    })
+    .await
+    .context("a chunk-caching worker panicked")??;
+    // publish_chunk tolerates a failed rename. A lazy view needs the cached file.
     let stored = chunk_codec_dir(cache, codec).join(hex);
     if !is_file(&stored) {
         bail!(
@@ -2519,12 +2609,29 @@ async fn ensure_chunk(source: &ChunkSource, layer: &OciDescriptor, len: u64) -> 
     Ok((codec, true))
 }
 
-/// Write the chunk at its offset in the image, and return whether it was downloaded. Cache
-/// hits skip digest verification because publication follows a verified download. An
-/// unreadable entry triggers a fresh download.
+/// Read a cached chunk, or `None` if it is missing or unreadable.
+async fn read_cached(
+    source: &ChunkSource,
+    hex: &str,
+    layer: &OciDescriptor,
+) -> Result<Option<(u8, chunks::Lent)>> {
+    let Some(codec) = find_cached_chunk(&source.cache, hex, layer) else {
+        return Ok(None);
+    };
+    let pool = Arc::clone(&source.pool);
+    let path = chunk_codec_dir(&source.cache, codec).join(hex);
+    let read = tokio::task::spawn_blocking(move || chunks::read_file(&pool, &path).ok())
+        .await
+        .context("a chunk-reading worker panicked")?;
+    Ok(read.map(|bytes| (codec, bytes)))
+}
+
+/// Write a chunk at every manifest offset and report whether it was downloaded.
+/// Published chunks already passed digest verification. Fetch if the cache entry is
+/// still missing or unreadable after acquiring the download lock.
 async fn place_chunk(
     source: &ChunkSource,
-    layer: OciDescriptor,
+    places: Vec<OciDescriptor>,
     total_size: u64,
     out: Arc<std::fs::File>,
     ext4: Arc<PathBuf>,
@@ -2536,24 +2643,24 @@ async fn place_chunk(
         pool,
     } = source;
     // Check image bounds before fetching or caching the chunk.
-    let (_, len) = chunk_bounds(&layer, total_size)?;
+    let len = same_length(&places, total_size)?;
+    let layer = &places[0];
     let hex = image::digest_hex(&layer.digest)?.to_string();
-    let cached = match find_cached_chunk(cache, &hex, &layer) {
-        Some(codec) => {
-            let (pool, path) = (Arc::clone(pool), chunk_codec_dir(cache, codec).join(&hex));
-            tokio::task::spawn_blocking(move || chunks::read_file(&pool, &path).ok())
-                .await
-                .context("a chunk-reading worker panicked")?
-                .map(|bytes| (codec, bytes))
+    let mut cached = read_cached(source, &hex, layer).await?;
+    let mut turn = None;
+    if cached.is_none() {
+        turn = Some(Fetching::wait(cache.join(&hex)).await);
+        cached = read_cached(source, &hex, layer).await?;
+        if cached.is_some() {
+            turn = None;
         }
-        None => None,
-    };
+    }
     let fetched = cached.is_none();
     let (blob, compressed, keep) = match cached {
         Some((codec, bytes)) => (bytes.into_bytes(), codec == VK_RO_IMG_CODEC_ZSTD, None),
         None => {
-            let received = receive_chunk(client, image, &layer, len, pool).await?;
-            let codec = stored_codec(&layer, &received);
+            let received = receive_chunk(client, image, layer, len, pool).await?;
+            let codec = stored_codec(layer, &received);
             // Reuse the bytes verified against the raw digest, including any decoded frame.
             let (blob, compressed) = if layer.media_type == CHUNK_MEDIA_TYPE {
                 (received.wire.clone(), true)
@@ -2568,7 +2675,8 @@ async fn place_chunk(
         if let Some((codec, wire)) = keep {
             publish_chunk(&cache, &hex, codec, &wire)?;
         }
-        pool.place(&layer, &blob, compressed, total_size, |offset, raw| {
+        drop(turn);
+        pool.place_each(&places, &blob, compressed, total_size, |offset, raw| {
             write_chunk_sparse(&out, offset, raw)
                 .with_context(|| format!("writing a chunk into {}", ext4.display()))
         })
@@ -7776,6 +7884,138 @@ pub(crate) mod tests {
             let out = state.join("img/older.raw");
             crate::qcow2::materialize_to_raw(&older, &out).unwrap();
             assert!(std::fs::read(&out).unwrap() == data);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// For both digest formats, a cold restore downloads each distinct chunk once, even
+    /// when concurrent restores share the cache. An eager restore decodes each compressed
+    /// chunk once for all its offsets.
+    #[test]
+    fn a_repeated_chunk_is_downloaded_and_decoded_once() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = retry_tmpdir("repeated-chunks");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Repeat the same mix of incompressible bytes and runs to produce duplicate chunks.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut part: Vec<u8> = (0..6 << 20)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        part.extend((0..3u32 << 20).map(|i| (i / 4096) as u8));
+        let data = part.repeat(3);
+        let ext4 = dir.join("runner.ext4");
+        std::fs::write(&ext4, &data).unwrap();
+
+        for transparent in [true, false] {
+            let root = dir.join(format!("store-{transparent}"));
+            let store = Arc::new(vk_registry::Store::new(root.clone()).unwrap());
+            let url = serve_store(store, vk_registry::auth::Auth::None);
+            let share = |url| {
+                Registry::for_share(
+                    url,
+                    true,
+                    None,
+                    String::new(),
+                    None,
+                    None,
+                    Some(transparent),
+                )
+            };
+            let pusher = if transparent {
+                local_registry(&root)
+            } else {
+                share(url.clone())
+            };
+            push_ext4(&pusher, "img", "t", &ext4, "generic-disk").unwrap();
+            let (proxy, requests) = recording_proxy(url);
+            let rg = share(proxy);
+            let bundle = fetch_bundle(&rg, "img", "t").unwrap().unwrap();
+            let hexes: Vec<String> = bundle.chunks.iter().map(|c| c.digest[7..].into()).collect();
+            let distinct: BTreeSet<&String> = hexes.iter().collect();
+            assert!(
+                distinct.len() < hexes.len(),
+                "the image repeats chunks: {:?}",
+                bundle
+                    .chunks
+                    .iter()
+                    .map(|c| (c.digest[7..15].to_string(), c.annotations.clone()))
+                    .collect::<Vec<_>>()
+            );
+            let frames = match transparent {
+                // The store keeps an incompressible chunk raw.
+                true => distinct
+                    .iter()
+                    .filter(|h| root.join("blobs/zstd").join(h).exists())
+                    .count() as u64,
+                // Every blob is a frame.
+                false => distinct.len() as u64,
+            };
+            // How often each chunk was downloaded since the last call.
+            let downloads = || {
+                let mut log = requests.lock().unwrap();
+                let mut n = BTreeMap::new();
+                for r in log.drain(..).filter(|r| r.starts_with("GET ")) {
+                    if let Some(h) = distinct.iter().find(|h| r.contains(h.as_str())) {
+                        *n.entry(h.to_string()).or_insert(0) += 1;
+                    }
+                }
+                n
+            };
+            let once: BTreeMap<String, i32> = distinct.iter().map(|h| (h.to_string(), 1)).collect();
+            // Restores under state/img share state/chunks. Count decodes and chunk-file reads.
+            let restore = |state: &Path, to: &str, lazy: bool| {
+                let img = state.join("img");
+                std::fs::create_dir_all(&img).unwrap();
+                let out = img.join(format!("{to}.raw"));
+                let pool = Arc::new(ChunkPool::default());
+                if lazy {
+                    let view = img.join(format!("{to}.vk_ro_img"));
+                    block_on(try_pull_ext4_lazy_async(
+                        &rg, "img", "t", &view, "img", None, &pool,
+                    ))
+                    .unwrap()
+                    .unwrap();
+                    crate::qcow2::materialize_to_raw(&view, &out).unwrap();
+                } else {
+                    block_on(try_pull_ext4_async(&rg, "img", "t", &out, "img", &pool))
+                        .unwrap()
+                        .unwrap();
+                }
+                assert!(std::fs::read(&out).unwrap() == data, "lazy: {lazy}");
+                (pool.decodes(), pool.reads())
+            };
+            downloads();
+
+            let state = dir.join(format!("state-{transparent}-lazy"));
+            let lazy_decodes = if transparent { frames } else { 0 };
+            let cold = restore(&state, "cold", true);
+            assert_eq!(downloads(), once, "cold lazy");
+            assert_eq!(cold, (lazy_decodes, 0));
+            let n = distinct.len() as u64;
+            assert_eq!(restore(&state, "warm", false), (frames, n));
+            assert!(downloads().is_empty());
+
+            let state = dir.join(format!("state-{transparent}-eager"));
+            let cold = restore(&state, "cold", false);
+            assert_eq!(downloads(), once, "cold eager");
+            assert_eq!(cold, (frames, 0));
+
+            let state = dir.join(format!("state-{transparent}-both"));
+            let (restore, state) = (&restore, &state);
+            std::thread::scope(|s| {
+                let restores = [("a", true), ("b", true), ("c", false)]
+                    .map(|(to, lazy)| s.spawn(move || restore(state, to, lazy)));
+                for r in restores {
+                    r.join().unwrap();
+                }
+            });
+            assert_eq!(downloads(), once, "concurrent restores");
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -127,6 +127,29 @@ impl ChunkPool {
         place(offset, &decoded)
     }
 
+    /// [`Self::place`] for every layer naming one blob, decoding it at most once.
+    pub(super) fn place_each(
+        self: &Arc<Self>,
+        layers: &[OciDescriptor],
+        blob: &[u8],
+        compressed: bool,
+        total_size: u64,
+        mut place: impl FnMut(u64, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let Some((first, rest)) = layers.split_first() else {
+            return Ok(());
+        };
+        self.place(first, blob, compressed, total_size, |offset, raw| {
+            place(offset, raw)?;
+            for layer in rest {
+                let (offset, len) = super::chunk_bounds(layer, total_size)?;
+                check_len(layer, raw.len(), len)?;
+                place(offset, raw)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Decode exactly `len` bytes. The registry supplies both the descriptor and the frame.
     /// Reject a conflicting header size before decoding and read at most one byte past `len`
     /// to bound memory use. A chunk is one frame. For concatenated frames, only the first
