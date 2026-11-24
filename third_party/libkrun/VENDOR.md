@@ -205,11 +205,11 @@ the image end truncated (an L2 entry past EOF).
 build-stage image lazily out of its compressed chunks. A `.vk_ro_img` manifest (written by
 vk-driver's `registry.rs`, layout documented on the module) lists the content-addressed chunks
 tiling an image and the local directory holding them; `LazyChunkStorage` is a read-only
-`imago::Storage` that decompresses a chunk the first time a read touches it. Attached directly
-as `DiskFormat::VkLazyChunks` (= 3), and resolved as a backing file at any depth of a qcow2
-chain by `LazyAwareOpenGate`, which swaps in the lazy storage for an implicitly opened
-`*.vk_ro_img` file. Keying on the host-chosen extension rather than the magic keeps a
-guest-writable image from ever being promoted into a manifest naming a host directory.
+`imago::Storage` that reads and decodes missing chunks outside the cache lock. Concurrent
+reads of the same missing chunk share the result. The device opens a manifest directly as
+`DiskFormat::VkLazyChunks` (= 3). In a qcow2 backing chain, `LazyAwareOpenGate` opens
+`*.vk_ro_img` as lazy storage at any depth. The host chooses the extension. Checking it
+prevents guest-written magic bytes from designating a manifest that names a host directory.
 
 A disk with neither option set, and no manifest in its chain, behaves as upstream's except for
 the batched requests behind the `RwLock`, the mmap reads of a read-only raw image and the

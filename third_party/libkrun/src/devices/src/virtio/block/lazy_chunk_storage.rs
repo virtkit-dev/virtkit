@@ -58,11 +58,13 @@ use imago::{
     StorageOpenOptions,
 };
 use maybe_async::maybe_async;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Read};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 const MAGIC: &[u8; 8] = b"VKROIMG1";
 const CODEC_ZSTD: u8 = 0;
@@ -93,8 +95,163 @@ pub struct LazyChunkStorage {
     /// Offset-sorted, non-overlapping, gaps read as zero, within `[0, total_size)` — see the
     /// format doc.
     chunks: Vec<ChunkEntry>,
-    decoded: Mutex<lru::LruCache<usize, Arc<Vec<u8>>>>,
+    decoded: DecodedChunks,
     common_storage_helper: CommonStorageHelper,
+}
+
+/// Recently decoded chunks and in-flight decodes, keyed by chunk index.
+///
+/// The first reader of a missing chunk reads and decodes it outside the cache lock.
+/// Other readers of that chunk wait for its result. Hits and misses on other chunks can proceed.
+///
+/// In-flight decodes neither count toward LRU capacity nor compete for eviction. Each reader
+/// decodes one chunk at a time, so the block worker has at most `IO_PARALLELISM` in flight.
+struct DecodedChunks {
+    state: Mutex<DecodedState>,
+}
+
+struct DecodedState {
+    lru: lru::LruCache<usize, Arc<Vec<u8>>>,
+    loading: HashMap<usize, Arc<Load>>,
+}
+
+/// An `io::Error` cannot be cloned. Each waiter rebuilds it from the kind and message.
+type LoadResult = Result<Arc<Vec<u8>>, (io::ErrorKind, String)>;
+
+/// Completion shared by readers waiting for the same decode.
+#[derive(Default)]
+struct Load {
+    result: Mutex<Option<LoadResult>>,
+    done: Condvar,
+}
+
+impl Load {
+    fn wait(&self) -> io::Result<Arc<Vec<u8>>> {
+        let result = self.result.lock().unwrap_or_else(PoisonError::into_inner);
+        let result = self
+            .done
+            .wait_while(result, |r| r.is_none())
+            .unwrap_or_else(PoisonError::into_inner);
+        match result.as_ref() {
+            Some(Ok(data)) => Ok(Arc::clone(data)),
+            Some(Err((kind, msg))) => Err(io::Error::new(*kind, msg.clone())),
+            None => Err(io::Error::other("chunk decode finished without a result")),
+        }
+    }
+}
+
+/// Publishes the decode result and wakes its waiters. If decoding panics, dropping the loader
+/// publishes an error and frees the index for retry.
+struct Loader<'a> {
+    chunks: &'a DecodedChunks,
+    idx: usize,
+    load: Arc<Load>,
+    published: bool,
+}
+
+impl Loader<'_> {
+    fn publish(&mut self, result: LoadResult) {
+        self.published = true;
+        let evicted;
+        {
+            let mut state = self.chunks.lock();
+            // A decode started before a clear must not repopulate the cache.
+            if state
+                .loading
+                .get(&self.idx)
+                .is_some_and(|l| Arc::ptr_eq(l, &self.load))
+            {
+                state.loading.remove(&self.idx);
+                evicted = match &result {
+                    Ok(data) => state.lru.push(self.idx, Arc::clone(data)),
+                    Err(_) => None,
+                };
+            } else {
+                evicted = None;
+            }
+        }
+        // Freed outside the lock.
+        drop(evicted);
+        *self
+            .load
+            .result
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(result);
+        self.load.done.notify_all();
+    }
+}
+
+impl Drop for Loader<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            let msg = format!("decoding chunk {} panicked", self.idx);
+            self.publish(Err((io::ErrorKind::Other, msg)));
+        }
+    }
+}
+
+impl DecodedChunks {
+    fn new(capacity: NonZeroUsize) -> Self {
+        DecodedChunks {
+            state: Mutex::new(DecodedState {
+                lru: lru::LruCache::new(capacity),
+                loading: HashMap::new(),
+            }),
+        }
+    }
+
+    /// Recover a poisoned lock. The critical sections operate only on cache entries and contain
+    /// no reader-supplied code.
+    fn lock(&self) -> MutexGuard<'_, DecodedState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Reuse a cached or in-flight result, or run `load` on this thread.
+    fn get_or_load(
+        &self,
+        idx: usize,
+        load: impl FnOnce() -> io::Result<Vec<u8>>,
+    ) -> io::Result<Arc<Vec<u8>>> {
+        let load_slot = {
+            let mut state = self.lock();
+            if let Some(data) = state.lru.get(&idx) {
+                return Ok(Arc::clone(data));
+            }
+            match state.loading.entry(idx) {
+                Entry::Occupied(e) => {
+                    let pending = Arc::clone(e.get());
+                    drop(state);
+                    return pending.wait();
+                }
+                Entry::Vacant(e) => Arc::clone(e.insert(Arc::default())),
+            }
+        };
+        let mut loader = Loader {
+            chunks: self,
+            idx,
+            load: load_slot,
+            published: false,
+        };
+        match load() {
+            Ok(data) => {
+                let data = Arc::new(data);
+                loader.publish(Ok(Arc::clone(&data)));
+                Ok(data)
+            }
+            Err(e) => {
+                loader.publish(Err((e.kind(), e.to_string())));
+                Err(e)
+            }
+        }
+    }
+
+    /// Clear the cache. Existing waiters keep their result. The first subsequent miss on each
+    /// index starts a new decode.
+    fn clear(&self) {
+        let mut state = self.lock();
+        state.lru.clear();
+        state.loading.clear();
+    }
 }
 
 fn digest_hex(digest: &[u8; 32]) -> String {
@@ -206,9 +363,7 @@ impl LazyChunkStorage {
             layout,
             cache_dir,
             chunks,
-            decoded: Mutex::new(lru::LruCache::new(
-                NonZeroUsize::new(DECODED_CACHE_ENTRIES).unwrap(),
-            )),
+            decoded: DecodedChunks::new(NonZeroUsize::new(DECODED_CACHE_ENTRIES).unwrap()),
             common_storage_helper: Default::default(),
         })
     }
@@ -229,65 +384,63 @@ impl LazyChunkStorage {
     }
 
     /// Decompressed bytes of chunk `idx`, from the decoded-chunk cache or freshly read off disk.
-    ///
-    /// Held across a cache-miss decode (not just the map lookup/insert) so two concurrent reads
-    /// landing on the same not-yet-decoded chunk don't both hit disk and decompress redundantly.
     fn decode_chunk(&self, idx: usize) -> io::Result<Arc<Vec<u8>>> {
-        let mut decoded = self.decoded.lock().unwrap();
-        let data = decoded.try_get_or_insert(idx, || {
-            let chunk = &self.chunks[idx];
-            let path = self.chunk_path(chunk);
-            let raw = std::fs::read(&path).map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!(
-                        "reading chunk {} for {}: {e}",
-                        path.display(),
-                        self.filename.display()
-                    ),
-                )
-            })?;
-            let data = match chunk.codec {
-                // No further than one byte past the length the header claims: a frame that
-                // inflates beyond it is refused below rather than held in memory.
-                CODEC_ZSTD => {
-                    use std::io::Read;
-                    // The largest chunk vk writes (`CDC_MAX` in vk-driver).
-                    const MAX_CHUNK: usize = 16 << 20;
-                    // Capacity hint only: capped at the largest chunk, whatever the header claims.
-                    let mut data = Vec::with_capacity((chunk.length as usize).min(MAX_CHUNK));
-                    zstd::stream::read::Decoder::new(&raw[..])
-                        .and_then(|d| d.take(u64::from(chunk.length) + 1).read_to_end(&mut data))
-                        .map_err(|e| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("zstd-decompressing chunk {}: {e}", path.display()),
-                            )
-                        })?;
-                    data
-                }
-                CODEC_RAW => raw,
-                other => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("chunk {}: unknown codec {other}", path.display()),
-                    ));
-                }
-            };
-            if data.len() != chunk.length as usize {
+        self.decoded.get_or_load(idx, || self.load_chunk(idx))
+    }
+
+    /// Read chunk `idx` from disk, decompress it if needed, and check its length.
+    fn load_chunk(&self, idx: usize) -> io::Result<Vec<u8>> {
+        let chunk = &self.chunks[idx];
+        let path = self.chunk_path(chunk);
+        let raw = std::fs::read(&path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "reading chunk {} for {}: {e}",
+                    path.display(),
+                    self.filename.display()
+                ),
+            )
+        })?;
+        let data = match chunk.codec {
+            // No further than one byte past the length the header claims: a frame that
+            // inflates beyond it is refused below rather than held in memory.
+            CODEC_ZSTD => {
+                use std::io::Read;
+                // The largest chunk vk writes (`CDC_MAX` in vk-driver).
+                const MAX_CHUNK: usize = 16 << 20;
+                // Capacity hint only: capped at the largest chunk, whatever the header claims.
+                let mut data = Vec::with_capacity((chunk.length as usize).min(MAX_CHUNK));
+                zstd::stream::read::Decoder::new(&raw[..])
+                    .and_then(|d| d.take(u64::from(chunk.length) + 1).read_to_end(&mut data))
+                    .map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("zstd-decompressing chunk {}: {e}", path.display()),
+                        )
+                    })?;
+                data
+            }
+            CODEC_RAW => raw,
+            other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "chunk {}: decompressed to {} bytes, expected {}",
-                        path.display(),
-                        data.len(),
-                        chunk.length
-                    ),
+                    format!("chunk {}: unknown codec {other}", path.display()),
                 ));
             }
-            Ok(Arc::new(data))
-        })?;
-        Ok(Arc::clone(data))
+        };
+        if data.len() != chunk.length as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "chunk {}: decompressed to {} bytes, expected {}",
+                    path.display(),
+                    data.len(),
+                    chunk.length
+                ),
+            ));
+        }
+        Ok(data)
     }
 
     /// Index of the first chunk that could contain or come after byte `pos` — either the
@@ -404,7 +557,7 @@ impl Storage for LazyChunkStorage {
     }
 
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
-        self.decoded.lock().unwrap().clear();
+        self.decoded.clear();
         Ok(())
     }
 
@@ -916,5 +1069,276 @@ mod tests {
         let mut out = vec![0u8; 50];
         let err = storage.read_range(0, &mut out).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    mod decoded_chunks {
+        use super::super::DecodedChunks;
+        use std::io;
+        use std::num::NonZeroUsize;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        const TIMEOUT: Duration = Duration::from_secs(10);
+
+        fn chunks(capacity: usize) -> DecodedChunks {
+            DecodedChunks::new(NonZeroUsize::new(capacity).unwrap())
+        }
+
+        /// Wait for `n` readers to join the decode of chunk `idx`. Each holds one handle,
+        /// as do the in-flight map and the reader running the decode.
+        fn wait_for_waiters(chunks: &DecodedChunks, idx: usize, n: usize) {
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                let held = chunks.lock().loading.get(&idx).map_or(0, Arc::strong_count);
+                if held == n + 2 {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "{held} handles, want {}", n + 2);
+                std::thread::yield_now();
+            }
+        }
+
+        /// Signal `started` and wait for `release` so the test can run during the decode.
+        fn stalled(
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            result: io::Result<Vec<u8>>,
+        ) -> impl FnOnce() -> io::Result<Vec<u8>> {
+            move || {
+                started.send(()).unwrap();
+                release.recv_timeout(TIMEOUT).expect("never released");
+                result
+            }
+        }
+
+        fn never() -> io::Result<Vec<u8>> {
+            panic!("this read must not decode")
+        }
+
+        #[test]
+        fn concurrent_misses_on_one_chunk_share_one_decode() {
+            let chunks = chunks(4);
+            let decodes = AtomicUsize::new(0);
+            let (started_tx, started) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel();
+            std::thread::scope(|s| {
+                let leader = s.spawn(|| {
+                    let decode = stalled(started_tx, release_rx, Ok(vec![7; 10]));
+                    chunks.get_or_load(0, || {
+                        decodes.fetch_add(1, Ordering::SeqCst);
+                        decode()
+                    })
+                });
+                started.recv_timeout(TIMEOUT).unwrap();
+                let waiters: Vec<_> = (0..7)
+                    .map(|_| {
+                        s.spawn(|| {
+                            chunks.get_or_load(0, || {
+                                decodes.fetch_add(1, Ordering::SeqCst);
+                                Ok(vec![9])
+                            })
+                        })
+                    })
+                    .collect();
+                wait_for_waiters(&chunks, 0, 7);
+                release.send(()).unwrap();
+                let first = leader.join().unwrap().unwrap();
+                assert_eq!(*first, vec![7; 10]);
+                for w in waiters {
+                    assert!(Arc::ptr_eq(&w.join().unwrap().unwrap(), &first));
+                }
+                assert!(Arc::ptr_eq(&chunks.get_or_load(0, never).unwrap(), &first));
+            });
+            assert_eq!(decodes.load(Ordering::SeqCst), 1);
+            assert!(chunks.lock().loading.is_empty());
+        }
+
+        /// A hit on one chunk and a miss on another both complete while a third chunk's decode
+        /// is stalled.
+        #[test]
+        fn other_chunks_do_not_wait_for_a_decode() {
+            let chunks = chunks(4);
+            chunks.get_or_load(1, || Ok(vec![1])).unwrap();
+            let (started_tx, started) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel();
+            std::thread::scope(|s| {
+                let leader =
+                    s.spawn(|| chunks.get_or_load(0, stalled(started_tx, release_rx, Ok(vec![0]))));
+                started.recv_timeout(TIMEOUT).unwrap();
+                assert_eq!(*chunks.get_or_load(1, never).unwrap(), vec![1]);
+                assert_eq!(*chunks.get_or_load(2, || Ok(vec![2])).unwrap(), vec![2]);
+                release.send(()).unwrap();
+                assert_eq!(*leader.join().unwrap().unwrap(), vec![0]);
+            });
+        }
+
+        #[test]
+        fn a_failed_decode_reaches_every_waiter_and_is_retried() {
+            let chunks = chunks(4);
+            let (started_tx, started) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel();
+            std::thread::scope(|s| {
+                let leader = s.spawn(|| {
+                    let err = io::Error::new(io::ErrorKind::InvalidData, "corrupt frame");
+                    chunks.get_or_load(0, stalled(started_tx, release_rx, Err(err)))
+                });
+                started.recv_timeout(TIMEOUT).unwrap();
+                let waiters: Vec<_> = (0..3)
+                    .map(|_| s.spawn(|| chunks.get_or_load(0, never)))
+                    .collect();
+                wait_for_waiters(&chunks, 0, 3);
+                release.send(()).unwrap();
+                let err = leader.join().unwrap().unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                for w in waiters {
+                    let err = w.join().unwrap().unwrap_err();
+                    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                    assert!(err.to_string().contains("corrupt frame"), "{err}");
+                }
+            });
+            assert!(chunks.lock().loading.is_empty());
+            assert!(chunks.lock().lru.is_empty());
+            assert_eq!(*chunks.get_or_load(0, || Ok(vec![5])).unwrap(), vec![5]);
+        }
+
+        #[test]
+        fn a_panicking_decode_fails_its_waiters_and_is_retried() {
+            let chunks = chunks(4);
+            let (started_tx, started) = mpsc::channel::<()>();
+            let (release, release_rx) = mpsc::channel::<()>();
+            std::thread::scope(|s| {
+                let chunks = &chunks;
+                let leader = s.spawn(move || {
+                    chunks.get_or_load(0, || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv_timeout(TIMEOUT).unwrap();
+                        panic!("decoder panicked");
+                    })
+                });
+                started.recv_timeout(TIMEOUT).unwrap();
+                let waiters: Vec<_> = (0..3)
+                    .map(|_| s.spawn(|| chunks.get_or_load(0, never)))
+                    .collect();
+                wait_for_waiters(chunks, 0, 3);
+                release.send(()).unwrap();
+                assert!(leader.join().is_err());
+                for w in waiters {
+                    w.join().unwrap().unwrap_err();
+                }
+            });
+            assert!(chunks.lock().loading.is_empty());
+            assert_eq!(*chunks.get_or_load(0, || Ok(vec![5])).unwrap(), vec![5]);
+        }
+
+        /// Eviction affects only finished chunks. An in-flight decode can still enter the cache,
+        /// and readers retain the bytes of evicted chunks.
+        #[test]
+        fn eviction_leaves_decodes_in_flight_alone() {
+            let chunks = chunks(2);
+            let (started_tx, started) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel();
+            std::thread::scope(|s| {
+                let leader = s.spawn(|| {
+                    chunks.get_or_load(0, stalled(started_tx, release_rx, Ok(vec![0; 3])))
+                });
+                started.recv_timeout(TIMEOUT).unwrap();
+                let waiter = s.spawn(|| chunks.get_or_load(0, never));
+                wait_for_waiters(&chunks, 0, 1);
+                let held = chunks.get_or_load(1, || Ok(vec![1; 3])).unwrap();
+                for idx in 2..5u8 {
+                    chunks.get_or_load(idx.into(), || Ok(vec![idx; 3])).unwrap();
+                }
+                assert!(chunks.lock().loading.contains_key(&0));
+                assert!(!chunks.lock().lru.contains(&1), "chunk 1 was evicted");
+                assert_eq!(*held, vec![1; 3]);
+                release.send(()).unwrap();
+                let first = leader.join().unwrap().unwrap();
+                assert!(Arc::ptr_eq(&waiter.join().unwrap().unwrap(), &first));
+                assert!(Arc::ptr_eq(&chunks.get_or_load(0, never).unwrap(), &first));
+            });
+            assert_eq!(chunks.lock().lru.len(), 2);
+            assert!(chunks.lock().loading.is_empty());
+        }
+
+        /// A pre-clear decode serves only its existing waiters. The cache keeps the new result.
+        #[test]
+        fn a_decode_from_before_a_clear_is_not_cached() {
+            let chunks = chunks(4);
+            let (started_tx, started) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel();
+            std::thread::scope(|s| {
+                let leader = s.spawn(|| {
+                    chunks.get_or_load(0, stalled(started_tx, release_rx, Ok(b"old".to_vec())))
+                });
+                started.recv_timeout(TIMEOUT).unwrap();
+                let waiter = s.spawn(|| chunks.get_or_load(0, never));
+                wait_for_waiters(&chunks, 0, 1);
+                chunks.clear();
+                assert_eq!(
+                    *chunks.get_or_load(0, || Ok(b"new".to_vec())).unwrap(),
+                    b"new"
+                );
+                release.send(()).unwrap();
+                assert_eq!(*leader.join().unwrap().unwrap(), b"old");
+                assert_eq!(*waiter.join().unwrap().unwrap(), b"old");
+            });
+            assert_eq!(*chunks.get_or_load(0, never).unwrap(), b"new");
+            assert!(chunks.lock().loading.is_empty());
+        }
+    }
+
+    /// Eight readers check the same slice of the first chunk. Seven then check the original
+    /// bytes across each of the seven chunk boundaries, one reader per boundary.
+    #[test]
+    fn concurrent_reads_on_same_and_different_chunks() {
+        let fx = Fixture::new("concurrent");
+        let chunk_len = 4096usize;
+        let mut whole = Vec::new();
+        let mut entries = Vec::new();
+        for n in 0..8u8 {
+            let chunk: Vec<u8> = (0..chunk_len)
+                .map(|i| (i as u8).wrapping_mul(n + 1))
+                .collect();
+            let digest = fake_digest(n + 1);
+            std::fs::write(
+                fx.dir.join(digest_hex(&digest)),
+                zstd::encode_all(&chunk[..], 3).unwrap(),
+            )
+            .unwrap();
+            entries.push((whole.len() as u64, chunk_len as u32, CODEC_ZSTD, digest));
+            whole.extend_from_slice(&chunk);
+        }
+        let manifest = fx.dir.join("test.vk_ro_img");
+        write_manifest(
+            &manifest,
+            whole.len() as u64,
+            LAYOUT_FLAT,
+            &fx.dir,
+            &entries,
+        );
+        let storage =
+            LazyChunkStorage::parse(std::fs::File::open(&manifest).unwrap(), manifest).unwrap();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    let mut out = vec![0u8; 100];
+                    storage.read_range(10, &mut out).unwrap();
+                    assert_eq!(out, whole[10..110]);
+                });
+            }
+        });
+        std::thread::scope(|s| {
+            for n in 1..8 {
+                let (storage, whole) = (&storage, &whole);
+                s.spawn(move || {
+                    let start = n * chunk_len - 50;
+                    let mut out = vec![0u8; 100];
+                    storage.read_range(start as u64, &mut out).unwrap();
+                    assert_eq!(out, whole[start..start + 100]);
+                });
+            }
+        });
     }
 }
