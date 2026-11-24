@@ -1,4 +1,4 @@
-use crate::virtio::descriptor_utils::{Reader, Writer};
+use crate::virtio::descriptor_utils::{Error as DescriptorUtilsError, Reader, Writer};
 
 use super::super::DeviceQueue;
 use super::SECTOR_SHIFT;
@@ -26,8 +26,10 @@ pub enum RequestError {
     Discarding(io::Error),
     DiscardingToZero(io::Error),
     FlushingToDisk(io::Error),
+    InvalidChain(DescriptorUtilsError),
     InvalidDataLength,
     InvalidOffset,
+    ReadingHeader(io::Error),
     ReadingFromDescriptor(io::Error),
     WritingToDescriptor(io::Error),
     WritingZeroes(io::Error),
@@ -141,7 +143,7 @@ impl Shared {
             }
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
                 let head = head?.attach(&self.mem);
-                BlockWorker::process_one(&self.mem, &self.disk, head)
+                Some(BlockWorker::process_one(&self.mem, &self.disk, head))
             }));
             batch = lock(&self.batch);
             batch.results[slot] = match outcome {
@@ -323,7 +325,7 @@ impl BlockWorker {
                 // A lone request runs on this thread: it would only wait here for a helper
                 // to finish it.
                 let completion = Self::process_one(mem, &self.shared.disk, head);
-                self.complete(mem, completion);
+                self.complete(mem, [completion]);
                 continue;
             };
             batch.reserve(IO_PARALLELISM);
@@ -421,43 +423,36 @@ impl BlockWorker {
 
     /// Runs one guest request to completion: builds its `Reader`/`Writer`, dispatches it, and
     /// writes the status byte. Returns the descriptor's table index and used length for
-    /// `add_used`. A chain with no writable byte is skipped and has used length 0.
-    /// Returns `None` if the chain is invalid or the request header cannot be read.
+    /// `add_used`: every chain is returned to the guest. A malformed one gets an I/O error
+    /// status if its writable buffers are in guest memory and hold at least one byte, and
+    /// otherwise used length 0 with nothing run.
     fn process_one(
         mem: &GuestMemoryMmap,
         disk: &DiskProperties,
         head: DescriptorChain,
-    ) -> Option<(u16, usize)> {
-        let mut reader = match Reader::new(mem, head.clone()) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("invalid descriptor chain: {e:?}");
-                return None;
-            }
-        };
+    ) -> (u16, usize) {
         let mut writer = match Writer::new(mem, head.clone()) {
             Ok(r) => r,
             Err(e) => {
                 error!("invalid descriptor chain: {e:?}");
-                return None;
+                return (head.index, 0);
             }
         };
         // virtio-blk fixes the status position even when the data buffer is only partly filled.
         let Some(status_byte) = writer.split_last_byte() else {
             // The guest needs a status byte to learn the outcome.
             error!("virtio-blk request without a status byte");
-            return Some((head.index, 0));
-        };
-        let request_header: RequestHeader = match reader.read_obj() {
-            Ok(h) => h,
-            Err(e) => {
-                error!("invalid request header: {e:?}");
-                return None;
-            }
+            return (head.index, 0);
         };
 
-        let status: u8 = match Self::process_request(disk, request_header, &mut reader, &mut writer)
-        {
+        let outcome = Reader::new(mem, head.clone())
+            .map_err(RequestError::InvalidChain)
+            .and_then(|mut reader| {
+                let request_header: RequestHeader =
+                    reader.read_obj().map_err(RequestError::ReadingHeader)?;
+                Self::process_request(disk, request_header, &mut reader, &mut writer)
+            });
+        let status: u8 = match outcome {
             Ok(()) => VIRTIO_BLK_S_OK.try_into().unwrap(),
             Err(e) => {
                 error!("error processing request: {e:?}");
@@ -471,7 +466,7 @@ impl BlockWorker {
 
         // The used length counts the bytes written into the chain: the request's, then the
         // status.
-        Some((head.index, writer.bytes_written() + 1))
+        (head.index, writer.bytes_written() + 1)
     }
 
     /// The byte offset of a `len`-byte request at guest `sector`, refused (IOERR) unless the
@@ -766,8 +761,8 @@ mod tests {
     const IOERR: u8 = VIRTIO_BLK_S_IOERR as u8;
 
     /// Lone reads, writes, flushes and failing requests are answered as a batch's would be: the
-    /// same status, used entry and data, and one interrupt per completed request. A chain
-    /// without a readable header gets neither a used entry nor an interrupt, as before.
+    /// same status, used entry and data, and one interrupt per completed request, a chain
+    /// without a readable header included.
     #[test]
     fn lone_requests_complete_and_signal_one_at_a_time() {
         let s = setup();
@@ -810,21 +805,19 @@ mod tests {
         w.process_queue(&s.mem);
         assert_eq!((status(&s.mem, 3), irqs()), (IOERR, 4));
 
-        // No readable header: consumed, never completed.
+        // No readable header: an I/O error too.
         queue_request(&s.mem, &vq, 4, VIRTIO_BLK_T_IN, 0, 512, 8);
         w.process_queue(&s.mem);
-        assert_eq!(status(&s.mem, 4), 0xff);
-        assert_eq!(irqs(), 4);
-        assert_eq!(used(&vq), [(0, 1025), (3, 1), (6, 1), (9, 1)]);
+        assert_eq!((status(&s.mem, 4), irqs()), (IOERR, 5));
+        assert_eq!(used(&vq), [(0, 1025), (3, 1), (6, 1), (9, 1), (12, 1)]);
 
         // Nothing left: no completion, no interrupt.
         w.process_queue(&s.mem);
-        assert_eq!((used(&vq).len(), irqs()), (4, 4));
+        assert_eq!((used(&vq).len(), irqs()), (5, 5));
     }
 
     /// Nine requests queued at once run as a batch of eight, then one alone; each batch is
-    /// completed in queue order with one interrupt, and a broken chain inside a batch drops
-    /// out of it without holding up the rest.
+    /// completed in queue order with one interrupt, a broken chain inside a batch included.
     #[test]
     fn a_batch_then_a_lone_request_complete_in_queue_order() {
         let s = setup();
@@ -846,8 +839,7 @@ mod tests {
         w.process_queue(&s.mem);
 
         let expected: Vec<(u32, u32)> = (0..9u32)
-            .filter(|&i| i != 3)
-            .map(|i| (3 * i, 513))
+            .map(|i| (3 * i, if i == 3 { 1 } else { 513 }))
             .collect();
         assert_eq!(used(&vq), expected);
         assert_eq!(s.irqs.0.load(Ordering::SeqCst), 2);
@@ -856,7 +848,8 @@ mod tests {
             let sector = usize::from(i) * 512;
             assert_eq!(data(&s.mem, i, 512), disk_bytes()[sector..sector + 512]);
         }
-        assert_eq!(status(&s.mem, 3), 0xff);
+        assert_eq!(status(&s.mem, 3), IOERR);
+        assert_eq!(data(&s.mem, 3, 512), [0; 512]);
     }
 
     /// Helpers start with the first batch that needs them, at most seven, and are kept across
@@ -1065,6 +1058,26 @@ mod tests {
                 .iter()
                 .all(|&b| b == 0xa5)
         );
+    }
+
+    /// A chain whose buffers are not all in guest memory is still returned to the guest: with
+    /// an I/O error if only its header is out of reach, with nothing written if a writable
+    /// buffer is.
+    #[test]
+    fn a_chain_outside_guest_memory_is_returned() {
+        let s = setup();
+        let vq = VirtQueue::new(GuestAddress(0), &s.mem, QUEUE_SIZE);
+        let mut w = worker(&s, &vq);
+        let outside = 0x100000;
+
+        queue_request(&s.mem, &vq, 0, VIRTIO_BLK_T_IN, 0, 512, 16);
+        vq.dtable[0].set(outside, 16, VIRTQ_DESC_F_NEXT, 1);
+        queue_request(&s.mem, &vq, 1, VIRTIO_BLK_T_IN, 0, 512, 16);
+        vq.dtable[4].set(outside, 512, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT, 5);
+        w.process_queue(&s.mem);
+
+        assert_eq!(used(&vq), [(0, 1), (3, 0)]);
+        assert_eq!((status(&s.mem, 0), status(&s.mem, 1)), (IOERR, 0xff));
     }
 
     #[test]

@@ -266,6 +266,15 @@ write payloads read from the guest. Upstream commit 54d4cd5cb71c includes status
 counts write payloads. Linux, viostor, OVMF, SeaBIOS, FreeBSD and NetBSD ignore the length.
 `block::worker::tests` checks the used-ring lengths.
 
+`src/devices/src/virtio/block/worker.rs` — every dequeued chain gets a used entry. If any
+writable buffer lies outside guest memory or there is no status byte, the device writes
+nothing and reports a used length of 0. Otherwise an unreadable header or a readable buffer
+outside guest memory gets IOERR in the last writable byte. The vendored version dropped
+requests with unreadable headers or out-of-bounds buffers. Upstream's later rework
+(54d4cd5cb71c) handles these chains the same way. `block::worker::tests` covers both buffer
+cases in `a_chain_outside_guest_memory_is_returned` and short headers in lone and batched
+requests.
+
 `src/devices/src/virtio/block/device.rs` — the dirty-control socket is owner-only (0600) and
 waits at most 5 s on a connection's command byte or reply, since connections are served one at
 a time. The mode is set after the bind, so the caller still puts the socket in a private

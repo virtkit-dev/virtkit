@@ -12,6 +12,8 @@ All notable changes to virtkit will be documented in this file.
   could appear to succeed.
 - Completed guest disk requests report how many bytes the device returned, including any
   status byte, as virtio requires. Common guests ignore this count.
+- Malformed guest disk requests now complete, reporting an I/O error when possible.
+  Guests could previously wait indefinitely for these requests.
 
 ## [0.116.0] - 2026-11-24
 
