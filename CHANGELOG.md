@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.116.1] - 2026-11-24
+
 ### Fixed
 
 - Guest disk requests without room for a completion status are rejected. Previously,
@@ -5911,7 +5913,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.116.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.116.1...HEAD
+[0.116.1]: https://github.com/virtkit-dev/virtkit/compare/v0.116.0...v0.116.1
 [0.116.0]: https://github.com/virtkit-dev/virtkit/compare/v0.115.0...v0.116.0
 [0.115.0]: https://github.com/virtkit-dev/virtkit/compare/v0.114.0...v0.115.0
 [0.114.0]: https://github.com/virtkit-dev/virtkit/compare/v0.113.1...v0.114.0
