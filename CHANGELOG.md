@@ -14,6 +14,9 @@ All notable changes to virtkit will be documented in this file.
   status byte, as virtio requires. Common guests ignore this count.
 - Malformed guest disk requests now complete, reporting an I/O error when possible.
   Guests could previously wait indefinitely for these requests.
+- If a guest disk request panics, that request and later requests on the same disk fail with
+  an I/O error. Later writes never reach the disk. Previously the guest could wait indefinitely
+  or the VM could abort.
 
 ## [0.116.0] - 2026-11-24
 

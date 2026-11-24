@@ -275,6 +275,26 @@ requests with unreadable headers or out-of-bounds buffers. Upstream's later rewo
 cases in `a_chain_outside_guest_memory_is_returned` and short headers in lone and batched
 requests.
 
+`src/devices/src/virtio/block/{device.rs,worker.rs}` + `src/devices/src/virtio/file_traits.rs`
+— a panic in request handling, imago or chunk storage fails the disk. The worker and helpers
+keep running. The panicking request and later requests, including GET_ID, report IOERR if
+there is a writable status byte. Later requests skip the image because a panicking writer
+may have left its metadata or cache inconsistent. Requests already in flight can finish.
+
+A request that panics under the image lock marks the disk failed before unlocking.
+Dirty-control and VMM-exit flushes check for failure under the write lock. A poisoned image
+lock also fails the disk. On a failed disk, a dirty-control drain closes the connection
+without a reply and a flush replies 1. Worker teardown skips the flush and retains the
+image for the life of the process so imago cannot flush it on drop. Activation reuses the
+open image, preserving failure across guest resets. Previously a request panic could strand
+the guest waiting on a dead worker or abort the VMM if it poisoned a write-back disk's image
+lock.
+New in this tree. Covered by `a_panicking_lone_request_fails_the_disk`,
+`a_panicking_request_on_a_helper_fails_the_disk`,
+`a_panicking_request_on_the_worker_thread_fails_the_disk`,
+`a_poisoned_image_lock_fails_the_disk`, `a_panic_holding_the_image_fails_the_disk`,
+`a_failed_disk_stays_failed_across_a_reset` and `a_poisoned_image_is_skipped_without_panicking`.
+
 `src/devices/src/virtio/block/device.rs` — the dirty-control socket is owner-only (0600) and
 waits at most 5 s on a connection's command byte or reply, since connections are served one at
 a time. The mode is set after the bind, so the caller still puts the socket in a private

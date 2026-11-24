@@ -5,11 +5,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use std::any::Any;
 use std::cmp;
 use std::convert::From;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::size_of;
+use std::ops::{Deref, DerefMut};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
@@ -18,7 +20,8 @@ use std::os::linux::fs::MetadataExt;
 use std::os::macos::fs::MetadataExt;
 use std::path::PathBuf;
 use std::result;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::JoinHandle;
 
 use imago::{
@@ -472,6 +475,64 @@ pub(crate) struct DiskProperties {
     /// unless the disk has a control socket to drain it (`spawn_dirty_control`): nothing else
     /// empties the sets.
     dirty: Option<Arc<Mutex<DirtyRanges>>>,
+    /// Set once a request panicked on the disk; shared with its `Block`. See [`image_failed`].
+    failed: Arc<AtomicBool>,
+}
+
+type Image = FormatAccess<Box<dyn DynStorage>>;
+
+/// Whether `image` is failed: a request panicked on it (`failed`), or a writer panicked holding
+/// its lock. Either may have left its metadata or cache inconsistent, so it is neither served
+/// nor flushed again. Activation reuses the open image, so a failed disk stays failed until
+/// the VMM exits.
+pub(crate) fn image_failed(failed: &AtomicBool, image: &RwLock<Image>) -> bool {
+    // A request that panics holding the image lock sets the flag before releasing it (see
+    // `ImageGuard`), so whoever takes the lock next sees it.
+    failed.load(Ordering::Relaxed) || image.is_poisoned()
+}
+
+fn poisoned<T>(_: PoisonError<T>) -> io::Error {
+    io::Error::other("disk image lock poisoned")
+}
+
+/// The image under its lock, as a request holds it. A panic while it is held fails the disk
+/// before the lock is released, so no flush can take the lock in between and write out what
+/// the panic left behind.
+pub(crate) struct ImageGuard<'a, G> {
+    guard: G,
+    failed: &'a AtomicBool,
+}
+
+impl<G: Deref<Target = Image>> Deref for ImageGuard<'_, G> {
+    type Target = Image;
+
+    fn deref(&self) -> &Image {
+        &self.guard
+    }
+}
+
+impl<G: DerefMut<Target = Image>> DerefMut for ImageGuard<'_, G> {
+    fn deref_mut(&mut self) -> &mut Image {
+        &mut self.guard
+    }
+}
+
+impl<G> Drop for ImageGuard<'_, G> {
+    // Runs before `guard` is dropped, which releases the lock.
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.failed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The panic message in `payload`, if it holds one.
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
 }
 
 impl DiskProperties {
@@ -481,8 +542,13 @@ impl DiskProperties {
         cache_type: CacheType,
         mmap: Option<Arc<DiskMmap>>,
         dirty: Option<Arc<Mutex<DirtyRanges>>>,
+        failed: Arc<AtomicBool>,
     ) -> io::Result<Self> {
-        let disk_size = disk_image.read().unwrap().size();
+        // Re-activating a failed disk still reads its size, which a panic cannot leave torn.
+        let disk_size = disk_image
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .size();
 
         // We only support disk size, which uses the first two words of the configuration space.
         // If the image is not a multiple of the sector size, the tail bits are not exposed.
@@ -500,6 +566,52 @@ impl DiskProperties {
             file: disk_image,
             mmap,
             dirty,
+            failed,
+        })
+    }
+
+    /// See [`image_failed`].
+    pub(crate) fn has_failed(&self) -> bool {
+        image_failed(&self.failed, &self.file)
+    }
+
+    /// Fails the disk after a request panicked with `payload`: see [`image_failed`].
+    pub(crate) fn fail(&self, payload: &(dyn Any + Send)) {
+        self.failed.store(true, Ordering::Relaxed);
+        let id = self.image_id.split(|&b| b == 0).next().unwrap_or_default();
+        error!(
+            "virtio-blk {}: a request panicked ({}); failing the disk with I/O errors",
+            id.escape_ascii(),
+            panic_message(payload)
+        );
+    }
+
+    /// An error once the disk has failed: a request that passed the worker's check while
+    /// another one panicked stops here.
+    fn check_failed(&self) -> io::Result<()> {
+        if self.failed.load(Ordering::Relaxed) {
+            return Err(io::Error::other("disk failed"));
+        }
+        Ok(())
+    }
+
+    /// The image, shared with the rest of the batch; an error if the disk has failed.
+    pub(crate) fn image(&self) -> io::Result<ImageGuard<'_, RwLockReadGuard<'_, Image>>> {
+        self.check_failed()?;
+        let guard = self.file.read().map_err(poisoned)?;
+        Ok(ImageGuard {
+            guard,
+            failed: &self.failed,
+        })
+    }
+
+    /// The image, excluding the rest of the batch; an error if the disk has failed.
+    pub(crate) fn image_mut(&self) -> io::Result<ImageGuard<'_, RwLockWriteGuard<'_, Image>>> {
+        self.check_failed()?;
+        let guard = self.file.write().map_err(poisoned)?;
+        Ok(ImageGuard {
+            guard,
+            failed: &self.failed,
         })
     }
 
@@ -599,14 +711,27 @@ impl DiskProperties {
 
 impl Drop for DiskProperties {
     fn drop(&mut self) {
+        if self.has_failed() {
+            // imago flushes an image when the last reference to it is dropped: this one is
+            // kept for the life of the process instead.
+            std::mem::forget(Arc::clone(&self.file));
+            if self.cache_type == CacheType::Writeback {
+                error!("Not flushing block data on drop: the disk failed.");
+            }
+            return;
+        }
         match self.cache_type {
             CacheType::Writeback => {
+                let Ok(file) = self.image() else {
+                    error!("Not flushing block data on drop: the disk failed.");
+                    return;
+                };
                 // flush() first to force any cached data out.
-                if self.file.read().unwrap().flush().is_err() {
+                if file.flush().is_err() {
                     error!("Failed to flush block data on drop.");
                 }
                 // Sync data out to physical media on host.
-                if self.file.read().unwrap().sync().is_err() {
+                if file.sync().is_err() {
                     error!("Failed to sync block data on drop.")
                 }
             }
@@ -692,6 +817,8 @@ pub struct Block {
     /// Dirty-cluster tracker, shared with the block worker and the host-side control listener;
     /// `None` unless a control socket was configured.
     dirty: Option<Arc<Mutex<DirtyRanges>>>,
+    /// Set once a request panicked on the disk: see [`image_failed`].
+    failed: Arc<AtomicBool>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -807,12 +934,14 @@ impl Block {
         #[cfg(not(unix))]
         let dirty = None;
 
+        let failed = Arc::new(AtomicBool::new(false));
         let disk_properties = DiskProperties::new(
             disk_image.clone(),
             disk_image_id.clone(),
             cache_type,
             mmap.clone(),
             dirty.clone(),
+            failed.clone(),
         )?;
 
         // Host-side dirty-drain control (virtkit build backend): serve a DRAIN protocol on the
@@ -820,7 +949,7 @@ impl Block {
         // worker (re)constructs its own `DiskProperties` from the shared `dirty` Arc on activate.
         #[cfg(unix)]
         if let (Some(listener), Some(dirty)) = (dirty_listener, &dirty) {
-            Self::spawn_dirty_control(listener, disk_image.clone(), dirty.clone());
+            Self::spawn_dirty_control(listener, disk_image.clone(), dirty.clone(), failed.clone());
         }
         #[cfg(not(unix))]
         if dirty_control_socket.is_some() {
@@ -870,6 +999,7 @@ impl Block {
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
             dirty,
+            failed,
         })
     }
 
@@ -910,12 +1040,15 @@ impl Block {
     ///   beside the flush.
     ///
     /// Errors are logged and the listener keeps serving; a dead socket just means no checkpoints
-    /// (the build falls back correctly on the virtkit side).
+    /// (the build falls back correctly on the virtkit side). A failed disk (see
+    /// [`image_failed`]) is never flushed: a drain closes the connection with no reply, and a
+    /// flush replies 1.
     #[cfg(unix)]
     fn spawn_dirty_control(
         listener: std::os::unix::net::UnixListener,
         disk_image: Arc<RwLock<FormatAccess<Box<dyn DynStorage>>>>,
         dirty: Arc<Mutex<DirtyRanges>>,
+        failed: Arc<AtomicBool>,
     ) {
         use std::io::Read;
 
@@ -954,13 +1087,24 @@ impl Block {
                         // makes the delta complete.
                         b'D' => {
                             let (written, discarded) = {
-                                let df = disk_image.write().unwrap();
+                                let df = match disk_image.write() {
+                                    Ok(df) if !image_failed(&failed, &disk_image) => df,
+                                    _ => {
+                                        error!("virtio-blk: dirty-control: the disk failed");
+                                        continue;
+                                    }
+                                };
                                 let size = df.size();
                                 if let Err(e) = flush_sync(&df) {
                                     error!("virtio-blk: dirty-control flush failed: {e}");
                                     continue;
                                 }
-                                dirty.lock().unwrap().take(size)
+                                // Poisoned by a request that panicked recording a write.
+                                let Ok(mut dirty) = dirty.lock() else {
+                                    error!("virtio-blk: dirty-control: the disk failed");
+                                    continue;
+                                };
+                                dirty.take(size)
                             };
                             // Two range blocks back to back: written first, then discarded.
                             let mut buf = encode_dirty_reply(&written);
@@ -977,15 +1121,21 @@ impl Block {
                             // Write lock: a write in flight beside the flush is one the kill
                             // that follows would lose. The caller has normally quiesced the
                             // guest by then, so this waits on nothing.
-                            let df = disk_image.write().unwrap();
-                            let reply = match flush_sync(&df) {
-                                Ok(()) => 0u8,
-                                Err(e) => {
-                                    error!("virtio-blk: dirty-control flush failed: {e}");
+                            let reply = match disk_image.write() {
+                                Ok(df) if !image_failed(&failed, &disk_image) => {
+                                    match flush_sync(&df) {
+                                        Ok(()) => 0u8,
+                                        Err(e) => {
+                                            error!("virtio-blk: dirty-control flush failed: {e}");
+                                            1u8
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    error!("virtio-blk: dirty-control: the disk failed");
                                     1u8
                                 }
                             };
-                            drop(df);
                             let _ = conn.write_all(&[reply]);
                         }
                         _ => continue,
@@ -1011,7 +1161,8 @@ impl Block {
     }
 }
 
-/// Zero `length` bytes at `offset` in `image`, holding its **write** lock.
+/// Zero `length` bytes at `offset` in `image`, which the caller holds under its **write** lock
+/// (the `&mut`).
 ///
 /// `FormatAccess::write_zeroes()` only needs `&self`, so this could share the lock with the rest
 /// of a batch (see `worker::IO_PARALLELISM`) — but it must not. Zeroing part of a cluster whose
@@ -1026,11 +1177,11 @@ impl Block {
 /// matter, the range can be split on cluster boundaries and zeroed under repeated short holds
 /// without reopening the race, since each cluster's decision falls entirely inside one chunk.
 pub(crate) fn write_zeroes_exclusive(
-    image: &RwLock<FormatAccess<Box<dyn DynStorage>>>,
+    image: &mut Image,
     offset: u64,
     length: u64,
 ) -> io::Result<()> {
-    image.write().unwrap().write_zeroes(offset, length)
+    image.write_zeroes(offset, length)
 }
 
 impl VmmExitObserver for Block {
@@ -1043,12 +1194,20 @@ impl VmmExitObserver for Block {
     ///
     /// Takes the write lock, like the dirty-control FLUSH it mirrors: this is the last flush
     /// before the process exits, so a write still in flight beside it is one nothing will write
-    /// again. A power-off means the guest has stopped issuing I/O, so it waits on nothing.
+    /// again. A power-off means the guest has stopped issuing I/O, so it waits on nothing. A
+    /// failed disk (see [`image_failed`]) is left alone: not flushed, and its poisoned lock not
+    /// unwrapped, as a panic here would skip the other devices' exit flushes and the exit itself.
     fn on_vmm_exit(&mut self) {
         if self.cache_type != CacheType::Writeback {
             return;
         }
-        let disk = self.disk_image.write().unwrap();
+        let disk = match self.disk_image.write() {
+            Ok(disk) if !image_failed(&self.failed, &self.disk_image) => disk,
+            _ => {
+                error!("block: not flushing image on VMM exit: the disk failed");
+                return;
+            }
+        };
         if let Err(e) = flush_sync(&disk) {
             error!("block: failed to flush image on VMM exit: {e}");
         }
@@ -1129,6 +1288,7 @@ impl VirtioDevice for Block {
                 self.cache_type,
                 self.mmap.clone(),
                 self.dirty.clone(),
+                self.failed.clone(),
             )
             .map_err(|_| ActivateError::BadActivate)?,
         };
@@ -1218,6 +1378,7 @@ mod tests {
             CacheType::Unsafe,
             Some(Arc::new(DiskMmap::open(&p).unwrap())),
             None,
+            Default::default(),
         )
         .unwrap()
     }
@@ -1751,7 +1912,8 @@ mod tests {
                 // The zeroes: the cluster's first slice, through the worker's own entry point.
                 let zeroer = Arc::clone(&fa);
                 scope.spawn(move || {
-                    write_zeroes_exclusive(&zeroer, c * CLUSTER, ZEROED).unwrap();
+                    write_zeroes_exclusive(&mut zeroer.write().unwrap(), c * CLUSTER, ZEROED)
+                        .unwrap();
                 });
             });
         }
@@ -1929,5 +2091,157 @@ mod tests {
         let image_id = DiskProperties::build_disk_image_id(backing.as_file(), "");
 
         assert_eq!(image_id.len(), VIRTIO_BLK_ID_BYTES as usize);
+    }
+
+    /// A request that panics holding the image fails the disk before the lock is released, a
+    /// read lock included, which the panic does not poison.
+    #[test]
+    fn a_panic_holding_the_image_fails_the_disk() {
+        let (_dir, image) = race_image("panic-guard", 1 << 16, None);
+        let disk = DiskProperties::new(
+            image,
+            vec![0; VIRTIO_BLK_ID_BYTES as usize],
+            CacheType::Unsafe,
+            None,
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _image = disk.image().unwrap();
+            panic!("a request panicking");
+        }))
+        .unwrap_err();
+        assert!(!disk.file.is_poisoned());
+        assert!(disk.has_failed());
+        assert!(disk.image().is_err() && disk.image_mut().is_err());
+    }
+
+    /// A disk failed by a panicking request stays failed across a guest reset, without
+    /// panicking on re-activation, a poisoned image lock included: activation reuses the image
+    /// the disk was opened with. The dirty-control listener refuses it, and neither the exit
+    /// flush nor dropping the device flushes it.
+    #[test]
+    fn a_failed_disk_stays_failed_across_a_reset() {
+        use super::super::worker::tests::{
+            IOERR, PANIC_SECTOR, QUEUE_SIZE, probe_image, queue_request, setup, status, used,
+            wait_used,
+        };
+        use crate::virtio::queue::tests::VirtQueue;
+        use std::io::Read;
+        use vm_memory::GuestAddress;
+
+        let s = setup();
+        let dir = TempDir(temp_dir("failed"));
+        let socket = dir.0.join("dirty.sock");
+        let mut block = Block::new(
+            "failed".into(),
+            None,
+            CacheType::Writeback,
+            s.path.to_str().unwrap().into(),
+            DiskFormat::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            Some(socket.to_str().unwrap().into()),
+        )
+        .unwrap();
+        let (image, probe) = probe_image(&s.path);
+        block.disk = None;
+        block.disk_image = image.clone();
+        let vq = VirtQueue::new(GuestAddress(0), &s.mem, QUEUE_SIZE);
+        let kick = Arc::new(EventFd::new(0).unwrap());
+        let activate = |block: &mut Block| {
+            vq.avail.idx.set(0);
+            vq.used.idx.set(0);
+            block
+                .activate(
+                    s.mem.clone(),
+                    InterruptTransport::from_handler(s.irqs.clone()),
+                    vec![DeviceQueue::new(vq.create_queue(), kick.clone())],
+                )
+                .unwrap();
+        };
+
+        activate(&mut block);
+        queue_request(&s.mem, &vq, 0, VIRTIO_BLK_T_IN, PANIC_SECTOR, 512, 16);
+        kick.write(1).unwrap();
+        wait_used(&vq, 1);
+        assert_eq!((used(&vq), status(&s.mem, 0)), (vec![(0, 1)], IOERR));
+        let calls = probe.calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        // A flush answers an error, a drain closes the connection with no reply.
+        let mut conn = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        conn.write_all(b"F").unwrap();
+        let mut reply = Vec::new();
+        conn.read_to_end(&mut reply).unwrap();
+        assert_eq!(reply, [1]);
+        let mut conn = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        conn.write_all(b"D").unwrap();
+        reply.clear();
+        conn.read_to_end(&mut reply).unwrap();
+        assert!(reply.is_empty());
+
+        // Reset, then re-activate twice: as failed, then with the image lock poisoned too.
+        assert!(block.reset());
+        activate(&mut block);
+        assert!(block.reset());
+        std::thread::spawn(move || {
+            let _held = image.write().unwrap();
+            panic!("poisoning the image lock");
+        })
+        .join()
+        .unwrap_err();
+        activate(&mut block);
+        queue_request(&s.mem, &vq, 1, VIRTIO_BLK_T_IN, 0, 512, 16);
+        kick.write(1).unwrap();
+        wait_used(&vq, 1);
+        assert_eq!((used(&vq), status(&s.mem, 1)), (vec![(3, 1)], IOERR));
+        assert!(block.reset());
+        assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+
+        block.on_vmm_exit();
+        drop(block);
+        assert_eq!(probe.flushes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Once a writer has panicked holding the image lock, the dirty-control flush answers an
+    /// error and keeps serving, and the exit flush and dropping the disk skip the image rather
+    /// than panic again: a second panic while the first unwinds would abort the process.
+    #[test]
+    fn a_poisoned_image_is_skipped_without_panicking() {
+        let dir = TempDir(temp_dir("poisoned"));
+        let path = dir.0.join("disk.raw");
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let mut block = Block::new(
+            "poisoned".into(),
+            None,
+            CacheType::Writeback,
+            path.to_str().unwrap().into(),
+            DiskFormat::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            Some(dir.0.join("dirty.sock").to_str().unwrap().into()),
+        )
+        .unwrap();
+        let image = block.disk_image.clone();
+        std::thread::spawn(move || {
+            let _held = image.write().unwrap();
+            panic!("poisoning the image lock");
+        })
+        .join()
+        .unwrap_err();
+
+        for _ in 0..2 {
+            let mut conn =
+                std::os::unix::net::UnixStream::connect(dir.0.join("dirty.sock")).unwrap();
+            conn.write_all(b"F").unwrap();
+            let mut reply = [0u8; 1];
+            std::io::Read::read_exact(&mut conn, &mut reply).unwrap();
+            assert_eq!(reply, [1]);
+        }
+        block.on_vmm_exit();
+        drop(block);
     }
 }

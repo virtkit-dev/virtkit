@@ -5,7 +5,6 @@ use super::SECTOR_SHIFT;
 use super::device::{CacheType, DiskProperties, write_zeroes_exclusive};
 
 use crate::virtio::{DescriptorChain, DetachedChain, InterruptTransport};
-use std::any::Any;
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -18,13 +17,14 @@ use utils::eventfd::EventFd;
 #[cfg(target_os = "windows")]
 use utils::windows::AsRawFd;
 use virtio_bindings::virtio_blk::*;
-use vm_memory::{ByteValued, Bytes, GuestMemoryMmap};
+use vm_memory::{ByteValued, Bytes, GuestMemoryMmap, VolatileSlice};
 
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum RequestError {
     Discarding(io::Error),
     DiscardingToZero(io::Error),
+    DiskFailed,
     FlushingToDisk(io::Error),
     InvalidChain(DescriptorUtilsError),
     InvalidDataLength,
@@ -98,15 +98,13 @@ struct Shared {
 }
 
 /// The batch being run: requests `next..len` are unclaimed, `unfinished` have not completed.
-/// Requests run unlocked, so a panicking one cannot poison it.
+/// Requests run unlocked and catch their own panics (`BlockWorker::process_one`).
 struct Batch {
     requests: [Option<DetachedChain>; IO_PARALLELISM],
     results: [Option<(u16, usize)>; IO_PARALLELISM],
     len: usize,
     next: usize,
     unfinished: usize,
-    /// The first panic of a request in this batch, re-raised on the worker thread.
-    panic: Option<Box<dyn Any + Send>>,
     /// Helpers blocked on `posted`.
     idle: usize,
     /// The worker thread is blocked on `finished`.
@@ -126,8 +124,7 @@ fn wait<'a>(cond: &Condvar, guard: MutexGuard<'a, Batch>) -> MutexGuard<'a, Batc
 impl Shared {
     /// Claims and runs the batch's unclaimed requests on this thread until none is left.
     /// `wake` idle helpers are woken once the first request is claimed and the lock released,
-    /// so they do not wake into a held lock. A panicking request is recorded rather than
-    /// unwound, so the batch still completes.
+    /// so they do not wake into a held lock.
     fn serve<'a>(
         &'a self,
         mut batch: MutexGuard<'a, Batch>,
@@ -141,18 +138,11 @@ impl Shared {
             for _ in 0..std::mem::take(&mut wake) {
                 self.posted.notify_one();
             }
-            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-                let head = head?.attach(&self.mem);
-                Some(BlockWorker::process_one(&self.mem, &self.disk, head))
-            }));
+            let completion = head.map(|head| {
+                BlockWorker::process_one(&self.mem, &self.disk, head.attach(&self.mem))
+            });
             batch = lock(&self.batch);
-            batch.results[slot] = match outcome {
-                Ok(completion) => completion,
-                Err(payload) => {
-                    batch.panic.get_or_insert(payload);
-                    None
-                }
-            };
+            batch.results[slot] = completion;
             batch.unfinished -= 1;
         }
         batch
@@ -189,13 +179,14 @@ pub struct BlockWorker {
 }
 
 impl Drop for BlockWorker {
-    /// Stops and joins the helpers. No batch is running here: `run_batch` returns or unwinds
-    /// only once its batch has finished.
+    /// Stops and joins the helpers. No batch is running here: `run_batch` returns only once
+    /// its batch has finished.
     fn drop(&mut self) {
         lock(&self.shared.batch).stop = true;
         self.shared.posted.notify_all();
         for helper in self.helpers.drain(..) {
-            // Requests' panics are caught, so a helper can only return.
+            // Requests catch their own panics, so a helper returns unless the code around
+            // them panics.
             let _ = helper.join();
         }
     }
@@ -218,7 +209,6 @@ impl BlockWorker {
                 len: 0,
                 next: 0,
                 unfinished: 0,
-                panic: None,
                 idle: 0,
                 waiting: false,
                 stop: false,
@@ -346,9 +336,8 @@ impl BlockWorker {
     /// Runs a batch of two or more requests concurrently, hiding a real disk's per-request
     /// latency: idle helpers are woken for all but one request, and this thread runs whatever
     /// they have not claimed yet, then waits for the rest. Results land in `completions` in batch
-    /// order. A request that panicked is re-raised here once every other request of the batch
-    /// has finished, so no helper touches guest memory after this returns or unwinds. How
-    /// conflicting accesses are synchronized: see `IO_PARALLELISM` (imago's own `RwLock`).
+    /// order, and no helper touches guest memory after this returns. How conflicting accesses
+    /// are synchronized: see `IO_PARALLELISM` (imago's own `RwLock`).
     fn run_batch(
         &mut self,
         batch: &mut Vec<DescriptorChain>,
@@ -374,10 +363,6 @@ impl BlockWorker {
         completions.extend_from_slice(&state.results[..len]);
         state.len = 0;
         state.next = 0;
-        if let Some(payload) = state.panic.take() {
-            drop(state);
-            panic::resume_unwind(payload);
-        }
     }
 
     /// Grows the helpers to `want` (at most `IO_PARALLELISM - 1`). They are spawned from this
@@ -421,15 +406,43 @@ impl BlockWorker {
         }
     }
 
-    /// Runs one guest request to completion: builds its `Reader`/`Writer`, dispatches it, and
-    /// writes the status byte. Returns the descriptor's table index and used length for
-    /// `add_used`: every chain is returned to the guest. A malformed one gets an I/O error
-    /// status if its writable buffers are in guest memory and hold at least one byte, and
-    /// otherwise used length 0 with nothing run.
+    /// Runs one guest request to completion and returns the descriptor's table index and used
+    /// length for `add_used`: every chain is returned to the guest, once. A request that panics
+    /// fails the disk (see `DiskProperties::fail`) and gets an I/O error status, if its chain
+    /// has one; its data buffers are left as they are.
     fn process_one(
         mem: &GuestMemoryMmap,
         disk: &DiskProperties,
         head: DescriptorChain,
+    ) -> (u16, usize) {
+        let index = head.index;
+        let mut status_byte = None;
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            Self::run_request(mem, disk, head, &mut status_byte)
+        }))
+        .unwrap_or_else(|payload| {
+            disk.fail(&*payload);
+            let Some(status_byte) = status_byte else {
+                return (index, 0);
+            };
+            if let Err(e) = status_byte.write_obj(VIRTIO_BLK_S_IOERR as u8, 0) {
+                error!("Failed to write virtio block status: {e:?}")
+            }
+            // What the request wrote before it panicked is undefined: only the status counts.
+            (index, 1)
+        })
+    }
+
+    /// `process_one`'s request: builds its `Reader`/`Writer`, records where the status byte is
+    /// in `status_byte` before running anything, dispatches the request unless the disk has
+    /// failed, and writes the status. A
+    /// malformed chain gets an I/O error status if its writable buffers are in guest memory and
+    /// hold at least one byte, and otherwise used length 0 with nothing run.
+    fn run_request<'a>(
+        mem: &'a GuestMemoryMmap,
+        disk: &DiskProperties,
+        head: DescriptorChain<'a>,
+        status_byte: &mut Option<VolatileSlice<'a>>,
     ) -> (u16, usize) {
         let mut writer = match Writer::new(mem, head.clone()) {
             Ok(r) => r,
@@ -439,28 +452,35 @@ impl BlockWorker {
             }
         };
         // virtio-blk fixes the status position even when the data buffer is only partly filled.
-        let Some(status_byte) = writer.split_last_byte() else {
+        *status_byte = writer.split_last_byte();
+        let Some(status_slot) = *status_byte else {
             // The guest needs a status byte to learn the outcome.
             error!("virtio-blk request without a status byte");
             return (head.index, 0);
         };
 
-        let outcome = Reader::new(mem, head.clone())
-            .map_err(RequestError::InvalidChain)
-            .and_then(|mut reader| {
-                let request_header: RequestHeader =
-                    reader.read_obj().map_err(RequestError::ReadingHeader)?;
-                Self::process_request(disk, request_header, &mut reader, &mut writer)
-            });
+        let outcome = if disk.has_failed() {
+            Err(RequestError::DiskFailed)
+        } else {
+            Reader::new(mem, head.clone())
+                .map_err(RequestError::InvalidChain)
+                .and_then(|mut reader| {
+                    let request_header: RequestHeader =
+                        reader.read_obj().map_err(RequestError::ReadingHeader)?;
+                    Self::process_request(disk, request_header, &mut reader, &mut writer)
+                })
+        };
         let status: u8 = match outcome {
             Ok(()) => VIRTIO_BLK_S_OK.try_into().unwrap(),
+            // Why it failed was logged when it did.
+            Err(RequestError::DiskFailed) => VIRTIO_BLK_S_IOERR.try_into().unwrap(),
             Err(e) => {
                 error!("error processing request: {e:?}");
                 VIRTIO_BLK_S_IOERR.try_into().unwrap()
             }
         };
 
-        if let Err(e) = status_byte.write_obj(status, 0) {
+        if let Err(e) = status_slot.write_obj(status, 0) {
             error!("Failed to write virtio block status: {e:?}")
         }
 
@@ -522,7 +542,7 @@ impl BlockWorker {
             }
             VIRTIO_BLK_T_FLUSH => match disk.cache_type() {
                 CacheType::Writeback => {
-                    let diskfile = disk.file.read().unwrap();
+                    let diskfile = disk.image().map_err(RequestError::FlushingToDisk)?;
                     diskfile.flush().map_err(RequestError::FlushingToDisk)?;
                     diskfile.sync().map_err(RequestError::FlushingToDisk)?;
                     Ok(())
@@ -552,7 +572,7 @@ impl BlockWorker {
                 )?;
                 // `&mut` op (allocation bookkeeping): takes the write lock, briefly excluding
                 // the rest of the batch.
-                let mut diskfile = disk.file.write().unwrap();
+                let mut diskfile = disk.image_mut().map_err(RequestError::Discarding)?;
                 diskfile
                     .discard_to_any(offset, discard_write_data.num_sectors as u64 * 512)
                     .map_err(RequestError::Discarding)?;
@@ -574,16 +594,15 @@ impl BlockWorker {
                 let unmap = (discard_write_data.flags & VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP) != 0;
                 if unmap {
                     // `&mut` op, same as discard above: write lock.
-                    disk.file
-                        .write()
-                        .unwrap()
+                    disk.image_mut()
+                        .map_err(RequestError::DiscardingToZero)?
                         .discard_to_zero(offset, discard_write_data.num_sectors as u64 * 512)
                         .map_err(RequestError::DiscardingToZero)?;
                 } else {
                     // Write lock like the unmap case above, for a different reason — see
                     // `write_zeroes_exclusive`.
                     write_zeroes_exclusive(
-                        &disk.file,
+                        &mut *disk.image_mut().map_err(RequestError::WritingZeroes)?,
                         offset,
                         discard_write_data.num_sectors as u64 * 512,
                     )
@@ -600,12 +619,13 @@ impl BlockWorker {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::panic::{self, AssertUnwindSafe};
+pub(super) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, RwLock, mpsc};
+    use std::sync::{Arc, Mutex, RwLock, mpsc};
     use std::time::{Duration, Instant};
 
+    use imago::io_buffers::{IoVector, IoVectorMut};
+    use imago::storage::drivers::CommonStorageHelper;
     use imago::{
         DynStorage, FormatAccess, Storage, StorageOpenOptions, file::File as ImagoFile, raw::Raw,
     };
@@ -621,14 +641,14 @@ mod tests {
     use crate::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use crate::virtio::{DeviceQueue, InterruptTransport};
 
-    const DISK_LEN: usize = 64 * 1024;
-    const QUEUE_SIZE: u16 = 64;
+    pub(crate) const DISK_LEN: usize = 64 * 1024;
+    pub(crate) const QUEUE_SIZE: u16 = 64;
     /// Request `i` keeps its header at `REQ_BASE + i * REQ_STRIDE`, its status byte 16 bytes
     /// after it and its data 4 KiB after it.
     const REQ_BASE: u64 = 0x4000;
     const REQ_STRIDE: u64 = 0x2000;
 
-    struct CountIrqs(AtomicUsize);
+    pub(crate) struct CountIrqs(pub(crate) AtomicUsize);
 
     impl InterruptHandler for CountIrqs {
         fn try_signal(&self, _interrupt: InterruptType) -> Result<(), crate::Error> {
@@ -642,14 +662,14 @@ mod tests {
         (0..DISK_LEN).map(|i| (i / 512) as u8).collect()
     }
 
-    struct Setup {
+    pub(crate) struct Setup {
         _file: TempFile,
-        path: std::path::PathBuf,
-        mem: GuestMemoryMmap,
-        irqs: Arc<CountIrqs>,
+        pub(crate) path: std::path::PathBuf,
+        pub(crate) mem: GuestMemoryMmap,
+        pub(crate) irqs: Arc<CountIrqs>,
     }
 
-    fn setup() -> Setup {
+    pub(crate) fn setup() -> Setup {
         let file = TempFile::new().unwrap();
         std::fs::write(file.as_path(), disk_bytes()).unwrap();
         Setup {
@@ -673,22 +693,147 @@ mod tests {
             ImagoFile::open(StorageOpenOptions::new().write(true).filename(&s.path)).unwrap();
         let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), true).unwrap();
         let image = Arc::new(RwLock::new(FormatAccess::new(raw)));
+        (worker_on(s, vq, image.clone(), cache), image)
+    }
+
+    /// A worker over `image` with cache `cache`, serving `vq`.
+    fn worker_on(s: &Setup, vq: &VirtQueue, image: Image, cache: CacheType) -> BlockWorker {
         let disk = DiskProperties::new(
-            image.clone(),
+            image,
             vec![0; VIRTIO_BLK_ID_BYTES as usize],
             cache,
             None,
             None,
+            Default::default(),
         )
         .unwrap();
-        let worker = BlockWorker::new(
+        BlockWorker::new(
             DeviceQueue::new(vq.create_queue(), Arc::new(EventFd::new(0).unwrap())),
             InterruptTransport::from_handler(s.irqs.clone()),
             s.mem.clone(),
             disk,
             EventFd::new(0).unwrap(),
-        );
-        (worker, image)
+        )
+    }
+
+    /// A sector whose read panics in the storage (see [`Probe`]).
+    pub(crate) const PANIC_SECTOR: u64 = 120;
+    /// A sector whose read waits in the storage until a read of `PANIC_SECTOR` has panicked.
+    pub(crate) const GATE_SECTOR: u64 = 121;
+
+    /// What a [`ProbeStorage`] saw, and when it panics.
+    #[derive(Debug, Default)]
+    pub(crate) struct Probe {
+        /// Reads, writes, flushes and syncs that reached the storage.
+        pub(crate) calls: AtomicUsize,
+        /// Flushes and syncs.
+        pub(crate) flushes: AtomicUsize,
+        /// Reads of other sectors finished.
+        reads: AtomicUsize,
+        /// A read of `PANIC_SECTOR` first waits for this many other reads.
+        pub(crate) reads_before_panic: AtomicUsize,
+        /// The thread a read of `PANIC_SECTOR` panicked on.
+        pub(crate) panicked_on: Mutex<Option<std::thread::ThreadId>>,
+    }
+
+    impl Probe {
+        fn wait_for(&self, what: &str, done: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !done() {
+                assert!(
+                    Instant::now() < deadline,
+                    "probe: timed out waiting for {what}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// A file that reports to its [`Probe`]: a read of `PANIC_SECTOR` panics, as a bug in the
+    /// storage would.
+    #[derive(Debug)]
+    pub(crate) struct ProbeStorage {
+        inner: ImagoFile,
+        probe: Arc<Probe>,
+    }
+
+    impl std::fmt::Display for ProbeStorage {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "probe:{}", self.inner)
+        }
+    }
+
+    #[maybe_async::maybe_async(AFIT)]
+    impl Storage for ProbeStorage {
+        fn size(&self) -> std::io::Result<u64> {
+            self.inner.size()
+        }
+
+        async unsafe fn pure_readv(
+            &self,
+            bufv: IoVectorMut<'_>,
+            offset: u64,
+        ) -> std::io::Result<()> {
+            let probe = &self.probe;
+            probe.calls.fetch_add(1, Ordering::SeqCst);
+            if offset == PANIC_SECTOR * 512 {
+                let want = probe.reads_before_panic.load(Ordering::SeqCst);
+                probe.wait_for("reads", || probe.reads.load(Ordering::SeqCst) >= want);
+                *probe.panicked_on.lock().unwrap() = Some(std::thread::current().id());
+                panic!("probe: injected panic");
+            }
+            if offset == GATE_SECTOR * 512 {
+                probe.wait_for("the panic", || probe.panicked_on.lock().unwrap().is_some());
+            }
+            // SAFETY: forwarded as received.
+            let result = unsafe { self.inner.pure_readv(bufv, offset) };
+            probe.reads.fetch_add(1, Ordering::SeqCst);
+            result
+        }
+
+        async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> std::io::Result<()> {
+            self.probe.calls.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: forwarded as received.
+            unsafe { self.inner.pure_writev(bufv, offset) }
+        }
+
+        async fn flush(&self) -> std::io::Result<()> {
+            self.probe.calls.fetch_add(1, Ordering::SeqCst);
+            self.probe.flushes.fetch_add(1, Ordering::SeqCst);
+            self.inner.flush()
+        }
+
+        async fn sync(&self) -> std::io::Result<()> {
+            self.probe.calls.fetch_add(1, Ordering::SeqCst);
+            self.probe.flushes.fetch_add(1, Ordering::SeqCst);
+            self.inner.sync()
+        }
+
+        async unsafe fn invalidate_cache(&self) -> std::io::Result<()> {
+            // SAFETY: forwarded as received.
+            unsafe { self.inner.invalidate_cache() }
+        }
+
+        fn get_storage_helper(&self) -> &CommonStorageHelper {
+            self.inner.get_storage_helper()
+        }
+    }
+
+    /// A writable raw image over `path` whose storage reports to the returned [`Probe`].
+    pub(crate) fn probe_image(path: &std::path::Path) -> (Image, Arc<Probe>) {
+        let probe = Arc::new(Probe::default());
+        let storage = ProbeStorage {
+            inner: ImagoFile::open(StorageOpenOptions::new().write(true).filename(path)).unwrap(),
+            probe: probe.clone(),
+        };
+        let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(storage), true).unwrap();
+        (Arc::new(RwLock::new(FormatAccess::new(raw))), probe)
+    }
+
+    /// A worker like [`worker_with`]'s whose image is a [`probe_image`].
+    fn probe_worker(s: &Setup, vq: &VirtQueue, cache: CacheType) -> (BlockWorker, Arc<Probe>) {
+        let (image, probe) = probe_image(&s.path);
+        (worker_on(s, vq, image, cache), probe)
     }
 
     fn helper_ids(w: &BlockWorker) -> Vec<std::thread::ThreadId> {
@@ -697,7 +842,7 @@ mod tests {
 
     /// Makes request `i` available to the device: descriptors `3i..3i + 3` (header, `len` data
     /// bytes unless `len` is 0, status). `header_len` short of 16 makes the header unreadable.
-    fn queue_request(
+    pub(crate) fn queue_request(
         mem: &GuestMemoryMmap,
         vq: &VirtQueue,
         i: u16,
@@ -732,7 +877,7 @@ mod tests {
         vq.avail.idx.set(slot.wrapping_add(1));
     }
 
-    fn status(mem: &GuestMemoryMmap, i: u16) -> u8 {
+    pub(crate) fn status(mem: &GuestMemoryMmap, i: u16) -> u8 {
         mem.read_obj(GuestAddress(REQ_BASE + u64::from(i) * REQ_STRIDE + 16))
             .unwrap()
     }
@@ -748,7 +893,7 @@ mod tests {
     }
 
     /// The used ring's `(head index, len)` entries so far.
-    fn used(vq: &VirtQueue) -> Vec<(u32, u32)> {
+    pub(crate) fn used(vq: &VirtQueue) -> Vec<(u32, u32)> {
         (0..vq.used.idx.get())
             .map(|k| {
                 let e = vq.used.ring[(k % QUEUE_SIZE) as usize].get();
@@ -758,7 +903,7 @@ mod tests {
     }
 
     const OK: u8 = VIRTIO_BLK_S_OK as u8;
-    const IOERR: u8 = VIRTIO_BLK_S_IOERR as u8;
+    pub(crate) const IOERR: u8 = VIRTIO_BLK_S_IOERR as u8;
 
     /// Lone reads, writes, flushes and failing requests are answered as a batch's would be: the
     /// same status, used entry and data, and one interrupt per completed request, a chain
@@ -927,24 +1072,152 @@ mod tests {
         assert_eq!(shared.strong_count(), 0);
     }
 
-    /// A panicking request still takes the worker down, but only after the rest of its batch
-    /// has finished: nothing of the batch reaches the used ring, and the helpers survive to be
-    /// joined.
+    /// Waits up to 30 s for `vq` to have `n` used entries.
+    pub(crate) fn wait_used(vq: &VirtQueue, n: u16) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while vq.used.idx.get() < n {
+            assert!(Instant::now() < deadline, "the request never completed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Requests on a failed disk complete with an I/O error and never reach its image: a
+    /// read, a write, a flush and a disk ID request, each alone.
+    fn later_requests_fail(s: &Setup, vq: &VirtQueue, probe: &Probe, mut run: impl FnMut()) {
+        let calls = probe.calls.load(Ordering::SeqCst);
+        let first = vq.used.idx.get();
+        let base = |i: u16| GuestAddress(REQ_BASE + u64::from(i) * REQ_STRIDE + 0x1000);
+        for (i, request_type) in [
+            (4, VIRTIO_BLK_T_IN),
+            (5, VIRTIO_BLK_T_OUT),
+            (6, VIRTIO_BLK_T_FLUSH),
+            (7, VIRTIO_BLK_T_GET_ID),
+        ] {
+            s.mem.write_slice(&[0xa5; 512], base(i)).unwrap();
+            let len = if request_type == VIRTIO_BLK_T_FLUSH {
+                0
+            } else {
+                512
+            };
+            queue_request(&s.mem, vq, i, request_type, 1, len, 16);
+            if request_type == VIRTIO_BLK_T_GET_ID {
+                let flags = VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT;
+                vq.dtable[3 * usize::from(i) + 1].set(base(i).0, 512, flags, 3 * i + 2);
+            }
+            run();
+            assert_eq!(status(&s.mem, i), IOERR);
+            assert_eq!(data(&s.mem, i, 512), [0xa5; 512]);
+        }
+        let used = used(vq);
+        assert_eq!(
+            used[usize::from(first)..],
+            [(12, 1), (15, 1), (18, 1), (21, 1)]
+        );
+        assert_eq!(probe.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(std::fs::read(&s.path).unwrap(), disk_bytes());
+    }
+
+    /// A lone request that panics completes with an I/O error and fails the disk: the worker
+    /// thread keeps serving, every later request fails without reaching the image, and stopping
+    /// the worker drops the write-back disk without flushing it.
     #[test]
-    fn a_panicking_request_fails_its_batch_once_the_rest_finished() {
+    fn a_panicking_lone_request_fails_the_disk() {
         let s = setup();
         let vq = VirtQueue::new(GuestAddress(0), &s.mem, QUEUE_SIZE);
-        // No write-back cache: dropping the disk would flush through the poisoned lock.
-        let (mut w, image) = worker_with(&s, &vq, CacheType::Unsafe);
-        let shared = Arc::downgrade(&w.shared);
-        let message = |payload: Box<dyn std::any::Any + Send>| {
-            *payload
-                .downcast::<String>()
-                .expect("a formatted panic message")
-        };
+        let (w, probe) = probe_worker(&s, &vq, CacheType::Writeback);
+        let kick = w.device_queue.event.clone();
+        let stop = w.stop_fd.try_clone().unwrap();
+        let thread = w.run();
 
-        // Eight reads, blocked on the image lock until its holder panics: the worker thread
-        // waits in the first, so the helpers most likely claim the others; all of them panic.
+        queue_request(&s.mem, &vq, 0, VIRTIO_BLK_T_IN, PANIC_SECTOR, 512, 16);
+        kick.write(1).unwrap();
+        wait_used(&vq, 1);
+        assert_eq!(used(&vq), [(0, 1)]);
+        assert_eq!(
+            (status(&s.mem, 0), s.irqs.0.load(Ordering::SeqCst)),
+            (IOERR, 1)
+        );
+        assert!(probe.panicked_on.lock().unwrap().is_some());
+
+        later_requests_fail(&s, &vq, &probe, || {
+            let n = vq.used.idx.get();
+            kick.write(1).unwrap();
+            wait_used(&vq, n + 1);
+        });
+        assert!(!thread.is_finished());
+        assert_eq!(s.irqs.0.load(Ordering::SeqCst), 5);
+
+        stop.write(1).unwrap();
+        thread.join().unwrap();
+        assert_eq!(probe.flushes.load(Ordering::SeqCst), 0);
+    }
+
+    /// A batch of eight whose request in slot `panicking` panics, on the worker thread for slot
+    /// 0 and on a helper otherwise, once every other request but the worker thread's has been
+    /// read. The worker thread holds slot 0 throughout (it claims it before any helper can).
+    fn a_batch_with_a_panic(panicking: u16) {
+        let s = setup();
+        let vq = VirtQueue::new(GuestAddress(0), &s.mem, QUEUE_SIZE);
+        let (mut w, probe) = probe_worker(&s, &vq, CacheType::Writeback);
+        // Every other read but the gate's.
+        let others = if panicking == 0 { 7 } else { 6 };
+        probe.reads_before_panic.store(others, Ordering::SeqCst);
+        for i in 0..8u16 {
+            let sector = match i {
+                _ if i == panicking => PANIC_SECTOR,
+                // Read on the worker thread until the helper's request has panicked.
+                0 => GATE_SECTOR,
+                _ => u64::from(i),
+            };
+            queue_request(&s.mem, &vq, i, VIRTIO_BLK_T_IN, sector, 512, 16);
+        }
+        w.process_queue(&s.mem);
+
+        let on_worker = *probe.panicked_on.lock().unwrap() == Some(std::thread::current().id());
+        assert_eq!(on_worker, panicking == 0);
+        let expected: Vec<_> = (0..8u16)
+            .map(|i| (3 * u32::from(i), if i == panicking { 1 } else { 513 }))
+            .collect();
+        assert_eq!(used(&vq), expected);
+        assert_eq!(s.irqs.0.load(Ordering::SeqCst), 1);
+        for i in (0..8u16).filter(|&i| i != panicking) {
+            assert_eq!(status(&s.mem, i), OK);
+            let at = if i == 0 {
+                GATE_SECTOR as usize
+            } else {
+                usize::from(i)
+            } * 512;
+            assert_eq!(data(&s.mem, i, 512), disk_bytes()[at..at + 512]);
+        }
+        assert_eq!(status(&s.mem, panicking), IOERR);
+        assert_eq!(w.helpers.len(), 7);
+        assert!(w.helpers.iter().all(|h| !h.is_finished()));
+
+        later_requests_fail(&s, &vq, &probe, || w.process_queue(&s.mem));
+        drop(w);
+        assert_eq!(probe.flushes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_panicking_request_on_a_helper_fails_the_disk() {
+        a_batch_with_a_panic(1);
+    }
+
+    #[test]
+    fn a_panicking_request_on_the_worker_thread_fails_the_disk() {
+        a_batch_with_a_panic(0);
+    }
+
+    /// Requests that find the image lock poisoned, by a writer that panicked holding it, get an
+    /// I/O error rather than panic; the batch completes with one interrupt, the helpers keep
+    /// running, later requests fail too, and the write-back disk is dropped without panicking.
+    #[test]
+    fn a_poisoned_image_lock_fails_the_disk() {
+        let s = setup();
+        let vq = VirtQueue::new(GuestAddress(0), &s.mem, QUEUE_SIZE);
+        let (mut w, image) = worker_with(&s, &vq, CacheType::Writeback);
+
+        // Eight reads, blocked on the image lock until its holder panics.
         let (locked_tx, locked_rx) = mpsc::channel();
         let poisoner = std::thread::spawn(move || {
             let _held = image.write().unwrap();
@@ -956,29 +1229,19 @@ mod tests {
         for i in 0..8u16 {
             queue_request(&s.mem, &vq, i, VIRTIO_BLK_T_IN, u64::from(i), 512, 16);
         }
-        let payload = panic::catch_unwind(AssertUnwindSafe(|| w.process_queue(&s.mem)));
-        assert!(message(payload.unwrap_err()).contains("PoisonError"));
+        w.process_queue(&s.mem);
         assert!(poisoner.join().is_err());
-        assert_eq!((used(&vq).len(), s.irqs.0.load(Ordering::SeqCst)), (0, 0));
-
-        // The worker thread's own request panics; the flushes beside it (no image lock with
-        // this cache) have all finished when it unwinds.
-        queue_request(&s.mem, &vq, 0, VIRTIO_BLK_T_IN, 0, 512, 16);
-        for i in 1..8u16 {
-            queue_request(&s.mem, &vq, i, VIRTIO_BLK_T_FLUSH, 0, 0, 16);
-        }
-        let payload = panic::catch_unwind(AssertUnwindSafe(|| w.process_queue(&s.mem)));
-        assert!(message(payload.unwrap_err()).contains("PoisonError"));
-        assert_eq!(status(&s.mem, 0), 0xff);
-        for i in 1..8u16 {
-            assert_eq!(status(&s.mem, i), OK);
-        }
-        assert_eq!((used(&vq).len(), s.irqs.0.load(Ordering::SeqCst)), (0, 0));
-
+        let expected: Vec<_> = (0..8u32).map(|i| (3 * i, 1)).collect();
+        assert_eq!(used(&vq), expected);
+        assert!((0..8).all(|i| status(&s.mem, i) == IOERR));
+        assert_eq!(s.irqs.0.load(Ordering::SeqCst), 1);
         assert_eq!(w.helpers.len(), 7);
         assert!(w.helpers.iter().all(|h| !h.is_finished()));
+
+        queue_request(&s.mem, &vq, 0, VIRTIO_BLK_T_FLUSH, 0, 0, 16);
+        w.process_queue(&s.mem);
+        assert_eq!((status(&s.mem, 0), used(&vq).len()), (IOERR, 9));
         drop(w);
-        assert_eq!(shared.strong_count(), 0);
     }
 
     /// Statusless requests must complete with a used length of zero and leave the disk intact.
