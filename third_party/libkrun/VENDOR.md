@@ -206,8 +206,10 @@ build-stage image lazily out of its compressed chunks. A `.vk_ro_img` manifest (
 vk-driver's `registry.rs`, layout documented on the module) lists the content-addressed chunks
 tiling an image and the local directory holding them; `LazyChunkStorage` is a read-only
 `imago::Storage` that reads and decodes missing chunks outside the cache lock. Concurrent
-reads of the same missing chunk share the result. The device opens a manifest directly as
-`DiskFormat::VkLazyChunks` (= 3). In a qcow2 backing chain, `LazyAwareOpenGate` opens
+reads of the same missing chunk share the result. On a miss, the device streams zstd chunks
+through a reusable decoder or reads raw chunks directly. Both paths reuse evicted buffers
+when one fits. Both process-wide pools limit idle counts and bytes. The device opens a
+manifest directly as `DiskFormat::VkLazyChunks` (= 3). In a qcow2 backing chain, `LazyAwareOpenGate` opens
 `*.vk_ro_img` as lazy storage at any depth. The host chooses the extension. Checking it
 prevents guest-written magic bytes from designating a manifest that names a host directory.
 
@@ -221,7 +223,7 @@ flush of a write-back cache on power-off, which every disk gets. Covered by
 than one byte past the decompressed length its `.vk_ro_img` entry claims, then refused if it
 does not come to exactly that length: a frame that inflates beyond it (the chunks come from a
 registry anyone with push access fills) is no longer held whole in memory first. Forward-ported
-from the 1.19 tree. Search for `take(u64::from(chunk.length) + 1)`.
+from the 1.19 tree. Raw chunks use the same bound. Search for `chunk.length as usize + 1`.
 
 `src/devices/src/virtio/block/{device.rs,worker.rs}` — a write-zeroes records the partial
 clusters at its ends as written, not only its whole clusters as holes. The 1.19 tree recorded

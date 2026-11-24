@@ -11,8 +11,8 @@
 //! This is deliberately local-disk-only: vk-driver is responsible for ensuring every chunk
 //! blob referenced by the manifest is already present in the cache directory before it
 //! attaches a `.vk_ro_img` disk (fetching over the network, if needed, happens there) — this
-//! module only ever does `std::fs::read` + zstd decode, so it pulls no network/async runtime
-//! dependency into libkrun.
+//! module reads local chunks and decompresses zstd chunks without adding a network or async
+//! runtime dependency to libkrun.
 //!
 //! ## `.vk_ro_img` format
 //!
@@ -58,13 +58,15 @@ use imago::{
     StorageOpenOptions,
 };
 use maybe_async::maybe_async;
-use std::collections::HashMap;
+use std::cell::Cell;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Display, Formatter};
-use std::io::{self, Read};
+use std::io::{self, BufReader, Read};
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use zstd::zstd_safe::{DCtx, ResetDirective};
 
 const MAGIC: &[u8; 8] = b"VKROIMG1";
 const CODEC_ZSTD: u8 = 0;
@@ -78,6 +80,168 @@ const LAYOUT_STORE_ROOT: u8 = 1;
 const DECODED_CACHE_ENTRIES: usize = 128;
 /// Encoded size of one `ChunkEntry`: offset (8) + length (4) + codec (1) + digest (32).
 const CHUNK_ENTRY_SIZE: u64 = 8 + 4 + 1 + 32;
+/// Largest chunk vk writes (`CDC_MAX` in vk-driver). Initial buffer requests are capped at
+/// this size plus the one-byte overrun probe, even for larger manifest lengths.
+const MAX_CHUNK: usize = 16 << 20;
+
+/// Process-wide idle buffer limit, sized for one disk at the block worker's `IO_PARALLELISM`.
+const IDLE_BUFFERS: usize = 8;
+/// Total capacity of the idle decoded-chunk buffers.
+const IDLE_BUFFER_BYTES: usize = 64 << 20;
+/// Allow up to 1/`REUSE_SLACK` of the requested size in spare capacity per cached chunk.
+const REUSE_SLACK: usize = 4;
+/// Idle zstd decoder contexts kept for later misses, process-wide.
+const IDLE_DECODERS: usize = 8;
+/// A context grown past this (a frame with a large window) is freed rather than kept. vk's
+/// chunk frames need about 1 MiB.
+const MAX_IDLE_DECODER_BYTES: usize = 8 << 20;
+
+static CHUNK_BUFFERS: BufferPool = BufferPool::new();
+static DECODERS: Mutex<Vec<DCtx<'static>>> = Mutex::new(Vec::new());
+
+/// Evicted chunk buffers, reused so a miss can skip allocating and faulting in a new one.
+///
+/// All lazy disks share the pool limits. Oldest-first eviction eventually frees buffers that
+/// no longer fit new requests. Keeping the initialized length avoids zeroing those bytes on
+/// the next decode.
+struct BufferPool {
+    /// Oldest first.
+    idle: Mutex<VecDeque<Vec<u8>>>,
+}
+
+impl BufferPool {
+    const fn new() -> Self {
+        BufferPool {
+            idle: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Each push or pop is complete or has made no change, so a poisoned lock is recovered.
+    fn lock(&self) -> MutexGuard<'_, VecDeque<Vec<u8>>> {
+        self.idle.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Take the smallest buffer within the `REUSE_SLACK` limit, or allocate for `need` bytes.
+    fn take(&self, need: usize) -> Vec<u8> {
+        let mut idle = self.lock();
+        let fit = idle
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                (need..=need.saturating_add(need / REUSE_SLACK)).contains(&b.capacity())
+            })
+            .min_by_key(|(_, b)| b.capacity())
+            .map(|(i, _)| i);
+        match fit.and_then(|i| idle.remove(i)) {
+            Some(buf) => buf,
+            None => {
+                drop(idle);
+                Vec::with_capacity(need)
+            }
+        }
+    }
+
+    /// Keep `buf` for a later miss, dropping the oldest buffers to stay within the limits.
+    fn put(&self, buf: Vec<u8>) {
+        if buf.capacity() > MAX_CHUNK + 1 {
+            return;
+        }
+        let mut freed = Vec::new();
+        {
+            let mut idle = self.lock();
+            let mut held: usize = idle.iter().map(Vec::capacity).sum();
+            while idle.len() >= IDLE_BUFFERS || held + buf.capacity() > IDLE_BUFFER_BYTES {
+                let Some(old) = idle.pop_front() else { break };
+                held -= old.capacity();
+                freed.push(old);
+            }
+            idle.push_back(buf);
+        }
+        // Freed outside the lock.
+        drop(freed);
+    }
+}
+
+/// A zstd decoder context from the idle pool, or a new one.
+fn take_decoder() -> io::Result<DCtx<'static>> {
+    // Pop in a separate statement so the lock is released before the reset.
+    let kept = DECODERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .pop();
+    // A context abandoned mid-frame or after an error starts over clean.
+    if let Some(mut ctx) = kept
+        && ctx.reset(ResetDirective::SessionAndParameters).is_ok()
+    {
+        return Ok(ctx);
+    }
+    DCtx::try_create().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "zstd could not allocate a decoder context",
+        )
+    })
+}
+
+fn put_decoder(ctx: DCtx<'static>) {
+    if ctx.sizeof() > MAX_IDLE_DECODER_BYTES {
+        return;
+    }
+    let mut idle = DECODERS.lock().unwrap_or_else(PoisonError::into_inner);
+    if idle.len() < IDLE_DECODERS {
+        idle.push(ctx);
+    }
+}
+
+/// Track file read failures so the caller can preserve their error kind through zstd decoding.
+struct Source<'a> {
+    file: std::fs::File,
+    failed: &'a Cell<bool>,
+}
+
+impl Read for Source<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let result = self.file.read(buf);
+        if result
+            .as_ref()
+            .is_err_and(|e| e.kind() != io::ErrorKind::Interrupted)
+        {
+            self.failed.set(true);
+        }
+        result
+    }
+}
+
+/// Decode concatenated zstd frames into `buf`, stopping at `limit` output bytes. Before that
+/// limit, truncated frames and trailing junk are errors. On success, `buf` contains only the
+/// decoded bytes. Reuse avoids zeroing the initialized part of the buffer.
+fn decode_zstd(file: impl Read, buf: &mut Vec<u8>, limit: usize) -> io::Result<()> {
+    let mut ctx = take_decoder()?;
+    let result = {
+        let input = BufReader::with_capacity(DCtx::in_size(), file);
+        let mut decoder = zstd::stream::read::Decoder::with_context(input, &mut ctx);
+        buf.resize(limit.min(MAX_CHUNK + 1), 0);
+        let mut n = 0;
+        loop {
+            if n == buf.len() {
+                if n == limit {
+                    break Ok(n);
+                }
+                // Only a chunk declared larger than `MAX_CHUNK` gets here.
+                buf.resize(limit.min(n.saturating_mul(2)), 0);
+            }
+            match decoder.read(&mut buf[n..]) {
+                Ok(0) => break Ok(n),
+                Ok(k) => n += k,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => break Err(e),
+            }
+        }
+    };
+    put_decoder(ctx);
+    buf.truncate(result?);
+    Ok(())
+}
 
 struct ChunkEntry {
     offset: u64,
@@ -108,6 +272,8 @@ pub struct LazyChunkStorage {
 /// decodes one chunk at a time, so the block worker has at most `IO_PARALLELISM` in flight.
 struct DecodedChunks {
     state: Mutex<DecodedState>,
+    /// Source of buffers for misses and destination for evicted buffers.
+    buffers: &'static BufferPool,
 }
 
 struct DecodedState {
@@ -170,8 +336,12 @@ impl Loader<'_> {
                 evicted = None;
             }
         }
-        // Freed outside the lock.
-        drop(evicted);
+        // Recycle the evicted buffer outside the cache lock if its last reader has released it.
+        if let Some((_, data)) = evicted
+            && let Ok(buf) = Arc::try_unwrap(data)
+        {
+            self.chunks.buffers.put(buf);
+        }
         *self
             .load
             .result
@@ -192,11 +362,16 @@ impl Drop for Loader<'_> {
 
 impl DecodedChunks {
     fn new(capacity: NonZeroUsize) -> Self {
+        Self::with_buffers(capacity, &CHUNK_BUFFERS)
+    }
+
+    fn with_buffers(capacity: NonZeroUsize, buffers: &'static BufferPool) -> Self {
         DecodedChunks {
             state: Mutex::new(DecodedState {
                 lru: lru::LruCache::new(capacity),
                 loading: HashMap::new(),
             }),
+            buffers,
         }
     }
 
@@ -261,6 +436,19 @@ fn digest_hex(digest: &[u8; 32]) -> String {
         write!(&mut hex, "{b:02x}").unwrap();
     }
     hex
+}
+
+fn check_length(path: &Path, got: usize, expected: u32) -> io::Result<()> {
+    if got == expected as usize {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "chunk {}: decompressed to {got} bytes, expected {expected}",
+            path.display()
+        ),
+    ))
 }
 
 fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<()> {
@@ -388,11 +576,11 @@ impl LazyChunkStorage {
         self.decoded.get_or_load(idx, || self.load_chunk(idx))
     }
 
-    /// Read chunk `idx` from disk, decompress it if needed, and check its length.
+    /// Read raw or compressed chunk `idx` into a buffer from the pool and verify its length.
     fn load_chunk(&self, idx: usize) -> io::Result<Vec<u8>> {
         let chunk = &self.chunks[idx];
         let path = self.chunk_path(chunk);
-        let raw = std::fs::read(&path).map_err(|e| {
+        let reading = |e: io::Error| {
             io::Error::new(
                 e.kind(),
                 format!(
@@ -401,46 +589,50 @@ impl LazyChunkStorage {
                     self.filename.display()
                 ),
             )
-        })?;
-        let data = match chunk.codec {
-            // No further than one byte past the length the header claims: a frame that
-            // inflates beyond it is refused below rather than held in memory.
-            CODEC_ZSTD => {
-                use std::io::Read;
-                // The largest chunk vk writes (`CDC_MAX` in vk-driver).
-                const MAX_CHUNK: usize = 16 << 20;
-                // Capacity hint only: capped at the largest chunk, whatever the header claims.
-                let mut data = Vec::with_capacity((chunk.length as usize).min(MAX_CHUNK));
-                zstd::stream::read::Decoder::new(&raw[..])
-                    .and_then(|d| d.take(u64::from(chunk.length) + 1).read_to_end(&mut data))
-                    .map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("zstd-decompressing chunk {}: {e}", path.display()),
-                        )
-                    })?;
-                data
-            }
-            CODEC_RAW => raw,
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("chunk {}: unknown codec {other}", path.display()),
-                ));
-            }
         };
-        if data.len() != chunk.length as usize {
+        let file = std::fs::File::open(&path).map_err(reading)?;
+        if chunk.codec != CODEC_ZSTD && chunk.codec != CODEC_RAW {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "chunk {}: decompressed to {} bytes, expected {}",
-                    path.display(),
-                    data.len(),
-                    chunk.length
-                ),
+                format!("chunk {}: unknown codec {}", path.display(), chunk.codec),
             ));
         }
-        Ok(data)
+        // One extra byte detects an overrun without buffering the rest of an oversized chunk.
+        let limit = chunk.length as usize + 1;
+        let mut buf = self.decoded.buffers.take(limit.min(MAX_CHUNK + 1));
+        let result = if chunk.codec == CODEC_ZSTD {
+            let read_failed = Cell::new(false);
+            let source = Source {
+                file,
+                failed: &read_failed,
+            };
+            decode_zstd(source, &mut buf, limit).map_err(|e| {
+                if read_failed.get() {
+                    reading(e)
+                } else if e.kind() == io::ErrorKind::OutOfMemory {
+                    e
+                } else {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("zstd-decompressing chunk {}: {e}", path.display()),
+                    )
+                }
+            })
+        } else {
+            buf.clear();
+            file.take(limit as u64)
+                .read_to_end(&mut buf)
+                .map(drop)
+                .map_err(reading)
+        };
+        let result = result.and_then(|()| check_length(&path, buf.len(), chunk.length));
+        match result {
+            Ok(()) => Ok(buf),
+            Err(e) => {
+                self.decoded.buffers.put(buf);
+                Err(e)
+            }
+        }
     }
 
     /// Index of the first chunk that could contain or come after byte `pos` — either the
@@ -512,8 +704,7 @@ impl Storage for LazyChunkStorage {
     async fn open(opts: StorageOpenOptions) -> io::Result<Self> {
         // `opts.write`/`opts.direct` have no public getters on `StorageOpenOptions` (only
         // `get_filename` does) — a caller requesting O_DIRECT or writable semantics can't be
-        // detected or honored here; the read-only, page-cache-backed `std::fs::read` this
-        // module does is unconditional.
+        // detected or honored here. Chunk files always use read-only, page-cache-backed I/O.
         let Some(filename) = opts.get_filename() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1069,6 +1260,234 @@ mod tests {
         let mut out = vec![0u8; 50];
         let err = storage.read_range(0, &mut out).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Open a flat image of consecutive chunks with a cache of `entries` chunks. Return the
+    /// storage, its private buffer pool, and the expected image bytes.
+    fn open_chunks(
+        fx: &Fixture,
+        entries: usize,
+        chunks: &[(Vec<u8>, u8)],
+    ) -> (LazyChunkStorage, &'static BufferPool, Vec<u8>) {
+        let mut whole = Vec::new();
+        let mut manifest_entries = Vec::new();
+        for (n, (data, codec)) in chunks.iter().enumerate() {
+            let digest = fake_digest(n as u8 + 1);
+            let blob = match *codec {
+                CODEC_ZSTD => zstd::encode_all(&data[..], 3).unwrap(),
+                _ => data.clone(),
+            };
+            std::fs::write(fx.dir.join(digest_hex(&digest)), blob).unwrap();
+            manifest_entries.push((whole.len() as u64, data.len() as u32, *codec, digest));
+            whole.extend_from_slice(data);
+        }
+        let manifest = fx.dir.join("test.vk_ro_img");
+        write_manifest(
+            &manifest,
+            whole.len() as u64,
+            LAYOUT_FLAT,
+            &fx.dir,
+            &manifest_entries,
+        );
+        let mut storage =
+            LazyChunkStorage::parse(std::fs::File::open(&manifest).unwrap(), manifest).unwrap();
+        let pool: &'static BufferPool = Box::leak(Box::new(BufferPool::new()));
+        storage.decoded = DecodedChunks::with_buffers(NonZeroUsize::new(entries).unwrap(), pool);
+        (storage, pool, whole)
+    }
+
+    fn idle_ptrs(pool: &BufferPool) -> Vec<*const u8> {
+        pool.lock().iter().map(|b| b.as_ptr()).collect()
+    }
+
+    /// Raw and zstd misses reuse evicted buffers and expose only the new chunk's bytes.
+    /// Readers keep their buffers after eviction. A failed decode returns its buffer.
+    #[test]
+    fn evicted_buffers_are_reused_for_later_misses() {
+        let fx = Fixture::new("reuse");
+        let pattern = |len: usize, mul: u32| -> Vec<u8> {
+            (0..len as u32)
+                .map(|i| (i.wrapping_mul(mul) % 251) as u8)
+                .collect()
+        };
+        let chunks = [
+            (vec![0xAA; 72 << 10], CODEC_ZSTD),
+            (pattern(64 << 10, 3), CODEC_ZSTD),
+            (pattern(60 << 10, 5), CODEC_RAW),
+            (pattern(56 << 10, 7), CODEC_ZSTD),
+        ];
+        let (storage, pool, whole) = open_chunks(&fx, 1, &chunks);
+        let span = |idx: usize| {
+            let start: usize = chunks[..idx].iter().map(|c| c.0.len()).sum();
+            start..start + chunks[idx].0.len()
+        };
+        let read = |idx: usize| {
+            let range = span(idx);
+            let mut out = vec![0x55; range.len()];
+            storage.read_range(range.start as u64, &mut out).unwrap();
+            assert_eq!(out, whole[range], "chunk {idx}");
+        };
+
+        read(0);
+        read(1);
+        let buf0 = idle_ptrs(pool);
+        assert_eq!(buf0.len(), 1, "chunk 0's buffer was kept");
+        read(2);
+        assert_eq!(storage.decode_chunk(2).unwrap().as_ptr(), buf0[0]);
+        let buf1 = idle_ptrs(pool);
+        assert_eq!(buf1.len(), 1, "chunk 1's buffer was kept");
+        read(3);
+        let held = storage.decode_chunk(3).unwrap();
+        assert_eq!(held.as_ptr(), buf1[0]);
+        assert_eq!(*held, whole[span(3)]);
+
+        // Chunk 0 takes chunk 2's buffer back and evicts chunk 3, which is still held.
+        read(0);
+        assert!(idle_ptrs(pool).is_empty());
+        assert_eq!(*held, whole[span(3)]);
+        drop(held);
+
+        // A chunk that decodes short returns its buffer.
+        std::fs::write(
+            fx.dir.join(digest_hex(&fake_digest(2))),
+            zstd::encode_all(&[1u8; 100][..], 3).unwrap(),
+        )
+        .unwrap();
+        let mut out = vec![0; 10];
+        let err = storage
+            .read_range(span(1).start as u64, &mut out)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(idle_ptrs(pool).len(), 1);
+    }
+
+    #[test]
+    fn buffer_pool_limits() {
+        let pool = BufferPool::new();
+        for cap in 1..=IDLE_BUFFERS + 1 {
+            pool.put(Vec::with_capacity(cap));
+        }
+        let caps: Vec<usize> = pool.lock().iter().map(Vec::capacity).collect();
+        assert_eq!(
+            caps,
+            (2..=IDLE_BUFFERS + 1).collect::<Vec<_>>(),
+            "oldest dropped"
+        );
+
+        // Best fit, but never more than a quarter over the need.
+        let pool = BufferPool::new();
+        for cap in [126, 110, 100, 125, 90] {
+            pool.put(Vec::with_capacity(cap));
+        }
+        for cap in [100, 110, 125] {
+            assert_eq!(pool.take(100).capacity(), cap);
+        }
+        let fresh = pool.take(100);
+        assert_eq!(
+            fresh.capacity(),
+            100,
+            "a new buffer: 126 is too large, 90 too small"
+        );
+        assert_eq!(pool.lock().len(), 2);
+
+        let pool = BufferPool::new();
+        pool.put(Vec::with_capacity(MAX_CHUNK + 2));
+        assert!(pool.lock().is_empty(), "larger than any chunk vk writes");
+        for _ in 0..IDLE_BUFFERS {
+            pool.put(Vec::with_capacity(MAX_CHUNK + 1));
+        }
+        let held: usize = pool.lock().iter().map(Vec::capacity).sum();
+        assert_eq!(pool.lock().len(), IDLE_BUFFER_BYTES / (MAX_CHUNK + 1));
+        assert!(held <= IDLE_BUFFER_BYTES);
+    }
+
+    /// Concatenated frames form one chunk. Truncated frames, trailing junk and raw blobs of the
+    /// wrong length fail.
+    #[test]
+    fn chunk_blobs_must_decode_to_exactly_the_declared_bytes() {
+        let fx = Fixture::new("framing");
+        let a: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let b = vec![0x42u8; 3000];
+        let frame_a = zstd::encode_all(&a[..], 3).unwrap();
+        let frame_b = zstd::encode_all(&b[..], 3).unwrap();
+        let both = [a.clone(), b.clone()].concat();
+        let check = |name: &str, blob: Vec<u8>, codec: u8, ok: bool| {
+            let digest = fake_digest(1);
+            std::fs::write(fx.dir.join(digest_hex(&digest)), blob).unwrap();
+            let manifest = fx.dir.join(format!("{name}.vk_ro_img"));
+            let len = both.len() as u32;
+            write_manifest(
+                &manifest,
+                len.into(),
+                LAYOUT_FLAT,
+                &fx.dir,
+                &[(0, len, codec, digest)],
+            );
+            let storage =
+                LazyChunkStorage::parse(std::fs::File::open(&manifest).unwrap(), manifest).unwrap();
+            let mut out = vec![0u8; both.len()];
+            match storage.read_range(0, &mut out) {
+                Ok(()) => {
+                    assert!(ok, "{name}: accepted");
+                    assert_eq!(out, both, "{name}");
+                }
+                Err(e) => {
+                    assert!(!ok, "{name}: {e}");
+                    assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{name}");
+                }
+            }
+        };
+        check(
+            "concatenated",
+            [&frame_a[..], &frame_b[..]].concat(),
+            CODEC_ZSTD,
+            true,
+        );
+        let cut = [&frame_a[..], &frame_b[..frame_b.len() - 3]].concat();
+        check("truncated", cut, CODEC_ZSTD, false);
+        let trailing = [&frame_a[..], &frame_b[..], b"junk"].concat();
+        check("trailing", trailing, CODEC_ZSTD, false);
+        check("raw", both.clone(), CODEC_RAW, true);
+        check("raw-short", both[1..].to_vec(), CODEC_RAW, false);
+        check("raw-long", [&both[..], &[0]].concat(), CODEC_RAW, false);
+    }
+
+    /// Chunks larger than vk writes can grow the buffer up to the declared length plus one.
+    /// A single extra decoded byte fails the length check.
+    #[test]
+    fn chunks_declared_larger_than_vk_writes_decode_within_their_length() {
+        let fx = Fixture::new("oversized");
+        let data = vec![0u8; MAX_CHUNK + 4096];
+        let digest = fake_digest(1);
+        std::fs::write(
+            fx.dir.join(digest_hex(&digest)),
+            zstd::encode_all(&data[..], 1).unwrap(),
+        )
+        .unwrap();
+        for (declared, ok) in [(data.len(), true), (data.len() - 1, false)] {
+            let manifest = fx.dir.join("test.vk_ro_img");
+            let len = declared as u32;
+            write_manifest(
+                &manifest,
+                len.into(),
+                LAYOUT_FLAT,
+                &fx.dir,
+                &[(0, len, CODEC_ZSTD, digest)],
+            );
+            let storage =
+                LazyChunkStorage::parse(std::fs::File::open(&manifest).unwrap(), manifest).unwrap();
+            match storage.decode_chunk(0) {
+                Ok(chunk) => {
+                    assert!(ok, "declared {declared}: accepted");
+                    assert_eq!(chunk.len(), declared);
+                    assert!(chunk.iter().all(|&b| b == 0));
+                }
+                Err(e) => {
+                    assert!(!ok, "declared {declared}: {e}");
+                    assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+                }
+            }
+        }
     }
 
     mod decoded_chunks {
