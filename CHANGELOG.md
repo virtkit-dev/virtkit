@@ -16,6 +16,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest reads from a lazily restored image can proceed while another chunk is being
   decompressed.
 - Decompressing chunks of a lazily restored image uses less host CPU and allocates less memory.
+- Writing lazily restored images to disk for exports, persistent disks, or `--debug` checks
+  uses less host CPU and allocates less memory.
 
 ### Fixed
 

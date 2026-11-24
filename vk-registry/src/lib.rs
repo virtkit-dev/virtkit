@@ -377,6 +377,12 @@ pub fn zstd_reader(frames: &[u8]) -> std::io::Result<impl std::io::Read + '_> {
     zctx::decoder_buffered(frames)
 }
 
+/// [`zstd_reader`] for frames streamed from `input`, read through one buffer of zstd's
+/// recommended input size.
+pub fn zstd_stream_reader<R: std::io::Read>(input: R) -> std::io::Result<impl std::io::Read> {
+    zctx::decoder(input)
+}
+
 /// The on-disk content-addressed store. Shared by the HTTP handlers below and the
 /// in-process build-cache backend (`registry::local`), so both write identical
 /// on-disk state. Cheap to clone-share via `Arc`.

@@ -9,11 +9,14 @@
 //! refcounts. Anything outside that is rejected rather than mis-read. Overlay creation is
 //! native too (`create_overlay`) — no `qemu-img` at runtime.
 
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
+use std::io::{self, Read};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context, Result, bail};
 
@@ -995,11 +998,13 @@ pub struct VkRoImg {
     layout: u8,
     cache_dir: PathBuf,
     chunks: Vec<VkRoChunk>,
-    /// Most recently decoded chunk, by index into `chunks` — `read_at` is driven by
+    /// Index into `chunks` of the chunk `last_data` holds — `read_at` is driven by
     /// `Qcow2::read_at`'s cluster-at-a-time loop, so consecutive calls usually land in the
     /// same or the next chunk; without this, a single 16 MiB chunk would be re-decompressed
-    /// once per 64 KiB cluster.
-    last: Option<(usize, Vec<u8>)>,
+    /// once per 64 KiB cluster. `None` while `last_data` holds nothing valid.
+    last: Option<usize>,
+    /// Buffer reused across sequential cache misses.
+    last_data: Vec<u8>,
 }
 
 struct VkRoChunk {
@@ -1073,6 +1078,7 @@ impl VkRoImg {
             cache_dir,
             chunks,
             last: None,
+            last_data: Vec::new(),
         })
     }
 
@@ -1105,44 +1111,68 @@ impl VkRoImg {
         }
     }
 
-    /// Read and decode chunk `idx` from the cache directory, checked against its recorded
-    /// length. Takes `&self` so several threads can decode disjoint chunks at once.
-    fn load_chunk(&self, idx: usize) -> Result<Vec<u8>> {
+    /// Read chunk `idx` from the cache directory into `buf` and check its length.
+    /// Decode zstd and read all other codecs as stored. Concurrent callers supply their
+    /// own buffers, which are reused when large enough.
+    fn load_chunk(&self, idx: usize, buf: &mut Vec<u8>) -> Result<()> {
         let chunk = &self.chunks[idx];
         let path = self.chunk_path(chunk);
-        let raw =
-            std::fs::read(&path).with_context(|| format!("reading chunk {}", path.display()))?;
-        // Decode at most the claimed length plus one byte to reject oversized frames
-        // without buffering them whole.
-        let data = if chunk.codec == crate::registry::VK_RO_IMG_CODEC_ZSTD {
-            use std::io::Read;
-            // Capacity hint only: capped at the largest chunk, whatever the header claims.
-            let mut data =
-                Vec::with_capacity((chunk.length as usize).min(crate::registry::CDC_MAX));
-            vk_registry::zstd_reader(&raw)
-                .and_then(|d| d.take(u64::from(chunk.length) + 1).read_to_end(&mut data))
-                .with_context(|| format!("zstd-decompressing chunk {}", path.display()))?;
-            data
+        let reading = || format!("reading chunk {}", path.display());
+        let file = File::open(&path).with_context(reading)?;
+        let zstd = chunk.codec == crate::registry::VK_RO_IMG_CODEC_ZSTD;
+        // Read at most the claimed length plus one byte to reject oversized chunks without
+        // buffering them whole.
+        let limit = chunk.length as usize + 1;
+        let size = chunk_buffer_size(chunk.length);
+        if buf.capacity() < size {
+            // Replacing the allocation avoids copying the old chunk.
+            *buf = Vec::with_capacity(size);
+        }
+        let read_failed = Cell::new(false);
+        let loaded = if zstd {
+            let source = ChunkFile {
+                file: &file,
+                failed: &read_failed,
+            };
+            vk_registry::zstd_stream_reader(source).and_then(|d| fill(d, buf, size, limit))
         } else {
-            raw
+            // File reads can fill spare capacity without zeroing it first.
+            buf.clear();
+            (&file).take(limit as u64).read_to_end(buf).map(drop)
         };
-        if data.len() != chunk.length as usize {
+        if let Err(e) = loaded {
+            return if zstd && !read_failed.get() {
+                Err(e).with_context(|| format!("zstd-decompressing chunk {}", path.display()))
+            } else {
+                Err(e).with_context(reading)
+            };
+        }
+        if buf.len() != chunk.length as usize {
+            // Report the file size for oversized raw chunks, or the bytes read if metadata fails.
+            let got = match file.metadata() {
+                Ok(meta) if !zstd && buf.len() == limit => meta.len(),
+                _ => buf.len() as u64,
+            };
             bail!(
-                "chunk {}: decompressed to {} bytes, expected {}",
+                "chunk {}: decompressed to {got} bytes, expected {}",
                 path.display(),
-                data.len(),
                 chunk.length
             );
         }
-        Ok(data)
+        Ok(())
     }
 
     fn decode_chunk(&mut self, idx: usize) -> Result<&[u8]> {
-        if !matches!(&self.last, Some((i, _)) if *i == idx) {
-            let data = self.load_chunk(idx)?;
-            self.last = Some((idx, data));
+        if self.last != Some(idx) {
+            // A failed load can leave a partial chunk in the buffer.
+            self.last = None;
+            let mut data = std::mem::take(&mut self.last_data);
+            let loaded = self.load_chunk(idx, &mut data);
+            self.last_data = data;
+            loaded?;
+            self.last = Some(idx);
         }
-        Ok(&self.last.as_ref().unwrap().1)
+        Ok(&self.last_data)
     }
 
     /// Decode chunks with a capped worker pool and feed 64 KiB nonzero blocks to `sink`
@@ -1157,22 +1187,26 @@ impl VkRoImg {
         let decode_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
         let workers = crate::registry::chunk_workers(self.chunks.len());
         // Bounded: at most the channel's `workers` queued plus one blocked mid-`send` in
-        // each decoder, so decoded data in flight stays within ~2*workers chunks.
+        // each decoder, so roughly twice that many buffers are in flight. The writer returns
+        // buffers for reuse, with at most `ChunkBuffers::MAX_IDLE_BYTES` idle.
         let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(workers);
+        let buffers = ChunkBuffers::new(workers);
         std::thread::scope(|s| {
             for _ in 0..workers {
                 let tx = tx.clone();
                 let next = &next;
                 let decode_err = &decode_err;
+                let buffers = &buffers;
                 s.spawn(move || {
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= self.chunks.len() {
                             break;
                         }
-                        match self.load_chunk(i) {
+                        let mut data = buffers.take(chunk_buffer_size(self.chunks[i].length));
+                        match self.load_chunk(i, &mut data) {
                             // A closed channel means the writer gave up: stop too.
-                            Ok(data) => {
+                            Ok(()) => {
                                 if tx.send((self.chunks[i].offset, data)).is_err() {
                                     break;
                                 }
@@ -1220,6 +1254,7 @@ impl VkRoImg {
                     write_err = Some(e);
                     break;
                 }
+                buffers.put(data);
             }
             drop(rx);
             write_err
@@ -1278,6 +1313,116 @@ impl VkRoImg {
             pos = copy_end;
         }
         Ok(())
+    }
+}
+
+/// Initial capacity covers the smaller of the claimed length and the largest chunk vk
+/// writes, plus one byte to detect overruns. Larger chunks grow the buffer as needed.
+fn chunk_buffer_size(length: u32) -> usize {
+    (length as usize).min(crate::registry::CDC_MAX) + 1
+}
+
+/// Overwrite `buf` with up to `limit` bytes from `src`, starting with `size` bytes of room.
+/// The decoder needs initialized memory, so only newly exposed bytes need zeroing.
+fn fill(mut src: impl Read, buf: &mut Vec<u8>, size: usize, limit: usize) -> io::Result<()> {
+    debug_assert!(size <= limit);
+    buf.resize(size, 0);
+    let mut n = 0;
+    let result = loop {
+        if n == buf.len() {
+            if n >= limit {
+                break Ok(());
+            }
+            buf.resize(limit.min(n.saturating_mul(2)), 0);
+        }
+        match src.read(&mut buf[n..]) {
+            Ok(0) => break Ok(()),
+            Ok(k) => n += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => break Err(e),
+        }
+    };
+    buf.truncate(n);
+    result
+}
+
+/// Track file read errors through the zstd decoder so callers can identify their source.
+struct ChunkFile<'a> {
+    file: &'a File,
+    failed: &'a Cell<bool>,
+}
+
+impl Read for ChunkFile<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut file = self.file;
+        let result = file.read(buf);
+        if result
+            .as_ref()
+            .is_err_and(|e| e.kind() != io::ErrorKind::Interrupted)
+        {
+            self.failed.set(true);
+        }
+        result
+    }
+}
+
+/// Decoders reuse buffers the writer returns during one parallel materialization.
+/// The pool keeps at most `max_idle` buffers with a combined capacity of at most
+/// [`ChunkBuffers::MAX_IDLE_BYTES`]. It drops the oldest first and rejects buffers
+/// larger than the largest chunk vk writes plus its overrun byte.
+struct ChunkBuffers {
+    /// Oldest first.
+    idle: Mutex<VecDeque<Vec<u8>>>,
+    max_idle: usize,
+}
+
+impl ChunkBuffers {
+    const MAX_IDLE_BYTES: usize = 64 << 20;
+
+    fn new(max_idle: usize) -> Self {
+        ChunkBuffers {
+            idle: Mutex::new(VecDeque::new()),
+            max_idle,
+        }
+    }
+
+    /// Each push or pop is complete or has made no change, so a poisoned lock is recovered.
+    fn lock(&self) -> MutexGuard<'_, VecDeque<Vec<u8>>> {
+        self.idle.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Take the smallest idle buffer that fits `size`, or an empty buffer if none fits.
+    /// The guest cache retains decoded chunks across reads. Here even an oversized fit
+    /// is released by the end of materialization.
+    fn take(&self, size: usize) -> Vec<u8> {
+        let mut idle = self.lock();
+        let fit = idle
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.capacity() >= size)
+            .min_by_key(|(_, b)| b.capacity())
+            .map(|(i, _)| i);
+        fit.and_then(|i| idle.remove(i)).unwrap_or_default()
+    }
+
+    /// Keep `buf` for a later chunk, dropping the oldest buffers to stay within the limits.
+    fn put(&self, buf: Vec<u8>) {
+        if buf.capacity() > crate::registry::CDC_MAX + 1 {
+            return;
+        }
+        let mut freed = Vec::new();
+        {
+            let mut idle = self.lock();
+            let mut held: usize = idle.iter().map(Vec::capacity).sum();
+            while idle.len() >= self.max_idle || held + buf.capacity() > Self::MAX_IDLE_BYTES {
+                let Some(old) = idle.pop_front() else { break };
+                held -= old.capacity();
+                freed.push(old);
+            }
+            idle.push_back(buf);
+        }
+        // Freed outside the lock.
+        drop(freed);
     }
 }
 
@@ -2338,11 +2483,13 @@ mod tests {
                 }],
             )
             .unwrap();
-            let got = VkRoImg::open(&manifest).unwrap().load_chunk(0);
+            let mut got = Vec::new();
+            let loaded = VkRoImg::open(&manifest).unwrap().load_chunk(0, &mut got);
             if claimed == 100 {
-                assert_eq!(got.unwrap(), chunk);
+                loaded.unwrap();
+                assert_eq!(got, chunk);
             } else {
-                let err = format!("{:#}", got.unwrap_err());
+                let err = format!("{:#}", loaded.unwrap_err());
                 assert!(err.contains("decompressed to"), "{claimed}: {err}");
             }
         }
@@ -2405,6 +2552,310 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write chunks in `layout`, compressing only those marked zstd. Leave `gap` bytes
+    /// before each chunk and after the last. Return the manifest path and expected image.
+    fn write_chunked_view(
+        dir: &Path,
+        layout: u8,
+        chunks: &[(Vec<u8>, u8)],
+        gap: usize,
+    ) -> (PathBuf, Vec<u8>) {
+        let mut want = Vec::new();
+        let mut entries = Vec::new();
+        for (n, (data, codec)) in chunks.iter().enumerate() {
+            let digest = fake_digest(n as u8 + 1);
+            let zstd = *codec == crate::registry::VK_RO_IMG_CODEC_ZSTD;
+            let blob = if zstd {
+                zstd::encode_all(&data[..], 3).unwrap()
+            } else {
+                data.clone()
+            };
+            let blob_dir = match layout {
+                crate::registry::VK_RO_IMG_LAYOUT_STORE_ROOT if zstd => dir.join("blobs/zstd"),
+                crate::registry::VK_RO_IMG_LAYOUT_STORE_ROOT => dir.join("blobs/sha256"),
+                _ => dir.to_path_buf(),
+            };
+            std::fs::create_dir_all(&blob_dir).unwrap();
+            std::fs::write(blob_dir.join(digest_hex(&digest)), blob).unwrap();
+            want.resize(want.len() + gap, 0);
+            entries.push(crate::registry::LazyChunk {
+                offset: want.len() as u64,
+                length: data.len() as u32,
+                codec: *codec,
+                digest,
+            });
+            want.extend_from_slice(data);
+        }
+        want.resize(want.len() + gap, 0);
+        let manifest = dir.join("view.vk_ro_img");
+        crate::registry::write_vk_ro_img(&manifest, want.len() as u64, layout, dir, &entries)
+            .unwrap();
+        (manifest, want)
+    }
+
+    /// Check parallel raw and qcow2 output and sequential raw output against the expected
+    /// image in both layouts. Mix chunk sizes and codecs, including an unknown codec
+    /// stored raw, and include a zero block in every chunk.
+    #[test]
+    fn materializing_mixed_chunks_is_byte_exact_on_every_path() {
+        const BLOCK: usize = 64 << 10;
+        let dir = crate::testtmp::Scratch::dir(format!("vk-ro-img-reuse-{}", std::process::id()));
+        let chunks: Vec<(Vec<u8>, u8)> = (0..24u32)
+            .map(|n| {
+                let len = if n % 3 == 0 {
+                    5 * BLOCK + 123
+                } else {
+                    BLOCK + 7 + n as usize
+                };
+                let mut data: Vec<u8> = (0..len as u32)
+                    .map(|i| ((i.wrapping_mul(n + 3) + n) % 251 + 1) as u8)
+                    .collect();
+                let zeros = if len >= 2 * BLOCK {
+                    BLOCK..2 * BLOCK
+                } else {
+                    0..BLOCK
+                };
+                data[zeros].fill(0);
+                let codec = match n % 4 {
+                    0 | 1 => crate::registry::VK_RO_IMG_CODEC_ZSTD,
+                    2 => crate::registry::VK_RO_IMG_CODEC_RAW,
+                    _ if n == 7 => 9,
+                    _ => crate::registry::VK_RO_IMG_CODEC_RAW,
+                };
+                (data, codec)
+            })
+            .collect();
+        for layout in [
+            crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+            crate::registry::VK_RO_IMG_LAYOUT_STORE_ROOT,
+        ] {
+            let sub = dir.join(format!("layout-{layout}"));
+            std::fs::create_dir(&sub).unwrap();
+            let (manifest, want) = write_chunked_view(&sub, layout, &chunks, 4096);
+
+            let raw = sub.join("parallel.raw");
+            materialize_lazy_parallel(&manifest, &raw).unwrap();
+            assert_eq!(
+                std::fs::read(&raw).unwrap(),
+                want,
+                "layout {layout}: parallel"
+            );
+
+            let qcow2 = sub.join("parallel.qcow2");
+            let mut w = Qcow2Writer::create(&qcow2, want.len() as u64, 0o600).unwrap();
+            materialize_lazy_into(&manifest, &mut w).unwrap();
+            w.finish().unwrap();
+            let mut got = vec![0xAAu8; want.len()];
+            Qcow2::open(&qcow2).unwrap().read_at(0, &mut got).unwrap();
+            assert_eq!(got, want, "layout {layout}: qcow2 output");
+
+            let seq = sub.join("seq.raw");
+            materialize_to_raw(&manifest, &seq).unwrap();
+            assert_eq!(
+                std::fs::read(&seq).unwrap(),
+                want,
+                "layout {layout}: sequential"
+            );
+        }
+    }
+
+    #[test]
+    fn sequential_reads_reuse_one_buffer_and_forget_a_failed_chunk() {
+        let dir = crate::testtmp::Scratch::dir(format!("vk-ro-img-seq-{}", std::process::id()));
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 249 + 1) as u8).collect();
+        let small: Vec<u8> = (0..50_000u32).map(|i| (i % 241 + 2) as u8).collect();
+        let chunks = [
+            (big.clone(), crate::registry::VK_RO_IMG_CODEC_ZSTD),
+            (small.clone(), crate::registry::VK_RO_IMG_CODEC_RAW),
+            (small.clone(), crate::registry::VK_RO_IMG_CODEC_ZSTD),
+        ];
+        let (manifest, want) =
+            write_chunked_view(&dir, crate::registry::VK_RO_IMG_LAYOUT_FLAT, &chunks, 0);
+        let mut img = VkRoImg::open(&manifest).unwrap();
+        let read = |img: &mut VkRoImg, idx: usize| {
+            let c = &img.chunks[idx];
+            let (off, len) = (c.offset as usize, c.length as usize);
+            let mut got = vec![0xEEu8; len];
+            img.read_at(off as u64, &mut got)
+                .map(|()| got == want[off..off + len])
+        };
+        assert!(read(&mut img, 0).unwrap());
+        let buffer = img.last_data.as_ptr();
+        assert!(read(&mut img, 1).unwrap());
+        assert!(read(&mut img, 2).unwrap());
+        assert_eq!(
+            img.last_data.as_ptr(),
+            buffer,
+            "loaded into the same buffer"
+        );
+
+        // Shorten raw chunk 1 while chunk 2 is cached.
+        std::fs::write(dir.join(digest_hex(&fake_digest(2))), &small[1..]).unwrap();
+        let err = format!("{:#}", read(&mut img, 1).unwrap_err());
+        assert!(err.contains("decompressed to 49999 bytes"), "{err}");
+        assert_eq!(img.last, None);
+        assert!(read(&mut img, 2).unwrap(), "reloaded after the failure");
+        std::fs::write(dir.join(digest_hex(&fake_digest(2))), &small).unwrap();
+        assert!(
+            read(&mut img, 1).unwrap(),
+            "loads once its blob is whole again"
+        );
+    }
+
+    /// Concatenated zstd frames form one chunk. Truncation and trailing junk produce
+    /// decoder errors. Raw length errors report the size, and file errors keep their
+    /// read context even through the decoder.
+    #[test]
+    fn chunk_blobs_must_hold_exactly_the_claimed_bytes() {
+        let dir = crate::testtmp::Scratch::dir(format!("vk-ro-img-blobs-{}", std::process::id()));
+        let a: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let b = vec![0x42u8; 3000];
+        let (frame_a, frame_b) = (
+            zstd::encode_all(&a[..], 3).unwrap(),
+            zstd::encode_all(&b[..], 3).unwrap(),
+        );
+        let both = [a, b].concat();
+        let zstd = crate::registry::VK_RO_IMG_CODEC_ZSTD;
+        let raw = crate::registry::VK_RO_IMG_CODEC_RAW;
+        let cases = [
+            (
+                "concatenated",
+                Some([&frame_a[..], &frame_b[..]].concat()),
+                zstd,
+                None,
+            ),
+            (
+                "truncated",
+                Some([&frame_a[..], &frame_b[..frame_b.len() - 3]].concat()),
+                zstd,
+                Some("zstd-decompressing chunk"),
+            ),
+            (
+                "trailing",
+                Some([&frame_a[..], &frame_b[..], b"junk"].concat()),
+                zstd,
+                Some("zstd-decompressing chunk"),
+            ),
+            ("raw", Some(both.clone()), raw, None),
+            (
+                "raw-short",
+                Some(both[1..].to_vec()),
+                raw,
+                Some("decompressed to 7999 bytes"),
+            ),
+            (
+                "raw-long",
+                Some([&both[..], &[0; 100]].concat()),
+                raw,
+                Some("decompressed to 8100 bytes, expected 8000"),
+            ),
+            ("missing", None, raw, Some("reading chunk")),
+            // Opens, then fails to read (EISDIR) inside the decoder.
+            ("unreadable", None, zstd, Some("reading chunk")),
+        ];
+        for (name, blob, codec, fails) in cases {
+            let sub = dir.join(name);
+            std::fs::create_dir(&sub).unwrap();
+            let digest = fake_digest(1);
+            if let Some(blob) = blob {
+                std::fs::write(sub.join(digest_hex(&digest)), blob).unwrap();
+            } else if name == "unreadable" {
+                std::fs::create_dir(sub.join(digest_hex(&digest))).unwrap();
+            }
+            let manifest = sub.join("blob.vk_ro_img");
+            crate::registry::write_vk_ro_img(
+                &manifest,
+                both.len() as u64,
+                crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+                &sub,
+                &[crate::registry::LazyChunk {
+                    offset: 0,
+                    length: both.len() as u32,
+                    codec,
+                    digest,
+                }],
+            )
+            .unwrap();
+            let mut got = vec![7u8; 3];
+            let loaded = VkRoImg::open(&manifest).unwrap().load_chunk(0, &mut got);
+            match fails {
+                None => {
+                    loaded.unwrap();
+                    assert_eq!(got, both, "{name}");
+                }
+                Some(want) => {
+                    let err = format!("{:#}", loaded.unwrap_err());
+                    assert!(err.contains(want), "{name}: {err}");
+                }
+            }
+        }
+    }
+
+    /// Sink and chunk read errors must stop parallel materialization.
+    #[test]
+    fn materialize_parallel_stops_on_sink_and_load_errors() {
+        let dir = crate::testtmp::Scratch::dir(format!("vk-ro-img-stop-{}", std::process::id()));
+        let chunks: Vec<(Vec<u8>, u8)> = (0..64u32)
+            .map(|n| {
+                (
+                    vec![n as u8 + 1; 70_000],
+                    crate::registry::VK_RO_IMG_CODEC_ZSTD,
+                )
+            })
+            .collect();
+        let (manifest, _) =
+            write_chunked_view(&dir, crate::registry::VK_RO_IMG_LAYOUT_FLAT, &chunks, 0);
+        let img = VkRoImg::open(&manifest).unwrap();
+        let mut calls = 0;
+        let err = img
+            .materialize_parallel(&mut |_, _| {
+                calls += 1;
+                // Let the decoders fill the channel before failing.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                bail!("sink refused")
+            })
+            .unwrap_err();
+        assert_eq!(format!("{err}"), "sink refused");
+        assert_eq!(calls, 1);
+
+        std::fs::remove_file(dir.join(digest_hex(&fake_digest(40)))).unwrap();
+        let err = img.materialize_parallel(&mut |_, _| Ok(())).unwrap_err();
+        assert!(format!("{err:#}").contains("reading chunk"), "{err:#}");
+    }
+
+    /// Evict the oldest buffers first when the pool reaches a limit.
+    #[test]
+    fn chunk_buffers_take_the_best_fit_within_their_limits() {
+        let pool = ChunkBuffers::new(4);
+        for cap in [300, 100, 200, 150] {
+            pool.put(Vec::with_capacity(cap));
+        }
+        assert_eq!(pool.take(120).capacity(), 150);
+        assert_eq!(pool.take(120).capacity(), 200);
+        assert_eq!(pool.take(400).capacity(), 0, "none fits: a new buffer");
+        assert_eq!(pool.lock().len(), 2);
+
+        let pool = ChunkBuffers::new(3);
+        for cap in 1..=5 {
+            pool.put(Vec::with_capacity(cap));
+        }
+        let caps: Vec<usize> = pool.lock().iter().map(Vec::capacity).collect();
+        assert_eq!(caps, [3, 4, 5], "oldest dropped");
+
+        let pool = ChunkBuffers::new(16);
+        pool.put(Vec::with_capacity(crate::registry::CDC_MAX + 2));
+        assert!(pool.lock().is_empty(), "more room than any chunk vk writes");
+        for _ in 0..16 {
+            pool.put(Vec::with_capacity(crate::registry::CDC_MAX + 1));
+        }
+        let held: usize = pool.lock().iter().map(Vec::capacity).sum();
+        assert_eq!(
+            pool.lock().len(),
+            ChunkBuffers::MAX_IDLE_BYTES / (crate::registry::CDC_MAX + 1)
+        );
+        assert!(held <= ChunkBuffers::MAX_IDLE_BYTES);
     }
 
     /// `open_backing` must sniff a `.vk_ro_img` manifest (by magic, not extension) and hand
