@@ -182,8 +182,9 @@ and so does every disk off Unix hosts.
 
 `src/devices/src/virtio/block/{device.rs,worker.rs}` — the image sits behind an `RwLock`, and
 the worker pops up to `IO_PARALLELISM` requests and runs each on a scoped thread, since imago's
-`readv`/`writev` need only `&self`; write-zeroes and the dirty-control commands take the write
-lock. Interrupts are raised once per batch that completed anything.
+`readv`/`writev` need only `&self`. The exception is a lone request, which runs on the worker
+thread. Write-zeroes and dirty-control commands take the write lock. The worker signals once
+per batch if any request completed and the guest requested notification.
 
 `src/devices/src/virtio/block/{device.rs,worker.rs}` + `src/libkrun/src/api/device_builders.rs` —
 track guest-written clusters and drain them on demand, so virtkit's build backend captures only
