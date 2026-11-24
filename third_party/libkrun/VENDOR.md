@@ -246,6 +246,12 @@ range does not fit the disk answers IOERR before it reaches imago or the dirty t
 1.19 tree multiplied the guest's sector unchecked, wrapping in release builds and panicking
 the worker in debug ones, and recorded writes past the end as dirty. New in this tree.
 
+`src/devices/src/virtio/block/worker.rs` — the worker skips requests with no writable status
+byte and returns a used length of 0. The vendored upstream subtracted the status byte from
+a read's writable length, which could underflow and panic in debug builds. Writes could
+reach disk without reporting their outcome. Upstream's later rework (54d4cd5cb71c) handles
+these requests the same way. Covered by `a_request_without_a_status_byte_is_not_run`.
+
 `src/devices/src/virtio/block/device.rs` — the dirty-control socket is owner-only (0600) and
 waits at most 5 s on a connection's command byte or reply, since connections are served one at
 a time. The mode is set after the bind, so the caller still puts the socket in a private

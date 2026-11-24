@@ -421,7 +421,8 @@ impl BlockWorker {
 
     /// Runs one guest request to completion: builds its `Reader`/`Writer`, dispatches it, and
     /// writes the status byte. Returns the descriptor's table index and used length for
-    /// `add_used`, or `None` if the chain itself was unusable (nothing to report back for it).
+    /// `add_used`. A chain with no writable byte is skipped and has used length 0.
+    /// Returns `None` if the chain is invalid or the request header cannot be read.
     fn process_one(
         mem: &GuestMemoryMmap,
         disk: &DiskProperties,
@@ -441,6 +442,11 @@ impl BlockWorker {
                 return None;
             }
         };
+        if writer.available_bytes() == 0 {
+            // The guest needs a status byte to learn the outcome.
+            error!("virtio-blk request without a status byte");
+            return Some((head.index, 0));
+        }
         let request_header: RequestHeader = match reader.read_obj() {
             Ok(h) => h,
             Err(e) => {
@@ -484,6 +490,7 @@ impl BlockWorker {
     ) -> result::Result<usize, RequestError> {
         match request_header.request_type {
             VIRTIO_BLK_T_IN => {
+                // `process_one` guarantees at least one writable byte for status.
                 let data_len = writer.available_bytes() - 1;
                 if !data_len.is_multiple_of(512) {
                     Err(RequestError::InvalidDataLength)
@@ -976,6 +983,33 @@ mod tests {
         assert!(w.helpers.iter().all(|h| !h.is_finished()));
         drop(w);
         assert_eq!(shared.strong_count(), 0);
+    }
+
+    /// Statusless requests must complete with a used length of zero and leave the disk intact.
+    #[test]
+    fn a_request_without_a_status_byte_is_not_run() {
+        let s = setup();
+        let vq = VirtQueue::new(GuestAddress(0), &s.mem, QUEUE_SIZE);
+        let mut w = worker(&s, &vq);
+
+        // A read and a write, each a lone header descriptor.
+        for (i, request_type) in [(0u16, VIRTIO_BLK_T_IN), (1, VIRTIO_BLK_T_OUT)] {
+            queue_request(&s.mem, &vq, i, request_type, 1, 0, 16);
+            let base = REQ_BASE + u64::from(i) * REQ_STRIDE;
+            vq.dtable[3 * usize::from(i)].set(base, 16, 0, 0);
+            w.process_queue(&s.mem);
+        }
+        // A write whose last descriptor is readable: data, but nowhere to put a status.
+        let base = REQ_BASE + 2 * REQ_STRIDE;
+        s.mem
+            .write_slice(&[0x5a; 512], GuestAddress(base + 0x1000))
+            .unwrap();
+        queue_request(&s.mem, &vq, 2, VIRTIO_BLK_T_OUT, 1, 512, 16);
+        vq.dtable[7].set(base + 0x1000, 512, 0, 0);
+        w.process_queue(&s.mem);
+
+        assert_eq!(used(&vq), [(0, 0), (3, 0), (6, 0)]);
+        assert_eq!(std::fs::read(&s.path).unwrap(), disk_bytes());
     }
 
     #[test]

@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Guest disk requests without room for a completion status are rejected. Previously,
+  writes could reach disk without reporting success or failure.
+
 ## [0.116.0] - 2026-11-24
 
 ### Changed
