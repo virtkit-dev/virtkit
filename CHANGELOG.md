@@ -17,6 +17,7 @@ All notable changes to virtkit will be documented in this file.
 - If a guest disk request panics, that request and later requests on the same disk fail with
   an I/O error. Later writes never reach the disk. Previously the guest could wait indefinitely
   or the VM could abort.
+- Guests now receive an unsupported status for unknown disk commands or unsupported flags.
 
 ## [0.116.0] - 2026-11-24
 

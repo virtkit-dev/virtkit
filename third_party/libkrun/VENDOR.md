@@ -295,6 +295,13 @@ New in this tree. Covered by `a_panicking_lone_request_fails_the_disk`,
 `a_poisoned_image_lock_fails_the_disk`, `a_panic_holding_the_image_fails_the_disk`,
 `a_failed_disk_stays_failed_across_a_reset` and `a_poisoned_image_is_skipped_without_panicking`.
 
+`src/devices/src/virtio/block/worker.rs` — unknown request types, discards with any flags,
+and write-zeroes requests with flags other than `UNMAP` return `VIRTIO_BLK_S_UNSUPP`
+without modifying the disk. Virtio requires this status for unsupported flags. Both the
+vendored revision and upstream main at the time of this patch returned IOERR for unknown
+types and ignored unsupported flags. Linux and viostor send discards with no flags.
+Covered by `unsupported_requests_and_flags_are_refused`.
+
 `src/devices/src/virtio/block/device.rs` — the dirty-control socket is owner-only (0600) and
 waits at most 5 s on a connection's command byte or reply, since connections are served one at
 a time. The mode is set after the bind, so the caller still puts the socket in a private

@@ -33,6 +33,7 @@ pub enum RequestError {
     ReadingFromDescriptor(io::Error),
     WritingToDescriptor(io::Error),
     WritingZeroes(io::Error),
+    UnsupportedFlags(u32),
     UnknownRequest,
 }
 
@@ -474,6 +475,10 @@ impl BlockWorker {
             Ok(()) => VIRTIO_BLK_S_OK.try_into().unwrap(),
             // Why it failed was logged when it did.
             Err(RequestError::DiskFailed) => VIRTIO_BLK_S_IOERR.try_into().unwrap(),
+            Err(e @ (RequestError::UnknownRequest | RequestError::UnsupportedFlags(_))) => {
+                error!("unsupported request: {e:?}");
+                VIRTIO_BLK_S_UNSUPP.try_into().unwrap()
+            }
             Err(e) => {
                 error!("error processing request: {e:?}");
                 VIRTIO_BLK_S_IOERR.try_into().unwrap()
@@ -565,6 +570,10 @@ impl BlockWorker {
                 let discard_write_data: DiscardWriteData = reader
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
+                // Virtio reserves `UNMAP` for write-zeroes.
+                if discard_write_data.flags != 0 {
+                    return Err(RequestError::UnsupportedFlags(discard_write_data.flags));
+                }
                 let offset = Self::request_offset(
                     disk.nsectors() << SECTOR_SHIFT,
                     discard_write_data.sector,
@@ -586,6 +595,9 @@ impl BlockWorker {
                 let discard_write_data: DiscardWriteData = reader
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
+                if discard_write_data.flags & !VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP != 0 {
+                    return Err(RequestError::UnsupportedFlags(discard_write_data.flags));
+                }
                 let offset = Self::request_offset(
                     disk.nsectors() << SECTOR_SHIFT,
                     discard_write_data.sector,
@@ -635,7 +647,7 @@ pub(super) mod tests {
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
     use super::super::device::{CacheType, DiskProperties};
-    use super::{BlockWorker, RequestError, RequestHeader};
+    use super::{BlockWorker, DiscardWriteData, RequestError, RequestHeader};
     use crate::virtio::device::{InterruptHandler, InterruptType};
     use crate::virtio::queue::tests::VirtQueue;
     use crate::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
@@ -904,6 +916,7 @@ pub(super) mod tests {
 
     const OK: u8 = VIRTIO_BLK_S_OK as u8;
     pub(crate) const IOERR: u8 = VIRTIO_BLK_S_IOERR as u8;
+    const UNSUPP: u8 = VIRTIO_BLK_S_UNSUPP as u8;
 
     /// Lone reads, writes, flushes and failing requests are answered as a batch's would be: the
     /// same status, used entry and data, and one interrupt per completed request, a chain
@@ -1341,6 +1354,37 @@ pub(super) mod tests {
 
         assert_eq!(used(&vq), [(0, 1), (3, 0)]);
         assert_eq!((status(&s.mem, 0), status(&s.mem, 1)), (IOERR, 0xff));
+    }
+
+    /// Rejected requests complete with `VIRTIO_BLK_S_UNSUPP` and leave the disk unchanged.
+    #[test]
+    fn unsupported_requests_and_flags_are_refused() {
+        let s = setup();
+        let vq = VirtQueue::new(GuestAddress(0), &s.mem, QUEUE_SIZE);
+        let mut w = worker(&s, &vq);
+
+        queue_request(&s.mem, &vq, 0, 99, 0, 0, 16);
+        for (i, request_type, flags) in [
+            (1, VIRTIO_BLK_T_DISCARD, VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP),
+            (2, VIRTIO_BLK_T_DISCARD, 1 << 5),
+            (3, VIRTIO_BLK_T_WRITE_ZEROES, 1 << 5),
+        ] {
+            let range = DiscardWriteData {
+                sector: 1,
+                num_sectors: 1,
+                flags,
+            };
+            let base = REQ_BASE + u64::from(i) * REQ_STRIDE;
+            s.mem.write_obj(range, GuestAddress(base + 0x1000)).unwrap();
+            queue_request(&s.mem, &vq, i, request_type, 0, 16, 16);
+        }
+        w.process_queue(&s.mem);
+
+        assert_eq!(used(&vq), [(0, 1), (3, 1), (6, 1), (9, 1)]);
+        for i in 0..4 {
+            assert_eq!(status(&s.mem, i), UNSUPP);
+        }
+        assert_eq!(std::fs::read(&s.path).unwrap(), disk_bytes());
     }
 
     #[test]
