@@ -252,6 +252,14 @@ a read's writable length, which could underflow and panic in debug builds. Write
 reach disk without reporting their outcome. Upstream's later rework (54d4cd5cb71c) handles
 these requests the same way. Covered by `a_request_without_a_status_byte_is_not_run`.
 
+`src/devices/src/virtio/block/worker.rs` + `src/devices/src/virtio/descriptor_utils.rs` —
+`Writer::split_last_byte` reserves the chain's last writable byte for virtio-blk status
+without allocating. The vendored upstream appended status after the data, leaving the
+status byte untouched on a failed read or a disk ID shorter than its buffer. The error
+overwrote the first data byte on a failed read. Upstream also splits off the last byte
+in 54d4cd5cb71c. Covered by `the_status_is_the_last_writable_byte` and
+`split_last_byte_skips_empty_descriptors`.
+
 `src/devices/src/virtio/block/device.rs` — the dirty-control socket is owner-only (0600) and
 waits at most 5 s on a connection's command byte or reply, since connections are served one at
 a time. The mode is set after the bind, so the caller still puts the socket in a private

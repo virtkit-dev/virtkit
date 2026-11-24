@@ -8,6 +8,8 @@ All notable changes to virtkit will be documented in this file.
 
 - Guest disk requests without room for a completion status are rejected. Previously,
   writes could reach disk without reporting success or failure.
+- Guests now receive an error when a disk read fails on the host. Previously, a failed read
+  could appear to succeed.
 
 ## [0.116.0] - 2026-11-24
 

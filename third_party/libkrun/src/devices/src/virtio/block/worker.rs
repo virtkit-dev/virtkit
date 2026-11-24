@@ -18,7 +18,7 @@ use utils::eventfd::EventFd;
 #[cfg(target_os = "windows")]
 use utils::windows::AsRawFd;
 use virtio_bindings::virtio_blk::*;
-use vm_memory::{ByteValued, GuestMemoryMmap};
+use vm_memory::{ByteValued, Bytes, GuestMemoryMmap};
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -442,11 +442,12 @@ impl BlockWorker {
                 return None;
             }
         };
-        if writer.available_bytes() == 0 {
+        // virtio-blk fixes the status position even when the data buffer is only partly filled.
+        let Some(status_byte) = writer.split_last_byte() else {
             // The guest needs a status byte to learn the outcome.
             error!("virtio-blk request without a status byte");
             return Some((head.index, 0));
-        }
+        };
         let request_header: RequestHeader = match reader.read_obj() {
             Ok(h) => h,
             Err(e) => {
@@ -464,7 +465,7 @@ impl BlockWorker {
                 }
             };
 
-        if let Err(e) = writer.write_obj(status) {
+        if let Err(e) = status_byte.write_obj(status, 0) {
             error!("Failed to write virtio block status: {e:?}")
         }
 
@@ -490,8 +491,7 @@ impl BlockWorker {
     ) -> result::Result<usize, RequestError> {
         match request_header.request_type {
             VIRTIO_BLK_T_IN => {
-                // `process_one` guarantees at least one writable byte for status.
-                let data_len = writer.available_bytes() - 1;
+                let data_len = writer.available_bytes();
                 if !data_len.is_multiple_of(512) {
                     Err(RequestError::InvalidDataLength)
                 } else {
@@ -1010,6 +1010,56 @@ mod tests {
 
         assert_eq!(used(&vq), [(0, 0), (3, 0), (6, 0)]);
         assert_eq!(std::fs::read(&s.path).unwrap(), disk_bytes());
+    }
+
+    /// The status lands in the last writable byte. Rejected reads preserve the data buffer; a
+    /// short disk ID preserves the unused tail.
+    #[test]
+    fn the_status_is_the_last_writable_byte() {
+        let s = setup();
+        let vq = VirtQueue::new(GuestAddress(0), &s.mem, QUEUE_SIZE);
+        let mut w = worker(&s, &vq);
+        let fill = |i: u16| {
+            let base = REQ_BASE + u64::from(i) * REQ_STRIDE;
+            s.mem
+                .write_slice(&[0xa5; 1024], GuestAddress(base + 0x1000))
+                .unwrap();
+        };
+
+        // Reject a read past the disk end and a read of a partial sector.
+        fill(0);
+        queue_request(
+            &s.mem,
+            &vq,
+            0,
+            VIRTIO_BLK_T_IN,
+            (DISK_LEN / 512) as u64,
+            512,
+            16,
+        );
+        fill(1);
+        queue_request(&s.mem, &vq, 1, VIRTIO_BLK_T_IN, 0, 100, 16);
+        // Request the disk ID in an oversized buffer.
+        fill(2);
+        queue_request(&s.mem, &vq, 2, VIRTIO_BLK_T_GET_ID, 0, 64, 16);
+        let base = REQ_BASE + 2 * REQ_STRIDE;
+        vq.dtable[7].set(base + 0x1000, 64, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT, 8);
+        w.process_queue(&s.mem);
+
+        assert_eq!((status(&s.mem, 0), status(&s.mem, 1)), (IOERR, IOERR));
+        assert_eq!(data(&s.mem, 0, 1024), [0xa5; 1024]);
+        assert_eq!(data(&s.mem, 1, 1024), [0xa5; 1024]);
+        assert_eq!(status(&s.mem, 2), OK);
+        let id = data(&s.mem, 2, 1024);
+        assert_eq!(
+            id[..VIRTIO_BLK_ID_BYTES as usize],
+            [0; VIRTIO_BLK_ID_BYTES as usize]
+        );
+        assert!(
+            id[VIRTIO_BLK_ID_BYTES as usize..]
+                .iter()
+                .all(|&b| b == 0xa5)
+        );
     }
 
     #[test]

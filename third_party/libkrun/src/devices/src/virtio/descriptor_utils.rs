@@ -144,6 +144,21 @@ impl<'a> DescriptorChainConsumer<'a> {
         Ok(bytes_consumed)
     }
 
+    /// Removes and returns the last byte without allocating, or `None` if no bytes remain.
+    fn split_last_byte(&mut self) -> Option<VolatileSlice<'a>> {
+        while let Some(last) = self.buffers.pop_back() {
+            let Some(len) = last.len().checked_sub(1) else {
+                continue;
+            };
+            if len > 0 {
+                self.buffers
+                    .push_back(last.subslice(0, len).expect("len < last.len()"));
+            }
+            return Some(last.offset(len).expect("len < last.len()"));
+        }
+        None
+    }
+
     fn split_at(&mut self, offset: usize) -> Result<DescriptorChainConsumer<'a>> {
         let mut rem = offset;
         let pos = self.buffers.iter().position(|vs| {
@@ -452,6 +467,12 @@ impl<'a> Writer<'a> {
     /// `offset > self.available_bytes()`.
     pub fn split_at(&mut self, offset: usize) -> Result<Writer<'a>> {
         self.buffer.split_at(offset).map(|buffer| Writer { buffer })
+    }
+
+    /// Splits off the last writable byte for a trailing device status. The writer retains
+    /// all preceding bytes. Returns `None` if no writable bytes remain.
+    pub fn split_last_byte(&mut self) -> Option<VolatileSlice<'a>> {
+        self.buffer.split_last_byte()
     }
 }
 
@@ -1036,6 +1057,48 @@ mod tests {
         assert_eq!(
             writer.write(&buf[..]).expect("failed to write from buffer"),
             48
+        );
+    }
+
+    #[test]
+    fn split_last_byte_skips_empty_descriptors() {
+        use DescriptorType::*;
+
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        // Buffers at 0x100 (16 bytes), 0x110 (8), 0x118 (1), 0x119 (0).
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0x0),
+            GuestAddress(0x100),
+            vec![(Readable, 16), (Writable, 8), (Writable, 1), (Writable, 0)],
+            0,
+        )
+        .unwrap();
+        let mut writer = Writer::new(&memory, chain).unwrap();
+
+        for (addr, left) in [(0x118, 8), (0x117, 7)] {
+            let last = writer.split_last_byte().unwrap();
+            assert_eq!(last.len(), 1);
+            last.write_obj(0xaau8, 0).unwrap();
+            assert_eq!(memory.read_obj::<u8>(GuestAddress(addr)).unwrap(), 0xaa);
+            assert_eq!(writer.available_bytes(), left);
+        }
+        assert_eq!(writer.write(&[0x55; 8]).unwrap(), 7);
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(0x117)).unwrap(), 0xaa);
+
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0x0),
+            GuestAddress(0x100),
+            vec![(Readable, 16), (Writable, 0)],
+            0,
+        )
+        .unwrap();
+        assert!(
+            Writer::new(&memory, chain)
+                .unwrap()
+                .split_last_byte()
+                .is_none()
         );
     }
 }
