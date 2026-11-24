@@ -22,6 +22,8 @@ All notable changes to virtkit will be documented in this file.
   reported separately.
 - Registry push and restore summaries no longer call the chunks of every image "ext4
   chunks".
+- Updated the packet parser behind VM networking for an out-of-bounds read on crafted IPv6
+  packets (RUSTSEC-2026-0596).
 
 ## [0.116.0] - 2026-11-24
 

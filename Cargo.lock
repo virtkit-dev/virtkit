@@ -1022,18 +1022,18 @@ dependencies = [
 
 [[package]]
 name = "etherparse"
-version = "0.20.3"
+version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aeebdb565da33451794551a771bd0b4e6f416d3182adc3ed2837f614d6168f9a"
+checksum = "73d959354dc058031f9944438972841ce014100e8692bbfe56d4ba7947fed59c"
 dependencies = [
  "arrayvec",
 ]
 
 [[package]]
 name = "etherparse"
-version = "0.21.0"
+version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17304d06addb3283cdc4bd528e42dd95e73c8ee2d6492ffce415e93660885449"
+checksum = "c78ea1640fbca18d7d2c7459be6db63705ca8cce8a18be4045f4ad7a1e7c4311"
 dependencies = [
  "arrayvec",
 ]
@@ -1691,7 +1691,7 @@ name = "ipstack"
 version = "1.0.2-dev"
 dependencies = [
  "ahash",
- "etherparse 0.20.3",
+ "etherparse 0.20.4",
  "log",
  "rand",
  "serde_json",
@@ -4151,7 +4151,7 @@ dependencies = [
  "bzip2",
  "clap",
  "console",
- "etherparse 0.21.0",
+ "etherparse 0.21.1",
  "fastcdc",
  "flate2",
  "futures",
