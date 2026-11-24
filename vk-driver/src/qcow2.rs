@@ -1098,17 +1098,26 @@ impl VkRoImg {
     }
 
     fn chunk_path(&self, chunk: &VkRoChunk) -> PathBuf {
-        let hex: String = chunk.digest.iter().map(|b| format!("{b:02x}")).collect();
-        if self.layout == crate::registry::VK_RO_IMG_LAYOUT_STORE_ROOT {
-            let sub = if chunk.codec == crate::registry::VK_RO_IMG_CODEC_ZSTD {
-                "blobs/zstd"
-            } else {
-                "blobs/sha256"
-            };
-            self.cache_dir.join(sub).join(hex)
-        } else {
-            self.cache_dir.join(hex)
+        use std::os::unix::ffi::OsStrExt;
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut hex = [[0u8; 2]; 32];
+        for (pair, b) in hex.iter_mut().zip(chunk.digest) {
+            *pair = [DIGITS[usize::from(b >> 4)], DIGITS[usize::from(b & 0xf)]];
         }
+        let hex = hex.as_flattened();
+        let sub = if chunk.codec == crate::registry::VK_RO_IMG_CODEC_ZSTD {
+            "blobs/zstd"
+        } else {
+            "blobs/sha256"
+        };
+        let sub = (self.layout == crate::registry::VK_RO_IMG_LAYOUT_STORE_ROOT).then_some(sub);
+        let mut path = PathBuf::with_capacity(
+            self.cache_dir.as_os_str().len() + "/blobs/sha256/".len() + hex.len(),
+        );
+        path.push(&self.cache_dir);
+        path.extend(sub);
+        path.push(OsStr::from_bytes(hex));
+        path
     }
 
     /// Read chunk `idx` from the cache directory into `buf` and check its length.
