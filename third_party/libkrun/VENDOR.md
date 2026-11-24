@@ -260,6 +260,12 @@ overwrote the first data byte on a failed read. Upstream also splits off the las
 in 54d4cd5cb71c. Covered by `the_status_is_the_last_writable_byte` and
 `split_last_byte_skips_empty_descriptors`.
 
+`src/devices/src/virtio/block/worker.rs` — the used length counts returned data or device ID
+bytes plus the status byte when present. The vendored version omitted status and counted
+write payloads read from the guest. Upstream commit 54d4cd5cb71c includes status but still
+counts write payloads. Linux, viostor, OVMF, SeaBIOS, FreeBSD and NetBSD ignore the length.
+`block::worker::tests` checks the used-ring lengths.
+
 `src/devices/src/virtio/block/device.rs` — the dirty-control socket is owner-only (0600) and
 waits at most 5 s on a connection's command byte or reply, since connections are served one at
 a time. The mode is set after the bind, so the caller still puts the socket in a private

@@ -456,20 +456,22 @@ impl BlockWorker {
             }
         };
 
-        let (status, len): (u8, usize) =
-            match Self::process_request(disk, request_header, &mut reader, &mut writer) {
-                Ok(l) => (VIRTIO_BLK_S_OK.try_into().unwrap(), l),
-                Err(e) => {
-                    error!("error processing request: {e:?}");
-                    (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0)
-                }
-            };
+        let status: u8 = match Self::process_request(disk, request_header, &mut reader, &mut writer)
+        {
+            Ok(()) => VIRTIO_BLK_S_OK.try_into().unwrap(),
+            Err(e) => {
+                error!("error processing request: {e:?}");
+                VIRTIO_BLK_S_IOERR.try_into().unwrap()
+            }
+        };
 
         if let Err(e) = status_byte.write_obj(status, 0) {
             error!("Failed to write virtio block status: {e:?}")
         }
 
-        Some((head.index, len))
+        // The used length counts the bytes written into the chain: the request's, then the
+        // status.
+        Some((head.index, writer.bytes_written() + 1))
     }
 
     /// The byte offset of a `len`-byte request at guest `sector`, refused (IOERR) unless the
@@ -488,7 +490,7 @@ impl BlockWorker {
         request_header: RequestHeader,
         reader: &mut Reader,
         writer: &mut Writer,
-    ) -> result::Result<usize, RequestError> {
+    ) -> result::Result<(), RequestError> {
         match request_header.request_type {
             VIRTIO_BLK_T_IN => {
                 let data_len = writer.available_bytes();
@@ -502,7 +504,8 @@ impl BlockWorker {
                     )?;
                     writer
                         .write_from_at(disk, data_len, offset)
-                        .map_err(RequestError::WritingToDescriptor)
+                        .map_err(RequestError::WritingToDescriptor)?;
+                    Ok(())
                 }
             }
             VIRTIO_BLK_T_OUT => {
@@ -515,11 +518,11 @@ impl BlockWorker {
                         request_header.sector,
                         data_len as u64,
                     )?;
-                    let written = reader
+                    reader
                         .read_to_at(disk, data_len, offset)
                         .map_err(RequestError::ReadingFromDescriptor)?;
                     disk.record_write(offset, data_len as u64);
-                    Ok(written)
+                    Ok(())
                 }
             }
             VIRTIO_BLK_T_FLUSH => match disk.cache_type() {
@@ -527,9 +530,9 @@ impl BlockWorker {
                     let diskfile = disk.file.read().unwrap();
                     diskfile.flush().map_err(RequestError::FlushingToDisk)?;
                     diskfile.sync().map_err(RequestError::FlushingToDisk)?;
-                    Ok(0)
+                    Ok(())
                 }
-                CacheType::Unsafe => Ok(0),
+                CacheType::Unsafe => Ok(()),
             },
             VIRTIO_BLK_T_GET_ID => {
                 let data_len = writer.available_bytes();
@@ -540,7 +543,7 @@ impl BlockWorker {
                     writer
                         .write_all(disk_id)
                         .map_err(RequestError::WritingToDescriptor)?;
-                    Ok(disk_id.len())
+                    Ok(())
                 }
             }
             VIRTIO_BLK_T_DISCARD => {
@@ -562,7 +565,7 @@ impl BlockWorker {
                 // A discard's partial edge clusters stay out of the written set: what the format
                 // layer zeroes inside them is content DISCARD leaves undefined anyway.
                 disk.record_discard(offset, discard_write_data.num_sectors as u64 * 512);
-                Ok(0)
+                Ok(())
             }
             VIRTIO_BLK_T_WRITE_ZEROES => {
                 let discard_write_data: DiscardWriteData = reader
@@ -594,7 +597,7 @@ impl BlockWorker {
                 // Zeroed either way: whole clusters are holed, a partial one at an end is read
                 // whole.
                 disk.record_zeroes(offset, discard_write_data.num_sectors as u64 * 512);
-                Ok(0)
+                Ok(())
             }
             _ => Err(RequestError::UnknownRequest),
         }
@@ -775,7 +778,7 @@ mod tests {
         // Read sectors 2..4.
         queue_request(&s.mem, &vq, 0, VIRTIO_BLK_T_IN, 2, 1024, 16);
         w.process_queue(&s.mem);
-        assert_eq!(used(&vq), [(0, 1024)]);
+        assert_eq!(used(&vq), [(0, 1025)]);
         assert_eq!((status(&s.mem, 0), irqs()), (OK, 1));
         assert_eq!(data(&s.mem, 0, 1024), disk_bytes()[1024..2048]);
 
@@ -812,7 +815,7 @@ mod tests {
         w.process_queue(&s.mem);
         assert_eq!(status(&s.mem, 4), 0xff);
         assert_eq!(irqs(), 4);
-        assert_eq!(used(&vq), [(0, 1024), (3, 512), (6, 0), (9, 0)]);
+        assert_eq!(used(&vq), [(0, 1025), (3, 1), (6, 1), (9, 1)]);
 
         // Nothing left: no completion, no interrupt.
         w.process_queue(&s.mem);
@@ -844,7 +847,7 @@ mod tests {
 
         let expected: Vec<(u32, u32)> = (0..9u32)
             .filter(|&i| i != 3)
-            .map(|i| (3 * i, 512))
+            .map(|i| (3 * i, 513))
             .collect();
         assert_eq!(used(&vq), expected);
         assert_eq!(s.irqs.0.load(Ordering::SeqCst), 2);
@@ -893,7 +896,7 @@ mod tests {
             assert_eq!((ids.len(), ids[0]), (7, first[0]));
             assert_eq!(*seven.get_or_insert_with(|| ids.clone()), ids);
             let used = used(&vq);
-            let batch: Vec<_> = (0..8u32).map(|i| (3 * i, 512)).collect();
+            let batch: Vec<_> = (0..8u32).map(|i| (3 * i, 513)).collect();
             assert_eq!(used[used.len() - 8..], batch);
             assert_eq!(irqs(), 3 + round as usize);
             for i in 0..8u16 {
@@ -1046,6 +1049,8 @@ mod tests {
         vq.dtable[7].set(base + 0x1000, 64, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT, 8);
         w.process_queue(&s.mem);
 
+        // Used lengths count what was written: the failed reads' status, the ID and its status.
+        assert_eq!(used(&vq), [(0, 1), (3, 1), (6, 21)]);
         assert_eq!((status(&s.mem, 0), status(&s.mem, 1)), (IOERR, IOERR));
         assert_eq!(data(&s.mem, 0, 1024), [0xa5; 1024]);
         assert_eq!(data(&s.mem, 1, 1024), [0xa5; 1024]);

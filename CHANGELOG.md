@@ -10,6 +10,8 @@ All notable changes to virtkit will be documented in this file.
   writes could reach disk without reporting success or failure.
 - Guests now receive an error when a disk read fails on the host. Previously, a failed read
   could appear to succeed.
+- Completed guest disk requests report how many bytes the device returned, including any
+  status byte, as virtio requires. Common guests ignore this count.
 
 ## [0.116.0] - 2026-11-24
 
