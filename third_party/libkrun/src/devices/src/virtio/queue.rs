@@ -317,6 +317,52 @@ impl<'a> DescriptorChain<'a> {
             next: self.next,
         }
     }
+
+    /// This chain without its borrow of guest memory, for a thread that holds its own handle
+    /// on the same memory.
+    pub fn detach(&self) -> DetachedChain {
+        DetachedChain {
+            desc_table: self.desc_table,
+            queue_size: self.queue_size,
+            ttl: self.ttl,
+            index: self.index,
+            addr: self.addr,
+            len: self.len,
+            flags: self.flags,
+            next: self.next,
+        }
+    }
+}
+
+/// A [`DescriptorChain`] apart from the guest memory it walks. Attached to a handle on other
+/// memory, it walks that memory instead: still bounds-checked, but meaningless.
+#[derive(Clone, Copy)]
+pub struct DetachedChain {
+    desc_table: GuestAddress,
+    queue_size: u16,
+    ttl: u16,
+    index: u16,
+    addr: GuestAddress,
+    len: u32,
+    flags: u16,
+    next: u16,
+}
+
+impl DetachedChain {
+    /// The chain again, walking `mem`.
+    pub fn attach(self, mem: &GuestMemoryMmap) -> DescriptorChain<'_> {
+        DescriptorChain {
+            desc_table: self.desc_table,
+            queue_size: self.queue_size,
+            ttl: self.ttl,
+            mem,
+            index: self.index,
+            addr: self.addr,
+            len: self.len,
+            flags: self.flags,
+            next: self.next,
+        }
+    }
 }
 
 #[derive(Debug)]

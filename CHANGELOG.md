@@ -13,6 +13,7 @@ All notable changes to virtkit will be documented in this file.
 - An image restore downloads each repeated chunk only once, and concurrent restores in one
   process no longer download a shared chunk twice.
 - Guest disk requests use less host CPU per request when issued one at a time.
+- Batched guest disk requests use less host CPU per request.
 - Guest reads from a lazily restored image can proceed while another chunk is being
   decompressed.
 - Decompressing chunks of a lazily restored image uses less host CPU and allocates less memory.

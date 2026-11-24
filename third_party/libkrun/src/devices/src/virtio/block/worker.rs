@@ -4,11 +4,14 @@ use super::super::DeviceQueue;
 use super::SECTOR_SHIFT;
 use super::device::{CacheType, DiskProperties, write_zeroes_exclusive};
 
-use crate::virtio::{DescriptorChain, InterruptTransport};
+use crate::virtio::{DescriptorChain, DetachedChain, InterruptTransport};
+use std::any::Any;
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+use std::panic::{self, AssertUnwindSafe};
 use std::result;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
@@ -60,30 +63,140 @@ pub struct DiscardWriteData {
 // Safe because DiscardWriteData only contains plain data.
 unsafe impl ByteValued for DiscardWriteData {}
 
-/// Guest requests dispatched to concurrent threads per batch; a batch of one runs on the worker
-/// thread itself. Real disk-backed images (SSD/NVMe) have per-request latency worth overlapping;
-/// a fixed small batch hides most of that latency without oversubscribing a single virtqueue's
-/// worth of work onto too many OS threads. `readv`/`writev`/`flush`/`sync` take a shared
-/// `RwLock` read lock on the image (imago's own internal locking, not this one, is what actually
-/// serializes conflicting accesses), so batched requests genuinely run concurrently; `discard`
-/// and both forms of write-zeroes take the write lock instead, briefly serializing against the
-/// rest of the batch — correct, and rare enough not to matter. (Discard and
-/// write-zeroes-with-unmap need a `&mut` borrow of the image anyway; plain write-zeroes does
-/// not, but must not run beside a write into the same cluster — see
+/// Guest requests run concurrently per batch: the worker thread and up to `IO_PARALLELISM - 1`
+/// helper threads, started on the first batch that needs them and kept until the worker stops; a
+/// batch of one runs on the worker thread alone. Real disk-backed images (SSD/NVMe) have
+/// per-request latency worth overlapping; a fixed small batch hides most of that latency without
+/// oversubscribing a single virtqueue's worth of work onto too many OS threads.
+/// `readv`/`writev`/`flush`/`sync` take a shared `RwLock` read lock on the image (imago's own
+/// internal locking, not this one, is what actually serializes conflicting accesses), so batched
+/// requests genuinely run concurrently; `discard` and both forms of write-zeroes take the write
+/// lock instead, briefly serializing against the rest of the batch — correct, and rare enough not
+/// to matter. (Discard and write-zeroes-with-unmap need a `&mut` borrow of the image anyway; plain
+/// write-zeroes does not, but must not run beside a write into the same cluster — see
 /// `device::write_zeroes_exclusive`.)
 ///
-/// Threads within one batch have no ordering between each other: a `FLUSH` and a write it is
+/// Requests within one batch have no ordering between each other: a `FLUSH` and a write it is
 /// meant to make durable must never land in the same batch. This relies on the guest never
 /// submitting a `FLUSH` before observing completion of the writes it covers — true of compliant
 /// block layers (Linux's included), which is why this isn't itself enforced here.
 const IO_PARALLELISM: usize = 8;
 
+/// What the worker thread shares with its helpers. Every thread reaches guest memory and the
+/// disk through it, so a request is handed over as plain data and nothing a helper holds
+/// borrows from the worker thread.
+struct Shared {
+    mem: GuestMemoryMmap,
+    disk: DiskProperties,
+    batch: Mutex<Batch>,
+    /// Helpers wait here for requests to claim, or for `stop`.
+    posted: Condvar,
+    /// The worker thread waits here for the batch's last running request.
+    finished: Condvar,
+}
+
+/// The batch being run: requests `next..len` are unclaimed, `unfinished` have not completed.
+/// Requests run unlocked, so a panicking one cannot poison it.
+struct Batch {
+    requests: [Option<DetachedChain>; IO_PARALLELISM],
+    results: [Option<(u16, usize)>; IO_PARALLELISM],
+    len: usize,
+    next: usize,
+    unfinished: usize,
+    /// The first panic of a request in this batch, re-raised on the worker thread.
+    panic: Option<Box<dyn Any + Send>>,
+    /// Helpers blocked on `posted`.
+    idle: usize,
+    /// The worker thread is blocked on `finished`.
+    waiting: bool,
+    stop: bool,
+}
+
+fn lock(batch: &Mutex<Batch>) -> MutexGuard<'_, Batch> {
+    // Poison carries no meaning: requests, the only code expected to panic, run unlocked.
+    batch.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn wait<'a>(cond: &Condvar, guard: MutexGuard<'a, Batch>) -> MutexGuard<'a, Batch> {
+    cond.wait(guard).unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Shared {
+    /// Claims and runs the batch's unclaimed requests on this thread until none is left.
+    /// `wake` idle helpers are woken once the first request is claimed and the lock released,
+    /// so they do not wake into a held lock. A panicking request is recorded rather than
+    /// unwound, so the batch still completes.
+    fn serve<'a>(
+        &'a self,
+        mut batch: MutexGuard<'a, Batch>,
+        mut wake: usize,
+    ) -> MutexGuard<'a, Batch> {
+        while batch.next < batch.len {
+            let slot = batch.next;
+            batch.next += 1;
+            let head = batch.requests[slot].take();
+            drop(batch);
+            for _ in 0..std::mem::take(&mut wake) {
+                self.posted.notify_one();
+            }
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                let head = head?.attach(&self.mem);
+                BlockWorker::process_one(&self.mem, &self.disk, head)
+            }));
+            batch = lock(&self.batch);
+            batch.results[slot] = match outcome {
+                Ok(completion) => completion,
+                Err(payload) => {
+                    batch.panic.get_or_insert(payload);
+                    None
+                }
+            };
+            batch.unfinished -= 1;
+        }
+        batch
+    }
+
+    /// A helper thread's loop: serve every batch it is woken for, until `stop`.
+    fn help(&self) {
+        let mut batch = lock(&self.batch);
+        while !batch.stop {
+            if batch.next < batch.len {
+                batch = self.serve(batch, 0);
+                if batch.unfinished == 0 && batch.waiting {
+                    self.finished.notify_one();
+                }
+            } else {
+                batch.idle += 1;
+                batch = wait(&self.posted, batch);
+                batch.idle -= 1;
+            }
+        }
+    }
+}
+
 pub struct BlockWorker {
     device_queue: DeviceQueue,
     interrupt: InterruptTransport,
     mem: GuestMemoryMmap,
-    disk: DiskProperties,
+    shared: Arc<Shared>,
+    /// Up to `IO_PARALLELISM - 1`, joined when the worker is dropped.
+    helpers: Vec<thread::JoinHandle<()>>,
+    /// A helper failed to start: retried on later batches, reported once.
+    spawn_failed: bool,
     stop_fd: EventFd,
+}
+
+impl Drop for BlockWorker {
+    /// Stops and joins the helpers. No batch is running here: `run_batch` returns or unwinds
+    /// only once its batch has finished.
+    fn drop(&mut self) {
+        lock(&self.shared.batch).stop = true;
+        self.shared.posted.notify_all();
+        for helper in self.helpers.drain(..) {
+            // Requests' panics are caught, so a helper can only return.
+            let _ = helper.join();
+        }
+    }
 }
 
 impl BlockWorker {
@@ -94,11 +207,30 @@ impl BlockWorker {
         disk: DiskProperties,
         stop_fd: EventFd,
     ) -> Self {
+        let shared = Arc::new(Shared {
+            mem: mem.clone(),
+            disk,
+            batch: Mutex::new(Batch {
+                requests: [None; IO_PARALLELISM],
+                results: [None; IO_PARALLELISM],
+                len: 0,
+                next: 0,
+                unfinished: 0,
+                panic: None,
+                idle: 0,
+                waiting: false,
+                stop: false,
+            }),
+            posted: Condvar::new(),
+            finished: Condvar::new(),
+        });
         Self {
             device_queue,
             interrupt,
             mem,
-            disk,
+            shared,
+            helpers: Vec::new(),
+            spawn_failed: false,
             stop_fd,
         }
     }
@@ -188,9 +320,9 @@ impl BlockWorker {
         let mut completions = Vec::new();
         while let Some(head) = self.device_queue.queue.pop(mem) {
             let Some(second) = self.device_queue.queue.pop(mem) else {
-                // A lone request runs on this thread: it would only wait here for a thread
-                // of its own to finish.
-                let completion = Self::process_one(mem, &self.disk, head);
+                // A lone request runs on this thread: it would only wait here for a helper
+                // to finish it.
+                let completion = Self::process_one(mem, &self.shared.disk, head);
                 self.complete(mem, completion);
                 continue;
             };
@@ -204,20 +336,63 @@ impl BlockWorker {
                 }
             }
 
-            // Each request gets its own thread for the duration of the batch: the actual I/O
-            // (and, for reads/writes, the guest memory copy) runs concurrently, hiding a
-            // real disk's per-request latency. `disk` is only ever borrowed (`&DiskProperties`)
-            // by these threads — see `process_one` / `process_request` for how conflicting
-            // accesses are still synchronized (imago's own `RwLock`, not this scope).
-            let disk = &self.disk;
-            thread::scope(|scope| {
-                let handles: Vec<_> = batch
-                    .drain(..)
-                    .map(|head| scope.spawn(move || Self::process_one(mem, disk, head)))
-                    .collect();
-                completions.extend(handles.into_iter().map(|handle| handle.join().unwrap()));
-            });
+            self.run_batch(&mut batch, &mut completions);
             self.complete(mem, completions.drain(..).flatten());
+        }
+    }
+
+    /// Runs a batch of two or more requests concurrently, hiding a real disk's per-request
+    /// latency: idle helpers are woken for all but one request, and this thread runs whatever
+    /// they have not claimed yet, then waits for the rest. Results land in `completions` in batch
+    /// order. A request that panicked is re-raised here once every other request of the batch
+    /// has finished, so no helper touches guest memory after this returns or unwinds. How
+    /// conflicting accesses are synchronized: see `IO_PARALLELISM` (imago's own `RwLock`).
+    fn run_batch(
+        &mut self,
+        batch: &mut Vec<DescriptorChain>,
+        completions: &mut Vec<Option<(u16, usize)>>,
+    ) {
+        self.start_helpers(batch.len() - 1);
+        let shared = &*self.shared;
+        let mut state = lock(&shared.batch);
+        let len = batch.len();
+        for (slot, head) in state.requests.iter_mut().zip(batch.drain(..)) {
+            *slot = Some(head.detach());
+        }
+        state.len = len;
+        state.next = 0;
+        state.unfinished = len;
+        let wake = state.idle.min(len - 1);
+        state = shared.serve(state, wake);
+        state.waiting = true;
+        while state.unfinished > 0 {
+            state = wait(&shared.finished, state);
+        }
+        state.waiting = false;
+        completions.extend_from_slice(&state.results[..len]);
+        state.len = 0;
+        state.next = 0;
+        if let Some(payload) = state.panic.take() {
+            drop(state);
+            panic::resume_unwind(payload);
+        }
+    }
+
+    /// Grows the helpers to `want` (at most `IO_PARALLELISM - 1`). They are spawned from this
+    /// thread, so they inherit its scheduling and I/O priority and its OS thread name. If one
+    /// cannot be spawned, the worker thread runs the requests left over.
+    fn start_helpers(&mut self, want: usize) {
+        while self.helpers.len() < want.min(IO_PARALLELISM - 1) {
+            let shared = Arc::clone(&self.shared);
+            match thread::Builder::new().spawn(move || shared.help()) {
+                Ok(helper) => self.helpers.push(helper),
+                Err(e) => {
+                    if !std::mem::replace(&mut self.spawn_failed, true) {
+                        warn!("cannot start a block request thread: {e}");
+                    }
+                    break;
+                }
+            }
         }
     }
 
@@ -421,8 +596,10 @@ impl BlockWorker {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{self, AssertUnwindSafe};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, RwLock};
+    use std::sync::{Arc, RwLock, mpsc};
+    use std::time::{Duration, Instant};
 
     use imago::{
         DynStorage, FormatAccess, Storage, StorageOpenOptions, file::File as ImagoFile, raw::Raw,
@@ -480,24 +657,37 @@ mod tests {
 
     /// A worker over a writable raw disk with a write-back cache, serving `vq`.
     fn worker(s: &Setup, vq: &VirtQueue) -> BlockWorker {
+        worker_with(s, vq, CacheType::Writeback).0
+    }
+
+    type Image = Arc<RwLock<FormatAccess<Box<dyn DynStorage>>>>;
+
+    /// A worker over a writable raw disk with cache `cache`, serving `vq`, and its image.
+    fn worker_with(s: &Setup, vq: &VirtQueue, cache: CacheType) -> (BlockWorker, Image) {
         let file =
             ImagoFile::open(StorageOpenOptions::new().write(true).filename(&s.path)).unwrap();
         let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), true).unwrap();
+        let image = Arc::new(RwLock::new(FormatAccess::new(raw)));
         let disk = DiskProperties::new(
-            Arc::new(RwLock::new(FormatAccess::new(raw))),
+            image.clone(),
             vec![0; VIRTIO_BLK_ID_BYTES as usize],
-            CacheType::Writeback,
+            cache,
             None,
             None,
         )
         .unwrap();
-        BlockWorker::new(
+        let worker = BlockWorker::new(
             DeviceQueue::new(vq.create_queue(), Arc::new(EventFd::new(0).unwrap())),
             InterruptTransport::from_handler(s.irqs.clone()),
             s.mem.clone(),
             disk,
             EventFd::new(0).unwrap(),
-        )
+        );
+        (worker, image)
+    }
+
+    fn helper_ids(w: &BlockWorker) -> Vec<std::thread::ThreadId> {
+        w.helpers.iter().map(|h| h.thread().id()).collect()
     }
 
     /// Makes request `i` available to the device: descriptors `3i..3i + 3` (header, `len` data
@@ -657,6 +847,135 @@ mod tests {
             assert_eq!(data(&s.mem, i, 512), disk_bytes()[sector..sector + 512]);
         }
         assert_eq!(status(&s.mem, 3), 0xff);
+    }
+
+    /// Helpers start with the first batch that needs them, at most seven, and are kept across
+    /// batches; each batch still completes in queue order with one interrupt.
+    #[test]
+    fn helpers_start_on_demand_and_are_reused() {
+        let s = setup();
+        let vq = VirtQueue::new(GuestAddress(0), &s.mem, QUEUE_SIZE);
+        let mut w = worker(&s, &vq);
+        let irqs = || s.irqs.0.load(Ordering::SeqCst);
+        let read_back = |i: u16, sector: u64| {
+            assert_eq!(status(&s.mem, i), OK);
+            let at = sector as usize * 512;
+            assert_eq!(data(&s.mem, i, 512), disk_bytes()[at..at + 512]);
+        };
+
+        queue_request(&s.mem, &vq, 0, VIRTIO_BLK_T_IN, 0, 512, 16);
+        w.process_queue(&s.mem);
+        assert!(w.helpers.is_empty());
+
+        for i in 1..3u16 {
+            queue_request(&s.mem, &vq, i, VIRTIO_BLK_T_IN, u64::from(i), 512, 16);
+        }
+        w.process_queue(&s.mem);
+        let first = helper_ids(&w);
+        assert_eq!(first.len(), 1);
+        assert_eq!((used(&vq).len(), irqs()), (3, 2));
+
+        let mut seven = None;
+        for round in 0..4u64 {
+            for i in 0..8u16 {
+                let sector = round * 8 + u64::from(i);
+                queue_request(&s.mem, &vq, i, VIRTIO_BLK_T_IN, sector, 512, 16);
+            }
+            w.process_queue(&s.mem);
+            let ids = helper_ids(&w);
+            assert_eq!((ids.len(), ids[0]), (7, first[0]));
+            assert_eq!(*seven.get_or_insert_with(|| ids.clone()), ids);
+            let used = used(&vq);
+            let batch: Vec<_> = (0..8u32).map(|i| (3 * i, 512)).collect();
+            assert_eq!(used[used.len() - 8..], batch);
+            assert_eq!(irqs(), 3 + round as usize);
+            for i in 0..8u16 {
+                read_back(i, round * 8 + u64::from(i));
+            }
+        }
+    }
+
+    /// Stopping a running worker joins its helpers: once its thread has ended, nothing
+    /// holds what they shared with it.
+    #[test]
+    fn stopping_the_worker_joins_its_helpers() {
+        let s = setup();
+        let vq = VirtQueue::new(GuestAddress(0), &s.mem, QUEUE_SIZE);
+        let w = worker(&s, &vq);
+        let shared = Arc::downgrade(&w.shared);
+        let kick = w.device_queue.event.clone();
+        let stop = w.stop_fd.try_clone().unwrap();
+        for i in 0..8u16 {
+            queue_request(&s.mem, &vq, i, VIRTIO_BLK_T_IN, u64::from(i), 512, 16);
+        }
+
+        let thread = w.run();
+        kick.write(1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while vq.used.idx.get() < 8 {
+            assert!(Instant::now() < deadline, "the batch never completed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The worker and its seven helpers.
+        assert_eq!(shared.strong_count(), 8);
+
+        stop.write(1).unwrap();
+        thread.join().unwrap();
+        assert_eq!(shared.strong_count(), 0);
+    }
+
+    /// A panicking request still takes the worker down, but only after the rest of its batch
+    /// has finished: nothing of the batch reaches the used ring, and the helpers survive to be
+    /// joined.
+    #[test]
+    fn a_panicking_request_fails_its_batch_once_the_rest_finished() {
+        let s = setup();
+        let vq = VirtQueue::new(GuestAddress(0), &s.mem, QUEUE_SIZE);
+        // No write-back cache: dropping the disk would flush through the poisoned lock.
+        let (mut w, image) = worker_with(&s, &vq, CacheType::Unsafe);
+        let shared = Arc::downgrade(&w.shared);
+        let message = |payload: Box<dyn std::any::Any + Send>| {
+            *payload
+                .downcast::<String>()
+                .expect("a formatted panic message")
+        };
+
+        // Eight reads, blocked on the image lock until its holder panics: the worker thread
+        // waits in the first, so the helpers most likely claim the others; all of them panic.
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let poisoner = std::thread::spawn(move || {
+            let _held = image.write().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            panic!("poisoning the image lock");
+        });
+        locked_rx.recv().unwrap();
+        for i in 0..8u16 {
+            queue_request(&s.mem, &vq, i, VIRTIO_BLK_T_IN, u64::from(i), 512, 16);
+        }
+        let payload = panic::catch_unwind(AssertUnwindSafe(|| w.process_queue(&s.mem)));
+        assert!(message(payload.unwrap_err()).contains("PoisonError"));
+        assert!(poisoner.join().is_err());
+        assert_eq!((used(&vq).len(), s.irqs.0.load(Ordering::SeqCst)), (0, 0));
+
+        // The worker thread's own request panics; the flushes beside it (no image lock with
+        // this cache) have all finished when it unwinds.
+        queue_request(&s.mem, &vq, 0, VIRTIO_BLK_T_IN, 0, 512, 16);
+        for i in 1..8u16 {
+            queue_request(&s.mem, &vq, i, VIRTIO_BLK_T_FLUSH, 0, 0, 16);
+        }
+        let payload = panic::catch_unwind(AssertUnwindSafe(|| w.process_queue(&s.mem)));
+        assert!(message(payload.unwrap_err()).contains("PoisonError"));
+        assert_eq!(status(&s.mem, 0), 0xff);
+        for i in 1..8u16 {
+            assert_eq!(status(&s.mem, i), OK);
+        }
+        assert_eq!((used(&vq).len(), s.irqs.0.load(Ordering::SeqCst)), (0, 0));
+
+        assert_eq!(w.helpers.len(), 7);
+        assert!(w.helpers.iter().all(|h| !h.is_finished()));
+        drop(w);
+        assert_eq!(shared.strong_count(), 0);
     }
 
     #[test]

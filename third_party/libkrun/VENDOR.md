@@ -180,11 +180,14 @@ out of an `mmap` of the image (`DiskMmap`) instead of a `pread` per request: suc
 its file offset. qcow2 and `direct_io` keep the imago path; a failed `mmap` falls back to it,
 and so does every disk off Unix hosts.
 
-`src/devices/src/virtio/block/{device.rs,worker.rs}` — the image sits behind an `RwLock`, and
-the worker pops up to `IO_PARALLELISM` requests and runs each on a scoped thread, since imago's
-`readv`/`writev` need only `&self`. The exception is a lone request, which runs on the worker
-thread. Write-zeroes and dirty-control commands take the write lock. The worker signals once
-per batch if any request completed and the guest requested notification.
+`src/devices/src/virtio/block/{device.rs,worker.rs}` + `src/devices/src/virtio/{queue.rs,mod.rs}`
+— the worker batches up to `IO_PARALLELISM` requests. It handles a lone request itself and
+shares larger batches with up to `IO_PARALLELISM - 1` helpers, started on demand and joined
+at shutdown. A `DetachedChain` carries the descriptor chain without its guest-memory borrow.
+Helpers reattach it to the shared guest-memory handle. imago's `readv` and `writev` take
+`&self`, so requests can run concurrently under the image's `RwLock`. Write-zeroes and
+dirty-control commands take the write lock. The worker signals once if any request in the
+batch completed and the guest requested notification.
 
 `src/devices/src/virtio/block/{device.rs,worker.rs}` + `src/libkrun/src/api/device_builders.rs` —
 track guest-written clusters and drain them on demand, so virtkit's build backend captures only

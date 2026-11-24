@@ -63,7 +63,7 @@ pub use self::mmio::*;
 pub use self::net::Net;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use self::pci::*;
-pub use self::queue::{Descriptor, DescriptorChain, Queue};
+pub use self::queue::{Descriptor, DescriptorChain, DetachedChain, Queue};
 #[cfg(not(feature = "tee"))]
 pub use self::rng::*;
 #[cfg(feature = "vhost-user")]
