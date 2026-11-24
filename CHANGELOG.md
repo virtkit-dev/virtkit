@@ -20,6 +20,8 @@ All notable changes to virtkit will be documented in this file.
 - Guests now receive an unsupported status for unknown disk commands or unsupported flags.
 - A restore summary no longer counts a chunk the image repeats as cached; repeats are
   reported separately.
+- Registry push and restore summaries no longer call the chunks of every image "ext4
+  chunks".
 
 ## [0.116.0] - 2026-11-24
 

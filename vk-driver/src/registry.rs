@@ -874,7 +874,7 @@ async fn try_pull_ext4_lazy_async(
     )?;
 
     crate::quiet::note!(
-        "virtkit: registry: {label}: {} ext4 chunks ({counts}, lazy restore)",
+        "virtkit: registry: {label}: {} chunks ({counts}, lazy restore)",
         counts.total()
     );
     Ok(Some(digest))
@@ -1478,7 +1478,7 @@ async fn push_disk_diff_async(
         }
     }
     crate::quiet::note!(
-        "virtkit: registry: {} ext4 chunks ({reused} reused, {regened} re-chunked, {added} added, {uploaded} uploaded)",
+        "virtkit: registry: {} chunks ({reused} reused, {regened} re-chunked, {added} added, {uploaded} uploaded)",
         layers.len()
     );
 
@@ -2014,7 +2014,7 @@ async fn push_async(
     }
     let chunk_count = layers.len();
     crate::quiet::note!(
-        "virtkit: registry: {chunk_count} ext4 chunks ({uploaded} uploaded, {skipped} deduped)"
+        "virtkit: registry: {chunk_count} chunks ({uploaded} uploaded, {skipped} deduped)"
     );
 
     // kernel/initrd, when present, as their own raw blobs (small; no chunking).
@@ -2276,7 +2276,7 @@ async fn pull_into(
     spawn_chunks(placements, |(was_fetched, n)| counts.add(was_fetched, n)).await?;
     drop(out);
     crate::quiet::note!(
-        "virtkit: registry: {label}: {} ext4 chunks ({counts})",
+        "virtkit: registry: {label}: {} chunks ({counts})",
         counts.total()
     );
 
