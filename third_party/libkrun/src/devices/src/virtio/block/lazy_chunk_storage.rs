@@ -96,6 +96,18 @@ const IDLE_DECODERS: usize = 8;
 /// chunk frames need about 1 MiB.
 const MAX_IDLE_DECODER_BYTES: usize = 8 << 20;
 
+/// Largest read buffer a thread keeps between requests: the largest request vk's Linux guest
+/// sends by default (`max_sectors_kb` 4096; the device sets no `size_max`). A larger request
+/// gets a buffer freed after it.
+const MAX_KEPT_BOUNCE: usize = 4 << 20;
+
+thread_local! {
+    /// Where a read is assembled before it is copied to the guest. Every request runs on the
+    /// block worker or one of its helpers, which live until the worker stops, so per disk at
+    /// most `IO_PARALLELISM` buffers of up to `MAX_KEPT_BOUNCE` stay allocated between requests.
+    static BOUNCE: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
+}
+
 static CHUNK_BUFFERS: BufferPool = BufferPool::new();
 static DECODERS: Mutex<Vec<DCtx<'static>>> = Mutex::new(Vec::new());
 
@@ -650,7 +662,7 @@ impl LazyChunkStorage {
         let mut pos = offset;
         while pos < end {
             if pos >= self.total_size {
-                // Past EOF: `Storage::pure_readv` fills the rest with zeroes.
+                // Past EOF: the rest reads as zero.
                 out[(pos - offset) as usize..].fill(0);
                 break;
             }
@@ -729,10 +741,26 @@ impl Storage for LazyChunkStorage {
     }
 
     async unsafe fn pure_readv(&self, mut bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
-        let mut out = vec![0u8; bufv.len() as usize];
-        self.read_range(offset, &mut out)?;
-        bufv.copy_from_slice(&out);
-        Ok(())
+        let len = usize::try_from(bufv.len()).map_err(io::Error::other)?;
+        let mut out = if len <= MAX_KEPT_BOUNCE {
+            BOUNCE.take()
+        } else {
+            Vec::new()
+        };
+        if out.len() < len {
+            out.reserve_exact(len - out.len());
+            out.resize(len, 0);
+        }
+        // `read_range` writes every byte of the range, so bytes left over from an earlier
+        // request never reach the guest; on an error the guest buffers stay untouched.
+        let result = self.read_range(offset, &mut out[..len]);
+        if result.is_ok() {
+            bufv.copy_from_slice(&out[..len]);
+        }
+        if out.capacity() <= MAX_KEPT_BOUNCE {
+            BOUNCE.set(out);
+        }
+        result
     }
 
     async unsafe fn pure_writev(&self, _bufv: IoVector<'_>, _offset: u64) -> io::Result<()> {
@@ -1064,6 +1092,170 @@ mod tests {
         let mut out = vec![0u8; 100];
         storage.read_range(80, &mut out).unwrap();
         assert_eq!(out, want[80..180]);
+    }
+
+    const SENTINEL: u8 = 0x5A;
+
+    /// `readv` at `offset` into sentinel-filled guest segments of `sizes` bytes. Returns the
+    /// result and the segments' bytes, concatenated.
+    fn readv_into(
+        storage: &LazyChunkStorage,
+        offset: u64,
+        sizes: &[usize],
+    ) -> (io::Result<()>, Vec<u8>) {
+        use imago::StorageExt;
+        let mut segments: Vec<Vec<u8>> = sizes.iter().map(|&n| vec![SENTINEL; n]).collect();
+        let slices: Vec<io::IoSliceMut<'_>> = segments
+            .iter_mut()
+            .map(|s| io::IoSliceMut::new(s))
+            .collect();
+        let result = storage.readv(IoVectorMut::from(slices), offset);
+        (result, segments.concat())
+    }
+
+    /// The calling thread's kept read buffer: (address, capacity).
+    fn kept_bounce() -> (*const u8, usize) {
+        let buf = BOUNCE.take();
+        let kept = (buf.as_ptr(), buf.capacity());
+        BOUNCE.set(buf);
+        kept
+    }
+
+    /// Reads across chunks, gaps and EOF land in guest segments of awkward sizes, empty ones
+    /// included, with every byte of the request written.
+    #[test]
+    fn readv_fills_uneven_segments_across_chunks_gaps_and_eof() {
+        let fx = Fixture::new("readv-segments");
+        let chunk_a: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let chunk_b: Vec<u8> = (0..3000u32).map(|i| ((i * 7) % 253) as u8 | 1).collect();
+        let (digest_a, digest_b) = (fake_digest(1), fake_digest(2));
+        std::fs::write(
+            fx.dir.join(digest_hex(&digest_a)),
+            zstd::encode_all(&chunk_a[..], 3).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(fx.dir.join(digest_hex(&digest_b)), &chunk_b).unwrap();
+        // [0,5000) = a, [5000,6000) = gap, [6000,9000) = b, [9000,10000) = trailing gap.
+        let manifest = fx.dir.join("test.vk_ro_img");
+        write_manifest(
+            &manifest,
+            10_000,
+            LAYOUT_FLAT,
+            &fx.dir,
+            &[
+                (0, 5000, CODEC_ZSTD, digest_a),
+                (6000, 3000, CODEC_RAW, digest_b),
+            ],
+        );
+        let storage =
+            LazyChunkStorage::parse(std::fs::File::open(&manifest).unwrap(), manifest).unwrap();
+        let mut want = vec![0u8; 12_000];
+        want[..5000].copy_from_slice(&chunk_a);
+        want[6000..9000].copy_from_slice(&chunk_b);
+
+        for (offset, sizes) in [
+            (0u64, &[1usize, 7, 4093, 3, 0, 5896][..]),
+            (4990, &[11, 0, 999, 10][..]),
+            (5100, &[100][..]),
+            (8990, &[3, 1007][..]),
+            (9000, &[1, 1999][..]),
+            (2, &[4999, 1, 1, 1997, 2000][..]),
+        ] {
+            let (result, got) = readv_into(&storage, offset, sizes);
+            result.unwrap();
+            let start = offset as usize;
+            assert_eq!(
+                got,
+                want[start..start + got.len()],
+                "readv at {offset} into {sizes:?}"
+            );
+        }
+    }
+
+    /// A thread keeps its read buffer for later requests, but never one larger than
+    /// `MAX_KEPT_BOUNCE`, and bytes from an earlier request never reach a later one.
+    #[test]
+    fn read_buffer_is_kept_within_its_cap_and_never_leaks_old_bytes() {
+        let fx = Fixture::new("readv-kept");
+        let chunk = vec![0xABu8; 1 << 20];
+        let digest = fake_digest(1);
+        std::fs::write(fx.dir.join(digest_hex(&digest)), &chunk).unwrap();
+        // [0, 1 MiB) = chunk, then a gap to 4 MiB.
+        let manifest = fx.dir.join("test.vk_ro_img");
+        write_manifest(
+            &manifest,
+            4 << 20,
+            LAYOUT_FLAT,
+            &fx.dir,
+            &[(0, 1 << 20, CODEC_RAW, digest)],
+        );
+        let storage =
+            LazyChunkStorage::parse(std::fs::File::open(&manifest).unwrap(), manifest).unwrap();
+
+        // A fresh thread, so the buffer starts out empty whatever ran before on this one.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let (result, got) = readv_into(&storage, 0, &[1 << 20]);
+                result.unwrap();
+                assert_eq!(got, chunk);
+                let (ptr, cap) = kept_bounce();
+                assert!(
+                    (1 << 20..=MAX_KEPT_BOUNCE).contains(&cap),
+                    "kept {cap} bytes"
+                );
+
+                // Larger than the cap: served from a buffer of its own, the kept one untouched.
+                let (result, got) = readv_into(&storage, 0, &[MAX_KEPT_BOUNCE + 4096]);
+                result.unwrap();
+                assert_eq!(got[..1 << 20], chunk[..]);
+                assert!(got[1 << 20..].iter().all(|&b| b == 0));
+                assert_eq!(kept_bounce(), (ptr, cap));
+
+                // The kept buffer still holds the chunk's bytes: a read straddling the chunk's
+                // end must carry exactly its own bytes, and a gap must read as zero.
+                let (result, got) = readv_into(&storage, (1 << 20) - 512, &[100, 3996]);
+                result.unwrap();
+                assert!(got[..512].iter().all(|&b| b == 0xAB));
+                assert!(got[512..].iter().all(|&b| b == 0));
+                readv_into(&storage, 0, &[4096]).0.unwrap();
+                let (result, got) = readv_into(&storage, 2 << 20, &[4096]);
+                result.unwrap();
+                assert_eq!(got, vec![0u8; 4096]);
+                assert_eq!(kept_bounce(), (ptr, cap));
+            });
+        });
+    }
+
+    /// A chunk failing partway through a request fails the whole request and leaves every
+    /// guest segment as it was; the thread's next request is unaffected.
+    #[test]
+    fn a_failed_chunk_mid_request_leaves_the_guest_segments_untouched() {
+        let fx = Fixture::new("readv-error");
+        let chunk_a = vec![0x11u8; 4096];
+        let (digest_a, digest_b) = (fake_digest(1), fake_digest(2));
+        std::fs::write(fx.dir.join(digest_hex(&digest_a)), &chunk_a).unwrap();
+        std::fs::write(fx.dir.join(digest_hex(&digest_b)), b"not a zstd frame").unwrap();
+        let manifest = fx.dir.join("test.vk_ro_img");
+        write_manifest(
+            &manifest,
+            8192,
+            LAYOUT_FLAT,
+            &fx.dir,
+            &[
+                (0, 4096, CODEC_RAW, digest_a),
+                (4096, 4096, CODEC_ZSTD, digest_b),
+            ],
+        );
+        let storage =
+            LazyChunkStorage::parse(std::fs::File::open(&manifest).unwrap(), manifest).unwrap();
+
+        let (result, got) = readv_into(&storage, 0, &[100, 5000, 3092]);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(got.iter().all(|&b| b == SENTINEL));
+
+        let (result, got) = readv_into(&storage, 0, &[4000, 96]);
+        result.unwrap();
+        assert_eq!(got, chunk_a);
     }
 
     /// Overlapping chunks (offsets going backwards) are a corrupt manifest, unlike a gap —

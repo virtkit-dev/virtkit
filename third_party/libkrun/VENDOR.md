@@ -211,8 +211,9 @@ tiling an image and the local directory holding them; `LazyChunkStorage` is a re
 `imago::Storage` that reads and decodes missing chunks outside the cache lock. Concurrent
 reads of the same missing chunk share the result. On a miss, the device streams zstd chunks
 through a reusable decoder or reads raw chunks directly. Both paths reuse evicted buffers
-when one fits. Both process-wide pools limit idle counts and bytes. The device opens a
-manifest directly as `DiskFormat::VkLazyChunks` (= 3). In a qcow2 backing chain, `LazyAwareOpenGate` opens
+when one fits. Both process-wide pools limit idle counts and bytes. Each request thread
+reuses a read buffer for requests up to 4 MiB; larger reads use a temporary one. The
+device opens a manifest directly as `DiskFormat::VkLazyChunks` (= 3). In a qcow2 backing chain, `LazyAwareOpenGate` opens
 `*.vk_ro_img` as lazy storage at any depth. The host chooses the extension. Checking it
 prevents guest-written magic bytes from designating a manifest that names a host directory.
 
