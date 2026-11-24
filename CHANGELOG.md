@@ -18,6 +18,8 @@ All notable changes to virtkit will be documented in this file.
   an I/O error. Later writes never reach the disk. Previously the guest could wait indefinitely
   or the VM could abort.
 - Guests now receive an unsupported status for unknown disk commands or unsupported flags.
+- A restore summary no longer counts a chunk the image repeats as cached; repeats are
+  reported separately.
 
 ## [0.116.0] - 2026-11-24
 

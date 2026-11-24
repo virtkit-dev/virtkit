@@ -831,7 +831,7 @@ async fn try_pull_ext4_lazy_async(
         cache: chunks_cache.clone(),
         pool: Arc::clone(pool),
     });
-    let (mut fetched, mut reused) = (0usize, 0usize);
+    let mut counts = RestoreCounts::default();
     let mut chunks = Vec::with_capacity(chunk_layers.len());
     let downloads = group_chunks(chunk_layers).into_iter().map(|places| {
         let source = Arc::clone(&source);
@@ -859,8 +859,7 @@ async fn try_pull_ext4_lazy_async(
         if let Some(m) = meter {
             m.add(size);
         }
-        fetched += usize::from(was_fetched);
-        reused += landed.len() - usize::from(was_fetched);
+        counts.add(was_fetched, landed.len());
         chunks.extend(landed);
     })
     .await?;
@@ -875,8 +874,8 @@ async fn try_pull_ext4_lazy_async(
     )?;
 
     crate::quiet::note!(
-        "virtkit: registry: {label}: {} ext4 chunks ({fetched} fetched, {reused} cached, lazy restore)",
-        fetched + reused
+        "virtkit: registry: {label}: {} ext4 chunks ({counts}, lazy restore)",
+        counts.total()
     );
     Ok(Some(digest))
 }
@@ -2273,16 +2272,12 @@ async fn pull_into(
             ))
         }
     });
-    let (mut fetched, mut reused) = (0usize, 0usize);
-    spawn_chunks(placements, |(was_fetched, n)| {
-        fetched += usize::from(was_fetched);
-        reused += n - usize::from(was_fetched);
-    })
-    .await?;
+    let mut counts = RestoreCounts::default();
+    spawn_chunks(placements, |(was_fetched, n)| counts.add(was_fetched, n)).await?;
     drop(out);
     crate::quiet::note!(
-        "virtkit: registry: {label}: {} ext4 chunks ({fetched} fetched, {reused} cached)",
-        fetched + reused
+        "virtkit: registry: {label}: {} ext4 chunks ({counts})",
+        counts.total()
     );
 
     // kernel/initrd (raw blobs), by media type.
@@ -2460,6 +2455,43 @@ struct ChunkSource {
     /// The node's shared chunk cache.
     cache: PathBuf,
     pool: Arc<ChunkPool>,
+}
+
+/// What a restore did with an image's chunks, for its summary line.
+#[derive(Default)]
+struct RestoreCounts {
+    /// Distinct chunks downloaded.
+    fetched: usize,
+    /// Distinct chunks already in the local cache.
+    cached: usize,
+    /// Further places in the image that hold a chunk counted above.
+    repeated: usize,
+}
+
+impl RestoreCounts {
+    /// Counts one distinct chunk placed `places` times.
+    fn add(&mut self, was_fetched: bool, places: usize) {
+        if was_fetched {
+            self.fetched += 1;
+        } else {
+            self.cached += 1;
+        }
+        self.repeated += places.saturating_sub(1);
+    }
+
+    fn total(&self) -> usize {
+        self.fetched + self.cached + self.repeated
+    }
+}
+
+impl std::fmt::Display for RestoreCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} fetched, {} cached", self.fetched, self.cached)?;
+        if self.repeated > 0 {
+            write!(f, ", {} repeated", self.repeated)?;
+        }
+        Ok(())
+    }
 }
 
 /// Group placements by digest and media type so they share a fetch on a cache miss.
@@ -5092,6 +5124,18 @@ mod local {
 pub(crate) mod tests {
     use super::*;
     use vk_registry::ZSTD_LEVEL;
+
+    #[test]
+    fn a_restore_summary_separates_repeated_chunks_from_cached_ones() {
+        let mut counts = RestoreCounts::default();
+        counts.add(true, 1);
+        counts.add(false, 1);
+        assert_eq!(counts.to_string(), "1 fetched, 1 cached");
+        // A chunk downloaded once and placed three times was never in the cache.
+        counts.add(true, 3);
+        assert_eq!(counts.to_string(), "2 fetched, 1 cached, 2 repeated");
+        assert_eq!(counts.total(), 5);
+    }
 
     fn live_token() -> crate::config::JobToken {
         crate::config::JobToken::new("vkt_x.y", u64::MAX)
