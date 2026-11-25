@@ -1,8 +1,8 @@
 //! sccache reads, stats and writes objects at `/s3/<bucket>/<key>`. The bucket is a
 //! top-level directory of `/dav/files/` and the key is the path below it. Listings, bucket
-//! operations, nonempty queries, multipart uploads, streaming payloads and unsupported
-//! checksum or encryption headers return `NotImplemented`. For signed requests, [`admit`]
-//! checks the signature first.
+//! operations, nonempty queries, multipart uploads, streaming payloads, content codings,
+//! conditional requests, partial writes and unsupported checksum or encryption headers
+//! return `NotImplemented`. For signed requests, [`admit`] checks the signature first.
 //!
 //! SigV4 uses the registry credential (API key, hub token or shared bearer) as both AWS
 //! keys. [`admit`] forwards it as `Authorization: Bearer <access key>`. WebDAV applies
@@ -157,28 +157,67 @@ fn check_request(
         Some((bucket, key)) if !bucket.is_empty() && !key.is_empty() => {}
         _ => return Err(NOT_IMPLEMENTED),
     }
+    check_headers(headers)?;
+    Ok(rest.to_string())
+}
+
+/// The store ignores preconditions and treats a partial write as a whole-object replacement.
+const UNSERVED_HEADERS: &[&str] = &[
+    "content-md5",
+    "content-range",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-unmodified-since",
+];
+
+/// Whether these headers pass the registry's S3 object header check. A forwarding proxy can
+/// check them before attaching credentials.
+pub fn admissible_headers(headers: &HeaderMap) -> bool {
+    check_headers(headers).is_ok()
+}
+
+fn check_headers(headers: &HeaderMap) -> Result<(), Refusal> {
     for name in headers.keys() {
         let name = name.as_str();
-        if (name.starts_with("x-amz-") && !AMZ_HEADERS.contains(&name)) || name == "content-md5" {
+        if (name.starts_with("x-amz-") && !AMZ_HEADERS.contains(&name))
+            || UNSERVED_HEADERS.contains(&name)
+        {
             return Err(NOT_IMPLEMENTED);
         }
     }
+    // The store keeps the body verbatim and no coding to return on a read: aws-chunked
+    // framing would become object data, and a gzip object would read back unlabelled.
+    let encoded = headers
+        .get_all(hyper::header::CONTENT_ENCODING)
+        .iter()
+        .any(|v| {
+            v.to_str().map_or(true, |v| {
+                v.split(',').any(|c| {
+                    let c = c.trim();
+                    !c.is_empty() && !c.eq_ignore_ascii_case("identity")
+                })
+            })
+        });
+    if encoded {
+        return Err(NOT_IMPLEMENTED);
+    }
     let mut sha = headers.get_all("x-amz-content-sha256").iter();
     match (sha.next().map(|v| v.to_str()), sha.next()) {
-        (None, _) => {}
+        (None, _) => Ok(()),
         (Some(Ok(v)), None)
-            if v == UNSIGNED_PAYLOAD || vk_hub_proto::from_hex_lower::<32>(v).is_some() => {}
-        // aws-chunked bodies (`STREAMING-…`) are not decoded here.
-        (Some(Ok(v)), None) if v.starts_with("STREAMING-") => return Err(NOT_IMPLEMENTED),
-        _ => {
-            return Err(Refusal(
-                StatusCode::BAD_REQUEST,
-                "InvalidArgument",
-                "x-amz-content-sha256 must be UNSIGNED-PAYLOAD or a SHA-256",
-            ));
+            if v == UNSIGNED_PAYLOAD || vk_hub_proto::from_hex_lower::<32>(v).is_some() =>
+        {
+            Ok(())
         }
+        // aws-chunked bodies (`STREAMING-…`) are not decoded here.
+        (Some(Ok(v)), None) if v.starts_with("STREAMING-") => Err(NOT_IMPLEMENTED),
+        _ => Err(Refusal(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "x-amz-content-sha256 must be UNSIGNED-PAYLOAD or a SHA-256",
+        )),
     }
-    Ok(rest.to_string())
 }
 
 /// Verify a SigV4 `Authorization` header (AWS4-HMAC-SHA256, header form) over `method`,
@@ -741,15 +780,55 @@ mod tests {
             ("x-amz-security-token", "t"),
             ("content-md5", "1B2M2Y8AsgTpgAmY7PhCfg=="),
             ("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+            ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+            ("if-match", "\"0\""),
+            ("if-none-match", "*"),
+            ("if-modified-since", "Thu, 26 Nov 2026 00:00:00 GMT"),
+            ("if-unmodified-since", "Thu, 26 Nov 2026 00:00:00 GMT"),
+            ("content-range", "bytes 0-1/2"),
+            ("content-encoding", "aws-chunked"),
+            ("content-encoding", "gzip, AWS-Chunked"),
+            ("content-encoding", "gzip"),
         ] {
-            assert_eq!(check(Method::PUT, "/s3/b/k", &[h]), Err(NOT_IMPLEMENTED));
+            assert_eq!(
+                check(Method::PUT, "/s3/b/k", &[h]),
+                Err(NOT_IMPLEMENTED),
+                "{h:?}"
+            );
+            assert!(!admissible_headers(&headers(&[h])), "{h:?}");
         }
-        assert_eq!(
-            check(Method::PUT, "/s3/b/k", &[("x-amz-content-sha256", "nope")])
-                .unwrap_err()
-                .1,
-            "InvalidArgument"
-        );
+        let sha = "c".repeat(64);
+        for h in [
+            &[("x-amz-content-sha256", "nope")][..],
+            &[("x-amz-content-sha256", &sha.to_uppercase())],
+            &[
+                ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+                ("x-amz-content-sha256", &sha),
+            ],
+            &[
+                ("x-amz-content-sha256", &sha),
+                ("x-amz-content-sha256", &sha),
+            ],
+        ] {
+            assert_eq!(
+                check(Method::PUT, "/s3/b/k", h).unwrap_err().1,
+                "InvalidArgument"
+            );
+            assert!(!admissible_headers(&headers(h)), "{h:?}");
+        }
+        for h in [
+            &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")][..],
+            &[
+                ("x-amz-content-sha256", &sha),
+                ("x-amz-date", "20261126T000000Z"),
+            ],
+            &[("transfer-encoding", "chunked")],
+            &[("content-encoding", "identity")],
+            &[("range", "bytes=0-1"), ("if-range", "\"0\"")],
+        ] {
+            assert!(check(Method::PUT, "/s3/b/k", h).is_ok(), "{h:?}");
+            assert!(admissible_headers(&headers(h)), "{h:?}");
+        }
     }
 
     #[tokio::test]

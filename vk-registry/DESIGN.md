@@ -677,10 +677,18 @@ the plain file at `/dav/files/<bucket>/<key>`, visible to WebDAV, `vk registry g
 
 The service root, bucket operations, other methods and nonempty queries (listings, presigned
 URLs, multipart and sub-resources) return 501 `NotImplemented`. So do `Content-MD5`,
-streaming payloads (`STREAMING-…`) and `x-amz-*` headers other than `x-amz-date` and
-`x-amz-content-sha256`. Signature checks run first, so an unsigned `x-amz-*` header on a
-signed request returns 403 `AccessDenied`. A `PUT` creates missing parent directories,
-including the bucket. A missing key returns 404 `NoSuchKey`, a cache miss for sccache.
+streaming payloads (`STREAMING-…`), a `Content-Encoding` other than `identity` (`aws-chunked`
+included), `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`,
+`Content-Range`, and `x-amz-*` headers other than `x-amz-date` and `x-amz-content-sha256`.
+The store ignores preconditions, writes whole objects verbatim and keeps no content coding
+to return on a read. A refused signed upload has its body read through as a WebDAV refusal
+does, with the same 413 past the object cap.
+
+Only SigV4 requires `x-amz-content-sha256`. Other than a `STREAMING-…` marker, a value must
+be one `UNSIGNED-PAYLOAD` or lowercase SHA-256 digest, or the request returns 400. Signature
+checks run first, so an unsigned `x-amz-*` header on a signed request returns 403
+`AccessDenied`. A `PUT` creates missing parent directories, including the bucket. A missing
+key returns 404 `NoSuchKey`, a cache miss for sccache.
 
 **Credentials.** Set both `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` to the registry
 credential (an API key, hub token or shared bearer). The registry uses the access key as the

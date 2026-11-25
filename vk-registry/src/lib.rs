@@ -74,6 +74,7 @@ mod zctx;
 
 pub use client::{ClientAuth, FailInfo, Held, LockClient};
 pub use config::{DEFAULT_ADDR, ServerConfig};
+pub use s3::admissible_headers as s3_admissible_headers;
 
 /// The client-auth model in force, resolved once at startup from [`config::AuthMode`].
 /// One field rather than a shared-secret/accounts pair, so "one or the other, never both"

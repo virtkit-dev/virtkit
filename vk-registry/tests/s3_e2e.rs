@@ -388,27 +388,48 @@ async fn the_s3_view_refuses_what_it_does_not_serve() {
     assert_eq!(anon.status(), 501);
     assert_eq!(anon.headers()["connection"], "close");
 
-    // A body past the object cap is refused by its length alone, before it is sent.
-    let req = signed(&c, reqwest::Method::PUT, &base, path, BEARER, UNSIGNED)
-        .build()
-        .unwrap();
-    let mut head = format!("PUT {path} HTTP/1.1\r\ncontent-length: 5000000000\r\n");
-    for (k, v) in req.headers() {
-        head.push_str(&format!("{k}: {}\r\n", v.to_str().unwrap()));
+    // A body past the object cap is refused by its length alone, before it is sent, on an
+    // upload refused for its headers too.
+    for extra in ["", "if-none-match: *\r\n"] {
+        let req = signed(&c, reqwest::Method::PUT, &base, path, BEARER, UNSIGNED)
+            .build()
+            .unwrap();
+        let mut head = format!("PUT {path} HTTP/1.1\r\ncontent-length: 5000000000\r\n{extra}");
+        for (k, v) in req.headers() {
+            head.push_str(&format!("{k}: {}\r\n", v.to_str().unwrap()));
+        }
+        head.push_str(&format!(
+            "host: {}\r\n\r\n",
+            base.trim_start_matches("http://")
+        ));
+        let mut tcp = tokio::net::TcpStream::connect(base.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        tcp.write_all(head.as_bytes()).await.unwrap();
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(10), tcp.read_to_end(&mut answer)).await;
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 413"), "{extra:?}: {answer}");
+        assert!(answer.contains("<Code>EntityTooLarge</Code>"), "{answer}");
     }
-    head.push_str(&format!(
-        "host: {}\r\n\r\n",
-        base.trim_start_matches("http://")
-    ));
-    let mut tcp = tokio::net::TcpStream::connect(base.trim_start_matches("http://"))
-        .await
-        .unwrap();
-    tcp.write_all(head.as_bytes()).await.unwrap();
-    let mut answer = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(10), tcp.read_to_end(&mut answer)).await;
-    let answer = String::from_utf8_lossy(&answer);
-    assert!(answer.starts_with("HTTP/1.1 413"), "{answer}");
-    assert!(answer.contains("<Code>EntityTooLarge</Code>"), "{answer}");
+
+    // Refusing these PUTs leaves the existing object as it was.
+    for (name, value) in [
+        ("if-none-match", "*"),
+        ("if-match", "\"0\""),
+        ("content-range", "bytes 0-0/1"),
+        ("content-encoding", "aws-chunked"),
+        ("content-encoding", "gzip"),
+    ] {
+        let resp = signed(&c, reqwest::Method::PUT, &base, path, BEARER, UNSIGNED)
+            .header(name, value)
+            .body("y")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 501, "{name}: {value}");
+        assert!(resp.text().await.unwrap().contains("NotImplemented"));
+    }
 
     // WebDAV reads the object written through S3.
     let dav = c

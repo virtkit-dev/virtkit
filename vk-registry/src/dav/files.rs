@@ -441,20 +441,9 @@ async fn put(
     href: &str,
     req: Request<Incoming>,
 ) -> Result<Response<Body>> {
-    // Reject oversized Content-Length before reading; streaming checks also cover chunked
-    // bodies.
-    if req
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .is_some_and(|n| n > MAX_OBJECT)
-    {
-        return Ok(error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "TOOBIG",
-            href,
-        ));
+    // Streaming checks also cover chunked bodies.
+    if declared_over_cap(&req) {
+        return Ok(too_big(href));
     }
     // A path ending in a slash names a collection, which takes no object.
     if collection {
@@ -546,17 +535,30 @@ async fn put(
 }
 
 /// Read a request's body through and discard it: a status sent with request bytes unread
-/// resets the connection. `Some(413)` if the body crosses the object cap on the way.
+/// resets the connection. `Some(413)` if the body declares a length over the object cap,
+/// unread, or crosses the cap on the way.
 pub(super) async fn drain(req: Request<Incoming>, href: &str) -> Result<Option<Response<Body>>> {
+    if declared_over_cap(&req) {
+        return Ok(Some(too_big(href)));
+    }
     match drain_into(&mut tokio::io::sink(), req.into_body(), MAX_OBJECT).await {
         Ok(_) => Ok(None),
-        Err(DrainError::OverCap) => Ok(Some(error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "TOOBIG",
-            href,
-        ))),
+        Err(DrainError::OverCap) => Ok(Some(too_big(href))),
         Err(DrainError::Failed(e)) => Err(e),
     }
+}
+
+/// Whether `Content-Length` declares a body over the object cap.
+fn declared_over_cap(req: &Request<Incoming>) -> bool {
+    req.headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|n| n > MAX_OBJECT)
+}
+
+fn too_big(href: &str) -> Response<Body> {
+    error_response(StatusCode::PAYLOAD_TOO_LARGE, "TOOBIG", href)
 }
 
 /// [`drain`] a refused request, then answer `refusal`, or the 413.
