@@ -16,18 +16,17 @@
 //! This module is the thin dispatcher plus the reference-parsing and local-cache
 //! helpers shared with the docker, registry and local paths.
 
-use std::io::{Read, Write};
-use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+use std::os::unix::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
 use vk_hub_proto::dispatch::Activity;
+use vk_registry::hostlock;
 
 /// The boot flavour recorded per cached bundle (`boot.kind`), so a cache hit
 /// — which skips the pull/build — still knows how to boot it.
@@ -159,164 +158,21 @@ pub(crate) fn digest_hex(digest: &str) -> Result<&str> {
 /// race it. A hash collision only serializes two unrelated pulls.
 ///
 /// The name is predictable and the abstract namespace has no permissions, so another local
-/// user can bind it first. A waiter refuses such a holder (see [`judge`]), which turns that
+/// user can bind it first. A waiter refuses a holder of a known foreign uid, or one that
+/// three queries in a row could not connect to (see [`hostlock::judge`]), which turns that
 /// into a failed pull rather than a hung one; it cannot stop it.
-fn pull_lock_hash(dir: &Path) -> u64 {
-    // FNV-1a, to stay within the 108-byte sun_path limit
-    fnv64(&[dir.as_os_str().as_bytes()])
+fn pull_lock_addr(dir: &Path) -> std::io::Result<SocketAddr> {
+    hostlock::addr("virtkit-pull", dir.as_os_str().as_bytes())
 }
 
-fn pull_lock_addr(h: u64) -> std::io::Result<SocketAddr> {
-    SocketAddr::from_abstract_name(format!("virtkit-pull-{h:016x}"))
-}
-
-/// Connect to the abstract socket `addr` without waiting: a holder that never accepts, its
-/// backlog full, refuses at once (`EAGAIN`) rather than hanging the waiter. The stream is
-/// returned blocking. `Ok(None)` when the holder is gone (`ECONNREFUSED`) or its backlog is
-/// full (`EAGAIN`); any other failure is ours, not the holder's, and is an error.
-fn connect_nonblocking(addr: &SocketAddr) -> std::io::Result<Option<UnixStream>> {
-    use std::os::fd::FromRawFd;
-    let (sa, len) = abstract_sockaddr(addr).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not an abstract socket name that fits sun_path",
-        )
-    })?;
-    // SAFETY: socket(2) has no memory preconditions; the descriptor is owned below.
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is a fresh socket owned by nothing else.
-    let stream = unsafe { UnixStream::from_raw_fd(fd) };
-    // SAFETY: `sa` is a valid sockaddr_un and `len` covers exactly what was filled in.
-    let rc = unsafe { libc::connect(fd, (&raw const sa).cast(), len as libc::socklen_t) };
-    if rc != 0 {
-        let e = std::io::Error::last_os_error();
-        return match e.raw_os_error() {
-            Some(libc::ECONNREFUSED | libc::EAGAIN) => Ok(None),
-            _ => Err(e),
-        };
-    }
-    stream.set_nonblocking(false)?;
-    Ok(Some(stream))
-}
-
-/// `addr`'s abstract name as a `sockaddr_un` and its length: the leading NUL that marks the
-/// abstract namespace, then the name, unterminated.
-fn abstract_sockaddr(addr: &SocketAddr) -> Option<(libc::sockaddr_un, usize)> {
-    let name = addr.as_abstract_name()?;
-    // SAFETY: an all-zero sockaddr_un is valid; the name is copied after the leading NUL, and
-    // the length check keeps it inside sun_path.
-    let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    if name.len() + 1 > sa.sun_path.len() {
-        return None;
-    }
-    for (dst, src) in sa.sun_path[1..].iter_mut().zip(name) {
-        *dst = *src as libc::c_char;
-    }
-    Some((
-        sa,
-        std::mem::size_of::<libc::sa_family_t>() + 1 + name.len(),
-    ))
-}
-
-/// Who answers on the lock's abstract socket. The name is in a namespace every local user
-/// shares and has no permissions, so anyone can bind it first; `uid` is the binder's, from the
-/// kernel, and `who` what its responder said it is.
-struct Holder {
-    uid: Option<u32>,
-    who: Option<String>,
-}
-
-/// Query the holder over its lock socket for its `jobctx::job_identity()` and kernel-provided
-/// uid. Return `Ok(None)` if the holder is gone, races our connect, or has a full backlog;
-/// propagate query errors such as descriptor exhaustion. Do not read another user's response.
-/// Our own holder gets 1 s total to answer. Keep at most 200 printable ASCII bytes for job logs.
-fn query_holder(addr: &SocketAddr) -> std::io::Result<Option<Holder>> {
-    use std::os::fd::AsRawFd;
-    let Some(s) = connect_nonblocking(addr)? else {
-        return Ok(None);
-    };
-    let mut cred = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: SO_PEERCRED writes one `ucred` through a pointer to a local of that size, and
-    // the descriptor is `s`'s, live for the call.
-    let uid = (unsafe {
-        libc::getsockopt(
-            s.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&raw mut cred).cast(),
-            &mut len,
-        )
-    } == 0)
-        .then_some(cred.uid);
-    // SAFETY: geteuid(2) has no preconditions and cannot fail.
-    if uid != Some(unsafe { libc::geteuid() }) {
-        return Ok(Some(Holder { uid, who: None }));
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 512];
-    while buf.len() < 4096 {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() || s.set_read_timeout(Some(left)).is_err() {
-            break;
-        }
-        match (&s).read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break,
-        }
-    }
-    let who: String = buf
-        .iter()
-        .map(|&b| char::from(b))
-        .filter(|c| c.is_ascii_graphic() || *c == ' ')
-        .take(200)
-        .collect();
-    let who = who.trim();
-    Ok(Some(Holder {
-        uid,
-        who: (!who.is_empty()).then(|| who.to_string()),
-    }))
-}
-
-/// FNV-1a over concatenated byte slices (cache keys and lock names, not
-/// security)
-pub(crate) fn fnv64(parts: &[&[u8]]) -> u64 {
-    parts
-        .iter()
-        .flat_map(|p| p.iter())
-        .fold(0xcbf29ce484222325u64, |h, b| {
-            (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
-        })
-}
-
-/// Holds the abstract socket independently of the responder, which reports this job's
-/// identity to waiters. Dropping the guard stops the responder and closes its listener.
-/// An inherited descriptor can keep the socket bound.
+/// A held pull lock. It answers waiters with `jobctx::job_identity()` until dropped.
 pub(crate) struct PullLock {
-    _sock: Arc<UnixListener>,
-    stop: Arc<AtomicBool>,
-    responder: Option<std::thread::JoinHandle<()>>,
+    /// The activity set by [`PullLock::report`]. Declared before `_held` so it is withdrawn
+    /// before the lock is let go.
+    said: Option<crate::activity::Said>,
+    _held: hostlock::Held,
     /// Where its holder tells the job's hub what it does.
     sink: Arc<crate::activity::Sink>,
-    /// What it told ([`PullLock::report`]), until released.
-    said: Option<crate::activity::Said>,
 }
 
 impl PullLock {
@@ -324,39 +180,6 @@ impl PullLock {
     /// whose cache, checked again under the lock, missed.
     pub(crate) fn report(&mut self, activity: Activity) {
         self.said = Some(self.sink.say(activity));
-    }
-}
-
-impl Drop for PullLock {
-    fn drop(&mut self) {
-        self.said = None;
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.responder.take() {
-            let _ = h.join();
-        }
-        // `_sock` drops after the responder exits.
-    }
-}
-
-/// What a waiter makes of the lock's holder.
-#[derive(Debug, PartialEq, Eq)]
-enum Verdict {
-    /// Ours, or not known otherwise: keep waiting.
-    Wait,
-    /// Bound by another user, who would hold this pull forever.
-    Foreign(u32),
-    /// Refused `unanswered` queries in a row. Our own holder always accepts, so this is not a
-    /// pull of ours.
-    Unanswering,
-}
-
-/// Judge the latest `query_holder` result and consecutive unanswered-query count, including
-/// this query. `me` is our effective uid.
-fn judge(holder: Option<&Holder>, me: u32, unanswered: u32) -> Verdict {
-    match holder {
-        Some(Holder { uid: Some(uid), .. }) if *uid != me => Verdict::Foreign(*uid),
-        None if unanswered >= 3 => Verdict::Unanswering,
-        _ => Verdict::Wait,
     }
 }
 
@@ -403,67 +226,20 @@ impl WaitBeat {
     }
 }
 
-/// Probes `dir`'s pull lock by connecting. Binding to probe could block a pull until a
-/// forked child closes the inherited descriptor at exec. Only a refused connection to a
-/// name with no matching stream socket counts as free.
+/// Whether `dir`'s pull lock is held, asked without taking it ([`hostlock::held`]).
 fn pull_lock_held(dir: &Path) -> bool {
-    let Ok(addr) = pull_lock_addr(pull_lock_hash(dir)) else {
+    let Ok(addr) = pull_lock_addr(dir) else {
         return true;
     };
-    let Some((sa, len)) = abstract_sockaddr(&addr) else {
-        return true;
-    };
-    // SAFETY: socket(2) has no memory preconditions; the descriptor is owned below.
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if fd < 0 {
-        return true;
-    }
-    // SAFETY: `fd` is a fresh socket owned by nothing else.
-    let _sock = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
-    // SAFETY: `sa` is a valid sockaddr_un and `len` covers exactly what was filled in.
-    let rc = unsafe { libc::connect(fd, (&raw const sa).cast(), len as libc::socklen_t) };
-    if rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ECONNREFUSED) {
-        return true;
-    }
-    // A bound stream socket also refuses connections before it starts listening.
-    addr.as_abstract_name().is_none_or(abstract_name_bound)
-}
-
-/// Looks up `@<name>` in this network namespace's Unix socket table. Only stream sockets
-/// conflict with a stream bind. An accepted connection can retain the name in the table,
-/// so a match can overreport contention. An unreadable table also counts as bound.
-fn abstract_name_bound(name: &[u8]) -> bool {
-    let Ok(table) = std::fs::read("/proc/net/unix") else {
-        return true;
-    };
-    // Columns: Num RefCount Protocol Flags Type St Inode Path. The type is `SOCK_STREAM` as
-    // `%04X`; the path is the last column, absent for an unbound socket.
-    table.split(|&b| b == b'\n').skip(1).any(|line| {
-        let fields: Vec<&[u8]> = line
-            .split(|&b| b == b' ')
-            .filter(|f| !f.is_empty())
-            .collect();
-        matches!(
-            fields.as_slice(),
-            [_, _, _, _, ty, _, _, path]
-                if *ty == b"0001" && path.strip_prefix(b"@") == Some(name)
-        )
-    })
+    hostlock::held(&addr)
 }
 
 /// [`acquire_pull_lock`] without waiting: `None` when another process holds it. Held, it
 /// answers waiters as a waited-for lock does, so they wait for it rather than give up.
 fn try_acquire_pull_lock(dir: &Path) -> Option<PullLock> {
-    let addr = pull_lock_addr(pull_lock_hash(dir)).ok()?;
-    UnixListener::bind_addr(&addr)
-        .ok()
-        .map(|lock| spawn_holder(lock, crate::activity::sink()))
+    let addr = pull_lock_addr(dir).ok()?;
+    let held = hostlock::try_acquire(&addr, &crate::jobctx::job_identity()).ok()??;
+    Some(pull_lock(held, crate::activity::sink()))
 }
 
 /// [`acquire_pull_lock`], retrying the bind every `poll`, and querying the holder at the first
@@ -478,7 +254,8 @@ fn acquire_pull_lock_with(
     beat: Option<std::time::Duration>,
     sink: Arc<crate::activity::Sink>,
 ) -> Result<PullLock> {
-    let addr = pull_lock_addr(pull_lock_hash(dir))?;
+    let addr = pull_lock_addr(dir)?;
+    let identity = crate::jobctx::job_identity();
     // Said while it waits, and over when the wait is, the lock taken or not.
     let mut waiting: Option<crate::activity::Said> = None;
     // The holder it was last said to wait for.
@@ -493,26 +270,25 @@ fn acquire_pull_lock_with(
     };
     loop {
         polls = polls.wrapping_add(1);
-        match UnixListener::bind_addr(&addr) {
-            Ok(lock) => return Ok(spawn_holder(lock, sink)),
+        let held =
+            hostlock::try_acquire(&addr, &identity).context("binding the pull-lock socket")?;
+        match held {
+            Some(held) => return Ok(pull_lock(held, sink)),
             // Asked again every 25 polls (5 s by default), not only at the first refusal: the
             // holder can go and another user's process take the name while this one waits.
-            Err(e)
-                if e.kind() == std::io::ErrorKind::AddrInUse
-                    && (waiting.is_none() || polls.is_multiple_of(25)) =>
-            {
-                let holder =
-                    query_holder(&addr).context("asking the pull-lock holder who it is")?;
+            None if waiting.is_none() || polls.is_multiple_of(25) => {
+                let holder = hostlock::query_holder(&addr)
+                    .context("asking the pull-lock holder who it is")?;
                 unanswered = if holder.is_some() { 0 } else { unanswered + 1 };
                 // SAFETY: geteuid(2) has no preconditions and cannot fail.
                 let me = unsafe { libc::geteuid() };
-                match judge(holder.as_ref(), me, unanswered) {
-                    Verdict::Wait => {}
-                    Verdict::Foreign(uid) => bail!(
+                match hostlock::judge(holder.as_ref(), me, unanswered) {
+                    hostlock::Verdict::Wait => {}
+                    hostlock::Verdict::Foreign(uid) => bail!(
                         "the {verb} lock for {name}@{digest} is held by uid {uid}, not by a \
                          virtkit of this user — refusing to wait on it"
                     ),
-                    Verdict::Unanswering => bail!(
+                    hostlock::Verdict::Unanswering => bail!(
                         "the {verb} lock for {name}@{digest} is held by a process that does \
                          not answer — refusing to wait on it"
                     ),
@@ -560,46 +336,16 @@ fn acquire_pull_lock_with(
                 }
                 std::thread::sleep(poll);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                std::thread::sleep(poll);
-            }
-            Err(e) => return Err(e).context("binding the pull-lock socket"),
+            None => std::thread::sleep(poll),
         }
     }
 }
 
-/// Start the holder's responder: a thread that shares the bound `lock` and answers each
-/// waiter's connection with our `jobctx::job_identity()` until the guard is dropped. It uses a
-/// non-blocking accept + a stop flag so drop ends it promptly (a bounded join), and rides out
-/// accept errors (`EMFILE`, `ECONNABORTED`, ...) rather than exiting: waiters treat a holder
-/// that stops answering as foreign and give up on it. The guard keeps its own reference to
-/// `lock`, so even if this thread dies the socket stays bound (the lock is held).
-fn spawn_holder(lock: UnixListener, sink: Arc<crate::activity::Sink>) -> PullLock {
-    let lock = Arc::new(lock);
-    let stop = Arc::new(AtomicBool::new(false));
-    let responder = {
-        let accept_sock = lock.clone();
-        let id = crate::jobctx::job_identity();
-        let stop = stop.clone();
-        std::thread::spawn(move || {
-            let _ = accept_sock.set_nonblocking(true);
-            while !stop.load(Ordering::Relaxed) {
-                match accept_sock.accept() {
-                    Ok((mut s, _)) => {
-                        let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(2)));
-                        let _ = s.write_all(id.as_bytes());
-                    }
-                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
-                }
-            }
-        })
-    };
+fn pull_lock(held: hostlock::Held, sink: Arc<crate::activity::Sink>) -> PullLock {
     PullLock {
-        _sock: lock,
-        stop,
-        responder: Some(responder),
-        sink,
         said: None,
+        _held: held,
+        sink,
     }
 }
 
@@ -1663,6 +1409,9 @@ fn dead_chunks(registry_root: &Path, counts: impl Fn(&Path) -> bool) -> Vec<(Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::AtomicBool;
 
     /// Exactly `sha256:` and 64 lowercase hex digits names a file; every other spelling fails
     /// rather than being stripped down to one that would.
@@ -1726,7 +1475,7 @@ mod tests {
             );
             return;
         };
-        let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
+        let addr = pull_lock_addr(&dir).unwrap();
         let held = UnixListener::bind_addr(&addr).unwrap();
         let err = UnixListener::bind_addr(&addr).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
@@ -1734,16 +1483,16 @@ mod tests {
         UnixListener::bind_addr(&addr).expect("the released lock addr binds again");
     }
 
-    /// A squatter that never accepts, its backlog full, cannot hang a waiter: the query gives
-    /// up at once instead of blocking in connect.
+    /// A squatter that never accepts, its backlog full, cannot hang a waiter: three queries
+    /// that cannot connect fail the pull, which says it waits no more.
     #[test]
-    fn a_holder_that_never_accepts_does_not_hang_the_query() {
+    fn a_waiter_gives_up_on_a_holder_that_never_accepts() {
         let dir = std::env::temp_dir().join(format!("virtkit-test-full-{}", std::process::id()));
         use std::os::fd::FromRawFd;
-        let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
+        let addr = pull_lock_addr(&dir).unwrap();
         // A listener with no backlog, which a connection or two fills — not one with the
         // default backlog, which would take thousands of descriptors to fill.
-        let (sa, len) = abstract_sockaddr(&addr).unwrap();
+        let (sa, len) = hostlock::abstract_sockaddr(&addr).unwrap();
         // SAFETY: plain socket calls on a fresh descriptor, owned by `squatter` below; `sa`
         // and `len` describe exactly the address filled in.
         let squatter = unsafe {
@@ -1758,15 +1507,10 @@ mod tests {
         };
         // Fill its backlog with connections it never accepts.
         let mut held = Vec::new();
-        while let Some(c) = connect_nonblocking(&addr).unwrap() {
+        while let Some(c) = hostlock::connect_nonblocking(&addr).unwrap() {
             held.push(c);
             assert!(held.len() < 8, "a backlog of 0 never filled");
         }
-        let started = std::time::Instant::now();
-        assert!(query_holder(&addr).unwrap().is_none());
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
-        // And a waiter gives up on it, a few unanswered queries in, rather than waiting
-        // forever on a name no pull of ours holds — and says it waits no more.
         let said =
             std::env::temp_dir().join(format!("virtkit-test-full-said-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&said);
@@ -1829,12 +1573,12 @@ mod tests {
         assert_eq!(crate::jobctx::job_identity(), JOB);
         let held = try_acquire_pull_lock(&dir).expect("a free lock is taken");
         assert!(try_acquire_pull_lock(&dir).is_none(), "a held lock is not");
-        let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
+        let addr = pull_lock_addr(&dir).unwrap();
         // SAFETY: geteuid(2) has no preconditions and cannot fail.
         let me = unsafe { libc::geteuid() };
         // Check the responder's job identity as well as the kernel's peer UID.
         let answered = || {
-            let holder = query_holder(&addr).unwrap().unwrap();
+            let holder = hostlock::query_holder(&addr).unwrap().unwrap();
             assert_eq!(holder.uid, Some(me));
             assert_eq!(holder.who.as_deref(), Some(JOB));
         };
@@ -1907,7 +1651,7 @@ mod tests {
         // A holder whose answer the test changes.
         let answer = Arc::new(std::sync::Mutex::new("job 1".to_string()));
         let stop = Arc::new(AtomicBool::new(false));
-        let addr = pull_lock_addr(pull_lock_hash(&root.join("img"))).unwrap();
+        let addr = pull_lock_addr(&root.join("img")).unwrap();
         let holder = {
             let lock = UnixListener::bind_addr(&addr).unwrap();
             let (answer, stop) = (answer.clone(), stop.clone());
@@ -1999,50 +1743,6 @@ mod tests {
     }
 
     #[test]
-    fn a_waiter_refuses_a_foreign_or_unanswering_holder() {
-        let ours = Holder {
-            uid: Some(1000),
-            who: Some("job 1".into()),
-        };
-        let theirs = Holder {
-            uid: Some(1001),
-            who: None,
-        };
-        let unknown = Holder {
-            uid: None,
-            who: None,
-        };
-        assert_eq!(judge(Some(&ours), 1000, 0), Verdict::Wait);
-        assert_eq!(judge(Some(&unknown), 1000, 0), Verdict::Wait);
-        assert_eq!(judge(Some(&theirs), 1000, 0), Verdict::Foreign(1001));
-        assert_eq!(judge(None, 1000, 1), Verdict::Wait);
-        assert_eq!(judge(None, 1000, 2), Verdict::Wait);
-        assert_eq!(judge(None, 1000, 3), Verdict::Unanswering);
-    }
-
-    /// Drop control bytes and truncate the holder's identity for job logs. Any local user can
-    /// bind the name and supply arbitrary text.
-    #[test]
-    fn a_holders_self_description_is_kept_printable() {
-        use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("virtkit-test-evil-{}", std::process::id()));
-        let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
-        let squatter = UnixListener::bind_addr(&addr).unwrap();
-        let answer = std::thread::spawn(move || {
-            let (mut s, _) = squatter.accept().unwrap();
-            let mut say = b"\x1b[2Jevil\x07 job".to_vec();
-            say.extend(std::iter::repeat_n(b'x', 1000));
-            let _ = s.write_all(&say);
-        });
-        let holder = query_holder(&addr).unwrap().expect("the squatter answers");
-        answer.join().unwrap();
-        let who = holder.who.unwrap();
-        assert!(who.starts_with("[2Jevil job"), "{who:?}");
-        assert!(who.chars().all(|c| c.is_ascii_graphic() || c == ' '));
-        assert!(who.len() <= 200);
-    }
-
-    #[test]
     fn pull_lock_answers_holder_identity_then_releases() {
         // In a process of its own, for the reason `pull_lock_excludes_and_releases` gives.
         const CHILD: &str = "VK_TEST_PULL_HOLDER_DIR";
@@ -2056,10 +1756,10 @@ mod tests {
             );
             return;
         };
-        let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
+        let addr = pull_lock_addr(&dir).unwrap();
         let lock = acquire_pull_lock(&dir, "build", "myimg", "sha256:x").unwrap();
         // a waiter reads the holder's identity over the lock socket (pid fallback, no CI env)
-        let holder = query_holder(&addr)
+        let holder = hostlock::query_holder(&addr)
             .unwrap()
             .expect("the holder should answer");
         assert!(holder.who.is_some_and(|w| !w.trim().is_empty()));
@@ -2178,8 +1878,7 @@ mod tests {
         }
         let bind = |dir: &str, ty: libc::c_int| {
             let (sa, len) =
-                abstract_sockaddr(&pull_lock_addr(pull_lock_hash(&root.join(dir))).unwrap())
-                    .unwrap();
+                hostlock::abstract_sockaddr(&pull_lock_addr(&root.join(dir)).unwrap()).unwrap();
             // SAFETY: plain socket calls on a fresh descriptor, owned by the result; `sa` and
             // `len` describe exactly the address filled in.
             unsafe {

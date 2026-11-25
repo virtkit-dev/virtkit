@@ -56,6 +56,7 @@ pub(crate) mod dav;
 pub(crate) mod files_put;
 pub(crate) mod forms;
 pub mod handover;
+pub mod hostlock;
 pub(crate) mod html;
 pub mod hub;
 pub mod hubtoken;
