@@ -46,6 +46,16 @@
 //! (an upload's `Location`, a lock's holders), which the proxy forwards too. A `PROPFIND`'s
 //! hrefs are the exception, mapped back to the alias, since a WebDAV client resolves a listing
 //! against the root it asked for.
+//!
+//! A credential lent for some areas only ([`Scope::Areas`], [`ProxyCfg::for_areas`]) is not
+//! one the registry scopes, so the proxy does: it forwards the `/v2/` ping, reading and
+//! writing manifests and blobs in the repositories under an area's prefix, and taking,
+//! renewing and releasing locks whose every name is under one ([`confined`]). Each request
+//! is checked once resolved and mapped, and sent with the headers those requests use and no
+//! other; a redirect is returned to the guest rather than followed, since the request it
+//! leads to would be sent with the credential, unchecked. Every refusal is logged on the
+//! host. The proxy confines the names a request uses, not what the registry serves under
+//! them: see [`Scope::Areas`].
 
 use std::convert::Infallible;
 use std::os::linux::net::SocketAddrExt;
@@ -65,7 +75,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::{UnixListener, UnixStream};
 
 use vk_hub_proto::dispatch::Area;
-use vk_hub_proto::token::{ALIAS_ROOT, under, valid_component, valid_prefix};
+use vk_hub_proto::token::{ALIAS_ROOT, servable_prefix, under, valid_component, valid_prefix};
 
 use crate::oci::Creds;
 use vk_registry::hostlock;
@@ -96,6 +106,15 @@ pub enum Scope {
     Job,
     /// Nothing: a job that should have had a token and has none.
     Deny,
+    /// `/v2/` and `/lock/`, within the proxy's areas only ([`confined`]): a credential the
+    /// registry does not scope, lent for those areas.
+    ///
+    /// This confines the repository and lock names a guest uses, and nothing else. A
+    /// registry serves such a credential any blob or manifest of its store by digest,
+    /// through whichever repository asks, so the store must hold the areas' content only:
+    /// lent for a store shared with other repositories, the credential reads their content
+    /// by digest too.
+    Areas,
 }
 
 impl Scope {
@@ -105,6 +124,7 @@ impl Scope {
             Scope::Oci => &["/v2/"],
             Scope::Job => &["/v2/", "/lock/", DAV_FILES, S3],
             Scope::Deny => &[],
+            Scope::Areas => &["/v2/", "/lock/"],
         }
     }
 }
@@ -119,7 +139,8 @@ pub struct ProxyCfg {
     /// one of the scope's paths
     root: String,
     scope: Scope,
-    /// The job's areas, mapped under [`Scope::Job`] only.
+    /// The areas whose aliases are mapped, under [`Scope::Job`] and [`Scope::Areas`]. Under
+    /// [`Scope::Areas`] they are also all the credential is lent for.
     areas: Vec<Area>,
     /// The credential injected into every forwarded request, so the job stays
     /// credential-free — and the trust anchor `client` was built against.
@@ -189,8 +210,12 @@ impl ProxyCfg {
 
     /// Set [`Self::for_job`]'s areas to those [`usable_areas`] keeps. Log each rejected area
     /// to the host's stderr without failing the job; its other paths still work.
-    /// `VK_REGISTRY_AREAS` also omits rejected areas.
+    /// `VK_REGISTRY_AREAS` also omits rejected areas. [`Self::for_areas`]'s areas stay as
+    /// it checked them: they are what its credential is lent for.
     pub fn with_areas(mut self, areas: &[Area]) -> Self {
+        if self.scope == Scope::Areas {
+            return self;
+        }
         self.areas = usable_areas(areas, |a, why| {
             eprintln!(
                 "virtkit: registry proxy: skipping the job's area {:?} at {:?}: {why}",
@@ -203,7 +228,50 @@ impl ProxyCfg {
         self
     }
 
+    /// Build to lend `creds` within `areas` only ([`Scope::Areas`]): `upstream` is the
+    /// registry's base URL, `creds` both what to inject and what TLS to trust. An area
+    /// [`usable_areas`] rejects is an error, as is a prefix the registry serves no
+    /// repository under ([`servable_prefix`]): nothing else names what the credential is
+    /// lent for.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn for_areas(upstream: &str, creds: Creds, areas: &[Area]) -> Result<Self> {
+        let mut rejected = None;
+        let kept = usable_areas(areas, |a, why| {
+            rejected.get_or_insert_with(|| format!("area {:?} at {:?}: {why}", a.alias, a.prefix));
+        });
+        if let Some(rejected) = rejected {
+            bail!("the registry proxy cannot serve {rejected}");
+        }
+        if let Some(a) = kept.iter().find(|a| !servable_prefix(&a.prefix)) {
+            bail!(
+                "the registry proxy cannot serve area {:?} at {:?}: the registry serves no \
+                 repository under the prefix",
+                a.alias,
+                a.prefix
+            );
+        }
+        // No redirect is followed: the request it leads to would be sent with the
+        // credential without having passed the area checks. The guest gets the redirect
+        // itself.
+        let mut cfg = Self::build_following(
+            upstream.trim_end_matches('/').to_string(),
+            creds,
+            reqwest::redirect::Policy::none(),
+        )?;
+        cfg.scope = Scope::Areas;
+        cfg.areas = kept.into_iter().cloned().collect();
+        Ok(cfg)
+    }
+
     fn build(upstream: String, creds: Creds) -> Result<Self> {
+        Self::build_following(upstream, creds, reqwest::redirect::Policy::default())
+    }
+
+    fn build_following(
+        upstream: String,
+        creds: Creds,
+        redirects: reqwest::redirect::Policy,
+    ) -> Result<Self> {
         let base = reqwest::Url::parse(&upstream)
             .with_context(|| format!("parsing the registry proxy upstream {upstream:?}"))?;
         anyhow::ensure!(
@@ -224,7 +292,7 @@ impl ProxyCfg {
             );
         }
         let root = base.path().trim_end_matches('/').to_string();
-        let mut b = reqwest::Client::builder();
+        let mut b = reqwest::Client::builder().redirect(redirects);
         if let Some(pem) = &creds.ca_pem {
             b = b.add_root_certificate(
                 reqwest::Certificate::from_pem(pem).context("parsing the registry CA")?,
@@ -588,21 +656,21 @@ fn upstream_url(cfg: &ProxyCfg, path_and_query: &str) -> Option<reqwest::Url> {
     (url.origin() == cfg.base.origin() && resolved.starts_with(prefix)).then_some(url)
 }
 
-/// What a request becomes under the job's areas.
+/// What a request becomes under the proxy's areas.
 #[derive(Debug, PartialEq, Eq)]
 enum Mapped<'a> {
     /// Nothing under [`ALIAS_ROOT`]: forwarded as it is.
     Unchanged,
     /// The path and query to forward instead, below the upstream's own path, and the area.
     To(String, &'a Area),
-    /// `job/…` naming no area of this job.
+    /// `job/…` naming no area of this proxy.
     Unknown,
 }
 
 /// `url` (an accepted upstream URL) under `cfg`'s areas: `job/<alias>` at the start of an
 /// OCI, WebDAV or S3 path, or of a lock name's path part, becomes the area's prefix.
 fn map_aliases<'a>(cfg: &'a ProxyCfg, url: &reqwest::Url) -> Mapped<'a> {
-    if cfg.scope != Scope::Job {
+    if !matches!(cfg.scope, Scope::Job | Scope::Areas) {
         return Mapped::Unchanged;
     }
     let Some(path) = url.path().strip_prefix(cfg.root.as_str()) else {
@@ -673,6 +741,162 @@ fn map_lock_names<'a>(areas: &'a [Area], query: &str) -> Result<Option<(String, 
     }
     Ok(first.map(|area| (pairs.join("&"), area)))
 }
+
+/// The lock requests forwarded within an area, all `POST`, and the numeric parameters each
+/// takes beside its names.
+const AREA_LOCKS: &[(&str, &[&str])] = &[
+    ("/lock/acquire", &["ttl", "wait"]),
+    ("/lock/renew", &["ttl"]),
+    ("/lock/release", &[]),
+];
+
+/// The request headers forwarded under [`Scope::Areas`]: those [`confined`]'s requests
+/// use. A header that could have a server between the proxy and the registry route the
+/// request elsewhere, or read it as another method, is not among them.
+const AREA_HEADERS: &[&str] = &[
+    "accept",
+    "accept-encoding",
+    "content-encoding",
+    "content-range",
+    "content-type",
+    "docker-content-digest",
+    "range",
+    "user-agent",
+    "x-vk-lock-holder",
+    "x-vk-lock-owner",
+];
+
+/// `url` (an accepted upstream URL, its aliases mapped) as [`Scope::Areas`] forwards it, or
+/// `None` when the credential is not lent for it. Forwarded are:
+/// - `GET`/`HEAD` of `/v2/` itself, which names no repository;
+/// - the requests [`area_oci_query`] takes, on a repository under an area's prefix, an
+///   upload the registry answered with its real name included;
+/// - `POST` to one of [`AREA_LOCKS`] with at least one name, every name under an area's
+///   prefix.
+///
+/// The query is written again from what was checked.
+fn confined(cfg: &ProxyCfg, method: &Method, url: &reqwest::Url) -> Option<reqwest::Url> {
+    let path = url.path().strip_prefix(cfg.root.as_str())?;
+    let asked = url.query().unwrap_or_default();
+    let query = match path.strip_prefix("/v2/") {
+        Some(rest) => area_oci_query(&cfg.areas, method, rest, asked)?,
+        None => {
+            let (_, params) = AREA_LOCKS.iter().find(|(lock, _)| *lock == path)?;
+            if *method != Method::POST {
+                return None;
+            }
+            area_lock_query(&cfg.areas, params, asked)?
+        }
+    };
+    let mut url = url.clone();
+    url.set_query((!query.is_empty()).then_some(query.as_str()));
+    Some(url)
+}
+
+/// Whether `name` is a repository name at or under an area's prefix, cut at a component:
+/// the repository's own name, not that of its plain files' repository.
+fn in_areas(areas: &[Area], name: &str) -> bool {
+    name.split('/').all(valid_component) && areas.iter().any(|a| under(&a.prefix, name))
+}
+
+/// The query to forward (empty for none) with `method` on the OCI path `rest` (what follows
+/// `/v2/`), or `None` when [`Scope::Areas`] refuses the request. Taken are, on a repository
+/// [`in_areas`]:
+/// - `GET`/`HEAD`/`PUT` of `manifests/<reference>`;
+/// - `GET`/`HEAD` of `blobs/<digest>`;
+/// - `POST` to `blobs/uploads/`, then `PATCH` of `blobs/uploads/<id>`, and `PUT` of it with
+///   the blob's `digest=`;
+///
+/// and `GET`/`HEAD` of the ping, an empty `rest`. No other query is taken: an OCI mount's
+/// `mount=` and `from=` would name a repository nothing checked.
+fn area_oci_query(areas: &[Area], method: &Method, rest: &str, query: &str) -> Option<String> {
+    let reads = matches!(*method, Method::GET | Method::HEAD);
+    let bare = query.is_empty();
+    let none = |taken: bool| taken.then(String::new);
+    if rest.is_empty() {
+        return none(reads && bare);
+    }
+    let (name, tail) = oci_repository(rest)?;
+    if !in_areas(areas, name) {
+        return None;
+    }
+    let one = |segment: &str| !segment.is_empty() && !segment.contains('/');
+    if let Some(reference) = tail.strip_prefix("manifests/") {
+        return none(one(reference) && bare && (reads || *method == Method::PUT));
+    }
+    let blob = tail.strip_prefix("blobs/")?;
+    match blob.strip_prefix("uploads/") {
+        Some("") => none(*method == Method::POST && bare),
+        Some(id) if one(id) => match *method {
+            Method::PATCH => none(bare),
+            Method::PUT => {
+                let digest = vk_registry::percent_decode(query.strip_prefix("digest=")?);
+                vk_registry::digest_hex(&digest)?;
+                Some(format!("digest={}", vk_registry::percent_encode(&digest)))
+            }
+            _ => None,
+        },
+        Some(_) => None,
+        None => none(reads && bare && vk_registry::digest_hex(blob).is_some()),
+    }
+}
+
+/// An OCI path (what follows `/v2/`) cut at its first `/manifests/`, `/blobs/` or `/tags/`:
+/// the shortest repository it can name, and the rest from that marker on. vk-registry cuts
+/// at the last marker of the route it matches, so the name it reads is this one or lies
+/// beneath it. `None` for a path with none of them, or with a `%` left once the URL is
+/// resolved: no repository, tag, digest or upload has one, and what it decodes to is not
+/// what was checked.
+fn oci_repository(rest: &str) -> Option<(&str, &str)> {
+    if rest.contains('%') {
+        return None;
+    }
+    let cut = ["/manifests/", "/blobs/", "/tags/"]
+        .iter()
+        .filter_map(|marker| rest.find(marker))
+        .min()?;
+    Some((&rest[..cut], &rest[cut + 1..]))
+}
+
+/// A lock request's query as [`Scope::Areas`] forwards it, or `None` when it is refused.
+/// Each `name=`, decoded as the registry decodes it, must be `<path>:<key>` with the path
+/// [`in_areas`], and is encoded again; there must be at least one. Any other pair must be
+/// one of `params`, once, with a number for value (`ttl=30`): no other spelling of `name`
+/// goes unchecked, whatever keys a registry comes to read.
+fn area_lock_query(areas: &[Area], params: &[&str], query: &str) -> Option<String> {
+    let mut names = 0;
+    let mut seen = Vec::new();
+    let mut pairs = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        match pair.split_once('=')? {
+            ("name", v) => {
+                let name = vk_registry::percent_decode(v);
+                let (path, key) = name.split_once(':')?;
+                if key.is_empty() || !in_areas(areas, path) {
+                    return None;
+                }
+                names += 1;
+                pairs.push(format!("name={}", vk_registry::percent_encode(&name)));
+            }
+            (k, v) if params.contains(&k) && !seen.contains(&k) => {
+                if !v.bytes().all(|b| b.is_ascii_digit()) || v.parse::<u64>().is_err() {
+                    return None;
+                }
+                seen.push(k);
+                pairs.push(pair.to_string());
+            }
+            _ => return None,
+        }
+    }
+    (names > 0).then(|| pairs.join("&"))
+}
+
+/// What a proxy lending for its areas only answers a request outside them.
+const OUTSIDE_AREAS: &[u8] = b"registry proxy: only the registry's ping, and manifests, blobs \
+                               and locks under this proxy's areas, are proxied";
+
+/// The most of a refused request's target that is logged, in characters.
+const MAX_LOGGED_TARGET: usize = 256;
 
 /// A 403 with `msg`.
 fn forbidden(msg: &'static [u8]) -> Response<ProxyBody> {
@@ -812,11 +1036,22 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     // the lock API and plain files too for a job's token. A guest-chosen path outside them —
     // a foreign authority smuggled via `//host`, or the `/lock/` control plane under the
     // host's credential — is refused rather than authenticated on the guest's behalf.
+    let method = req.method().clone();
+    // A refusal, which a proxy lending for its areas only also logs: nothing else tells the
+    // host what its guest was denied.
+    let refuse = |msg: &'static [u8]| {
+        if cfg.scope == Scope::Areas {
+            let target: String = path_and_query.chars().take(MAX_LOGGED_TARGET).collect();
+            eprintln!("virtkit: registry proxy: refused {method} {target:?}");
+        }
+        forbidden(msg)
+    };
     let Some(url) = upstream_url(cfg, &path_and_query) else {
-        return Ok(forbidden(match cfg.scope {
+        return Ok(refuse(match cfg.scope {
             Scope::Oci => b"registry proxy: only /v2/ registry paths are proxied",
             Scope::Job => b"registry proxy: only /v2/, /lock/, /dav/files/ and /s3/ are proxied",
             Scope::Deny => b"registry proxy: this job has no registry credential",
+            Scope::Areas => OUTSIDE_AREAS,
         }));
     };
     // The guests' token as it stands now, so a renewal reaches a job already running.
@@ -837,7 +1072,6 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
             }
         },
     };
-    let method = req.method().clone();
     // Plain files take the verbs vk-registry serves there, and no MOVE or COPY, whose
     // `Destination` names the proxy rather than the registry.
     if path_and_query.starts_with(DAV_FILES) && !DAV_FILES_METHODS.contains(&method.as_str()) {
@@ -850,19 +1084,29 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(body)?);
     }
-    // The job's aliases, mapped on the resolved URL, which then goes through the same checks
+    // The aliases, mapped on the resolved URL, which then goes through the same checks
     // again: the prefix is the hub's, but the rest of the path is still the guest's.
     let (url, area) = match map_aliases(cfg, &url) {
         Mapped::Unchanged => (url, None),
         Mapped::To(target, area) => match upstream_url(cfg, &target) {
             Some(url) => (url, Some(area)),
-            None => return Ok(forbidden(b"registry proxy: an area's path is refused")),
+            None => return Ok(refuse(b"registry proxy: an area's path is refused")),
         },
         Mapped::Unknown => {
-            return Ok(forbidden(
-                b"registry proxy: this job has no area of that alias",
-            ));
+            return Ok(refuse(match cfg.scope {
+                Scope::Areas => b"registry proxy: no area has that alias",
+                _ => b"registry proxy: this job has no area of that alias",
+            }));
         }
+    };
+    // A credential lent for its areas only goes nowhere else: checked last, on what would
+    // be sent.
+    let url = match cfg.scope {
+        Scope::Areas => match confined(cfg, &method, &url) {
+            Some(url) => url,
+            None => return Ok(refuse(OUTSIDE_AREAS)),
+        },
+        _ => url,
     };
     let path = url.path().strip_prefix(cfg.root.as_str()).unwrap_or("");
     // A listing's hrefs go back to the alias the guest asked for (see the module's doc).
@@ -881,7 +1125,9 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
         .iter()
         .filter(|(k, _)| {
             let name = k.as_str();
-            !is_skipped(name) && !scoped.iter().any(|s| s == name)
+            !is_skipped(name)
+                && !scoped.iter().any(|s| s == name)
+                && (cfg.scope != Scope::Areas || AREA_HEADERS.contains(&name))
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
@@ -2598,5 +2844,729 @@ mod tests {
         assert!(head.contains("\r\nx-kept: 1\r\n"), "{head}");
         assert!(!head.contains("x-dropped"), "{head}");
         assert!(!head.contains("proxy-connection"), "{head}");
+    }
+
+    /// A digest, as the registry spells one.
+    const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn areas_cfg(up_addr: SocketAddr) -> ProxyCfg {
+        ProxyCfg::for_areas(
+            &format!("http://{up_addr}/"),
+            Creds {
+                token: Some("vkr_build".to_string()),
+                ..Creds::anonymous()
+            },
+            &[area("task-cache", "team/dev/task-cache")],
+        )
+        .unwrap()
+    }
+
+    /// Within its areas the credential reaches the ping, manifests, blobs and locks, by alias
+    /// or by the real name the registry answers with.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_credential_lent_for_areas_reaches_them() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = fake_upstream();
+        let cfg = areas_cfg(up_addr);
+        assert_eq!(cfg.scope, Scope::Areas);
+        let (proxy, _served) = proxy_on_tcp(cfg);
+        let blob = format!("/blobs/{DIGEST}");
+        let finish = format!(
+            "/blobs/uploads/1-2-ab?digest={}",
+            DIGEST.replace(':', "%3A")
+        );
+        let at = |name: &str, tail: &str| format!("/v2/{name}{tail}");
+        for (method, target, want) in [
+            ("GET", "/v2/".to_string(), "/v2/".to_string()),
+            ("HEAD", "/v2/".to_string(), "/v2/".to_string()),
+            ("GET", "/v2/?".to_string(), "/v2/".to_string()),
+            (
+                "HEAD",
+                at("job/task-cache/ns", &blob),
+                at("team/dev/task-cache/ns", &blob),
+            ),
+            (
+                "GET",
+                at("job/task-cache", &blob),
+                at("team/dev/task-cache", &blob),
+            ),
+            (
+                "POST",
+                at("job/task-cache/ns", "/blobs/uploads/"),
+                at("team/dev/task-cache/ns", "/blobs/uploads/"),
+            ),
+            // An upload goes on at the real name its `Location` gave.
+            (
+                "PATCH",
+                at("team/dev/task-cache/ns", "/blobs/uploads/1-2-ab"),
+                at("team/dev/task-cache/ns", "/blobs/uploads/1-2-ab"),
+            ),
+            (
+                "PUT",
+                at("team/dev/task-cache/ns", &finish),
+                at("team/dev/task-cache/ns", &finish),
+            ),
+            // However the digest's `:` is written, it is forwarded encoded.
+            (
+                "PUT",
+                at("job/task-cache/ns", &finish.replace("%3A", ":")),
+                at("team/dev/task-cache/ns", &finish),
+            ),
+            (
+                "PUT",
+                at("job/task-cache/ns", "/manifests/key"),
+                at("team/dev/task-cache/ns", "/manifests/key"),
+            ),
+            (
+                "GET",
+                at("job/task-cache", "/manifests/latest"),
+                at("team/dev/task-cache", "/manifests/latest"),
+            ),
+            (
+                "HEAD",
+                at("job/task-cache/ns", &format!("/manifests/{DIGEST}")),
+                at("team/dev/task-cache/ns", &format!("/manifests/{DIGEST}")),
+            ),
+            (
+                "POST",
+                "/lock/acquire?name=job%2Ftask-cache%2Fns%3Ak&ttl=30&wait=0".to_string(),
+                "/lock/acquire?name=team%2Fdev%2Ftask-cache%2Fns%3Ak&ttl=30&wait=0".to_string(),
+            ),
+            (
+                "POST",
+                "/lock/renew?name=team/dev/task-cache:k&ttl=30".to_string(),
+                "/lock/renew?name=team%2Fdev%2Ftask-cache%3Ak&ttl=30".to_string(),
+            ),
+            (
+                "POST",
+                "/lock/release?name=job/task-cache:a&name=team/dev/task-cache/x:b".to_string(),
+                "/lock/release?name=team%2Fdev%2Ftask-cache%3Aa&name=team%2Fdev%2Ftask-cache%2Fx%3Ab"
+                    .to_string(),
+            ),
+        ] {
+            let (status, auth, path) = status_and_auth(proxy, method, &target, &seen).await;
+            assert_eq!(status, 200, "{method} {target}");
+            assert_eq!(auth, "Bearer vkr_build", "{method} {target}");
+            assert_eq!(path, want, "{method} {target}");
+        }
+    }
+
+    /// Outside its areas the credential goes nowhere: other repositories, the plain files'
+    /// repositories of its own areas, the registry's other APIs, and a lock request with one
+    /// name outside. Nor does it go with a request the scope does not list, whatever
+    /// repository it names: none of these reaches the registry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_credential_lent_for_areas_stays_within_them() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = fake_upstream();
+        let (proxy, _served) = proxy_on_tcp(areas_cfg(up_addr));
+        let within = |tail: &str| format!("/v2/job/task-cache/ns{tail}");
+        let mut refused: Vec<(&str, String)> = [
+            ("POST", "/v2/"),
+            ("GET", "/v2/?n=1"),
+            ("GET", "/v2/_catalog"),
+            ("GET", "/v2/other/manifests/latest"),
+            ("GET", "/v2/team/dev/manifests/latest"),
+            ("GET", "/v2/team/dev/task-cache-2/manifests/latest"),
+            ("GET", "/v2/job/other/manifests/1"),
+            ("GET", "/v2/job/task-cache"),
+            ("GET", "/v2/job/task-cache/"),
+            // The repositories behind an area's plain files are not the area's.
+            ("GET", "/v2/files/team/dev/task-cache/manifests/latest"),
+            ("PUT", "/v2/files/team/dev/task-cache/x/manifests/latest"),
+            ("POST", "/v2/files/team/dev/task-cache/blobs/uploads/"),
+            ("GET", "/v2/files/job/task-cache/manifests/latest"),
+            ("GET", "/dav/files/job/task-cache/x"),
+            ("PROPFIND", "/dav/files/team/dev/task-cache"),
+            ("PUT", "/dav/files/team/dev/task-cache/x"),
+            ("GET", "/dav/repos/team/dev/task-cache"),
+            ("POST", "/vk/manifests/exists?name=team/dev/task-cache"),
+            ("GET", "/settings/keys"),
+            ("GET", "/"),
+            ("POST", "/lock/status?name=job/task-cache:k"),
+            ("POST", "/lock/fail?name=job/task-cache:k"),
+            ("POST", "/lock/fail-status?name=job/task-cache:k"),
+            ("POST", "/lock/acquire/x?name=job/task-cache:k"),
+            ("GET", "/lock/acquire?name=job/task-cache:k"),
+            ("PUT", "/lock/release?name=job/task-cache:k"),
+            ("POST", "/lock/acquire"),
+            ("POST", "/lock/acquire?ttl=30"),
+            ("POST", "/lock/acquire?name=other:k"),
+            ("POST", "/lock/acquire?name=job/other:k"),
+            ("POST", "/lock/acquire?name=job/task-cache"),
+            ("POST", "/lock/acquire?name=job/task-cache:"),
+            ("POST", "/lock/acquire?name=team/dev:k"),
+            ("POST", "/lock/acquire?name=team/dev/task-cache-2:k"),
+            ("POST", "/lock/acquire?name=files/team/dev/task-cache:k"),
+            ("POST", "/lock/acquire?name=job/task-cache:k&name=other:k"),
+            ("POST", "/lock/acquire?name=other:k&name=job/task-cache:k"),
+            ("POST", "/lock/acquire?name=job/task-cache:k&%6eame=other:k"),
+            ("POST", "/lock/acquire?name=job/task-cache:k&NAME=other:k"),
+            ("POST", "/lock/acquire?name=job/task-cache:k&ttl=3%30"),
+            ("POST", "/lock/acquire?name=job/task-cache:k&name"),
+            // A parameter the request does not take, however plain.
+            ("POST", "/lock/acquire?name=job/task-cache:k&Name=5"),
+            ("POST", "/lock/acquire?name=job/task-cache:k&names=5"),
+            ("POST", "/lock/acquire?name=job/task-cache:k&TTL=30"),
+            ("POST", "/lock/acquire?name=job/task-cache:k&owner=5"),
+            ("POST", "/lock/renew?name=job/task-cache:k&wait=5"),
+            ("POST", "/lock/release?name=job/task-cache:k&ttl=30"),
+            ("POST", "/lock/acquire?name=job/task-cache:k&ttl=soon"),
+            ("POST", "/lock/acquire?name=job/task-cache:k&ttl=-1"),
+            ("POST", "/lock/acquire?name=job/task-cache:k&ttl=30&ttl=40"),
+            (
+                "POST",
+                "/lock/acquire?name=job/task-cache/..%2F..%2Fother:k",
+            ),
+            (
+                "POST",
+                "/lock/acquire?name=team/dev/task-cache/../../other:k",
+            ),
+        ]
+        .into_iter()
+        .map(|(method, target)| (method, target.to_string()))
+        .collect();
+        refused.extend([
+            ("GET", format!("/v2/team/dev/task-cachex/blobs/{DIGEST}")),
+            // However a registry cuts the name, it is not under the area.
+            (
+                "GET",
+                "/v2/other/blobs/team/dev/task-cache/manifests/x".to_string(),
+            ),
+            // Requests the scope does not list, in a repository of the area.
+            ("OPTIONS", within("/manifests/x")),
+            ("PROPFIND", within("/manifests/x")),
+            ("DELETE", within("/manifests/x")),
+            ("POST", within("/manifests/x")),
+            ("PATCH", within("/manifests/x")),
+            ("GET", within("/manifests/x?ns=other")),
+            ("GET", within("/manifests/")),
+            ("GET", within("/manifests/x/y")),
+            ("GET", within("/tags/list")),
+            ("GET", within("/referrers/x")),
+            ("GET", within("/blobs/sha256:aa")),
+            ("GET", within("/blobs/uploads")),
+            ("PUT", within(&format!("/blobs/{DIGEST}"))),
+            ("DELETE", within(&format!("/blobs/{DIGEST}"))),
+            ("GET", within(&format!("/blobs/{DIGEST}?x=1"))),
+            ("GET", within("/blobs/uploads/")),
+            ("GET", within("/blobs/uploads/1-2-ab")),
+            ("DELETE", within("/blobs/uploads/1-2-ab")),
+            ("POST", within("/blobs/uploads/1-2-ab")),
+            ("PATCH", within("/blobs/uploads/1-2-ab/x")),
+            ("PATCH", within("/blobs/uploads/1-2-ab?digest=x")),
+            ("PUT", within("/blobs/uploads/1-2-ab")),
+            ("PUT", within("/blobs/uploads/1-2-ab?digest=sha256:aa")),
+            (
+                "PUT",
+                within(&format!("/blobs/uploads/1-2-ab?digest={DIGEST}&from=other")),
+            ),
+            (
+                "PUT",
+                within(&format!("/blobs/uploads/1-2-ab?from=other&digest={DIGEST}")),
+            ),
+            // A mount names its source, another repository, in the query.
+            (
+                "POST",
+                within(&format!("/blobs/uploads/?mount={DIGEST}&from=other")),
+            ),
+            ("POST", within(&format!("/blobs/uploads/?mount={DIGEST}"))),
+            ("POST", within("/blobs/uploads/?from=other")),
+            ("POST", within(&format!("/blobs/uploads/?digest={DIGEST}"))),
+        ]);
+        for (method, target) in refused {
+            let (status, _, path) = status_and_auth(proxy, method, &target, &seen).await;
+            assert_eq!(status, 403, "{method} {target}");
+            assert_eq!(path, "", "{method} {target} must not be forwarded");
+        }
+        let r = reqwest::get(format!("http://{proxy}/v2/other/manifests/latest"))
+            .await
+            .unwrap();
+        assert_eq!(r.bytes().await.unwrap(), OUTSIDE_AREAS);
+    }
+
+    /// Of a guest's headers, the registry gets those the areas' requests use: none that
+    /// names another route or method to a server in between, and none the guest's
+    /// `Connection` keeps to its own connection. The credential is the proxy's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_credential_lent_for_areas_goes_with_the_headers_its_requests_use() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, took) = scripted_upstream(vec![answer(2, b"ok")]);
+        let (proxy, _served) = proxy_on_tcp(areas_cfg(up_addr));
+        let r = reqwest::Client::new()
+            .post(format!("http://{proxy}/lock/acquire?name=job/task-cache:k"))
+            .header("x-vk-lock-holder", "job 7")
+            .header("x-vk-lock-owner", "tok")
+            .header("accept-encoding", "zstd")
+            .header("content-encoding", "zstd")
+            .header("content-type", "text/plain")
+            .header("x-http-method-override", "DELETE")
+            .header("x-original-url", "/lock/status?name=other:k")
+            .header("x-forwarded-host", "evil.example")
+            .header("x-vk-lock-pipeline", "9")
+            .header("forwarded", "host=evil.example")
+            .header("connection", "x-vk-lock-owner, keep-alive")
+            .header("authorization", "Bearer guest-forged")
+            .body("held")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let took = took.lock().unwrap();
+        let head = &took[0].0;
+        assert!(head.starts_with("post /lock/acquire?name="), "{head}");
+        let mut names: Vec<&str> = head
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_once(':'))
+            .map(|(name, _)| name)
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "accept",
+                "accept-encoding",
+                "authorization",
+                "content-encoding",
+                "content-type",
+                "host",
+                "transfer-encoding",
+                "x-vk-lock-holder",
+            ],
+            "{head}"
+        );
+        assert!(
+            head.contains("authorization: bearer vkr_build\r\n"),
+            "{head}"
+        );
+        assert_eq!(took[0].1, b"held");
+    }
+
+    /// No spelling of a target leaves the areas: `..` and its escapes resolve before the
+    /// check, an escaped separator or any other escape left in an OCI path is refused, the
+    /// target names no other authority, and a query lets no path outside through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_raw_target_does_not_leave_the_areas() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = fake_upstream();
+        let (proxy, _served) = proxy_on_tcp(areas_cfg(up_addr));
+        for (method, target) in [
+            ("GET", "/v2/job/task-cache/../../other/manifests/x"),
+            ("GET", "/v2/job/task-cache/%2e%2e/%2E%2e/other/manifests/x"),
+            ("GET", "/v2/team/dev/task-cache/../other/manifests/x"),
+            ("GET", "/v2/team/dev/task-cache/..%2Fother/manifests/x"),
+            ("GET", "/v2/team/dev/task-cache/..%5Cother/manifests/x"),
+            ("GET", "/v2/job/task-cache%2Fx/manifests/y"),
+            ("GET", "/v2/team/dev/task-cache/manifests/a%3Fb"),
+            ("GET", "/v2/team/dev/task-cach%65/manifests/x"),
+            ("GET", "/v2/team/dev/task-cache/x/blobs/%252e%252e"),
+            ("GET", "//evil.example/v2/job/task-cache/manifests/x"),
+            ("GET", "/v2//team/dev/task-cache/manifests/x"),
+            ("GET", "/v2/job//task-cache/manifests/x"),
+            (
+                "GET",
+                "/v2/other/manifests/x?/v2/job/task-cache/manifests/x",
+            ),
+            ("GET", "/v2/other/manifests/x?name=job/task-cache:k"),
+            (
+                "POST",
+                "/v2/job/task-cache/../../../lock/status?name=job/task-cache:k",
+            ),
+            ("POST", "/lock/acquire/../status?name=job/task-cache:k"),
+            ("POST", "/lock/../vk/manifests/exists?name=job/task-cache"),
+            ("POST", "/lock/%2e%2e/dav/files/job/task-cache/x"),
+            ("POST", "/lock/acquire%3Fname=job/task-cache:k"),
+            ("POST", "/lock/acquire?name=job/task-cache:k&name=%6fther:k"),
+        ] {
+            assert_eq!(raw_status(proxy, method, target).await, 403, "{target}");
+            assert_eq!(seen.lock().unwrap().1, "", "{target} must not be forwarded");
+        }
+        // A `..` that stays within the areas is the path it resolves to.
+        let target = "/v2/job/task-cache/a/../b/manifests/x";
+        assert_eq!(raw_status(proxy, "GET", target).await, 200);
+        assert_eq!(
+            seen.lock().unwrap().1,
+            "/v2/team/dev/task-cache/b/manifests/x"
+        );
+    }
+
+    #[test]
+    fn an_oci_path_names_its_shortest_repository() {
+        for (rest, want) in [
+            ("a/b/manifests/latest", Some(("a/b", "manifests/latest"))),
+            ("a/b/blobs/sha256:aa", Some(("a/b", "blobs/sha256:aa"))),
+            ("a/b/blobs/uploads/", Some(("a/b", "blobs/uploads/"))),
+            ("a/b/tags/list", Some(("a/b", "tags/list"))),
+            ("a/blobs/b/manifests/x", Some(("a", "blobs/b/manifests/x"))),
+            (
+                "a/manifests/b/blobs/uploads/c",
+                Some(("a", "manifests/b/blobs/uploads/c")),
+            ),
+            ("/manifests/x", Some(("", "manifests/x"))),
+            ("a/b", None),
+            ("a/b/manifests", None),
+            ("_catalog", None),
+            ("a/b/manifests/x%2e", None),
+            ("a%2eb/manifests/x", None),
+        ] {
+            assert_eq!(oci_repository(rest), want, "{rest}");
+        }
+    }
+
+    /// A lock request's query is written again from its checked pairs, or refused whole.
+    #[test]
+    fn a_lock_query_is_rebuilt_from_what_was_checked() {
+        let areas = [area("task-cache", "team/dev/task-cache")];
+        let q = |query: &str| area_lock_query(&areas, &["ttl", "wait"], query);
+        assert_eq!(
+            q("name=team%2Fdev%2Ftask-cache%2Fns%3Ak&ttl=30&wait=0").as_deref(),
+            Some("name=team%2Fdev%2Ftask-cache%2Fns%3Ak&ttl=30&wait=0")
+        );
+        assert_eq!(
+            q("ttl=30&&name=team/dev/task-cache:a+b").as_deref(),
+            Some("ttl=30&name=team%2Fdev%2Ftask-cache%3Aa%20b")
+        );
+        // What another parser would split is one name here, and one name upstream.
+        assert_eq!(
+            q("name=team/dev/task-cache:k;name=other:k").as_deref(),
+            Some("name=team%2Fdev%2Ftask-cache%3Ak%3Bname%3Dother%3Ak")
+        );
+        assert_eq!(
+            q("name=team/dev/task-cache:k%26name%3Dother:k").as_deref(),
+            Some("name=team%2Fdev%2Ftask-cache%3Ak%26name%3Dother%3Ak")
+        );
+        for refused in [
+            "",
+            "ttl=30",
+            "name=",
+            "name=other:k",
+            "name=team/dev/task-cache",
+            "name=team/dev/task-cache:k&name=other:k",
+            "name=other:k&name=team/dev/task-cache:k",
+            "name=team/dev/task-cache:k&%6eame=other:k",
+            "name=team/dev/task-cache:k&Name=other:k",
+            "name=team/dev/task-cache:k&x=a%26name%3Dother:k",
+            "name=team/dev/task-cache:k&x=a+b",
+            "name=team/dev/task-cache:k&ttl",
+            "name=team%2Fdev%2Ftask-cache%2F..%2F..%2Fother:k",
+            "name=Team/dev/task-cache:k",
+            "name=files/team/dev/task-cache:k",
+            // A key the request does not take, though nothing in it needs decoding.
+            "name=team/dev/task-cache:k&Name=5",
+            "name=team/dev/task-cache:k&NAME=5",
+            "name=team/dev/task-cache:k&names=5",
+            "name=team/dev/task-cache:k&x=1",
+            "name=team/dev/task-cache:k&Ttl=30",
+            "name=team/dev/task-cache:k&ttl=",
+            "name=team/dev/task-cache:k&ttl=soon",
+            "name=team/dev/task-cache:k&ttl=+5",
+            "name=team/dev/task-cache:k&ttl=-5",
+            "name=team/dev/task-cache:k&ttl=1.5",
+            "name=team/dev/task-cache:k&ttl=99999999999999999999",
+            "name=team/dev/task-cache:k&ttl=30&ttl=30",
+        ] {
+            assert_eq!(q(refused), None, "{refused}");
+        }
+        // Each request takes its own parameters.
+        let renew = |query: &str| area_lock_query(&areas, &["ttl"], query);
+        assert!(renew("name=team/dev/task-cache:k&ttl=30").is_some());
+        assert_eq!(renew("name=team/dev/task-cache:k&wait=5"), None);
+        let release = |query: &str| area_lock_query(&areas, &[], query);
+        assert!(release("name=team/dev/task-cache:k").is_some());
+        assert_eq!(release("name=team/dev/task-cache:k&ttl=30"), None);
+    }
+
+    /// An area the proxy could not map, or whose prefix the registry serves no repository
+    /// under, fails the construction: the credential would be lent for something other than
+    /// what was asked.
+    #[test]
+    fn an_unusable_area_fails_at_construction() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cfg = |areas: &[Area]| {
+            ProxyCfg::for_areas("http://reg.example:5000", Creds::anonymous(), areas)
+        };
+        let deep = ["a"; 17].join("/");
+        for bad in [
+            area("task/cache", "dev/task-cache"),
+            area("task-cache", "Dev/task-cache"),
+            area("task-cache", "dev/../x"),
+            area("task-cache", ""),
+            area("task-cache", "job/task-cache"),
+            area("task-cache", "files/dev/task-cache"),
+            area("task-cache", "dev/blobs"),
+            area("task-cache", "manifests/dev"),
+            area("task-cache", "dev/tags/task-cache"),
+            area("task-cache", &deep),
+        ] {
+            assert!(cfg(std::slice::from_ref(&bad)).is_err(), "{bad:?}");
+        }
+        assert!(cfg(&[area("a", "p"), area("a", "q")]).is_err());
+        assert!(cfg(&[area("a", &deep[..31])]).is_ok());
+        let ok = cfg(&[area("a", "p/x"), area("b", "q")]).unwrap();
+        assert_eq!(ok.areas, [area("a", "p/x"), area("b", "q")]);
+        // With no area, only the ping.
+        let none = cfg(&[]).unwrap();
+        let url = |t: &str| upstream_url(&none, t).unwrap();
+        assert!(confined(&none, &Method::GET, &url("/v2/")).is_some());
+        assert!(confined(&none, &Method::GET, &url("/v2/a/manifests/x")).is_none());
+    }
+
+    /// The areas a credential is lent for are those it was built with: a job's areas do not
+    /// replace them.
+    #[test]
+    fn a_credential_lent_for_areas_keeps_them() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cfg = areas_cfg("127.0.0.1:1".parse().unwrap()).with_areas(&[area("other", "other")]);
+        assert_eq!(cfg.areas, [area("task-cache", "team/dev/task-cache")]);
+        let url = |t: &str| upstream_url(&cfg, t).unwrap();
+        assert!(confined(&cfg, &Method::GET, &url("/v2/other/manifests/x")).is_none());
+        let inside = url("/v2/team/dev/task-cache/manifests/x");
+        assert!(confined(&cfg, &Method::GET, &inside).is_some());
+    }
+
+    /// A redirect goes back to the guest as the registry sent it: the proxy sends nothing
+    /// where it points.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_credential_lent_for_areas_follows_no_redirect() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let redirect =
+            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /lock/status?name=other:k\r\n\
+                         Content-Length: 0\r\nConnection: close\r\n\r\n";
+        let (up_addr, took) = scripted_upstream(vec![Act::Write(redirect.to_vec())]);
+        let (proxy, _served) = proxy_on_tcp(areas_cfg(up_addr));
+        let guest = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let r = guest
+            .get(format!(
+                "http://{proxy}/v2/job/task-cache/ns/blobs/{DIGEST}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 307);
+        assert_eq!(r.headers()["location"], "/lock/status?name=other:k");
+        let took = took.lock().unwrap();
+        assert_eq!(took.len(), 1, "the redirect is not followed");
+        let forwarded = format!("get /v2/team/dev/task-cache/ns/blobs/{DIGEST} ");
+        assert!(took[0].0.starts_with(&forwarded));
+    }
+
+    /// A vk-registry over a store of its own, gated by a bearer token. Dropping it stops the
+    /// server and removes the store.
+    struct LocalRegistry {
+        addr: SocketAddr,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        _dir: crate::testtmp::Scratch,
+    }
+
+    impl Drop for LocalRegistry {
+        fn drop(&mut self) {
+            drop(self.stop.take());
+            let ended = self.thread.take().unwrap().join();
+            if !std::thread::panicking() {
+                ended.unwrap();
+            }
+        }
+    }
+
+    /// A [`LocalRegistry`] gated by `token`, its store in a new private directory `name`.
+    fn local_registry(name: &str, token: &str) -> LocalRegistry {
+        let dir = crate::testtmp::Scratch::dir(name);
+        let token_file = dir.join("token");
+        std::fs::write(&token_file, token).unwrap();
+        let mut cfg =
+            vk_registry::ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("store"));
+        cfg.token_file = Some(token_file);
+        let state = Arc::new(cfg.into_state().expect("a local config starts"));
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            // Dropping the runtime ends the connections still open.
+            rt.block_on(async move {
+                let listener = TcpListener::from_std(listener).unwrap();
+                tokio::select! {
+                    _ = stopped => {}
+                    served = vk_registry::serve_on(listener, state) => served.unwrap(),
+                }
+            });
+        });
+        LocalRegistry {
+            addr,
+            stop: Some(stop),
+            thread: Some(thread),
+            _dir: dir,
+        }
+    }
+
+    /// The requests a task cache makes (task v4.14.0's), against a real registry: the ping,
+    /// a chunk probed, pushed as a zstd frame and pulled as one, a manifest by tag, and a
+    /// lock taken, renewed and released, with no credential of the guest's own. All name the
+    /// alias but the upload's end, which goes to the `Location` the registry gave.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_task_cache_works_through_its_area() {
+        use sha2::Digest;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let served = local_registry("regproxy-task-cache", "s3cret");
+        let registry = served.addr;
+        let cfg = ProxyCfg::for_areas(
+            &format!("http://{registry}"),
+            Creds {
+                token: Some("s3cret".to_string()),
+                ..Creds::anonymous()
+            },
+            &[area("task-cache", "dev/task-cache")],
+        )
+        .unwrap();
+        let (proxy, _served) = proxy_on_tcp(cfg);
+        let base = format!("http://{proxy}");
+        let guest = reqwest::Client::new();
+        // Asked directly, the registry wants the credential.
+        let direct = guest
+            .get(format!(
+                "http://{registry}/v2/dev/task-cache/ns/manifests/key"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(direct.status().as_u16(), 401);
+
+        let ping = guest.get(format!("{base}/v2/")).send().await.unwrap();
+        assert_eq!(ping.status().as_u16(), 200);
+        assert_eq!(ping.headers()[vk_registry::TRANSPARENT_ZSTD_HEADER], "1");
+
+        // A chunk, named by the digest of its bytes and sent as a zstd frame.
+        let chunk = b"a task's output ".repeat(256);
+        let digest: String = sha2::Sha256::digest(&chunk)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let digest = format!("sha256:{digest}");
+        let frame = zstd::encode_all(&chunk[..], 3).unwrap();
+        let blob = format!("{base}/v2/job/task-cache/ns/blobs/{digest}");
+        let probe = guest.head(&blob).send().await.unwrap();
+        assert_eq!(probe.status().as_u16(), 404);
+        let started = guest
+            .post(format!("{base}/v2/job/task-cache/ns/blobs/uploads/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(started.status().as_u16(), 202);
+        // The registry answers with the real name, which the proxy takes too.
+        let location = started.headers()["location"].to_str().unwrap().to_string();
+        assert!(
+            location.starts_with("/v2/dev/task-cache/ns/blobs/uploads/"),
+            "{location}"
+        );
+        let pushed = guest
+            .put(format!("{base}{location}"))
+            .query(&[("digest", &digest)])
+            .header("content-encoding", "zstd")
+            .body(frame.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pushed.status().as_u16(), 201);
+        assert_eq!(guest.head(&blob).send().await.unwrap().status(), 200);
+        let pulled = guest
+            .get(&blob)
+            .header("accept-encoding", "zstd")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pulled.status().as_u16(), 200);
+        assert_eq!(pulled.headers()["content-encoding"], "zstd");
+        assert_eq!(pulled.bytes().await.unwrap(), frame);
+        let plain = guest.get(&blob).send().await.unwrap();
+        assert!(!plain.headers().contains_key("content-encoding"));
+        assert_eq!(plain.bytes().await.unwrap(), chunk);
+
+        const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": MANIFEST,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": digest, "size": chunk.len(),
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                "digest": digest, "size": chunk.len(),
+            }],
+        })
+        .to_string();
+        let tag = format!("{base}/v2/job/task-cache/ns/manifests/key");
+        assert_eq!(guest.get(&tag).send().await.unwrap().status(), 404);
+        let put = guest
+            .put(&tag)
+            .header("content-type", MANIFEST)
+            .body(manifest.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status().as_u16(), 201);
+        let got = guest.get(&tag).send().await.unwrap();
+        assert_eq!(got.status().as_u16(), 200);
+        assert_eq!(got.text().await.unwrap(), manifest);
+
+        let lock = |action: &str, pairs: &[(&str, &str)]| {
+            guest
+                .post(format!("{base}/lock/{action}"))
+                .query(&[("name", "job/task-cache/ns:key")])
+                .query(pairs)
+        };
+        let acquire = || {
+            lock("acquire", &[("ttl", "30"), ("wait", "0")])
+                .header("x-vk-lock-holder", "a guest")
+                .send()
+        };
+        let taken = acquire().await.unwrap();
+        assert_eq!(taken.status().as_u16(), 200);
+        let taken: serde_json::Value = taken.json().await.unwrap();
+        assert_eq!(taken["names"], serde_json::json!(["dev/task-cache/ns:key"]));
+        let owner = taken["owner"].as_str().unwrap().to_string();
+        assert_eq!(acquire().await.unwrap().status().as_u16(), 409);
+        let renewed = lock("renew", &[("ttl", "30")])
+            .header("x-vk-lock-owner", &owner)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(renewed.status().as_u16(), 200);
+        let released = lock("release", &[])
+            .header("x-vk-lock-owner", &owner)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(released.status().as_u16(), 200);
+        assert_eq!(acquire().await.unwrap().status().as_u16(), 200);
+
+        // Under any other name the proxy refuses the same requests.
+        for (method, target) in [
+            (reqwest::Method::GET, "/v2/other/manifests/key".to_string()),
+            (reqwest::Method::GET, format!("/v2/other/blobs/{digest}")),
+            (
+                reqwest::Method::POST,
+                "/lock/status?name=job/task-cache/ns:key".into(),
+            ),
+            (reqwest::Method::POST, "/lock/acquire?name=other:key".into()),
+            (reqwest::Method::GET, "/dav/files/dev/task-cache/".into()),
+        ] {
+            let r = guest
+                .request(method.clone(), format!("{base}{target}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 403, "{method} {target}");
+        }
     }
 }
