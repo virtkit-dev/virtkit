@@ -731,7 +731,10 @@ though within them it can claim protection.
 - **In-job tools.** task-rs takes `vk: http://registry.vk/job/task-cache` as its cache:
   entries under the alias and lock names `job/task-cache/<namespace>:<key>`. sccache uses
   `$VK_REGISTRY/dav/files/job/<alias>` as its WebDAV endpoint (the alias in the endpoint, not
-  in `key_prefix`, so it never creates `/dav/files/job/` itself). Neither holds a credential.
+  in `key_prefix`, so it never creates `/dav/files/job/` itself), or the same files over S3:
+  `SCCACHE_ENDPOINT=$VK_REGISTRY/s3 SCCACHE_BUCKET=job SCCACHE_S3_KEY_PREFIX=<alias>
+  SCCACHE_REGION=auto SCCACHE_S3_NO_CREDENTIALS=true` (sccache needs a region, any will do).
+  Neither holds a credential.
 - **Build caches.** A job's builds cache per project, protection and scope in `ci-build`, and
   a namespace may give chosen refs a scope of their own: see the
   [build caches design](build-cache-design.md).
@@ -861,8 +864,8 @@ secret can go.
   "job-or-node"`, which the hub names to every node taking tokens of its own (`"job"` to older
   ones): a placed job's guest gets the job's token only, none or expired refused; a
   gitlab-runner job's guest gets the guest token through `registry.vk`, on the paths a job's
-  token reaches (`/v2/`, `/lock/`, `/dav/files/`), read again for each request so a renewal
-  reaches a running job, and a proxy refusing everything while the node holds none. `"job"`
+  token reaches (`/v2/`, `/lock/`, `/dav/files/`, `/s3/`), read again for each request so a
+  renewal reaches a running job, and a proxy refusing everything while the node holds none. `"job"`
   keeps refusing a job without a token. Removing the node revokes both.
 
   ```sh

@@ -1017,6 +1017,9 @@ SCCACHE_BUCKET=cache SCCACHE_ENDPOINT=https://<registry>/s3 SCCACHE_REGION=auto 
 
 The endpoint supports object reads and single-request writes. See `vk-registry/DESIGN.md`.
 Treat the access key ID as a secret. S3 clients may log it (`SCCACHE_LOG=debug`).
+In a CI job, the guest registry proxy supplies the token. Use
+`SCCACHE_ENDPOINT=$VK_REGISTRY/s3`, `SCCACHE_REGION=auto` and
+`SCCACHE_S3_NO_CREDENTIALS=true` instead of AWS keys.
 
 `vk registry put [--dir <dir>] [--ttl 7d | --keep] <file>...` stores files there, each once by
 digest (`/dav/files/sha256/<hex>`) and, with `--dir`, by name (`/dav/files/<dir>/<name>`), and

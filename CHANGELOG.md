@@ -14,6 +14,10 @@ All notable changes to virtkit will be documented in this file.
   the same objects as `/dav/files/<bucket>/<key>`. Writes use a single request. Listings,
   multipart and bucket operations return `NotImplemented`. S3 defaults on even with
   `webdav = false`. Set `s3 = false` to disable it.
+- **CI jobs can use sccache's S3 backend through `registry.vk`.** The proxy supplies the
+  job token and resolves `job/<alias>` as it does for WebDAV. Set
+  `SCCACHE_ENDPOINT=$VK_REGISTRY/s3`, `SCCACHE_REGION=auto` and
+  `SCCACHE_S3_NO_CREDENTIALS=true`.
 
 ### Changed
 

@@ -14,8 +14,8 @@
 #    With them, outside any placed job: a build from a private base on the registry writing
 #    its cache there, `vk registry pull` of a bundle, and jobs given as gitlab-runner gives
 #    them, booting a Docker image through the relay and a `virtkit/` bundle, whose guests get
-#    the guests' grants only. A prefix next to a granted one is refused. Removing the node makes
-#    the registry refuse its tokens.
+#    the guests' grants only, over OCI and over the S3 view. A prefix next to a granted one is
+#    refused. Removing the node makes the registry refuse its tokens.
 #
 # Run:  VK=./dist/vk tests/fleet-registry-e2e.sh
 # Needs: a `vk` with an embedded kernel/agent and the `vk-hub` and `vk-registry` beside it (or
@@ -233,6 +233,10 @@ for tag in 1 2; do
 done
 host_vk kvm registry pull e2e-bundle:1 >"$FLEET/pull.log" 2>&1 ||
   { cat "$FLEET/pull.log"; fail "vk registry pull failed with the node's token"; }
+# A plain file the guests may read, for sccache's S3 view below.
+code=$(reg_code /dav/files/e2e-bundle/s3/probe -X PUT --data-binary s3-probe \
+  -H "$(bearer "$(cat "$FLEET/admin/token")")")
+[ "$code" = 201 ] || fail "the operator could not write a plain file ($code)"
 
 echo "== jobs gitlab-runner gives the node: images with its token, guests with theirs =="
 mkdir -p "$FLEET/gl"
@@ -241,6 +245,7 @@ cat >"$FLEET/gl/stage.sh" <<'EOF'
 code() { wget -S -q -O /dev/null "http://registry.vk$1" 2>&1 | awk '/^ *HTTP\//{c=$2} END{print c}'; }
 echo "guest-bundles=$(code /v2/e2e-bundle/tags/list)"
 echo "guest-docker=$(code /v2/docker.io/library/alpine/manifests/3.21)"
+echo "guest-s3=$(code /s3/e2e-bundle/s3/probe) $(code /s3/e2e-bundle/s3/missing) $(code /s3/build-cache/x)"
 cat /etc/e2e 2>/dev/null || true
 ) </dev/null
 EOF
@@ -273,6 +278,10 @@ grep -q 'guest-bundles=200' "$FLEET/gl/run-1.log" ||
   fail "the guest could not read what guests are granted"
 grep -q 'guest-docker=403' "$FLEET/gl/run-1.log" ||
   fail "the guest reached what only its node is granted"
+# With the guest token, S3 returns 200 for the seeded file, 404 for a missing file in the
+# same prefix and 403 for a prefix only the node can read.
+grep -q 'guest-s3=200 404 403' "$FLEET/gl/run-1.log" ||
+  fail "the guest's S3 view does not follow its grants"
 # A `virtkit/` bundle.
 runner_job 2 virtkit/e2e-bundle:2
 grep -q built-from-a-private-base "$FLEET/gl/run-2.log" || fail "the job did not boot the bundle"

@@ -25,13 +25,14 @@
 //! What the proxy lends decides what it forwards ([`Scope`]). The node's own credential is
 //! not scoped, so it reaches the OCI API only (`/v2/`). A job's registry token, which the hub
 //! scoped to the job's namespaces (`[registry] guest_credential = "job"`), also reaches the
-//! lock API (`/lock/`) and plain files (`/dav/files/`): the registry enforces the token's
-//! grants on each. A job meant to have a token and given none gets a proxy that forwards
+//! lock API (`/lock/`) and plain files, as WebDAV (`/dav/files/`) and as S3 (`/s3/`, for
+//! sccache with `SCCACHE_S3_NO_CREDENTIALS=true`): the registry enforces the token's grants on
+//! each. A job meant to have a token and given none gets a proxy that forwards
 //! nothing. A job no hub placed, under `guest_credential = "job-or-node"`, gets the token the
 //! hub gives the node for its runner's guests on the same paths, read again for each request so
 //! a renewal reaches a running job; while the node holds none, the proxy forwards nothing.
 //!
-//! A job's token may come with areas ([`Area`]): `job/<alias>` in an OCI or plain-file path, or
+//! A job's token may come with areas ([`Area`]): `job/<alias>` in an OCI, WebDAV or S3 path, or
 //! before the `:` of a lock name, stands for the area's prefix, so a guest names a fixed path
 //! whatever its project or protection. No other query parameter is mapped, an OCI mount's
 //! `from=` among them. Only requests are rewritten: the registry answers with the real names
@@ -73,12 +74,16 @@ const DAV_FILES_METHODS: &[&str] = &[
     "GET", "HEAD", "PROPFIND", "PUT", "MKCOL", "DELETE", "OPTIONS",
 ];
 
+/// `/s3/<bucket>/<key>` serves the same file as `/dav/files/<bucket>/<key>`.
+/// Forward every method so the registry can return S3 errors for unsupported operations.
+const S3: &str = "/s3/";
+
 /// Which of the registry's paths the proxy forwards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     /// The OCI API only, `/v2/`: what an unscoped credential may be lent for.
     Oci,
-    /// `/v2/`, `/lock/` and `/dav/files/`: a job token's, whose grants the registry enforces.
+    /// A job token reaches `/v2/`, `/lock/`, `/dav/files/` and `/s3/` under its registry grants.
     Job,
     /// Nothing: a job that should have had a token and has none.
     Deny,
@@ -89,7 +94,7 @@ impl Scope {
     fn paths(self) -> &'static [&'static str] {
         match self {
             Scope::Oci => &["/v2/"],
-            Scope::Job => &["/v2/", "/lock/", DAV_FILES],
+            Scope::Job => &["/v2/", "/lock/", DAV_FILES, S3],
             Scope::Deny => &[],
         }
     }
@@ -368,7 +373,7 @@ enum Mapped<'a> {
 }
 
 /// `url` (an accepted upstream URL) under `cfg`'s areas: `job/<alias>` at the start of an
-/// OCI or plain-file path, or of a lock name's path part, becomes the area's prefix.
+/// OCI, WebDAV or S3 path, or of a lock name's path part, becomes the area's prefix.
 fn map_aliases<'a>(cfg: &'a ProxyCfg, url: &reqwest::Url) -> Mapped<'a> {
     if cfg.scope != Scope::Job {
         return Mapped::Unchanged;
@@ -384,7 +389,7 @@ fn map_aliases<'a>(cfg: &'a ProxyCfg, url: &reqwest::Url) -> Mapped<'a> {
             Err(()) => Mapped::Unknown,
         };
     }
-    for base in ["/v2/", DAV_FILES] {
+    for base in ["/v2/", DAV_FILES, S3] {
         let Some(rest) = path.strip_prefix(base) else {
             continue;
         };
@@ -565,7 +570,7 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     let Some(url) = upstream_url(cfg, &path_and_query) else {
         return Ok(forbidden(match cfg.scope {
             Scope::Oci => b"registry proxy: only /v2/ registry paths are proxied",
-            Scope::Job => b"registry proxy: only /v2/, /lock/ and /dav/files/ are proxied",
+            Scope::Job => b"registry proxy: only /v2/, /lock/, /dav/files/ and /s3/ are proxied",
             Scope::Deny => b"registry proxy: this job has no registry credential",
         }));
     };
@@ -762,6 +767,7 @@ fn repeatable(method: &Method, path: &str) -> bool {
         "PUT" => {
             oci.is_some_and(|p| p.rsplit('/').nth(1) == Some("manifests"))
                 || path.starts_with(DAV_FILES)
+                || path.starts_with(S3)
         }
         "POST" => oci.is_some_and(|p| p.ends_with("/blobs/uploads/")),
         _ => false,
@@ -1276,8 +1282,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A job's token reaches the lock API and plain files as well as `/v2/`, injected in
-    /// place of whatever the guest sent; the section's own credential is never read.
+    /// OCI, lock, WebDAV and S3 requests use the job token in place of guest credentials.
+    /// The proxy never reads the registry section's credential.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_job_token_reaches_locks_and_files_too() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1290,6 +1296,10 @@ mod tests {
             ("POST", "/lock/acquire?name=p/gl/42:k"),
             ("PROPFIND", "/dav/files/p/gl/42/x"),
             ("PUT", "/dav/files/p/gl/42/x"),
+            ("GET", "/s3/p/gl/42/x"),
+            ("HEAD", "/s3/p/gl/42/x"),
+            ("PUT", "/s3/p/gl/42/x"),
+            ("DELETE", "/s3/p/gl/42/x"),
         ] {
             let (status, auth, path) = status_and_auth(proxy, method, target, &seen).await;
             assert_eq!(status, 200, "{method} {target}");
@@ -1301,6 +1311,11 @@ mod tests {
             "/settings/keys",
             "/dav/files/../../settings/keys",
             "/dav/files/%2e%2e/%2e%2e/browse",
+            "/s3",
+            "/s3?list-type=2",
+            "/s3/../settings/keys",
+            "/s3/p/%2e%2e/%2e%2e/browse",
+            "/s3/p%2F..%2F..%2Fbrowse",
         ] {
             let (status, _, path) = status_and_auth(proxy, "GET", target, &seen).await;
             assert_eq!(status, 403, "{target}");
@@ -1347,6 +1362,11 @@ mod tests {
                 "/dav/files/task-cache/gl/42/protected",
             ),
             (
+                "PUT",
+                "/s3/job/task-cache/a/b",
+                "/s3/task-cache/gl/42/protected/a/b",
+            ),
+            (
                 "POST",
                 "/lock/acquire?name=job%2Ftask-cache%3Ak&ttl=30",
                 "/lock/acquire?name=task-cache%2Fgl%2F42%2Fprotected%3Ak&ttl=30",
@@ -1368,6 +1388,7 @@ mod tests {
             "/v2/job/manifests/1",
             "/v2/job",
             "/dav/files/job/",
+            "/s3/job/other/k",
             "/lock/acquire?name=job/other:k",
             "/lock/acquire?name=job:k",
         ] {
@@ -1567,6 +1588,7 @@ mod tests {
         assert!(prefixed("/v2/../admin").is_none());
         // The node's credential reaches neither the locks nor the files.
         assert_eq!(ok("/dav/files/x"), None);
+        assert_eq!(ok("/s3/b/x"), None);
         // A job token's paths are checked once resolved as well, each against its own.
         let mut job = cfg("http://reg.example:5000");
         job.scope = Scope::Job;
@@ -1574,6 +1596,7 @@ mod tests {
         for fine in [
             "/lock/acquire?name=p:k",
             "/dav/files/p/x",
+            "/s3/p/x",
             "/v2/p/tags/list",
         ] {
             assert!(ok(fine).is_some(), "{fine}");
@@ -1584,6 +1607,8 @@ mod tests {
             "/v2/../dav/repos/x",
             "/dav/files/../../x",
             "/dav/files/../repos/x",
+            "/s3/../dav/repos/x",
+            "/s3/p/..%2f..%2fx",
             "/lock/%2e%2e/browse",
         ] {
             assert_eq!(ok(escape), None, "{escape}");
@@ -1918,6 +1943,8 @@ mod tests {
         assert!(repeatable(&put, "/v2/app/manifests/latest"));
         assert!(repeatable(&put, "/v2/team/app/manifests/sha256:ab"));
         assert!(repeatable(&put, "/dav/files/p/x"));
+        assert!(repeatable(&put, "/s3/p/x"));
+        assert!(!repeatable(&Method::DELETE, "/s3/p/x"));
         assert!(repeatable(&post, "/v2/app/blobs/uploads/"));
         assert!(!repeatable(&put, "/v2/app/blobs/uploads/u1"));
         assert!(!repeatable(&Method::PATCH, "/v2/app/blobs/uploads/u1"));
@@ -2101,5 +2128,17 @@ mod tests {
             assert!(err.contains("--ca"), "{upstream}: {err}");
         }
         assert!(ProxyCfg::from_parts("http://reg.example:5000", insecure).is_ok());
+    }
+
+    /// Drop guest authentication headers and cookies. Forward the S3 date, payload hash
+    /// and content type.
+    #[test]
+    fn credentials_are_dropped_and_s3_headers_kept() {
+        for name in ["authorization", "proxy-authorization", "cookie"] {
+            assert!(is_skipped(name), "{name}");
+        }
+        for name in ["x-amz-date", "x-amz-content-sha256", "content-type"] {
+            assert!(!is_skipped(name), "{name}");
+        }
     }
 }
