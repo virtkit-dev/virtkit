@@ -474,6 +474,7 @@ impl ServerConfig {
             tls,
             mode,
             webdav: self.webdav,
+            s3: self.s3,
             upstreams,
             max_connections: self.max_connections,
             settings: self.hub.clone(),
@@ -1879,8 +1880,10 @@ mod tests {
         assert!(!load("s3 = false\n").s3);
         let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), "/s".into());
         assert_eq!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
+        assert!(cfg.hub_facts().s3, "the hub is told");
         cfg.s3 = false;
         assert_ne!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
+        assert!(!cfg.hub_facts().s3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

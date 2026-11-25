@@ -4305,6 +4305,7 @@ fn render_registry(
         );
         field("store", i.store.clone());
         field("webdav", i.webdav.to_string());
+        field("s3", i.s3.to_string());
         field(
             "the hub may",
             if i.allow.is_empty() {

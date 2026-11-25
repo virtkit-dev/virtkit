@@ -219,6 +219,7 @@ pub struct Facts {
     pub tls: bool,
     pub mode: &'static str,
     pub webdav: bool,
+    pub s3: bool,
     pub upstreams: Vec<String>,
     pub max_connections: usize,
     pub settings: HubSettings,
@@ -813,6 +814,7 @@ impl Link {
             tokens: self.ctx.settings.tokens,
             revokes_subjects: true,
             files_put: true,
+            s3: self.ctx.s3,
         }
     }
 
@@ -1433,6 +1435,7 @@ mod tests {
             tls: false,
             mode: "shared-secret",
             webdav: false,
+            s3: false,
             upstreams: Vec::new(),
             max_connections: 1,
             settings,

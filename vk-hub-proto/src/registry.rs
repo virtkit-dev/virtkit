@@ -165,6 +165,10 @@ pub struct Inventory {
     /// Whether it takes files streamed to [`FILES_PATH`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub files_put: bool,
+    /// Whether the registry serves its plain files to sccache under `/s3/`.
+    /// The hub reads this as false when an older registry omits the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub s3: bool,
 }
 
 impl Inventory {
@@ -501,6 +505,7 @@ mod tests {
                 tokens: false,
                 revokes_subjects: false,
                 files_put: false,
+                s3: false,
             }),
             r#"{"type":"inventory","hostname":"h","version":"0.89.0","sha256":"s","listen":"0.0.0.0:5000","tls":true,"mode":"accounts","webdav":false,"upstreams":["docker.io"],"store":"/srv","store_size_bytes":100,"config_hash":"c","allow":["gc"],"requires_signed":true}"#,
         );
@@ -543,6 +548,20 @@ mod tests {
                 ..Inventory::default()
             }),
             r#"{"type":"inventory","hostname":"h","version":"0.109.0","listen":"l","tls":false,"mode":"accounts","webdav":false,"store":"/srv","store_size_bytes":0,"config_hash":"c","requires_signed":false,"files_put":true}"#,
+        );
+        pinned(
+            &RegistryMsg::Inventory(Inventory {
+                hostname: "h".into(),
+                version: "0.117.0".into(),
+                listen: "l".into(),
+                mode: "accounts".into(),
+                store: "/srv".into(),
+                config_hash: "c".into(),
+                files_put: true,
+                s3: true,
+                ..Inventory::default()
+            }),
+            r#"{"type":"inventory","hostname":"h","version":"0.117.0","listen":"l","tls":false,"mode":"accounts","webdav":false,"store":"/srv","store_size_bytes":0,"config_hash":"c","requires_signed":false,"files_put":true,"s3":true}"#,
         );
         pinned(
             &RegistryMsg::Heartbeat(Heartbeat {

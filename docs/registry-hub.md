@@ -84,9 +84,10 @@ has no jobs, runner or admission.
 
 **Registry → hub**
 
-- inventory, when it changes: version, listen address and TLS, mode, WebDAV, upstreams, store
-  filesystem and size, a hash of its effective config, what `[hub] allow` lists and whether
-  updates must be signed; later, as an optional field, TLS certificate expiry;
+- inventory, when it changes: version, listen address and TLS, mode, WebDAV, the S3 view,
+  upstreams, store filesystem and size, a hash of its effective config, what `[hub] allow`
+  lists and whether updates must be signed; later, as an optional field, TLS certificate
+  expiry;
 - a report, when it changes: the desired state it applied and what it refused, its gc
   schedule and last gc, the update under way;
 - a heartbeat every few seconds: connections against `max_connections`, uploads in flight,
@@ -360,13 +361,13 @@ TLS connection), then speaks `vk_hub_proto::registry`'s messages, version 1. `vk
 hub no longer knows stops dialing and says to `leave` and `join` again.
 
 **Monitoring.** The registry sends its inventory (version and binary sha256, listen address
-and TLS, mode, WebDAV, upstream prefixes, store filesystem size, a hash of its config, what
-`[hub] allow` lists and whether updates must be signed) on connect and when it changes, a
-heartbeat at the interval the hub asks (connections open and the limit, uploads in flight,
-build-once locks held, free space), its store usage after each gc and every 10 minutes
-(`status`'s figures, and its 256 largest repositories), and a report of what it applied and
-is doing. The hub keeps the latest of each: `vk-hub registries`, `vk-hub registries show
-<id>`, `/registries`, `/registry/<id>`.
+and TLS, mode, WebDAV, the S3 view, upstream prefixes, store filesystem size, config hash,
+`[hub] allow` list and signature requirement for updates) on connect and when it changes.
+Heartbeats follow the hub's interval and report open connections, the connection limit,
+uploads in flight, build-once locks held and free space. After each gc and every 10 minutes,
+the registry reports `status` figures and its 256 largest repositories. A separate report
+covers applied state and work in progress. The hub keeps the latest of each for
+`vk-hub registries`, `vk-hub registries show <id>`, `/registries` and `/registry/<id>`.
 
 **Steering.** Desired state carries, each optional, with a generation; the registry applies
 the newest one, and again after a restart:

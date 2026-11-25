@@ -88,6 +88,9 @@ takes_tokens() {
     [ "$(reg_code /v2/e2e-probe/tags/list -H "Authorization: Bearer $t")" = 200 ]
 }
 wait_for 60 takes_tokens || { tail -n 20 "$REG/log"; fail "the registry does not take the hub's tokens"; }
+# The S3 view is enabled by default.
+hub registries show "$id" | grep -x 's3: true' >/dev/null ||
+  fail "the hub does not show the registry's S3 view"
 
 echo "== the hub names the registry, bound to its URL and CA =="
 hub registries set-url "$id" "$REG_URL" --ca /etc/vk-hub/registry-ca.pem

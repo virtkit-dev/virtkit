@@ -18,6 +18,7 @@ All notable changes to virtkit will be documented in this file.
   job token and resolves `job/<alias>` as it does for WebDAV. Set
   `SCCACHE_ENDPOINT=$VK_REGISTRY/s3`, `SCCACHE_REGION=auto` and
   `SCCACHE_S3_NO_CREDENTIALS=true`.
+- The hub shows whether each registry serves sccache's S3 cache, next to WebDAV.
 
 ### Changed
 
