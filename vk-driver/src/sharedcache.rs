@@ -11,7 +11,8 @@
 //! but shared cache content — never the build cache — and is one `vk` made for the purpose and
 //! this user alone can reach ([`open_store`]). The runs using a store share its build-once
 //! locks ([`vk_registry::lock::LockManager::host_shared`]), so a task two environments want
-//! can be built by one of them and restored by the other.
+//! can be built by one of them and restored by the other. sccache reads and writes an area's
+//! plain files over the store's S3 view (`/s3/job/<alias>/…`).
 
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd};
@@ -161,15 +162,18 @@ pub async fn serve(root: &Path, aliases: &[String]) -> Result<ProxyCfg> {
     Ok(cfg)
 }
 
-/// The server's state over the store at `root`, made if absent ([`open_store`]): WebDAV off,
-/// the store's locks shared with every process serving it, and the rest of the API to
-/// whoever presents `token` — the guests' proxy forwards far less
+/// The server's state over the store at `root`, made if absent ([`open_store`]): WebDAV off
+/// but the S3 view on, the store's locks shared with every process serving it, and the
+/// enabled API to whoever presents `token` — the guests' proxy forwards far less
 /// ([`crate::regproxy::Scope::Areas`]).
 fn state(root: &Path, token: String) -> Result<vk_registry::ServerState> {
     let root = open_store(root, Missing::Create)?.context("the shared cache store was not made")?;
     let mut cfg =
         vk_registry::ServerConfig::local((std::net::Ipv4Addr::LOCALHOST, 0).into(), root.clone());
+    // The S3 view writes WebDAV's plain files even with WebDAV, and so its listings and
+    // namespace verbs, off.
     cfg.webdav = false;
+    cfg.s3 = true;
     let mut state = cfg
         .into_state()
         .with_context(|| format!("opening the shared cache store {}", root.display()))?;
@@ -309,7 +313,7 @@ fn token() -> Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -489,7 +493,7 @@ mod tests {
 
     /// Dial `socket` once and send `req`, an HTTP/1.1 request closing its connection; return
     /// the status and the whole response.
-    async fn ask(socket: &crate::regproxy::ProxySocket, req: String) -> (u16, String) {
+    pub(crate) async fn ask(socket: &crate::regproxy::ProxySocket, req: String) -> (u16, String) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut conn = crate::regproxy::connect(
             socket,
@@ -510,7 +514,7 @@ mod tests {
         (status, out)
     }
 
-    fn request(method: &str, target: &str, headers: &str, body: &str) -> String {
+    pub(crate) fn request(method: &str, target: &str, headers: &str, body: &str) -> String {
         format!(
             "{method} {target} HTTP/1.1\r\nhost: registry.vk\r\nconnection: close\r\n\
              content-length: {}\r\n{headers}\r\n{body}",
@@ -639,6 +643,60 @@ mod tests {
             ("GET", "/dav/files/dev/task-cache/".to_string()),
         ] {
             let (status, refused) = ask(&two, request(method, &target, "", "")).await;
+            assert_eq!(status, 403, "{method} {target}: {refused}");
+        }
+    }
+
+    /// sccache's S3 requests reach an area's plain files by the alias a CI job uses: its
+    /// startup probe and a sharded key are written, read and stated as tags under the area's
+    /// prefix, and a missing key is `NoSuchKey`. Unconfigured areas, listings, multipart
+    /// uploads, deletes and direct WebDAV access are refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sccache_reaches_an_areas_objects_over_s3() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = crate::testtmp::Scratch::dir("sharedcache-s3");
+        let root = dir.join("task-cache");
+        let aliases = ["sccache".to_string(), "task-cache".to_string()];
+        let proxy = crate::regproxy::spawn(serve(&root, &aliases).await.unwrap())
+            .await
+            .unwrap();
+        // An unsigned request may carry the UNSIGNED-PAYLOAD marker and a date, which the
+        // proxy passes on.
+        let amz = "x-amz-content-sha256: UNSIGNED-PAYLOAD\r\nx-amz-date: 20261125T000000Z\r\n";
+        for (key, body) in [
+            (".sccache_check", "Hello, World!"),
+            ("a/b/c/0123abcd", "obj"),
+        ] {
+            let target = format!("/s3/job/sccache/{key}");
+            let (status, put) = ask(&proxy, request("PUT", &target, amz, body)).await;
+            assert_eq!(status, 200, "{put}");
+            let (status, got) = ask(&proxy, request("GET", &target, amz, "")).await;
+            assert_eq!(status, 200, "{got}");
+            assert!(got.contains(body), "{got}");
+            let (status, head) = ask(&proxy, request("HEAD", &target, "", "")).await;
+            assert_eq!(status, 200, "{head}");
+        }
+        let (status, miss) = ask(&proxy, request("GET", "/s3/job/sccache/a/b/c/ff", "", "")).await;
+        assert_eq!(status, 404, "{miss}");
+        assert!(miss.contains("NoSuchKey"), "{miss}");
+        for (repo, tag) in [
+            ("dev/sccache", ".sccache_check"),
+            ("dev/sccache/a/b/c", "0123abcd"),
+        ] {
+            let file = root.join("repos/files").join(repo).join("tags").join(tag);
+            assert!(file.is_file(), "{}", file.display());
+        }
+
+        for (method, target) in [
+            ("GET", "/s3/job/other/x"),
+            ("GET", "/s3/dev/other/x"),
+            ("PUT", "/s3/dev/x"),
+            ("GET", "/s3/job/sccache/?list-type=2"),
+            ("POST", "/s3/job/sccache/x?uploads"),
+            ("DELETE", "/s3/job/sccache/.sccache_check"),
+            ("GET", "/dav/files/dev/sccache/.sccache_check"),
+        ] {
+            let (status, refused) = ask(&proxy, request(method, target, "", "")).await;
             assert_eq!(status, 403, "{method} {target}: {refused}");
         }
     }

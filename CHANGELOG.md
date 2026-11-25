@@ -27,6 +27,9 @@ All notable changes to virtkit will be documented in this file.
   `http://registry.vk/job/task-cache`, as a CI job does, so a project's task cache settings
   work unchanged in both, build-once locks included. `vk gc` collects the cache like the
   build cache.
+- `vk dev` environments can share sccache objects through a shared cache, with the
+  settings a CI job uses: endpoint `http://registry.vk/s3`, bucket `job`, the cache's name
+  as key prefix and no AWS credentials. `vk gc` collects unused objects with the rest.
 
 ### Changed
 

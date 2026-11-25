@@ -49,8 +49,9 @@
 //!
 //! A credential lent for some areas only ([`Scope::Areas`], [`ProxyCfg::for_areas`]) is not
 //! one the registry scopes, so the proxy does: it forwards the `/v2/` ping, reading and
-//! writing manifests and blobs in the repositories under an area's prefix, and taking,
-//! renewing and releasing locks whose every name is under one ([`confined`]). Each request
+//! writing manifests and blobs in the repositories under an area's prefix, reading and
+//! writing sccache's S3 objects under one, and taking, renewing and releasing locks whose
+//! every name is under one ([`confined`]). Each request
 //! is checked once resolved and mapped, and sent with the headers those requests use and no
 //! other; a redirect is returned to the guest rather than followed, since the request it
 //! leads to would be sent with the credential, unchecked. Every refusal is logged on the
@@ -106,8 +107,8 @@ pub enum Scope {
     Job,
     /// Nothing: a job that should have had a token and has none.
     Deny,
-    /// `/v2/` and `/lock/`, within the proxy's areas only ([`confined`]): a credential the
-    /// registry does not scope, lent for those areas.
+    /// The `/v2/` ping, and OCI requests, locks and `/s3/` objects within the proxy's areas
+    /// only ([`confined`]): a credential the registry does not scope, lent for those areas.
     ///
     /// This confines the repository and lock names a guest uses, and nothing else. A
     /// registry serves such a credential any blob or manifest of its store by digest,
@@ -124,7 +125,7 @@ impl Scope {
             Scope::Oci => &["/v2/"],
             Scope::Job => &["/v2/", "/lock/", DAV_FILES, S3],
             Scope::Deny => &[],
-            Scope::Areas => &["/v2/", "/lock/"],
+            Scope::Areas => &["/v2/", "/lock/", S3],
         }
     }
 }
@@ -760,6 +761,8 @@ const AREA_HEADERS: &[&str] = &[
     "docker-content-digest",
     "range",
     "user-agent",
+    "x-amz-content-sha256",
+    "x-amz-date",
     "x-vk-lock-holder",
     "x-vk-lock-owner",
 ];
@@ -769,22 +772,30 @@ const AREA_HEADERS: &[&str] = &[
 /// - `GET`/`HEAD` of `/v2/` itself, which names no repository;
 /// - the requests [`area_oci_query`] takes, on a repository under an area's prefix, an
 ///   upload the registry answered with its real name included;
+/// - the S3 object requests [`area_s3_object`] takes, with no query or an empty one;
 /// - `POST` to one of [`AREA_LOCKS`] with at least one name, every name under an area's
 ///   prefix.
 ///
 /// The query is written again from what was checked.
-fn confined(cfg: &ProxyCfg, method: &Method, url: &reqwest::Url) -> Option<reqwest::Url> {
+fn confined(
+    cfg: &ProxyCfg,
+    method: &Method,
+    headers: &hyper::HeaderMap,
+    url: &reqwest::Url,
+) -> Option<reqwest::Url> {
     let path = url.path().strip_prefix(cfg.root.as_str())?;
     let asked = url.query().unwrap_or_default();
-    let query = match path.strip_prefix("/v2/") {
-        Some(rest) => area_oci_query(&cfg.areas, method, rest, asked)?,
-        None => {
-            let (_, params) = AREA_LOCKS.iter().find(|(lock, _)| *lock == path)?;
-            if *method != Method::POST {
-                return None;
-            }
-            area_lock_query(&cfg.areas, params, asked)?
+    let query = if let Some(rest) = path.strip_prefix("/v2/") {
+        area_oci_query(&cfg.areas, method, rest, asked)?
+    } else if let Some(object) = path.strip_prefix(S3) {
+        let taken = asked.is_empty() && area_s3_object(&cfg.areas, method, headers, object);
+        taken.then(String::new)?
+    } else {
+        let (_, params) = AREA_LOCKS.iter().find(|(lock, _)| *lock == path)?;
+        if *method != Method::POST {
+            return None;
         }
+        area_lock_query(&cfg.areas, params, asked)?
     };
     let mut url = url.clone();
     url.set_query((!query.is_empty()).then_some(query.as_str()));
@@ -839,6 +850,37 @@ fn area_oci_query(areas: &[Area], method: &Method, rest: &str, query: &str) -> O
     }
 }
 
+/// Whether [`Scope::Areas`] takes `method` with `headers` on the S3 object `object` (what
+/// follows `/s3/`). An S3 `GET`, `HEAD` or single-request `PUT` addresses the plain file
+/// `/dav/files/<bucket>/<key>`: the store must be able to name it, and the key's directory,
+/// the bucket included, must be [`in_areas`]. Reject residual `%` escapes so decoding cannot
+/// change the checked name; sccache's keys need none.
+///
+/// The headers are held to vk-registry's own S3 rules, as received: a precondition or a
+/// header for another operation (a copy, say) that the proxy dropped instead would turn the
+/// request into an unconditional whole write. A `Connection` option naming a forwarded
+/// header is refused too, since removing it after this check would send a request other
+/// than the one checked.
+fn area_s3_object(
+    areas: &[Area],
+    method: &Method,
+    headers: &hyper::HeaderMap,
+    object: &str,
+) -> bool {
+    let scoped = connection_scoped(headers);
+    let Some((dir, _)) = object.rsplit_once('/') else {
+        return false;
+    };
+    matches!(*method, Method::GET | Method::HEAD | Method::PUT)
+        && vk_registry::s3_admissible_headers(headers)
+        && !scoped
+            .iter()
+            .any(|name| AREA_HEADERS.contains(&name.as_str()))
+        && !object.contains('%')
+        && vk_registry::valid_plain_file(object)
+        && in_areas(areas, dir)
+}
+
 /// An OCI path (what follows `/v2/`) cut at its first `/manifests/`, `/blobs/` or `/tags/`:
 /// the shortest repository it can name, and the rest from that marker on. vk-registry cuts
 /// at the last marker of the route it matches, so the name it reads is this one or lies
@@ -890,8 +932,8 @@ fn area_lock_query(areas: &[Area], params: &[&str], query: &str) -> Option<Strin
 }
 
 /// What a proxy lending for its areas only answers a request outside them.
-const OUTSIDE_AREAS: &[u8] = b"registry proxy: only the registry's ping, and manifests, blobs \
-                               and locks under this proxy's areas, are proxied";
+const OUTSIDE_AREAS: &[u8] = b"registry proxy: only the registry's ping, and manifests, blobs, \
+                               S3 objects and locks under this proxy's areas, are proxied";
 
 /// The most of a refused request's target that is logged, in characters.
 const MAX_LOGGED_TARGET: usize = 256;
@@ -1100,7 +1142,7 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     // A credential lent for its areas only goes nowhere else: checked last, on what would
     // be sent.
     let url = match cfg.scope {
-        Scope::Areas => match confined(cfg, &method, &url) {
+        Scope::Areas => match confined(cfg, &method, req.headers(), &url) {
             Some(url) => url,
             None => return Ok(refuse(OUTSIDE_AREAS)),
         },
@@ -2859,8 +2901,8 @@ mod tests {
         .unwrap()
     }
 
-    /// Within its areas the credential reaches the ping, manifests, blobs and locks, by alias
-    /// or by the real name the registry answers with.
+    /// The credential reaches the ping, which names no area, and the manifests, blobs, S3
+    /// objects and locks of its areas, by alias or by the real name the registry answers with.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_credential_lent_for_areas_reaches_them() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -2940,6 +2982,27 @@ mod tests {
                 "/lock/release?name=job/task-cache:a&name=team/dev/task-cache/x:b".to_string(),
                 "/lock/release?name=team%2Fdev%2Ftask-cache%3Aa&name=team%2Fdev%2Ftask-cache%2Fx%3Ab"
                     .to_string(),
+            ),
+            // sccache's startup probe and a sharded key, as its S3 backend names them.
+            (
+                "PUT",
+                "/s3/job/task-cache/.sccache_check".to_string(),
+                "/s3/team/dev/task-cache/.sccache_check".to_string(),
+            ),
+            (
+                "GET",
+                "/s3/job/task-cache/a/b/c/A1.b_c-d".to_string(),
+                "/s3/team/dev/task-cache/a/b/c/A1.b_c-d".to_string(),
+            ),
+            (
+                "HEAD",
+                "/s3/team/dev/task-cache/a/key".to_string(),
+                "/s3/team/dev/task-cache/a/key".to_string(),
+            ),
+            (
+                "PUT",
+                "/s3/job/task-cache/a/b/c/key?".to_string(),
+                "/s3/team/dev/task-cache/a/b/c/key".to_string(),
             ),
         ] {
             let (status, auth, path) = status_and_auth(proxy, method, &target, &seen).await;
@@ -3072,6 +3135,41 @@ mod tests {
             ("POST", within("/blobs/uploads/?from=other")),
             ("POST", within(&format!("/blobs/uploads/?digest={DIGEST}"))),
         ]);
+        let s3 = |key: &str| format!("/s3/job/task-cache/{key}");
+        refused.extend([
+            ("GET", "/s3/".to_string()),
+            ("GET", "/s3/team".to_string()),
+            ("PUT", "/s3/team/x".to_string()),
+            ("GET", "/s3/team/dev/x".to_string()),
+            ("GET", "/s3/team/dev/task-cache-2/x".to_string()),
+            ("GET", "/s3/other/team/dev/task-cache/x".to_string()),
+            ("GET", "/s3/files/team/dev/task-cache/x".to_string()),
+            ("GET", "/s3/job/other/x".to_string()),
+            ("GET", "/s3/job/task-cache".to_string()),
+            ("GET", s3("")),
+            ("PUT", s3("a/")),
+            ("GET", s3("a//x")),
+            ("GET", s3("A/x")),
+            ("GET", s3("a b/x")),
+            ("GET", s3("tags/x")),
+            ("GET", s3("a/blobs")),
+            ("GET", s3(&format!("{}x", "a/".repeat(12)))),
+            ("GET", s3(&"a".repeat(256))),
+            ("GET", s3("x%41")),
+            ("GET", s3("a%2Fb")),
+            ("GET", s3("x?list-type=2")),
+            ("GET", s3("x?acl")),
+            ("PUT", s3("x?partNumber=1&uploadId=1")),
+            ("POST", s3("x?uploads")),
+            ("POST", s3("x")),
+            ("DELETE", s3("x")),
+            ("OPTIONS", s3("x")),
+            ("PROPFIND", s3("x")),
+            (
+                "GET",
+                "/s3/job/task-cache/?list-type=2&prefix=a".to_string(),
+            ),
+        ]);
         for (method, target) in refused {
             let (status, _, path) = status_and_auth(proxy, method, &target, &seen).await;
             assert_eq!(status, 403, "{method} {target}");
@@ -3139,6 +3237,105 @@ mod tests {
             "{head}"
         );
         assert_eq!(took[0].1, b"held");
+    }
+
+    /// S3 writes pass the payload hash and signing date. A header the registry's S3 view
+    /// refuses (a copy, an additional checksum, encryption, a precondition, a partial write,
+    /// a content coding, a streaming or ambiguous payload), or a `Connection` option that
+    /// would drop a forwarded header, is refused before the request reaches the registry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_s3_object_within_an_area_goes_with_its_requests_headers() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, took) = scripted_upstream(vec![answer(0, b"")]);
+        let (proxy, _served) = proxy_on_tcp(areas_cfg(up_addr));
+        let target = format!("http://{proxy}/s3/job/task-cache/a/b/c/key");
+        let sha = "c".repeat(64);
+        let r = reqwest::Client::new()
+            .put(&target)
+            .header("x-amz-date", "20261125T000000Z")
+            .header("x-amz-content-sha256", &sha)
+            .header("content-type", "application/octet-stream")
+            .header("x-forwarded-host", "evil.example")
+            .header("authorization", "AWS4-HMAC-SHA256 Credential=guest")
+            .body("object")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        {
+            let took = took.lock().unwrap();
+            let head = &took[0].0;
+            assert!(
+                head.starts_with("put /s3/team/dev/task-cache/a/b/c/key "),
+                "{head}"
+            );
+            let mut names: Vec<&str> = head
+                .lines()
+                .skip(1)
+                .filter_map(|l| l.split_once(':'))
+                .map(|(name, _)| name)
+                .collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                [
+                    "accept",
+                    "authorization",
+                    "content-length",
+                    "content-type",
+                    "host",
+                    "x-amz-content-sha256",
+                    "x-amz-date",
+                ],
+                "{head}"
+            );
+            assert!(
+                head.contains("authorization: bearer vkr_build\r\n"),
+                "{head}"
+            );
+            assert!(head.contains(&format!("x-amz-content-sha256: {sha}\r\n")));
+            assert_eq!(took[0].1, b"object");
+        }
+
+        let (up_addr, seen) = fake_upstream();
+        let (proxy, _served) = proxy_on_tcp(areas_cfg(up_addr));
+        let target = format!("http://{proxy}/s3/job/task-cache/a/key");
+        let sha = sha.as_str();
+        for headers in [
+            &[("x-amz-copy-source", "/team/dev/task-cache/a/other")][..],
+            &[("x-amz-server-side-encryption", "AES256")],
+            &[("x-amz-checksum-crc32", "AAAAAA==")],
+            &[("content-md5", "1B2M2Y8AsgTpgAmY7PhCfg==")],
+            &[("if-none-match", "*")],
+            &[("if-match", "\"0\"")],
+            &[("if-unmodified-since", "Thu, 26 Nov 2026 00:00:00 GMT")],
+            &[("content-range", "bytes 0-5/6")],
+            &[("content-encoding", "aws-chunked")],
+            &[("content-encoding", "gzip")],
+            &[("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")],
+            &[("x-amz-content-sha256", "nope")],
+            &[("x-amz-content-sha256", sha), ("x-amz-content-sha256", sha)],
+            &[
+                ("x-amz-content-sha256", sha),
+                ("connection", "x-amz-content-sha256"),
+            ],
+            &[
+                ("content-type", "text/plain"),
+                ("connection", "Content-Type"),
+            ],
+        ] {
+            let mut rb = reqwest::Client::new().put(&target).body("object");
+            for (name, value) in headers {
+                rb = rb.header(*name, *value);
+            }
+            let r = rb.send().await.unwrap();
+            assert_eq!(r.status().as_u16(), 403, "{headers:?}");
+            assert_eq!(
+                seen.lock().unwrap().1,
+                "",
+                "{headers:?} must not be forwarded"
+            );
+        }
     }
 
     /// No spelling of a target leaves the areas: `..` and its escapes resolve before the
@@ -3306,8 +3503,9 @@ mod tests {
         // With no area, only the ping.
         let none = cfg(&[]).unwrap();
         let url = |t: &str| upstream_url(&none, t).unwrap();
-        assert!(confined(&none, &Method::GET, &url("/v2/")).is_some());
-        assert!(confined(&none, &Method::GET, &url("/v2/a/manifests/x")).is_none());
+        let no_headers = hyper::HeaderMap::new();
+        assert!(confined(&none, &Method::GET, &no_headers, &url("/v2/")).is_some());
+        assert!(confined(&none, &Method::GET, &no_headers, &url("/v2/a/manifests/x")).is_none());
     }
 
     /// The areas a credential is lent for are those it was built with: a job's areas do not
@@ -3318,9 +3516,18 @@ mod tests {
         let cfg = areas_cfg("127.0.0.1:1".parse().unwrap()).with_areas(&[area("other", "other")]);
         assert_eq!(cfg.areas, [area("task-cache", "team/dev/task-cache")]);
         let url = |t: &str| upstream_url(&cfg, t).unwrap();
-        assert!(confined(&cfg, &Method::GET, &url("/v2/other/manifests/x")).is_none());
+        let no_headers = hyper::HeaderMap::new();
+        assert!(
+            confined(
+                &cfg,
+                &Method::GET,
+                &no_headers,
+                &url("/v2/other/manifests/x")
+            )
+            .is_none()
+        );
         let inside = url("/v2/team/dev/task-cache/manifests/x");
-        assert!(confined(&cfg, &Method::GET, &inside).is_some());
+        assert!(confined(&cfg, &Method::GET, &no_headers, &inside).is_some());
     }
 
     /// A redirect goes back to the guest as the registry sent it: the proxy sends nothing

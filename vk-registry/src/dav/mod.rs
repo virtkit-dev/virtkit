@@ -19,6 +19,8 @@ use hyper::{Request, Response, StatusCode};
 
 use crate::{Authenticator, Authz, Body, ServerState, Store, body_of, error_response};
 
+pub use files::valid_plain_file;
+
 /// Maximum path depth below `/dav/<area>/`: the deepest `repos/` path, a full-length
 /// repository name and then `blobs/<hex>`. Under `files/` the repository name bound refuses
 /// a path first, past 15 components.

@@ -888,6 +888,52 @@ mod tests {
         assert!(!absent.exists());
     }
 
+    /// Shared cache gc collects unused S3 objects like its other entries: a collected key is
+    /// then a 404 over S3, and a fresh one stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shared_cache_loses_its_unused_s3_objects() {
+        use crate::sharedcache::tests::{ask, request};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmp = crate::testtmp::Scratch::dir("gc-shared-cache-s3");
+        let dir = tmp.join("shared-cache");
+        let cfg = crate::sharedcache::serve(&dir, &["sccache".to_string()])
+            .await
+            .unwrap();
+        let proxy = crate::regproxy::spawn(cfg).await.unwrap();
+        let object = |key: &str| format!("/s3/job/sccache/a/b/c/{key}");
+        for key in ["stale", "fresh"] {
+            let (status, put) = ask(&proxy, request("PUT", &object(key), "", key)).await;
+            assert_eq!(status, 200, "{put}");
+        }
+        let tags = dir.join("repos/files/dev/sccache/a/b/c/tags");
+        let old = std::time::SystemTime::now() - Duration::from_secs(30 * 86_400);
+        std::fs::File::open(tags.join("stale"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let req = Request {
+            dry_run: false,
+            all_unused: false,
+            auto: false,
+            image_idle: crate::image::EVICT_GRACE,
+            checkout_idle: crate::image::EVICT_GRACE,
+        };
+        let mut sum = Summary::new(false, &[dir.as_path()]);
+        tokio::task::block_in_place(|| {
+            let swept = task_store(dir.clone());
+            collect_store(&Config::default(), &swept, &req, None, &mut sum);
+        });
+        let rows: Vec<_> = sum.rows.iter().map(|r| (r.category, r.count)).collect();
+        assert_eq!(rows, [("shared caches", 1)], "{}", sum.render());
+        assert!(!tags.join("stale").exists());
+        assert!(tags.join("fresh").exists());
+        let (status, gone) = ask(&proxy, request("GET", &object("stale"), "", "")).await;
+        assert_eq!(status, 404, "{gone}");
+        let (status, kept) = ask(&proxy, request("GET", &object("fresh"), "", "")).await;
+        assert_eq!(status, 200, "{kept}");
+    }
+
     /// A shared cache store at `dir` holding one tag unused for 30 days; its tag file.
     fn stale_task_store(dir: &Path) -> PathBuf {
         const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";

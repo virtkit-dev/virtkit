@@ -931,12 +931,14 @@ marked as the shared cache store, which each run serves in-process on a loopback
 a bearer token made for that run and with [host-shared locks](#locks-of-a-local-store). Each
 shared cache is an area: its name `<alias>` is the prefix `dev/<alias>`, the same for every
 environment using the store. The token is not scoped, so the proxy does the confining: it
-forwards the ping, the manifests and blobs of repositories under an area's prefix, and
-`/lock/acquire`, `renew` and `release` whose every name is under one — by alias
-(`job/<alias>`) or by real name — and refuses the rest. That confines names only: a
-shared-secret credential reads any blob or manifest of a store by digest, whichever area it
-was pushed to, which is why the shared cache store is never the build cache's store nor a
-registry server, but a store holding nothing else.
+forwards the ping, the manifests and blobs of repositories under an area's prefix, S3 object
+`GET`, `HEAD` and single-request `PUT` under one (the store serves `/s3/` with WebDAV off),
+with the headers the [S3 view](#s3-view-for-sccache-s3) admits, and `/lock/acquire`, `renew`
+and `release` whose every name is under one — by alias (`job/<alias>`) or by real name — and
+refuses the rest. That confines names only: a shared-secret credential reads any blob or
+manifest of a store by digest, whichever area it was pushed to, which is why the shared cache
+store is never the build cache's store nor a registry server, but a store holding nothing
+else.
 
 ## Connection limits
 

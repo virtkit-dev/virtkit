@@ -91,6 +91,14 @@ impl Node {
     }
 }
 
+/// Whether `path`, decoded `/`-separated components below `/dav/files/` (an S3 object's
+/// `<bucket>/<key>`), is a name the store serves. Each component passes WebDAV's path rules,
+/// and the path as a repository name, the leaf included, passes the OCI name rules, which
+/// also keep `tags`, `manifests` and `blobs` out of it and bound its depth.
+pub fn valid_plain_file(path: &str) -> bool {
+    path.split('/').all(super::valid_segment) && crate::valid_name(&format!("{FILES_REPO}/{path}"))
+}
+
 /// The repository a run of path components names: `files/<segs…>`.
 fn repo_name(segs: &[String]) -> String {
     let mut name = String::from(FILES_REPO);
@@ -174,9 +182,7 @@ pub(super) async fn route(
     if segs.is_empty() {
         return root(state, authz, method, req).await;
     }
-    // The path as a repository name is what every component has to pass, the leaf
-    // included: the OCI name rules, which also keep `tags`, `manifests` and `blobs` out of it.
-    if !crate::valid_name(&repo_name(segs)) {
+    if !valid_plain_file(&segs.join("/")) {
         let resp = error_response(StatusCode::BAD_REQUEST, "NAME_INVALID", &this);
         return refuse(req, resp, &this).await;
     }

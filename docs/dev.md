@@ -276,6 +276,41 @@ development environment. Its build-once locks are shared too: a task two
 environments need at once can be built by one while the other waits, then restores
 the result.
 
+A shared cache also holds plain files, which [sccache](https://github.com/mozilla/sccache)
+reads and writes through its S3 backend at `http://registry.vk/s3/job/<name>/…`.
+As in CI, use `job` as the bucket and the cache's name as the key prefix. For one
+named `sccache`, in `.virtkit/local.toml`:
+
+```toml
+[dev.cache]
+shared = ["task-cache", "sccache"]
+
+[dev.exec-env]
+SCCACHE_ENDPOINT = "http://registry.vk/s3"   # $VK_REGISTRY/s3
+SCCACHE_BUCKET = "job"
+SCCACHE_S3_KEY_PREFIX = "sccache"
+SCCACHE_REGION = "auto"
+SCCACHE_S3_NO_CREDENTIALS = "true"
+SCCACHE_S3_USE_SSL = "false"
+RUSTC_WRAPPER = "sccache"
+```
+
+sccache does not cache a crate compiled incrementally: it runs rustc on it
+uncached. Cargo compiles only the workspace's own crates incrementally in the dev
+profile, so dependencies are cached as they are and your crates keep incremental
+rebuilds. `CARGO_INCREMENTAL=0` caches your crates too, which pays off in a fresh
+checkout or a worktree, at the cost of recompiling a whole crate on every edit to
+it.
+
+The proxy supplies the registry credential, so the guest needs no AWS keys. Each
+shared cache the environment names serves object `GET`, `HEAD` and single-request `PUT`;
+listings, bucket operations, deletion, copies, multipart uploads and conditional,
+partial or compressed writes are refused. `vk` sets none of sccache's variables:
+routing builds through it (`RUSTC_WRAPPER`, or `CC="sccache cc"`) is the project's
+choice. CI scripts that set these variables from `VK_REGISTRY` and
+`VK_REGISTRY_CACHES` give a development environment sharing the same cache the
+same settings.
+
 Shared caches are off by default and belong in `.virtkit/local.toml`, since they
 are a choice about this machine. Each environment asks for its own: one under
 `[environments.<name>]` gets none from `[dev]`, so a pre-commit environment needs
@@ -297,7 +332,7 @@ then the least recently used until it fits its cap, when they are old enough to 
 --root` and `vk registry gc --root` inspect and reclaim it by hand.
 
 A guest reaches the shared caches its environment names and nothing else: no other
-repository's name, no lock outside them, and nothing of the build cache or of any
+repository's name, lock name or S3 object path, and nothing of the build cache or of any
 registry credential on the host — the proxy authenticates for it. Everything inside
 a shared cache is shared: an environment can read and replace what another wrote
 there. The proxy confines names, not content: a guest that knows a digest can read
