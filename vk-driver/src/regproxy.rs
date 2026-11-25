@@ -233,7 +233,6 @@ impl ProxyCfg {
     /// [`usable_areas`] rejects is an error, as is a prefix the registry serves no
     /// repository under ([`servable_prefix`]): nothing else names what the credential is
     /// lent for.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn for_areas(upstream: &str, creds: Creds, areas: &[Area]) -> Result<Self> {
         let mut rejected = None;
         let kept = usable_areas(areas, |a, why| {
@@ -252,11 +251,14 @@ impl ProxyCfg {
         }
         // No redirect is followed: the request it leads to would be sent with the
         // credential without having passed the area checks. The guest gets the redirect
-        // itself.
-        let mut cfg = Self::build_following(
+        // itself. Nor does any HTTP proxy the environment names see the credential: the
+        // registry is one this process serves itself, on loopback ([`crate::sharedcache`]).
+        let mut cfg = Self::build_with(
             upstream.trim_end_matches('/').to_string(),
             creds,
-            reqwest::redirect::Policy::none(),
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy(),
         )?;
         cfg.scope = Scope::Areas;
         cfg.areas = kept.into_iter().cloned().collect();
@@ -264,14 +266,11 @@ impl ProxyCfg {
     }
 
     fn build(upstream: String, creds: Creds) -> Result<Self> {
-        Self::build_following(upstream, creds, reqwest::redirect::Policy::default())
+        Self::build_with(upstream, creds, reqwest::Client::builder())
     }
 
-    fn build_following(
-        upstream: String,
-        creds: Creds,
-        redirects: reqwest::redirect::Policy,
-    ) -> Result<Self> {
+    /// [`Self::build`], its client made by `b` with the trust `creds` adds.
+    fn build_with(upstream: String, creds: Creds, mut b: reqwest::ClientBuilder) -> Result<Self> {
         let base = reqwest::Url::parse(&upstream)
             .with_context(|| format!("parsing the registry proxy upstream {upstream:?}"))?;
         anyhow::ensure!(
@@ -292,7 +291,6 @@ impl ProxyCfg {
             );
         }
         let root = base.path().trim_end_matches('/').to_string();
-        let mut b = reqwest::Client::builder().redirect(redirects);
         if let Some(pem) = &creds.ca_pem {
             b = b.add_root_certificate(
                 reqwest::Certificate::from_pem(pem).context("parsing the registry CA")?,

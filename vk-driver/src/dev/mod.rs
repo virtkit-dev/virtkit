@@ -167,7 +167,7 @@ pub(crate) mod testutil {
         pub(crate) fn new(tag: &str) -> Homes {
             let env = env_guard();
             let dir = scratch(tag);
-            let vars = ["XDG_STATE_HOME", "XDG_DATA_HOME"];
+            let vars = ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"];
             let saved = vars.map(|v| (v, std::env::var_os(v))).to_vec();
             for v in vars {
                 // SAFETY: serialized by env_guard, put back on drop.

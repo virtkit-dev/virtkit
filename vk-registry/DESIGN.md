@@ -917,6 +917,19 @@ grants this registry enforces ([Hub tokens](#hub-tokens)), and forwards `/lock/`
 OPTIONS pass, MOVE and COPY naming the proxy in their `Destination`. A job without a token,
 a gitlab-runner job included, gets a proxy that refuses everything.
 
+A `vk dev` environment with `[dev.cache] shared` gets a proxy over its shared caches instead:
+a local store of their own (`$XDG_CACHE_HOME/virtkit/shared-cache`), private to its user and
+marked as the shared cache store, which each run serves in-process on a loopback port, behind
+a bearer token made for that run and with [host-shared locks](#locks-of-a-local-store). Each
+shared cache is an area: its name `<alias>` is the prefix `dev/<alias>`, the same for every
+environment using the store. The token is not scoped, so the proxy does the confining: it
+forwards the ping, the manifests and blobs of repositories under an area's prefix, and
+`/lock/acquire`, `renew` and `release` whose every name is under one — by alias
+(`job/<alias>`) or by real name — and refuses the rest. That confines names only: a
+shared-secret credential reads any blob or manifest of a store by digest, whichever area it
+was pushed to, which is why the shared cache store is never the build cache's store nor a
+registry server, but a store holding nothing else.
+
 ## Connection limits
 
 Every limit below applies before authentication, so a client that connects and sends

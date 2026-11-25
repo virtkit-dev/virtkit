@@ -88,6 +88,7 @@ mod rundirs;
 mod schedule;
 mod scratch;
 mod services;
+mod sharedcache;
 mod shell;
 mod shutdown;
 mod sites;
@@ -3763,6 +3764,20 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
         }
     }
     writeln!(out)?;
+    writeln!(
+        out,
+        "shared caches   {} (default: $XDG_CACHE_HOME/virtkit/shared-cache)",
+        sharedcache::store_root()?.display()
+    )?;
+    writeln!(
+        out,
+        "                the caches `vk dev` environments share (`[dev.cache] shared`), made on"
+    )?;
+    writeln!(
+        out,
+        "                first use; `vk gc` collects them like the build cache"
+    )?;
+    writeln!(out)?;
     let vms = vms::registry_dir()?;
     writeln!(
         out,
@@ -4607,7 +4622,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             egress_allow,
             // Fixed for the run: only `vk dev` edits a running guest's allowlist.
             egress_file: None,
-            registry_proxy: registry_proxy.clone(),
+            registry_proxy: registry_proxy.clone().map(run::RegistryProxy::Upstream),
             compose: compose.clone(),
             profiles: profile.clone(),
             primary: primary.clone(),
@@ -7698,6 +7713,13 @@ mod tests {
         for line in [
             format!("\ndata dir        {} (", data.display()),
             format!("\nruns ledger     {} (", data.join("runs").display()),
+            format!(
+                "\nshared caches   {} (",
+                homes
+                    .dir()
+                    .join("XDG_CACHE_HOME/virtkit/shared-cache")
+                    .display()
+            ),
             format!("\nVM state        {} (", state.display()),
             "\n  dev/  ".to_string(),
             "\n  run/  ".to_string(),

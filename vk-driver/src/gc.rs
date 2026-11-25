@@ -49,6 +49,10 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
     if let Ok(crate::build::CacheStore::Dir(dir)) = &store {
         roots.push(dir);
     }
+    let shared = shared_store_dir();
+    if let Ok(Some(dir)) = &shared {
+        roots.push(dir);
+    }
     let scratch = crate::run::default_scratch_base();
     if let Ok(base) = &scratch {
         roots.push(base);
@@ -120,6 +124,7 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
     );
     sum.kept.extend(trees.left);
     build_cache(cfg, &store, req, None, &mut sum);
+    shared_cache(cfg, &shared, req, &mut sum);
     if let Ok(base) = &dev_base {
         dev_images(cfg, req, base, &mut sum);
     }
@@ -345,9 +350,7 @@ fn cache_store(cfg: &Config) -> anyhow::Result<crate::build::CacheStore> {
 }
 
 /// Collect the build cache's `store`, when it is in this filesystem: tags of its build-cache
-/// repository unused past the retention, then the least recently used until it fits its cap,
-/// then the blobs nothing references any more. A pass waits up to [`STORE_WAIT`] for each lock
-/// on the store the builds using it hold, then leaves what it has not reached for the next.
+/// repository, as [`collect_store`] collects them.
 fn build_cache(
     cfg: &Config,
     store: &anyhow::Result<crate::build::CacheStore>,
@@ -366,20 +369,93 @@ fn build_cache(
             return;
         }
     };
-    let store = match vk_registry::Store::open(&dir) {
+    let swept = Swept {
+        what: "build cache",
+        users: "builds",
+        dir,
+        repository: Some(vk_registry::BUILD_CACHE_REPO.into()),
+        // A Windows layer's view outlives the build that pulled it, reading the store by path.
+        keep_prefixes: vec![crate::wincache::TAG_PREFIX.into()],
+    };
+    collect_store(cfg, &swept, req, free_bytes, sum);
+}
+
+/// The shared cache store ([`crate::sharedcache`]), checked as a store of its own before
+/// anything is collected or the pass reads space: `None` while there is none.
+fn shared_store_dir() -> anyhow::Result<Option<PathBuf>> {
+    let root = crate::sharedcache::store_root()?;
+    crate::sharedcache::open_store(&root, crate::sharedcache::Missing::Leave)
+}
+
+/// Collect the shared cache `store` ([`shared_store_dir`]): the tags of every repository, as
+/// [`collect_store`] collects them, under the build cache's retention and cap but held to
+/// them apart from it.
+fn shared_cache(
+    cfg: &Config,
+    store: &anyhow::Result<Option<PathBuf>>,
+    req: &Request,
+    sum: &mut Summary,
+) {
+    match store {
+        Ok(Some(dir)) => collect_store(cfg, &task_store(dir.clone()), req, None, sum),
+        Ok(None) => {}
+        Err(e) => sum.keep(format!("shared caches: {e:#}")),
+    }
+}
+
+/// The shared cache store at `dir`, as a pass collects it.
+fn task_store(dir: PathBuf) -> Swept {
+    Swept {
+        what: "shared caches",
+        users: "environments",
+        dir,
+        repository: None,
+        keep_prefixes: Vec::new(),
+    }
+}
+
+/// A content-addressed store a pass collects.
+struct Swept {
+    /// Its row in the summary, and what a note about it starts with.
+    what: &'static str,
+    /// Who else holds its locks, for a note to name.
+    users: &'static str,
+    dir: PathBuf,
+    /// The one repository whose tags may go; `None`: every repository's.
+    repository: Option<String>,
+    /// Tags never dropped, by the start of their name.
+    keep_prefixes: Vec<String>,
+}
+
+/// Collect the store `swept` names, if there is one: the tags unused past the build cache's
+/// retention, then the least recently used until it fits the build cache's cap, then the
+/// blobs nothing references any more. A pass waits up to [`STORE_WAIT`] ([`AUTO_STORE_WAIT`]
+/// in the background) for each lock on the store its users hold, then leaves what it has not
+/// reached for the next.
+fn collect_store(
+    cfg: &Config,
+    swept: &Swept,
+    req: &Request,
+    free_bytes: Option<u64>,
+    sum: &mut Summary,
+) {
+    let Swept {
+        what, users, dir, ..
+    } = swept;
+    let store = match vk_registry::Store::open(dir) {
         Ok(Some(store)) => store,
         Ok(None) => return,
         Err(e) => {
-            sum.keep(format!("build cache: {e:#}"));
+            sum.keep(format!("{what}: {e:#}"));
             return;
         }
     };
     // A cap that cannot be sized is no cap, never one of nothing.
-    let max = match crate::usage::fs_space(&dir) {
+    let max = match crate::usage::fs_space(dir) {
         Ok(space) => cfg.gc.build_cache_max(space.total),
         Err(e) => {
             sum.keep(format!(
-                "build cache: not capped, its filesystem cannot be read: {e}"
+                "{what}: not capped, its filesystem cannot be read: {e}"
             ));
             None
         }
@@ -398,9 +474,8 @@ fn build_cache(
     let policy = vk_registry::GcPolicy {
         retention,
         grace: floor,
-        repository: Some(vk_registry::BUILD_CACHE_REPO.into()),
-        // A Windows layer's view outlives the build that pulled it, reading the store by path.
-        keep_prefixes: vec![crate::wincache::TAG_PREFIX.into()],
+        repository: swept.repository.clone(),
+        keep_prefixes: swept.keep_prefixes.clone(),
         max_bytes: max,
         free_bytes,
         min_age: floor,
@@ -412,14 +487,14 @@ fn build_cache(
         Ok(vk_registry::GcOutcome::Done(r)) => r,
         Ok(vk_registry::GcOutcome::Busy) => {
             sum.keep(format!(
-                "build cache: in use for {}, left for the next pass",
+                "{what}: in use for {}, left for the next pass",
                 fmt_secs(wait)
             ));
             sum.complete = false;
             return;
         }
         Err(e) => {
-            sum.keep(format!("build cache: {e:#}"));
+            sum.keep(format!("{what}: {e:#}"));
             return;
         }
     };
@@ -431,22 +506,24 @@ fn build_cache(
         (None, None) => "no longer referenced".into(),
     };
     sum.row(
-        "build cache",
+        what,
         u64::try_from(r.tags_dropped + r.tags_capped).unwrap_or(u64::MAX),
         r.bytes_freed,
-        &dir,
-        format!("{why}; builds waited {} at most", fmt_hold(r.longest_hold)),
+        dir,
+        format!("{why}; {users} waited {} at most", fmt_hold(r.longest_hold)),
     );
     if r.incomplete {
-        sum.keep("build cache: builds held it part-way, the rest is left for the next pass".into());
+        sum.keep(format!(
+            "{what}: {users} held it part-way, the rest is left for the next pass"
+        ));
         sum.complete = false;
     }
     if let (Some(after), Some(max)) = (r.bytes_after, max)
         && after > max
     {
         sum.keep(format!(
-            "build cache: {} in {}, over its {} cap — the rest was used within {}, is kept by \
-             its manifest or its name, or is read by running builds",
+            "{what}: {} in {}, over its {} cap — the rest was used within {}, is kept by \
+             its manifest or its name, or is read by running {users}",
             fmt_bytes(after),
             dir.display(),
             fmt_bytes(max),
@@ -455,7 +532,7 @@ fn build_cache(
     }
     if r.blobs_leased > 0 {
         sum.keep(format!(
-            "build cache: {} chunk(s), {}, read by running builds",
+            "{what}: {} chunk(s), {}, read by running {users}",
             r.blobs_leased,
             fmt_bytes(r.bytes_leased)
         ));
@@ -736,6 +813,227 @@ mod tests {
         });
         sum.keep("/data/virtkit/build/x.tmp: another user's".into());
         sum
+    }
+
+    /// The shared cache has no repository of its own to collect: an entry goes wherever a
+    /// guest put it once it sits unused, and a fresh one stays.
+    #[test]
+    fn the_shared_cache_loses_its_unused_entries_in_every_repository() {
+        let tmp = crate::testtmp::Scratch::dir("gc-shared-cache");
+        let dir = tmp.join("shared-cache");
+        let store = vk_registry::Store::new(dir.clone()).unwrap();
+        const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+        let entry = |repo: &str, tag: &str, content: &[u8]| {
+            let digest = store.put_blob(content).unwrap();
+            let manifest = serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": MANIFEST,
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": digest, "size": content.len(),
+                },
+                "layers": [],
+            });
+            store
+                .put_manifest(repo, tag, MANIFEST, manifest.to_string().as_bytes())
+                .unwrap();
+            dir.join("repos").join(repo).join("tags").join(tag)
+        };
+        let old = std::time::SystemTime::now() - Duration::from_secs(30 * 86_400);
+        let stale = [
+            entry("dev/task-cache", "stale", b"one"),
+            entry("dev/other/ns", "stale", b"two"),
+        ];
+        for tag in &stale {
+            std::fs::File::open(tag).unwrap().set_modified(old).unwrap();
+        }
+        let fresh = entry("dev/task-cache", "fresh", b"three");
+
+        let req = |dry_run| Request {
+            dry_run,
+            all_unused: false,
+            auto: false,
+            image_idle: crate::image::EVICT_GRACE,
+            checkout_idle: crate::image::EVICT_GRACE,
+        };
+        let pass = |dry_run| {
+            let mut sum = Summary::new(dry_run, &[dir.as_path()]);
+            let swept = task_store(dir.clone());
+            collect_store(&Config::default(), &swept, &req(dry_run), None, &mut sum);
+            sum
+        };
+        let dropped = |sum: &Summary| {
+            let rows: Vec<_> = sum.rows.iter().map(|r| (r.category, r.count)).collect();
+            assert_eq!(rows, [("shared caches", 2)], "{}", sum.render());
+        };
+        dropped(&pass(true));
+        assert!(
+            stale.iter().all(|tag| tag.exists()),
+            "a dry run drops nothing"
+        );
+        dropped(&pass(false));
+        assert!(stale.iter().all(|tag| !tag.exists()));
+        assert!(fresh.exists());
+
+        // No store yet: nothing to report, and none is made.
+        let absent = tmp.join("absent");
+        let mut sum = Summary::new(false, &[&*tmp]);
+        let swept = task_store(absent.clone());
+        collect_store(&Config::default(), &swept, &req(false), None, &mut sum);
+        assert!(
+            sum.rows.is_empty() && sum.kept.is_empty(),
+            "{}",
+            sum.render()
+        );
+        assert!(!absent.exists());
+    }
+
+    /// A shared cache store at `dir` holding one tag unused for 30 days; its tag file.
+    fn stale_task_store(dir: &Path) -> PathBuf {
+        const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+        let store = vk_registry::Store::new(dir.to_path_buf()).unwrap();
+        let digest = store.put_blob(b"output").unwrap();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": MANIFEST,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": digest, "size": 6,
+            },
+            "layers": [],
+        });
+        store
+            .put_manifest(
+                "dev/task-cache",
+                "k",
+                MANIFEST,
+                manifest.to_string().as_bytes(),
+            )
+            .unwrap();
+        let tag = dir.join("repos/dev/task-cache/tags/k");
+        let old = std::time::SystemTime::now() - Duration::from_secs(30 * 86_400);
+        std::fs::File::open(&tag)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        tag
+    }
+
+    /// A pass finds the shared cache where `vk dev` keeps it, reads its filesystem's space
+    /// before anything goes — on a filesystem of its own when the host has a second one —
+    /// and collects it only once it is a private store `vk` made: never through a link,
+    /// nor one open to other users or holding something else, nor before the first boot.
+    #[test]
+    fn a_pass_collects_the_shared_cache_only_as_a_private_store_of_its_own() {
+        const CHILD: &str = "VK_TEST_GC_TASK_STORE";
+        const NAME: &str =
+            "gc::tests::a_pass_collects_the_shared_cache_only_as_a_private_store_of_its_own";
+        let Some(home) = crate::dev::testutil::child_marker(CHILD).map(PathBuf::from) else {
+            let _guard = crate::dev::testutil::env_guard();
+            let tmp = crate::dev::testutil::scratch("gc-task-store");
+            // `/dev/shm` is a tmpfs apart from the scratch dir's filesystem on most hosts.
+            let shm = Path::new("/dev/shm");
+            let cache = match shm.is_dir() {
+                true => shm.join(format!("vk-test-gc-task-store-{}", std::process::id())),
+                false => tmp.0.join("cache"),
+            };
+            let _ = std::fs::remove_dir_all(&cache);
+            std::fs::create_dir(&cache).unwrap();
+            let output = crate::dev::testutil::child_test(NAME)
+                .env(CHILD, &tmp.0)
+                .env("XDG_STATE_HOME", tmp.0.join("state"))
+                .env("XDG_DATA_HOME", tmp.0.join("data"))
+                .env("XDG_CACHE_HOME", &cache)
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(&cache);
+            crate::dev::testutil::ran_alone(NAME, &output);
+            return;
+        };
+        let root = crate::sharedcache::store_root().unwrap();
+        assert!(
+            root.starts_with(std::env::var_os("XDG_CACHE_HOME").unwrap()),
+            "{}",
+            root.display()
+        );
+        let state_dir = home.join("vk-state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut cfg = Config {
+            state_dir: Some(state_dir.clone()),
+            ..Config::default()
+        };
+        cfg.build.cache_registry = Some(home.join("build-cache").display().to_string());
+        let req = Request {
+            dry_run: false,
+            all_unused: false,
+            auto: false,
+            image_idle: crate::image::EVICT_GRACE,
+            checkout_idle: crate::image::EVICT_GRACE,
+        };
+        let pass = || run(&cfg, &state_dir, &req);
+        let task_rows = |sum: &Summary| {
+            sum.rows
+                .iter()
+                .filter(|r| r.category == "shared caches")
+                .map(|r| r.count)
+                .sum::<u64>()
+        };
+        let kept = |sum: &Summary, why: &str| {
+            assert!(
+                sum.kept
+                    .iter()
+                    .any(|k| k.starts_with("shared caches: ") && k.contains(why)),
+                "{why}: {}",
+                sum.render()
+            );
+        };
+
+        // Before the first boot: nothing to say, and nothing made.
+        let sum = pass();
+        assert_eq!(task_rows(&sum), 0, "{}", sum.render());
+        assert!(
+            !sum.kept.iter().any(|k| k.starts_with("shared caches")),
+            "{}",
+            sum.render()
+        );
+        assert!(!root.exists());
+
+        // A link to another store, however much it looks like one, leads the pass nowhere.
+        let elsewhere = home.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let elsewhere_tag = stale_task_store(&elsewhere);
+        std::fs::write(elsewhere.join("vk-shared-cache"), b"").unwrap();
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
+        kept(&pass(), "symbolic link");
+        assert!(elsewhere_tag.exists());
+        std::fs::remove_file(&root).unwrap();
+
+        // A store other users can reach is not the private one guests are promised.
+        use std::os::unix::fs::PermissionsExt;
+        crate::sharedcache::open_store(&root, crate::sharedcache::Missing::Create).unwrap();
+        let tag = stale_task_store(&root);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        kept(&pass(), "open to other users");
+        assert!(tag.exists());
+
+        // Nor is a store `vk` did not make for the shared cache.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_file(root.join("vk-shared-cache")).unwrap();
+        kept(&pass(), "not a shared cache store");
+        assert!(tag.exists());
+
+        // The store itself: collected, on a filesystem whose space was read up front.
+        std::fs::write(root.join("vk-shared-cache"), b"").unwrap();
+        let sum = pass();
+        assert_eq!(task_rows(&sum), 1, "{}", sum.render());
+        assert!(!tag.exists());
+        let id = crate::usage::fs_id(&root);
+        assert!(
+            sum.space.iter().any(|s| s.id == id && s.before.is_some()),
+            "{}",
+            sum.render()
+        );
     }
 
     #[test]

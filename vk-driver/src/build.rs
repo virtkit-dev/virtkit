@@ -664,7 +664,7 @@ fn run_config(st: &ShellState) -> vk_core::runcfg::RunConfig {
 /// paths and `file://` URLs select the in-process store, everything else is a registry
 /// host — so a spelling that names neither is refused rather than read as one of them.
 pub(crate) fn cache_repo(cache_registry: Option<&str>) -> Result<Option<String>> {
-    Ok(match cache_registry {
+    let repo = match cache_registry {
         Some("none") => None,
         // A hostname can start with neither a dot nor nothing at all, and a `file://` URL
         // that continues with anything but `/` is a path relative to wherever `vk` happens
@@ -687,7 +687,21 @@ pub(crate) fn cache_repo(cache_registry: Option<&str>) -> Result<Option<String>>
                 .display()
                 .to_string(),
         ),
-    })
+    };
+    // The shared cache store lends whatever it holds to guests by digest: a build cache there
+    // would be theirs to read, and its entries collected as tasks'.
+    if let Some(dir) = repo
+        .as_deref()
+        .and_then(crate::config::Registry::local_root_of)
+        && crate::sharedcache::is_store(&dir)
+    {
+        bail!(
+            "cache destination {} is the shared cache store: a build cache needs a store of \
+             its own",
+            dir.display()
+        );
+    }
+    Ok(repo)
 }
 
 /// Where the instruction cache keeps what it caches, as [`cache_store`] answers it.
@@ -6177,6 +6191,31 @@ mod tests {
         assert!(default.starts_with('/'), "not absolute: {default}");
         // A relative path would be misread as a registry host; refuse it.
         assert!(cache_repo(Some("./cache")).is_err());
+    }
+
+    #[test]
+    fn the_shared_cache_store_is_never_a_build_cache() {
+        let homes = crate::dev::testutil::Homes::new("cache-repo-task-store");
+        let root = crate::sharedcache::store_root().unwrap();
+        crate::sharedcache::open_store(&root, crate::sharedcache::Missing::Create).unwrap();
+        let link = homes.dir().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let file_url = format!("file://{}", root.display());
+        for named in [
+            root.display().to_string(),
+            file_url,
+            link.display().to_string(),
+        ] {
+            let err = cache_repo(Some(&named)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("shared cache store"),
+                "{named}: {err:#}"
+            );
+        }
+        let other = homes.dir().join("build-cache");
+        std::fs::create_dir(&other).unwrap();
+        let other = other.display().to_string();
+        assert_eq!(cache_repo(Some(&other)).unwrap(), Some(other));
     }
 
     // Where `vk registry status`/`gc` and `vk paths` look when no `--root` says otherwise:

@@ -365,6 +365,28 @@ fn run_args(
         }
     }
     args.require_cached |= over.no_build;
+    // The config's shared caches: the run serves them at `registry.vk`, and the guest's own
+    // environment says so to the tools that look for it. What it says is what the proxy
+    // serves, so nothing else may set those variables. The proxy lives on the run's switch:
+    // compose siblings on it reach the same caches, as their primary does.
+    if !plan.cache.shared.is_empty() {
+        let names = |env: &[crate::dev::plan::EnvVar]| -> Vec<String> {
+            env.iter().map(|e| e.name.clone()).collect()
+        };
+        for (env, what) in [
+            (&plan.container_env, "`container-env`"),
+            (&plan.exec_env, "`exec-env`"),
+        ] {
+            crate::sharedcache::refuse_guest_env(
+                &plan.cache.shared,
+                names(env).iter().map(String::as_str),
+                what,
+            )?;
+        }
+        args.registry_proxy = Some(crate::run::RegistryProxy::Areas(plan.cache.shared.clone()));
+        args.env
+            .extend(crate::sharedcache::guest_env(&plan.cache.shared));
+    }
     // A compose primary lives as long as its service's command; an image or build alone has
     // no command to live by, so the run keeps the VM until `vk dev stop`.
     if !matches!(plan.source, Source::Compose { .. }) {
@@ -465,6 +487,11 @@ pub fn task_args(
         args.target = Some(t.to_string());
         args.require_cached = false;
     }
+    crate::sharedcache::refuse_guest_env(
+        &plan.cache.shared,
+        task.env.iter().map(|e| e.name.as_str()),
+        &format!("task {}'s `env`", task.name),
+    )?;
     args.env.extend(
         plan.exec_env
             .iter()
@@ -1735,6 +1762,7 @@ mod tests {
         plan.cache = crate::dev::config::Cache {
             registry: Some("127.0.0.1:5000/cache".into()),
             insecure: true,
+            ..Default::default()
         };
         let cfg = crate::config::Config::default();
         let args = run_args(
@@ -2017,6 +2045,7 @@ mod tests {
         plan.cache = crate::dev::config::Cache {
             registry: Some("127.0.0.1:5000/cache".into()),
             insecure: true,
+            ..Default::default()
         };
         let cfg = crate::config::Config::default();
 
@@ -3956,6 +3985,136 @@ mod tests {
         assert!(
             (1..=32).contains(&name.chars().count()),
             "a long name is truncated to fit: {leaf}"
+        );
+    }
+
+    #[test]
+    fn shared_caches_reach_the_guest_of_an_environment_and_of_its_tasks() {
+        let t = scratch("cache-areas");
+        let mut plan = plan_in(&t.0);
+        let cfg = crate::config::Config::default();
+        let over = Overrides::default();
+        let var = |args: &crate::run::RunArgs, name: &str| {
+            let mut found = args.env.iter().filter(|(k, _)| k == name);
+            let value = found.next().map(|(_, v)| v.clone());
+            assert!(found.next().is_none(), "{name} is set once");
+            value
+        };
+
+        // Not asked for: no proxy, and nothing said of a registry.
+        let args = run_args(&plan, None, &over, &cfg, CheckoutMode::Shared).unwrap();
+        assert_eq!(args.registry_proxy, None);
+        assert_eq!(var(&args, "VK_REGISTRY"), None);
+        assert_eq!(var(&args, "VK_REGISTRY_CACHES"), None);
+        assert_eq!(var(&args, "VK_REGISTRY_AREAS"), None);
+
+        // Asked for: the run serves the caches and the guest's environment names them.
+        plan.cache.shared = vec!["other".into(), "task-cache".into()];
+        let areas = crate::run::RegistryProxy::Areas(plan.cache.shared.clone());
+        let args = run_args(&plan, None, &over, &cfg, CheckoutMode::Shared).unwrap();
+        assert_eq!(args.registry_proxy.as_ref(), Some(&areas));
+        assert!(args.net, "the proxy is reached through the switch");
+        assert_eq!(
+            var(&args, "VK_REGISTRY").as_deref(),
+            Some("http://registry.vk")
+        );
+        for name in ["VK_REGISTRY_CACHES", "VK_REGISTRY_AREAS"] {
+            assert_eq!(
+                var(&args, name).as_deref(),
+                Some("other=rwl task-cache=rwl"),
+                "{name}"
+            );
+        }
+
+        // An ephemeral task's VM is a run of its own, with the same caches.
+        let mut task = crate::dev::plan::TaskPlan {
+            name: "check".into(),
+            argv: vec!["true".into()],
+            env: vec![],
+            policy: crate::dev::config::Policy::Ephemeral,
+            environment: "dev".into(),
+            reuse: "dev".into(),
+            checkout: CheckoutMode::Shared,
+        };
+        let scratch_dir = t.0.join("scratch");
+        let args = task_args(&plan, &over, &cfg, &task, &[], None, Some(&scratch_dir)).unwrap();
+        assert_eq!(args.registry_proxy.as_ref(), Some(&areas));
+        assert_eq!(
+            var(&args, "VK_REGISTRY_CACHES").as_deref(),
+            Some("other=rwl task-cache=rwl")
+        );
+
+        // The variables say what the proxy serves: neither the config nor a task may set
+        // them, at a boot or in a task's VM.
+        let set = |name: &str| {
+            vec![crate::dev::plan::EnvVar {
+                name: name.into(),
+                value: "http://elsewhere".into(),
+                sensitive: false,
+            }]
+        };
+        let refused = |r: Result<crate::run::RunArgs>, what: &str, name: &str| {
+            let msg = format!("{:#}", r.err().expect("refused"));
+            assert!(msg.contains(&format!("{what} sets {name}")), "{msg}");
+        };
+        let mut bad = plan.clone();
+        bad.container_env = set("VK_REGISTRY");
+        refused(
+            run_args(&bad, None, &over, &cfg, CheckoutMode::Shared),
+            "`container-env`",
+            "VK_REGISTRY",
+        );
+        let mut bad = plan.clone();
+        bad.exec_env = set("VK_REGISTRY_AREAS");
+        refused(
+            run_args(&bad, None, &over, &cfg, CheckoutMode::Shared),
+            "`exec-env`",
+            "VK_REGISTRY_AREAS",
+        );
+        let mut bad = plan.clone();
+        bad.exec_env = set("VK_REGISTRY_CACHES");
+        refused(
+            run_args(&bad, None, &over, &cfg, CheckoutMode::Shared),
+            "`exec-env`",
+            "VK_REGISTRY_CACHES",
+        );
+        task.env = set("VK_REGISTRY");
+        refused(
+            task_args(&plan, &over, &cfg, &task, &[], None, Some(&scratch_dir)),
+            "task check's `env`",
+            "VK_REGISTRY",
+        );
+        // Without shared caches, they are the config's to set.
+        plan.cache.shared.clear();
+        plan.container_env = set("VK_REGISTRY");
+        let args = task_args(&plan, &over, &cfg, &task, &[], None, Some(&scratch_dir)).unwrap();
+        assert_eq!(args.registry_proxy, None);
+    }
+
+    /// A session in a running environment with shared caches is refused an `exec-env` that
+    /// sets the variables naming them, before any guest is reached.
+    #[tokio::test]
+    async fn a_session_is_refused_an_exec_env_naming_the_shared_caches() {
+        let t = scratch("cache-areas-attach");
+        let mut plan = plan_in(&t.0);
+        plan.cache.shared = vec!["task-cache".into()];
+        plan.exec_env = vec![crate::dev::plan::EnvVar {
+            name: "VK_REGISTRY".into(),
+            value: "http://elsewhere".into(),
+            sensitive: false,
+        }];
+        let err = crate::dev::exec_in_guest(
+            &plan,
+            &["true".into()],
+            None,
+            false,
+            vk_core::exec::client::Stdin::Closed,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("`exec-env` sets VK_REGISTRY"),
+            "{err:#}"
         );
     }
 

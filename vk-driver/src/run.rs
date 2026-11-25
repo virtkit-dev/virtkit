@@ -411,6 +411,27 @@ pub(crate) async fn run_or_exit_on_stop(args: &RunArgs, cfg: &crate::config::Con
     result
 }
 
+/// What a run's registry proxy lends its guest ([`RunArgs::registry_proxy`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegistryProxy {
+    /// `--registry-proxy`: the upstream registry base URL (`scheme://host`), forwarded to
+    /// with the `--username`/`--password` credential and the `--ca` trust.
+    Upstream(String),
+    /// `vk dev`'s `[dev.cache] shared`: the shared cache store ([`crate::sharedcache`]), its
+    /// proxy confined to the shared caches these aliases name.
+    Areas(Vec<String>),
+}
+
+impl RegistryProxy {
+    /// How the user asked for it, for a refusal to name.
+    pub fn asked_as(&self) -> &'static str {
+        match self {
+            RegistryProxy::Upstream(_) => "--registry-proxy",
+            RegistryProxy::Areas(_) => "`[dev.cache] shared`",
+        }
+    }
+}
+
 pub struct RunArgs {
     /// Image to boot (a docker ref or an OCI reference). Ignored when `dockerfile` is set
     /// — the rootfs is then built from the Dockerfile target.
@@ -548,11 +569,9 @@ pub struct RunArgs {
     /// running guest's allowlist without a restart (`vk dev`'s host-side apply). `None` = the
     /// lists are passed once and fixed. Ignored without `egress_allow`.
     pub egress_file: Option<PathBuf>,
-    /// opt-in credential-injecting registry proxy: the upstream registry base URL
-    /// (`scheme://host`). `vk` runs a host-local proxy forwarding to it with the
-    /// `--username`/`--password`/`--ca` credentials, and the guest reaches it
-    /// credential-free at `registry.vk` (needs `--net`). `None` = disabled.
-    pub registry_proxy: Option<String>,
+    /// opt-in credential-injecting registry proxy: `vk` runs a host-local proxy and the guest
+    /// reaches it credential-free at `registry.vk` (needs `--net`). `None` = disabled.
+    pub registry_proxy: Option<RegistryProxy>,
     /// compose file whose services boot as sibling unit VMs on the run switch,
     /// resolvable by alias, torn down with the run. Images materialize per run
     /// into the work dir; the instruction cache provides repeat-run warmth.
@@ -1994,8 +2013,13 @@ async fn build_and_boot(
         .or_else(|| primary_idx.and_then(|i| compose_units[i].tap.clone()));
     // These live on the switch, which a tap guest's default route no longer goes through.
     // Only the primary is pointed at the registry proxy; any tap guest escapes the rest.
-    if primary_tap.is_some() && args.registry_proxy.is_some() {
-        bail!("--registry-proxy needs the switch as the guest's route; drop the tap");
+    if primary_tap.is_some()
+        && let Some(proxy) = &args.registry_proxy
+    {
+        bail!(
+            "{} needs the switch as the guest's route; drop the tap",
+            proxy.asked_as()
+        );
     }
     let any_tap = primary_tap.is_some() || compose_units.iter().any(|u| u.tap.is_some());
     if any_tap {
@@ -2075,12 +2099,7 @@ async fn build_and_boot(
     // --env/--env-file extras, upserted so they win over the image env — both in
     // `drive`'s exports and in the guest's own env (the media below carry the
     // merged list in the boot config).
-    for (k, v) in &args.env {
-        match image_env.iter_mut().find(|(ek, _)| ek == k) {
-            Some(e) => e.1 = v.clone(),
-            None => image_env.push((k.clone(), v.clone())),
-        }
-    }
+    upsert_env(&mut image_env, &args.env);
     check_guest_env(&image_env)?;
 
     // 2. assemble the boot medium (virtkit-agent injected as PID 1). The media are unlinked
@@ -2525,11 +2544,25 @@ async fn build_and_boot(
         // Opt-in credential proxy: run a host-local proxy that injects the runner's
         // registry credentials, and redirect the guest's `registry.vk` (a sentinel
         // class-E address the switch special-cases) to it — the job stays credential-free.
+        // The switch redirects by destination, so every guest routed through it — a compose
+        // sibling as much as the primary — reaches what the proxy lends: a run's proxy is
+        // the whole run's, `vk dev`'s shared caches included.
         let mut hosts = planned.hosts.clone();
         let registry_proxy = match &args.registry_proxy {
-            Some(upstream) => {
+            Some(proxy) => {
                 const SENTINEL: std::net::Ipv4Addr = std::net::Ipv4Addr::new(240, 0, 0, 1);
-                let cfg = crate::regproxy::ProxyCfg::from_parts(upstream, cli_creds(args)?)?;
+                let cfg = match proxy {
+                    RegistryProxy::Upstream(upstream) => {
+                        crate::regproxy::ProxyCfg::from_parts(upstream, cli_creds(args)?)?
+                    }
+                    // Served by this run for as long as it lasts: runs share the store,
+                    // each with a server and a credential of its own.
+                    RegistryProxy::Areas(aliases) => {
+                        crate::sharedcache::serve(&crate::sharedcache::store_root()?, aliases)
+                            .await
+                            .context("serving the shared cache (`[dev.cache] shared`)")?
+                    }
+                };
                 let socket = crate::regproxy::spawn(cfg).await?;
                 hosts.push(("registry.vk".to_string(), SENTINEL.to_string()));
                 cmdline.push_str(" VIRTKIT_REGISTRY=registry.vk");
@@ -2583,10 +2616,11 @@ async fn build_and_boot(
         net_attach = Some(attach);
         Some(child)
     } else {
-        if args.registry_proxy.is_some() {
+        if let Some(proxy) = &args.registry_proxy {
             bail!(
-                "--registry-proxy requires --net: the guest reaches the credential proxy \
-                 through the switch's sentinel redirect, which only exists with networking"
+                "{} requires --net: the guest reaches the credential proxy through the \
+                 switch's sentinel redirect, which only exists with networking",
+                proxy.asked_as()
             );
         }
         None
@@ -5209,6 +5243,29 @@ fn scratch_boot_config(
     Ok(scratch)
 }
 
+/// Set `extra` (`--env`/`--env-file`, and what a run adds such as its shared caches' variables)
+/// over `env`, the image's: each keeps the first inherited copy's place and every later copy
+/// goes, since an image may list a name twice and the guest's shell exports them in order.
+fn upsert_env(env: &mut Vec<(String, String)>, extra: &[(String, String)]) {
+    for (k, v) in extra {
+        let mut seen = false;
+        env.retain_mut(|(ek, ev)| {
+            if ek != k {
+                return true;
+            }
+            if seen {
+                return false;
+            }
+            seen = true;
+            v.clone_into(ev);
+            true
+        });
+        if !seen {
+            env.push((k.clone(), v.clone()));
+        }
+    }
+}
+
 /// Refuse a guest env entry the guest cannot set, naming it: an empty name, `=` in a name,
 /// or a NUL anywhere. Anything else — newlines, tabs, any UTF-8 — reaches the guest whole.
 fn check_guest_env(env: &[(String, String)]) -> Result<()> {
@@ -6492,6 +6549,33 @@ impl Drop for VmSession {
 #[cfg(test)]
 mod tests {
     use vk_core::messages::CmdResult;
+
+    /// A run's variables win over every copy of the name an image lists, keeping the first
+    /// copy's place.
+    #[test]
+    fn a_run_variable_replaces_every_image_copy() {
+        let kv = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let mut env = vec![
+            kv("VK_REGISTRY_CACHES", "image"),
+            kv("PATH", "/bin"),
+            kv("VK_REGISTRY_CACHES", "image-again"),
+        ];
+        super::upsert_env(
+            &mut env,
+            &[
+                kv("VK_REGISTRY_CACHES", "run"),
+                kv("VK_REGISTRY", "http://registry.vk"),
+            ],
+        );
+        assert_eq!(
+            env,
+            [
+                kv("VK_REGISTRY_CACHES", "run"),
+                kv("PATH", "/bin"),
+                kv("VK_REGISTRY", "http://registry.vk"),
+            ]
+        );
+    }
 
     use super::*;
 

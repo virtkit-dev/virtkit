@@ -604,6 +604,12 @@ async fn exec_with(
     extra: &[(String, String)],
 ) -> Result<vk_core::messages::CmdResult> {
     plan.require_resolved()?;
+    // The variables naming the guest's shared caches say what its proxy serves.
+    crate::sharedcache::refuse_guest_env(
+        &plan.cache.shared,
+        plan.exec_env.iter().map(|e| e.name.as_str()),
+        "`exec-env`",
+    )?;
     let entry = crate::vms::resolve_one(Some(&plan.state_dir))?;
     let addr: vk_core::addr::SocketAddr = entry.exec_addr.parse()?;
     let env: Vec<String> = plan

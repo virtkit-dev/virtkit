@@ -516,13 +516,39 @@ pub struct SshHost {
     pub key: Option<String>,
 }
 
-/// `[dev.cache]`: where built stages are cached.
+/// `[dev.cache]`: where built stages are cached, and which shared caches the guest reaches.
 #[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Cache {
     pub registry: Option<String>,
     #[serde(default)]
     pub insecure: bool,
+    /// the shared caches the guest reaches, each by this name at
+    /// `http://registry.vk/job/<name>`, in no particular order ([`Cache::canonical`]). Left
+    /// out of the record when empty, so an environment that never asked for one keeps the
+    /// identity it booted with.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared: Vec<String>,
+}
+
+impl Cache {
+    fn validate(&self) -> Result<()> {
+        for alias in &self.shared {
+            if let Err(why) = crate::sharedcache::check_alias(alias) {
+                bail!("shared: {alias:?} {why}");
+            }
+        }
+        Ok(())
+    }
+
+    /// With the shared caches in the one order and number that mean the same set
+    /// ([`crate::sharedcache::canonical`]).
+    pub fn canonical(&self) -> Cache {
+        Cache {
+            shared: crate::sharedcache::canonical(&self.shared),
+            ..self.clone()
+        }
+    }
 }
 
 /// `[dev.endpoints.<name>]`: one guest port, published on the host.
@@ -964,6 +990,9 @@ impl Environment {
         self.network
             .validate()
             .with_context(|| format!("[{at}.network]"))?;
+        self.cache
+            .validate()
+            .with_context(|| format!("[{at}.cache]"))?;
         for (hook, cmd) in [
             ("init", &self.hooks.init),
             ("create", &self.hooks.create),
@@ -1124,6 +1153,9 @@ impl Environment {
                     }
                 ),
             );
+        }
+        if !self.cache.shared.is_empty() {
+            line("shared", self.cache.canonical().shared.join(", "));
         }
         let mut host = Vec::new();
         if self.host.git_gui {
@@ -3051,6 +3083,56 @@ host-port = 9443
             "schema = 1\nenv-files = [\"extra.env\"]\n[dev]\nimage = \"x\"\n",
         );
         assert!(format!("{:#}", load_in(&f).unwrap_err()).contains("env-files"));
+    }
+
+    #[test]
+    fn shared_caches_are_each_environments_own_and_layer_from_the_local_file() {
+        let f = workspace("cache-areas");
+        // Off unless asked for, and an environment inherits nothing from `dev`.
+        write(
+            &f,
+            CONFIG_FILE,
+            "schema = 1\n[dev]\nimage = \"x\"\n[dev.cache]\nregistry = \"none\"\n\
+             [environments.hook]\nimage = \"y\"\n",
+        );
+        let l = load_in(&f).unwrap();
+        assert!(dev_of(&l).cache.shared.is_empty());
+        assert!(!l.describe().contains("shared cache"), "{}", l.describe());
+
+        // The local layer turns them on per environment, beside what the table already says.
+        write(
+            &f,
+            LOCAL_FILE,
+            "[dev.cache]\nshared = [\"task-cache\"]\n\
+             [environments.hook.cache]\nshared = [\"task-cache\", \"other.one\"]\n",
+        );
+        let l = load_in(&f).unwrap();
+        let dev = dev_of(&l);
+        assert_eq!(dev.cache.shared, ["task-cache"]);
+        assert_eq!(dev.cache.registry.as_deref(), Some("none"));
+        assert_eq!(
+            l.environment("hook").unwrap().cache.shared,
+            ["task-cache", "other.one"]
+        );
+        let report = l.describe();
+        assert!(report.contains("shared      task-cache\n"), "{report}");
+        assert!(report.contains("other.one, task-cache"), "{report}");
+
+        // A shared cache's name is one repository name component, naming a prefix the registry serves.
+        let too_long = format!("[\"{}\"]", "a".repeat(252));
+        for (areas, why) in [
+            ("[\"Task\"]", "repository name component"),
+            ("[\"a/b\"]", "repository name component"),
+            ("[\"\"]", "repository name component"),
+            ("[\"tags\"]", "keeps for its own layout"),
+            (too_long.as_str(), "longer than 251 bytes"),
+        ] {
+            for table in ["dev.cache", "environments.hook.cache"] {
+                write(&f, LOCAL_FILE, &format!("[{table}]\nshared = {areas}\n"));
+                let msg = format!("{:#}", load_in(&f).unwrap_err());
+                assert!(msg.contains(why) && msg.contains(table), "{areas}: {msg}");
+            }
+        }
     }
 
     #[test]

@@ -127,6 +127,11 @@ async fn attach(plan: &Plan, task: &TaskPlan, extra: &[String]) -> Result<ExitCo
         task.name,
         plan.environment
     );
+    crate::sharedcache::refuse_guest_env(
+        &plan.cache.shared,
+        task.env.iter().map(|e| e.name.as_str()),
+        &format!("task {}'s `env`", task.name),
+    )?;
     let mut argv = task.argv.clone();
     argv.extend_from_slice(extra);
     let env: Vec<(String, String)> = task
@@ -150,15 +155,7 @@ async fn ephemeral(
     cfg: &crate::config::Config,
     over: &crate::dev::Overrides,
 ) -> Result<ExitCode> {
-    let mut env_plan = crate::dev::plan::resolve(loaded, &task.environment)?;
-    // `[environments.<name>]` inherits nothing from `[dev]`, which is right for what an
-    // environment *is* — but where built stages are cached is a property of the project and
-    // the machine, not of one environment, and a task warmed from another store rebuilds
-    // everything. So the dev environment's cache stands in when the task's names none.
-    if env_plan.cache.registry.is_none() {
-        env_plan.cache = plan.cache.clone();
-    }
-    env_plan.require_resolved()?;
+    let env_plan = ephemeral_plan(loaded, plan, task)?;
     crate::quiet::enote!(
         "task {}: ephemeral {} VM ({})",
         task.name,
@@ -181,6 +178,23 @@ async fn ephemeral(
         Outcome::Done => ExitCode::SUCCESS,
         Outcome::Exit(result) => crate::exec::exit(result),
     })
+}
+
+/// The plan of the environment `task` runs an ephemeral VM of, resolved.
+///
+/// `[environments.<name>]` inherits nothing from `[dev]`, which is right for what an
+/// environment *is* — but where built stages are cached is a property of the project and
+/// the machine, not of one environment, and a task warmed from another store rebuilds
+/// everything. So the calling environment's cache registry stands in when the task's names
+/// none. Its shared caches never do: what a guest reaches is its own environment's to say.
+fn ephemeral_plan(loaded: &Loaded, plan: &Plan, task: &TaskPlan) -> Result<Plan> {
+    let mut env_plan = crate::dev::plan::resolve(loaded, &task.environment)?;
+    if env_plan.cache.registry.is_none() {
+        env_plan.cache.registry = plan.cache.registry.clone();
+        env_plan.cache.insecure = plan.cache.insecure;
+    }
+    env_plan.require_resolved()?;
+    Ok(env_plan)
 }
 
 /// Return the outcome so [`ephemeral`] drops the scratch guard before `exec::exit`
@@ -344,6 +358,61 @@ checkout = "overlay"
             placement_of(&f.0, "roe").unwrap(),
             Placement::Ephemeral
         ));
+    }
+
+    /// An ephemeral task on another environment takes the caller's build cache registry when
+    /// its own names none, and never the caller's shared caches: it has its own, or none.
+    #[test]
+    fn an_ephemeral_task_borrows_the_build_cache_and_never_the_shared_caches() {
+        let f = fixture("ephemeral-cache");
+        let config = std::fs::read_to_string(f.0.join(".virtkit/config.toml")).unwrap();
+        std::fs::write(
+            f.0.join(".virtkit/config.toml"),
+            format!(
+                "{config}
+[dev.cache]
+registry = \"127.0.0.1:5000/cache\"
+insecure = true
+shared = [\"mine\"]
+
+[dev.tasks.on-hook]
+run = \"true\"
+policy = \"ephemeral\"
+environment = \"hook\"
+
+[dev.tasks.on-bare]
+run = \"true\"
+policy = \"ephemeral\"
+environment = \"bare\"
+
+[environments.hook]
+image = \"alpine\"
+workspace = \"/w\"
+[environments.hook.cache]
+shared = [\"theirs\"]
+
+[environments.bare]
+image = \"alpine\"
+workspace = \"/w\"
+"
+            ),
+        )
+        .unwrap();
+        let loaded =
+            crate::dev::config::load(crate::dev::config::discover(&f.0, Some(&f.0), None).unwrap())
+                .unwrap();
+        let plan = crate::dev::plan::resolve(&loaded, "dev").unwrap();
+        for (name, areas) in [("on-hook", vec!["theirs".to_string()]), ("on-bare", vec![])] {
+            let task = find(&plan, name).unwrap();
+            let env_plan = ephemeral_plan(&loaded, &plan, task).unwrap();
+            assert_eq!(
+                env_plan.cache.registry.as_deref(),
+                Some("127.0.0.1:5000/cache"),
+                "{name}"
+            );
+            assert!(env_plan.cache.insecure, "{name}");
+            assert_eq!(env_plan.cache.shared, areas, "{name}");
+        }
     }
 
     #[test]

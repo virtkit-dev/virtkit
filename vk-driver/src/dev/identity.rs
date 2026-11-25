@@ -961,8 +961,9 @@ impl Effect {
 /// hooks run at a start and managed directories are mounted at a boot, so those two need
 /// the restart they are classified under, as is the compose document, read at the boot. What
 /// only a build reads — the cache it is aimed at, the target it falls back to — is a
-/// rebuild, not a restart, and an `${localEnv:…}` that has become available since the boot
-/// is picked up by the next session along with the value it fills in.
+/// rebuild, not a restart; the shared caches, set up at the boot, are a restart. An
+/// `${localEnv:…}` that has become available since the boot is picked up by the next
+/// session along with the value it fills in.
 fn effect_of(key: &str) -> Effect {
     match top_key(key) {
         "exec_env" | "vscode" | "freshness" | "config" | "environment" | "tasks" | "unresolved" => {
@@ -972,6 +973,8 @@ fn effect_of(key: &str) -> Effect {
         // The switch follows its allowlist file, which the next attach rewrites; turning the
         // restriction on or off (`egress.mode`) is a different switch, so a restart.
         "egress" if key.starts_with("egress.allow_") => Effect::Host,
+        // The shared caches are served, and the guest told of them, at a boot.
+        "cache" if key.starts_with("cache.shared") => Effect::Restart,
         "cache" | "cached_only" | "fallback_target" => Effect::Rebuild,
         "source" if key.starts_with("source.Build") => Effect::Rebuild,
         _ => Effect::Restart,
@@ -1919,6 +1922,18 @@ mod tests {
         let groups = drift(&before, &only_env);
         assert!(groups.keys().all(|e| *e == Effect::Session), "{groups:?}");
         assert!(drift(&before, &before).is_empty());
+        // Turning a shared cache on needs the restart that serves it, and an environment
+        // with none keeps the identity it had before shared caches existed.
+        assert!(!before.to_string().contains("shared"), "{before}");
+        let mut d = a.clone();
+        d.cache.shared = vec!["task-cache".into()];
+        let with_area = identity_of(&d, None).unwrap().manifest;
+        let groups = drift(&before, &with_area);
+        assert_eq!(
+            groups.keys().collect::<Vec<_>>(),
+            [&Effect::Restart],
+            "{groups:?}"
+        );
         // A secret's value is fingerprinted, so a changed one still shows — as session-only.
         assert_eq!(effects["exec_env.TOKEN.value"], Effect::Session);
         // A mount is keyed by its name, so reordering is nothing; a new one is a restart.
@@ -1945,6 +1960,9 @@ mod tests {
         );
         // What only a build reads is a rebuild, not a restart.
         assert_eq!(effect_of("cache.registry"), Effect::Rebuild);
+        // The shared caches are the guest's, set up at its boot.
+        assert_eq!(effect_of("cache.shared[\"task-cache\"]"), Effect::Restart);
+        assert_eq!(effect_of("cache.shared"), Effect::Restart);
         assert_eq!(effect_of("cached_only"), Effect::Rebuild);
         assert_eq!(effect_of("fallback_target"), Effect::Rebuild);
     }

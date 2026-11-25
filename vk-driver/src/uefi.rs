@@ -345,7 +345,12 @@ fn refuse_unsupported(args: &RunArgs) -> Result<()> {
         (args.atop.is_some(), "--atop"),
         (args.nics.is_some(), "--nics"),
         (args.audit_egress, "--audit-egress"),
-        (args.registry_proxy.is_some(), "--registry-proxy"),
+        (
+            args.registry_proxy.is_some(),
+            args.registry_proxy
+                .as_ref()
+                .map_or("--registry-proxy", crate::run::RegistryProxy::asked_as),
+        ),
         (
             args.inactivity_timeout_secs.is_some(),
             "--inactivity-timeout",
@@ -1551,7 +1556,7 @@ mod tests {
             command: vec!["true".into()],
             ssh: true,
             audit_egress: true,
-            registry_proxy: Some("10.0.2.2:5000".into()),
+            registry_proxy: Some(crate::run::RegistryProxy::Upstream("10.0.2.2:5000".into())),
             inactivity_timeout_secs: Some(60),
             ..Default::default()
         };

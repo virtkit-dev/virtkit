@@ -377,6 +377,8 @@ pub struct Cache {
     pub registry: Option<String>,
     #[serde(default)]
     pub insecure: bool,
+    #[serde(default)]
+    pub shared: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1106,6 +1108,12 @@ pub fn translate(
         if cache.insecure {
             d.set("insecure", true);
         }
+        if !cache.shared.is_empty() {
+            d.set(
+                "shared",
+                toml::Value::Array(cache.shared.iter().map(|a| a.clone().into()).collect()),
+            );
+        }
         d.translated("customizations.virtkit.cache", "as `cache`");
     }
     Ok(d)
@@ -1455,6 +1463,31 @@ mod tests {
         // An unterminated block comment blanks to EOF, so the value never closes.
         let stripped = strip_comments(r#"{"a": /*/ 1 }"#);
         assert!(serde_json::from_str::<serde_json::Value>(&stripped).is_err());
+    }
+
+    #[test]
+    fn the_virtkit_cache_translates_with_its_shared_caches() {
+        let ws = scratch("cache");
+        let d = translate_json(
+            r#"{"image": "x", "customizations": {"virtkit": {"cache": {
+                "registry": "127.0.0.1:5000/cache", "insecure": true,
+                "shared": ["task-cache", "other"]}}}}"#,
+            &ws,
+        );
+        let rendered = d.render();
+        let cfg: toml::Value =
+            toml::from_str(&rendered).unwrap_or_else(|e| panic!("{e}\n{rendered}"));
+        let cache = &cfg["dev"]["cache"];
+        assert_eq!(cache["registry"].as_str(), Some("127.0.0.1:5000/cache"));
+        assert_eq!(cache["insecure"].as_bool(), Some(true));
+        let areas: Vec<_> = cache["shared"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(areas, ["task-cache", "other"]);
+        assert!(translated(&d, "customizations.virtkit.cache"));
     }
 
     #[test]

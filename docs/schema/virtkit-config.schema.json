@@ -384,7 +384,7 @@
     },
     "cache": {
       "title": "cache",
-      "description": "`[dev.cache]`: where built stages are cached",
+      "description": "`[dev.cache]`: where built stages are cached, and which shared caches the guest reaches",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -395,6 +395,11 @@
         "insecure": {
           "description": "allow plain HTTP and unverified TLS to that registry",
           "type": "boolean"
+        },
+        "shared": {
+          "description": "the shared caches the guest reaches, each at `http://registry.vk/job/<name>`; a name is one repository name component (lowercase letters and digits, separated by `.`, `_`, `__` or hyphens) of at most 251 bytes, and not `blobs`, `manifests` or `tags`",
+          "type": "array",
+          "items": { "type": "string" }
         }
       }
     },

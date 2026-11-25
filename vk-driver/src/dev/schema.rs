@@ -421,6 +421,7 @@ key = "work"
 [dev.cache]
 registry = "https://vk-registry.corp:5000"
 insecure = false
+shared = ["task-cache"]
 
 [dev.endpoints."runner.https"]
 service = "runner"

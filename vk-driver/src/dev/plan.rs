@@ -498,7 +498,7 @@ pub fn resolve(loaded: &Loaded, name: &str) -> Result<Plan> {
         endpoints,
         host_exec,
         ssh: env.ssh.clone(),
-        cache: env.cache.clone(),
+        cache: env.cache.canonical(),
         requires: loaded.schema.requires.clone(),
         cached_only: env.cached_only,
         fallback_target: env.fallback.as_ref().and_then(|f| f.target.clone()),
@@ -1463,6 +1463,18 @@ impl Plan {
                 ),
             );
         }
+        if !self.cache.shared.is_empty() {
+            comment(
+                &mut out,
+                &format!(
+                    "[dev.cache] shared: the guest reaches {} at http://{}/job/<name>, \
+                     named by VK_REGISTRY and VK_REGISTRY_CACHES — no `vk run` flag spells \
+                     this",
+                    self.cache.shared.join(" "),
+                    crate::regproxy::GUEST_HOST,
+                ),
+            );
+        }
         if let Some(e) = &self.egress {
             let list = |v: &[String]| match v {
                 [] => "none".to_string(),
@@ -1758,6 +1770,55 @@ extensions = ["ms-python.python"]
     fn plan_of(root: &Path, env: &str) -> Result<Plan> {
         let loaded = crate::dev::config::load(crate::dev::config::discover(root, None, None)?)?;
         resolve(&loaded, env)
+    }
+
+    /// The order shared caches are listed in, or a repeat, changes nothing: not the identity a boot
+    /// records and compares, not the drift `vk dev diff` and `status` show, not what the
+    /// guest is told.
+    #[test]
+    fn the_order_of_shared_caches_changes_nothing() {
+        let _env = env_guard();
+        let plan_with = |tag: &str, areas: &str| {
+            let f = crate::dev::testutil::scratch(tag);
+            std::fs::create_dir_all(f.0.join(".virtkit")).unwrap();
+            std::fs::write(
+                f.0.join(".virtkit/config.toml"),
+                format!(
+                    "schema = 1\n[dev]\nimage = \"x\"\nworkspace = \"/w\"\n\
+                     [dev.cache]\nshared = {areas}\n"
+                ),
+            )
+            .unwrap();
+            let mut plan = plan_of(&f.0, "dev").unwrap();
+            // The two workspaces differ in nothing else.
+            plan.workspace = PathBuf::from("/w");
+            plan.config = PathBuf::from("/w/.virtkit/config.toml");
+            plan.state_dir = PathBuf::from("/s");
+            plan
+        };
+        let one = plan_with("areas-one", r#"["b", "a"]"#);
+        let two = plan_with("areas-two", r#"["a", "b", "a"]"#);
+        assert_eq!(one.cache.shared, ["a", "b"]);
+        assert_eq!(one.cache, two.cache);
+
+        let (a, b) = (
+            crate::dev::identity::identity_of(&one, None).unwrap(),
+            crate::dev::identity::identity_of(&two, None).unwrap(),
+        );
+        assert_eq!(a.digest, b.digest, "a boot finds the same config");
+        assert!(crate::dev::identity::same_config(
+            &a.digest,
+            &a.manifest,
+            &b
+        ));
+        assert!(
+            crate::dev::identity::drift(&a.manifest, &b.manifest).is_empty(),
+            "diff and status show nothing"
+        );
+        assert_eq!(
+            crate::sharedcache::guest_env(&one.cache.shared),
+            crate::sharedcache::guest_env(&two.cache.shared)
+        );
     }
 
     #[test]
@@ -2379,6 +2440,16 @@ extensions = ["ms-python.python"]
             "the checkout is mounted where the config says: {shell}"
         );
         assert!(p.vscode.is_none() && p.managed_dirs.is_empty());
+
+        // Shared caches have no `vk run` flag: the printed plan says what the boot does.
+        assert!(!p.to_shell(false).unwrap().contains("shared cache"));
+        let mut cached = p.clone();
+        cached.cache.shared = vec!["task-cache".into()];
+        let shell = cached.to_shell(false).unwrap();
+        assert!(
+            shell.contains("# [dev.cache] shared: the guest reaches task-cache at"),
+            "{shell}"
+        );
 
         // A persistent editor on an image or build source gets vk's managed server mount at
         // the user's home — the default one, or the one the config names.

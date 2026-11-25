@@ -21,6 +21,11 @@ All notable changes to virtkit will be documented in this file.
 - CI jobs find their aliases in `VK_REGISTRY_CACHES` too, the new name of
   `VK_REGISTRY_AREAS`, which keeps its value.
 - The hub shows whether each registry serves sccache's S3 cache, next to WebDAV.
+- `vk dev` environments can share caches across repositories and worktrees:
+  `[dev.cache] shared = ["task-cache"]` lets the guest reach one, without a credential, at
+  `http://registry.vk/job/task-cache`, as a CI job does, so a project's task cache settings
+  work unchanged in both, build-once locks included. `vk gc` collects the cache like the
+  build cache.
 
 ### Changed
 

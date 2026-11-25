@@ -248,7 +248,64 @@ environment. `cached-only = true` is available for a `build` source: it requires
 a cache hit unless `fallback = { target = "smaller-stage" }` names a stage to
 build on a miss. The fallback responds to a cache miss, not a failed guest boot
 or command. An ephemeral task whose environment has no cache registry uses the
-calling environment's cache settings. See [Project tasks](#project-tasks) for an example.
+calling environment's, but never its shared caches. See [Project tasks](#project-tasks) for an example.
+
+### Shared caches
+
+```toml
+[dev.cache]
+shared = ["task-cache"]
+```
+
+`shared` lets the guest's tools share their outputs with your other environments
+that list the same name: other repositories, other worktrees of this one, ephemeral
+tasks. Each name is a shared cache, which the guest reaches without a credential at
+`http://registry.vk/job/<name>`. The guest's environment names what it was given,
+as a CI job's does, and nothing else may set these variables while shared caches
+are on:
+
+```sh
+VK_REGISTRY=http://registry.vk
+VK_REGISTRY_CACHES=task-cache=rwl
+VK_REGISTRY_AREAS=task-cache=rwl   # the same, under its older name
+```
+
+A [task](https://github.com/wallix/task-rs) cache declared as
+`vk: http://registry.vk/job/task-cache` therefore works unchanged in CI and in a
+development environment. Its build-once locks are shared too: a task two
+environments need at once can be built by one while the other waits, then restores
+the result.
+
+Shared caches are off by default and belong in `.virtkit/local.toml`, since they
+are a choice about this machine. Each environment asks for its own: one under
+`[environments.<name>]` gets none from `[dev]`, so a pre-commit environment needs
+its own `[environments.<name>.cache] shared`, and an ephemeral task gets those of
+the environment it runs. Changing them takes effect at the next restart. A shared
+cache's name is one repository name component — lowercase letters and digits, separated by
+`.`, `_`, `__` or hyphens — of at most 251 bytes, and not `blobs`, `manifests` or
+`tags`.
+
+Shared caches live in a store of their own, `$XDG_CACHE_HOME/virtkit/shared-cache`
+(else `~/.cache/virtkit/shared-cache`; shown by `vk paths`), apart from the build
+cache that `registry` above selects, which may never be the same directory. `vk`
+makes it private to your user and marks it as the shared cache store, and refuses
+to serve or collect it otherwise: open to other users, a
+symbolic link, or a directory holding something else. `vk gc` collects it under the
+build cache's limits, each store held to them on its own: tags unused for 14 days,
+then the least recently used until it fits its cap, when they are old enough to go
+(`[gc] build_cache_retention_days` and `build_cache_max`). `vk registry status
+--root` and `vk registry gc --root` inspect and reclaim it by hand.
+
+A guest reaches the shared caches its environment names and nothing else: no other
+repository's name, no lock outside them, and nothing of the build cache or of any
+registry credential on the host — the proxy authenticates for it. Everything inside
+a shared cache is shared: an environment can read and replace what another wrote
+there. The proxy confines names, not content: a guest that knows a digest can read
+it whichever cache it was pushed to. So share caches only between environments you
+trust alike. The shared caches are the whole environment's, not its primary's alone:
+every service of a compose environment whose traffic goes through its network
+reaches them at the same address, though only the primary's environment names them.
+An environment that routes its primary through a tap device cannot use them.
 
 ## Daily workflow and freshness
 

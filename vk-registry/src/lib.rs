@@ -4347,23 +4347,25 @@ pub async fn serve_on(listener: TcpListener, state: Arc<ServerState>) -> Result<
     serve_limited(listener, state, CONN_LIMITS).await
 }
 
+/// [`serve_on`] without the lines a server announces itself with: for a process that serves
+/// a store to itself, whose user never asked for a server.
+pub async fn serve_unannounced_on(listener: TcpListener, state: Arc<ServerState>) -> Result<()> {
+    let refusals = Arc::new(tokio::sync::Semaphore::new(CONN_LIMITS.refusals));
+    serve_refusing(listener, state, CONN_LIMITS, refusals).await
+}
+
 async fn serve_limited(
     listener: TcpListener,
     state: Arc<ServerState>,
     limits: ConnLimits,
 ) -> Result<()> {
+    announce(&listener, &state);
     let refusals = Arc::new(tokio::sync::Semaphore::new(limits.refusals));
     serve_refusing(listener, state, limits, refusals).await
 }
 
-/// [`serve_limited`] with caller-supplied refusal permits (`limits.refusals`) so tests can
-/// observe their use.
-async fn serve_refusing(
-    listener: TcpListener,
-    state: Arc<ServerState>,
-    limits: ConnLimits,
-    refusals: Arc<tokio::sync::Semaphore>,
-) -> Result<()> {
+/// Say on stderr what is about to be served, and what an operator should know of it.
+fn announce(listener: &TcpListener, state: &ServerState) {
     if let Ok(addr) = listener.local_addr() {
         eprintln!(
             "{}",
@@ -4385,6 +4387,16 @@ async fn serve_refusing(
     if !state.s3 {
         eprintln!("vk-registry: S3 view off (s3 = false): /s3/ answers 404");
     }
+}
+
+/// [`serve_limited`] with caller-supplied refusal permits (`limits.refusals`) so tests can
+/// observe their use, and without its announcement.
+async fn serve_refusing(
+    listener: TcpListener,
+    state: Arc<ServerState>,
+    limits: ConnLimits,
+    refusals: Arc<tokio::sync::Semaphore>,
+) -> Result<()> {
     let slots = Arc::new(tokio::sync::Semaphore::new(limits.connections));
     let peers = PeerCounts::default();
     let mut refused = RefusalLog::default();
