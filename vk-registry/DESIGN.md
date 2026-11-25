@@ -438,7 +438,7 @@ Registries advertise the route to their hub in their inventory.
 
 The registry process is the authority for leased locks. No Redis or shared filesystem lock
 is involved in the request path. Locks are process-local: restarting the server releases all
-leases.
+leases, unless it hands its table to the release that updates it.
 
 Locks are keyed by content fingerprint. A lease defaults to 30 seconds and clients renew it
 periodically. An expired lease is reclaimed automatically. Only the opaque owner token
@@ -476,6 +476,38 @@ after a wait or renewed, ends by the token's expiry. The tokens of one subject (
 at most 256 live locks together: an acquire that would take more is answered 429 at once,
 without waiting. A token past its expiry, though within the skew it is otherwise taken with,
 is refused here with the mode's challenge.
+
+### Locks of a local store
+
+A local store has no daemon. A process that serves one in-process would be a lock authority
+of its own, next to every other process of the host doing the same. A lock manager made
+host-shared for a store root instead acts as one authority with the others made so. For each
+name it leases, it also holds a host lock: an abstract Unix socket, shared by the processes
+of one network namespace, named after the resolved store root and the lock name. It stays
+bound while the lease lives and is closed when the lease is released or lapses, or when the
+process dies, once no child holds a copy of it. A `vk build` caching into a local store
+takes the same host lock directly around a stage, with no lease, so it and such a manager
+exclude each other on a name. The `vk-registry` server keeps its process-local table, even
+over the same store.
+
+- A batch is still all-or-nothing: a name another process holds unbinds what the batch had
+  bound, and the acquire tries again within 250 ms until its wait is over.
+- `/lock/status` and the blockers of a refused acquire name another process's holder by
+  asking it over the socket. The holders asked share what is left of the acquire's wait, or
+  250 ms when less is, and one second for a status request. A holder that says nothing by
+  then is named `another process`.
+- A lapsed lease is removed when it lapses, not at the next request, since other processes
+  wait on its socket.
+- A lease lasts at most 5 minutes, and a manager holds at most 256 at once, answering 429
+  past them: no token bounds the clients of an in-process server.
+- The socket namespace has no permissions. A name bound by another user's process, or that
+  three queries in a row cannot connect to, is not waited for: the lease is granted and
+  excludes that manager's own clients only, as when the name cannot be bound at all. A
+  holder that connects and names no one is waited for. Sharing is an optimisation, never a
+  reason to hang or fail.
+- The store root is created when missing, so that every process resolves it to one name.
+- Failure records are not shared between processes, and a host-shared manager refuses to
+  hand its table over: the sockets would not follow.
 
 ## Batched manifest probe
 

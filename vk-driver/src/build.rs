@@ -2472,11 +2472,11 @@ fn build_stage(
             ex.stage_end(&fs, Some(key))?;
             return Ok(fs);
         }
-        // Build-once across runners: take the lock on this stage's final content key (a no-op
-        // unless the cache is a remote vk-registry) so peers building the same stage don't
-        // duplicate it. After acquiring, re-check the cache — a peer may have finished while we
-        // waited — and restore instead of building. The guard is held for the whole stage
-        // (through the final `cache_save`) and releases on return.
+        // Build-once across runners, or with a local cache across the processes of this host:
+        // take the lock on this stage's final content key (a no-op without a cache) so peers
+        // building the same stage don't duplicate it. After acquiring, re-check the cache — a
+        // peer may have finished while we waited — and restore instead of building. The guard
+        // is held for the whole stage (through the final `cache_save`) and releases on return.
         let _build_lock = match &final_key {
             Some(final_key) => {
                 // On contention the lock names its holder; show it under this stage until acquired.

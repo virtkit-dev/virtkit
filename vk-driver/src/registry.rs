@@ -3713,7 +3713,7 @@ pub(crate) fn http_client_builder(rg: &Registry) -> Result<reqwest::ClientBuilde
     Ok(b)
 }
 
-// ---- build-once lock (client of the vk-registry /lock API) ----
+// ---- build-once lock (client of the vk-registry /lock API, or a local store's host lock) ----
 
 /// Lease TTL requested for a build-once lock; renewed by the heartbeat below.
 const BUILD_LOCK_TTL: Duration = Duration::from_secs(30);
@@ -3722,7 +3722,7 @@ const BUILD_LOCK_TTL: Duration = Duration::from_secs(30);
 const BUILD_LOCK_WAIT: Duration = Duration::from_secs(3600);
 
 /// The base URL (`scheme://authority`) of a remote vk-registry's lock endpoint, or
-/// `None` for a local filesystem store (no lock server) — the authority is the repo
+/// `None` for a local filesystem store (no server) — the authority is the repo
 /// prefix up to its first `/`, scheme from `insecure`.
 fn lock_base(rg: &Registry) -> Option<String> {
     if rg.local_root().is_some() {
@@ -3738,10 +3738,13 @@ fn lock_base(rg: &Registry) -> Option<String> {
     Some(format!("{scheme}://{authority}"))
 }
 
-/// A held cross-runner build-once lock. Renews the lease on a background heartbeat until
-/// dropped; `Drop` stops the heartbeat and releases the lock (best-effort).
+/// A held build-once lock. One of a registry renews its lease on a background heartbeat
+/// until dropped; `Drop` stops the heartbeat and releases the lock (best-effort). One of a
+/// local store is held by this process, and let go when dropped or when the process ends,
+/// once no child still holds a copy of its socket.
 pub struct BuildLock {
     inner: Option<BuildLockInner>,
+    _local: Option<vk_registry::hostlock::Held>,
 }
 
 struct BuildLockInner {
@@ -3793,15 +3796,18 @@ fn acquire_once(
         .flatten()
 }
 
-/// Acquire a build-once lock on `key` against the (remote) cache registry `rg`, so peers
-/// building the same content-key don't duplicate the work. Returns `None` for a local
-/// store (no lock server) or if acquisition fails/times out — the caller then builds
-/// uncoordinated. Blocks until acquired or [`BUILD_LOCK_WAIT`].
+/// Acquire a build-once lock on `key` against the cache registry `rg`, so peers building
+/// the same content-key don't duplicate the work: the runners of a remote registry, or the
+/// processes of this host building into the same local store. Returns `None` if
+/// acquisition fails/times out — the caller then builds uncoordinated. Blocks until
+/// acquired or [`BUILD_LOCK_WAIT`].
 ///
-/// The lease records this job's identity (`jobctx::job_identity`) as the holder, so a
+/// The lock records this job's identity (`jobctx::job_identity`) as the holder, so a
 /// peer waiting on the same key can name who owns the build. When the first (non-blocking)
 /// attempt finds the key already held, `on_wait` is called once with that holder's identity
 /// before parking — the caller uses it to show a "waiting for a concurrent build" message.
+/// With a local store it is called once a holder is connected to, which a wait that fails
+/// early may never see.
 pub fn build_lock(rg: &Registry, key: &str, on_wait: &mut dyn FnMut(&str)) -> Option<BuildLock> {
     build_lock_waiting(rg, key, BUILD_LOCK_WAIT, on_wait)
 }
@@ -3814,6 +3820,13 @@ pub fn build_lock_waiting(
     wait: Duration,
     on_wait: &mut dyn FnMut(&str),
 ) -> Option<BuildLock> {
+    if let Some(root) = rg.local_root() {
+        let held = local_build_lock(&root, key, wait, LOCAL_LOCK_POLL, on_wait)?;
+        return Some(BuildLock {
+            inner: None,
+            _local: Some(held),
+        });
+    }
     // Authenticate the lock API with the cache registry's credentials — the /lock/ endpoint
     // is gated like every other path, so a tokenless client 401s against an auth-gated
     // registry (no fleet-wide build-once serialization).
@@ -3897,7 +3910,68 @@ pub fn build_lock_waiting(
             stop,
             heartbeat: Some(heartbeat),
         }),
+        _local: None,
     })
+}
+
+/// How often a build waiting for a local store's lock tries it again.
+const LOCAL_LOCK_POLL: Duration = Duration::from_millis(200);
+
+/// Take lock `key` of the local store at `root` among the processes of this host, as a
+/// lock manager sharing that store's locks takes it for its clients
+/// ([`vk_registry::lock::LockManager::host_shared`]). Retry after at most `poll`, for up to
+/// `wait`, calling `on_wait` at most once: with what the first holder connected to says it
+/// is, `another process` if it says nothing. `None` when the wait runs out; when the name
+/// is bound by another user's process, or three queries in a row cannot connect to it, as
+/// neither would be seen to let it go; or when the lock cannot be taken at all.
+fn local_build_lock(
+    root: &Path,
+    key: &str,
+    wait: Duration,
+    poll: Duration,
+    on_wait: &mut dyn FnMut(&str),
+) -> Option<vk_registry::hostlock::Held> {
+    use vk_registry::hostlock;
+    let addr = vk_registry::lock::HostLocks::new(root)
+        .and_then(|locks| locks.addr(key))
+        .ok()?;
+    let identity = crate::jobctx::job_identity();
+    // SAFETY: geteuid(2) has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let deadline = std::time::Instant::now() + wait;
+    let mut told = false;
+    let mut polls: u32 = 0;
+    // Queries in a row that could not connect while the name stays bound.
+    let mut unanswered: u32 = 0;
+    loop {
+        if let Some(held) = hostlock::try_acquire(&addr, &identity).ok()? {
+            return Some(held);
+        }
+        // Asked until a holder is connected to, then every 25 polls (5 s by default): it
+        // can go and another user's process take the name while this one waits. A query
+        // that fails on this side says nothing of the holder, and is not counted. The
+        // holder's time to answer ends with the wait.
+        if (!told || polls.is_multiple_of(25))
+            && let Ok(holder) = hostlock::query_holder_by(&addr, hostlock::answer_by(deadline))
+        {
+            unanswered = if holder.is_some() { 0 } else { unanswered + 1 };
+            if hostlock::judge(holder.as_ref(), me, unanswered) != hostlock::Verdict::Wait {
+                return None;
+            }
+            if let Some(holder) = holder
+                && !told
+            {
+                told = true;
+                on_wait(holder.who.as_deref().unwrap_or("another process"));
+            }
+        }
+        polls = polls.wrapping_add(1);
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        std::thread::sleep(left.min(poll));
+    }
 }
 
 impl Drop for BuildLock {
@@ -3950,7 +4024,7 @@ pub(crate) fn lock_name(rg: &Registry, repo: &str, tag: &str) -> String {
 }
 
 /// A lock client for `rg`'s failure-memo endpoints, or `None` when there is nothing to talk
-/// to: a local filesystem store (no lock server), outside CI without a job token (no
+/// to: a local filesystem store (no server to keep memos), outside CI without a job token (no
 /// pipeline id — a local `vk build`/`vk run` always retries, never memoized), with the node's
 /// own token, or with no credential to be had. Shared setup for
 /// [`check_build_failure`]/[`report_build_failure`].
@@ -7379,6 +7453,92 @@ pub(crate) mod tests {
             None,
             None,
         )
+    }
+
+    /// The builds into one local store, in whatever process, exclude each other on a key:
+    /// its lock is one of the host, shared with a lock manager made to share the store's.
+    #[test]
+    fn a_local_stores_build_lock_is_shared_on_the_host() {
+        // In a process of its own: a child another test forks keeps a copy of a lock's
+        // socket until it execs, and nothing unbinds a socket before then.
+        const CHILD: &str = "VK_TEST_LOCAL_BUILD_LOCK";
+        let Some(root) = crate::dev::testutil::child_marker(CHILD).map(PathBuf::from) else {
+            let root = std::env::temp_dir().join(format!(
+                "virtkit-test-local-build-lock-{}",
+                std::process::id()
+            ));
+            crate::dev::testutil::in_child(
+                "registry::tests::a_local_stores_build_lock_is_shared_on_the_host",
+                CHILD,
+                &root,
+            );
+            return;
+        };
+        let rg = local_registry(&root);
+        let me = crate::jobctx::job_identity();
+        let poll = Duration::from_millis(10);
+        let soon = Duration::from_secs(10);
+        let mut waits: Vec<String> = Vec::new();
+
+        let held = build_lock(&rg, "cache:k", &mut |h| waits.push(h.into())).expect("a free key");
+        assert!(build_lock(&rg, "cache:other", &mut |h| waits.push(h.into())).is_some());
+        assert!(waits.is_empty(), "nothing was waited for: {waits:?}");
+        // A second build of the key waits, naming the first, and goes on without the lock.
+        let brief = Duration::from_millis(100);
+        assert!(build_lock_waiting(&rg, "cache:k", brief, &mut |h| waits.push(h.into())).is_none());
+        assert_eq!(waits, [me.as_str()]);
+        // It takes the lock once the first is done.
+        let waiter = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                local_build_lock(&root, "cache:k", soon, poll, &mut |_| {}).is_some()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        drop(held);
+        assert!(waiter.join().unwrap());
+
+        // A holder that says nothing is waited for, its time to answer cut at the wait's
+        // end rather than a second past it.
+        let mute = vk_registry::lock::HostLocks::new(&root)
+            .and_then(|locks| locks.addr("cache:mute"))
+            .unwrap();
+        let _mute = std::os::unix::net::UnixListener::bind_addr(&mute).unwrap();
+        waits.clear();
+        let started = std::time::Instant::now();
+        assert!(
+            build_lock_waiting(&rg, "cache:mute", brief, &mut |h| waits.push(h.into())).is_none()
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(waits, ["another process"]);
+
+        // A manager sharing the store's locks leases the same names.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let served = vk_registry::lock::LockManager::host_shared(&root).unwrap();
+        let ttl = Duration::from_secs(30);
+        let acquire = |wait: Duration| {
+            rt.block_on(served.acquire("cache:k", ttl, "task A", std::time::Instant::now() + wait))
+        };
+        let owner = acquire(soon).expect("the build is done");
+        waits.clear();
+        assert!(build_lock_waiting(&rg, "cache:k", brief, &mut |h| waits.push(h.into())).is_none());
+        assert_eq!(waits, ["task A"]);
+        assert!(served.release("cache:k", &owner));
+        let held = local_build_lock(&root, "cache:k", soon, poll, &mut |_| {}).expect("released");
+        assert!(acquire(Duration::ZERO).is_none(), "a build holds the key");
+        assert_eq!(
+            rt.block_on(served.holder_on_host("cache:k")).as_deref(),
+            Some(me.as_str())
+        );
+        drop(held);
+        assert!(acquire(soon).is_some());
     }
 
     #[test]

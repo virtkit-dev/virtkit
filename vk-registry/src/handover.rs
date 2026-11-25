@@ -406,7 +406,13 @@ pub struct Handed {
 pub fn hand_over(state: &ServerState) -> Result<Handed> {
     let (at, at_ms) = (std::time::Instant::now(), unix_ms());
     state.handover.gate.close();
-    let locks = state.locks.hand_over();
+    let locks = match state.locks.hand_over() {
+        Ok(locks) => locks,
+        Err(e) => {
+            state.handover.gate.open();
+            return Err(e);
+        }
+    };
     let mut logins = Vec::new();
     if let Authenticator::Accounts { db, oidc } = &state.auth {
         logins = oidc
@@ -886,7 +892,7 @@ mod tests {
         let carried = Carried {
             format: FORMAT,
             at_ms: unix_ms(),
-            locks: m.hand_over(),
+            locks: m.hand_over().unwrap(),
             logins: vec![Login {
                 state: "s".into(),
                 target: "/".into(),

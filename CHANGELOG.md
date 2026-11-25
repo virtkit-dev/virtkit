@@ -28,6 +28,9 @@ All notable changes to virtkit will be documented in this file.
   digest-addressed manifest is absent from the registry.
 - `vk-registry` logs how long each hub-run garbage collection took and what it removed,
   would remove in a dry run, or why it failed.
+- Concurrent `vk build` runs on one host that share a local build cache now build a stage
+  once: the others wait for it, showing who builds it, then restore the result. Previously
+  only builds sharing a `vk-registry` cache did.
 
 ### Fixed
 

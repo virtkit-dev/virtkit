@@ -132,6 +132,26 @@ pub struct Holder {
 /// failed or empty read leaves `who` unset. Keep at most 200 printable ASCII bytes, fit for
 /// a log.
 pub fn query_holder(addr: &SocketAddr) -> std::io::Result<Option<Holder>> {
+    query_holder_by(addr, Instant::now() + ANSWER_WAIT)
+}
+
+/// Longest a holder is given to say who it is.
+const ANSWER_WAIT: Duration = Duration::from_secs(1);
+
+/// What a holder is given to say who it is even by a caller out of time, so one that does
+/// not wait at all still names what holds the lock.
+const ANSWER_GRACE: Duration = Duration::from_millis(250);
+
+/// When the holders asked from now on must have answered, for a caller that has until
+/// `deadline`: no earlier than [`ANSWER_GRACE`] from now. One such time bounds every
+/// [`query_holder_by`] of a batch together.
+pub fn answer_by(deadline: Instant) -> Instant {
+    deadline.max(Instant::now() + ANSWER_GRACE)
+}
+
+/// [`query_holder`], the holder's second to answer in cut at `by`: past it the holder is
+/// returned with `who` unset.
+pub fn query_holder_by(addr: &SocketAddr, by: Instant) -> std::io::Result<Option<Holder>> {
     let Some(s) = connect_nonblocking(addr)? else {
         return Ok(None);
     };
@@ -140,7 +160,7 @@ pub fn query_holder(addr: &SocketAddr) -> std::io::Result<Option<Holder>> {
     if uid != Some(unsafe { libc::geteuid() }) {
         return Ok(Some(Holder { uid, who: None }));
     }
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = by.min(Instant::now() + ANSWER_WAIT);
     let mut buf = Vec::new();
     let mut chunk = [0u8; 512];
     while buf.len() < 4096 {
@@ -269,11 +289,12 @@ fn table_has_stream(table: &[u8], name: &[u8]) -> bool {
 }
 
 /// A held lock: the bound socket, and the responder that tells waiters who holds it. The
-/// socket is held independently of the responder. Dropping the guard stops the responder,
-/// waits for it, then closes its listener: up to the responder's 100 ms accept poll, or
-/// mid-answer its 2 s write timeout. An inherited descriptor can keep the socket bound.
+/// socket is held independently of the responder. Dropping the guard wakes the responder
+/// out of its accept, waits for it, then closes its listener. The wait is only for an
+/// answer under way, cut by its 2 s write timeout, or for the 100 ms pause after a failed
+/// accept. An inherited descriptor can keep the socket bound.
 pub struct Held {
-    _sock: Arc<UnixListener>,
+    sock: Arc<UnixListener>,
     stop: Arc<AtomicBool>,
     responder: Option<std::thread::JoinHandle<()>>,
 }
@@ -281,6 +302,10 @@ pub struct Held {
 impl Drop for Held {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Shutting down a listening socket fails the accept the responder waits in, and
+        // every later one.
+        // SAFETY: shutdown(2) on a descriptor `sock` keeps open for the call.
+        unsafe { libc::shutdown(self.sock.as_raw_fd(), libc::SHUT_RD) };
         if let Some(h) = self.responder.take() {
             let _ = h.join();
         }
@@ -291,42 +316,44 @@ impl Drop for Held {
 /// held: `Ok(None)` when the name is already bound, by a holder or by anything else.
 pub fn try_acquire(addr: &SocketAddr, identity: &str) -> std::io::Result<Option<Held>> {
     match UnixListener::bind_addr(addr) {
-        Ok(lock) => Ok(Some(spawn_holder(lock, identity.to_string()))),
+        Ok(lock) => spawn_holder(lock, identity.to_string()).map(Some),
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Ok(None),
         Err(e) => Err(e),
     }
 }
 
 /// Start the holder's responder: a thread that shares the bound `lock` and answers each
-/// waiter's connection with `identity` until the guard is dropped. It polls a non-blocking
-/// accept every 100 ms against a stop flag, so drop ends it, and rides out accept errors
-/// (`EMFILE`, `ECONNABORTED`, ...) rather than exiting: waiters give up on a holder they
-/// repeatedly cannot connect to. The guard keeps its own reference to `lock`, so even if
-/// this thread dies the socket stays bound (the lock is held).
-fn spawn_holder(lock: UnixListener, identity: String) -> Held {
+/// waiter's connection with `identity` until the guard is dropped, which wakes it out of
+/// its accept. It rides out accept errors (`EMFILE`, `ECONNABORTED`, ...) rather than
+/// exiting: waiters give up on a holder they repeatedly cannot connect to. The guard keeps
+/// its own reference to `lock`, so even if this thread dies the socket stays bound (the
+/// lock is held). An error, the name unbound again, when the thread cannot be started.
+fn spawn_holder(lock: UnixListener, identity: String) -> std::io::Result<Held> {
     let lock = Arc::new(lock);
     let stop = Arc::new(AtomicBool::new(false));
     let responder = {
         let accept_sock = lock.clone();
         let stop = stop.clone();
-        std::thread::spawn(move || {
-            let _ = accept_sock.set_nonblocking(true);
-            while !stop.load(Ordering::Relaxed) {
-                match accept_sock.accept() {
-                    Ok((mut s, _)) => {
-                        let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
-                        let _ = s.write_all(identity.as_bytes());
+        std::thread::Builder::new()
+            .name("vk-hostlock".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match accept_sock.accept() {
+                        Ok((mut s, _)) => {
+                            let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
+                            let _ = s.write_all(identity.as_bytes());
+                        }
+                        Err(_) if stop.load(Ordering::Relaxed) => break,
+                        Err(_) => std::thread::sleep(Duration::from_millis(100)),
                     }
-                    Err(_) => std::thread::sleep(Duration::from_millis(100)),
                 }
-            }
-        })
+            })?
     };
-    Held {
-        _sock: lock,
+    Ok(Held {
+        sock: lock,
         stop,
         responder: Some(responder),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -465,6 +492,25 @@ mod tests {
         };
         assert!(held(&addr));
         drop(bound);
+    }
+
+    /// Letting go of a lock wakes its idle responder, rather than leaving it to a timer or to
+    /// the next connection. Only the releases are timed, and loosely: a loaded machine takes
+    /// tens of milliseconds to wake and join each responder, so the 25 s allowed is half what
+    /// a responder polling once a second would take for these hundred.
+    #[test]
+    fn a_lock_is_let_go_at_once() {
+        let mut releasing = Duration::ZERO;
+        for i in 0..100 {
+            let addr = test_addr(&format!("prompt-{i}"));
+            let held = try_acquire(&addr, "job 1").unwrap().expect("a fresh name");
+            // Who it is may come too late on a loaded machine; that it answers is enough.
+            query_holder(&addr).unwrap().expect("the holder answers");
+            let started = Instant::now();
+            drop(held);
+            releasing += started.elapsed();
+        }
+        assert!(releasing < Duration::from_secs(25), "{releasing:?}");
     }
 
     // Asking leaves the lock as it found it, and a held lock says who holds it.

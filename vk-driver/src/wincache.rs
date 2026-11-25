@@ -100,11 +100,13 @@ pub(crate) fn write_password(dir: &Path, password: &str) -> Result<()> {
 /// its settle, the longest step there is. A holder that dies loses its lease long before.
 pub(crate) const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
 
-/// Take the fleet's build lock on layer `key`, waiting while another host makes it. `None`
-/// without a lock server (a local store) or when the wait runs out: the build then goes on
-/// uncoordinated, and says so.
+/// Take the build lock on layer `key`, waiting while another host of the fleet, or with a
+/// local store another process of this one, makes it. `None` when the lock cannot be taken
+/// or the wait runs out: the build then goes on uncoordinated, and says so if it had said
+/// it waits.
 pub(crate) fn lock(rg: &Registry, key: &str, what: &str) -> Option<crate::registry::BuildLock> {
     let mut waited = false;
+    let started = std::time::Instant::now();
     let lock = crate::registry::build_lock_waiting(
         rg,
         &crate::registry::lock_name(rg, CACHE_REPO, &tag(key)),
@@ -118,13 +120,19 @@ pub(crate) fn lock(rg: &Registry, key: &str, what: &str) -> Option<crate::regist
         },
     );
     if waited && lock.is_none() {
-        eprintln!(
-            "virtkit: warning: {what} {}: gave up waiting after {}h; making it here too",
-            &key[..12],
-            LOCK_WAIT.as_secs() / 3600
-        );
+        eprintln!("{}", gave_up(what, key, started.elapsed()));
     }
     lock
+}
+
+/// What a build says when it stops waiting for another to make layer `key`, `waited` into
+/// the wait: that can be long before [`LOCK_WAIT`], when the lock is lost track of.
+fn gave_up(what: &str, key: &str, waited: std::time::Duration) -> String {
+    format!(
+        "virtkit: warning: {what} {}: gave up waiting after {}; making it here too",
+        &key[..12],
+        crate::build::fmt_wait(waited)
+    )
 }
 
 /// Whether the registry has layer `key`, without pulling it: the manifest digest that names it,
@@ -697,6 +705,20 @@ mod tests {
     use std::process::Command;
 
     const SIZE: u64 = 8 << 20;
+
+    /// A wait given up on is reported as long as it was, not as the longest it may be.
+    #[test]
+    fn a_wait_given_up_on_says_how_long_it_was() {
+        assert_eq!(
+            gave_up(
+                "layer",
+                "0123456789abcdef",
+                std::time::Duration::from_secs(95)
+            ),
+            "virtkit: warning: layer 0123456789ab: gave up waiting after 1m35s; making it \
+             here too"
+        );
+    }
 
     fn have(tool: &str) -> bool {
         Command::new(tool).arg("--version").output().is_ok()

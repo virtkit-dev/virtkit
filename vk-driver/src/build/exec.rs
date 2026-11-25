@@ -223,11 +223,12 @@ pub trait Executor {
         Ok(())
     }
 
-    /// Acquire a cross-runner build-once lock on `key` (a stage's final content hash) when
-    /// the cache is a remote vk-registry offering a lock endpoint, so peers building the
-    /// same stage don't duplicate it. `None` = uncoordinated (local cache, no cache, or the
-    /// registry has no lock). The guard releases on drop. `on_wait` is called once with the
-    /// current holder's identity if the lock is contended, before parking. Default: no lock.
+    /// Acquire a build-once lock on `key` (a stage's final content hash), so peers building
+    /// the same stage don't duplicate it: the runners sharing a remote vk-registry cache
+    /// through its lock endpoint, or the processes of this host sharing a local one. `None`
+    /// = uncoordinated (no cache, or its lock cannot be taken). The guard releases on drop.
+    /// `on_wait` is called at most once with the current holder's identity if the lock is
+    /// contended, before parking. Default: no lock.
     fn build_lock(
         &mut self,
         _key: &str,
