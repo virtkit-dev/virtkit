@@ -896,14 +896,19 @@ pinned there, nor one before its date.
 ## Guest credential proxy
 
 With `vk run --registry-proxy` or `[registry] proxy_guests = true`, the host starts a
-loopback reverse proxy that injects the runner's registry credential — a bearer token when
-`token_file` names one, else the Basic pair, the precedence every other `[registry]` client
-applies. The guest accesses it without credentials at `registry.vk` through a sentinel
-address handled by the userspace network switch.
+reverse proxy that injects a registry credential: the one `vk run` was given, or the
+runner's — a bearer token when `token_file` names one, else the Basic pair, the precedence
+every other `[registry]` client applies. The guest accesses it without credentials at
+`registry.vk` through a sentinel address handled by the userspace network switch.
 
-The proxy never binds a network interface, and request and response bodies stream in both
-directions. This keeps registry credentials out of guest jobs without buffering large
-layers. The feature is opt-in and requires guest networking.
+The proxy listens on a Unix socket rather than a port, and serves only processes of the user
+running `vk`: the host's other users cannot borrow the credential through it. The proxy and
+the switch each require the uid at the other end of a connection to be their own. Neither
+accepts the kernel's overflow uid (`/proc/sys/kernel/overflowuid`, 65534 by default), which
+stands for every user a user namespace cannot name: a `vk` running as that uid starts no
+proxy. Large layers stream in both directions without being buffered; a request the proxy
+can send again is held for that up to 16 MiB. The feature is opt-in and requires guest
+networking.
 
 The runner's credential is not scoped, so the proxy lends it for `/v2/` only. Under
 `[registry] guest_credential = "job"` it lends a hub-placed job's own token instead, whose

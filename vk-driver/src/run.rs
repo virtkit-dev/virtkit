@@ -2530,10 +2530,10 @@ async fn build_and_boot(
             Some(upstream) => {
                 const SENTINEL: std::net::Ipv4Addr = std::net::Ipv4Addr::new(240, 0, 0, 1);
                 let cfg = crate::regproxy::ProxyCfg::from_parts(upstream, cli_creds(args)?)?;
-                let addr = crate::regproxy::spawn(cfg).await?;
+                let socket = crate::regproxy::spawn(cfg).await?;
                 hosts.push(("registry.vk".to_string(), SENTINEL.to_string()));
                 cmdline.push_str(" VIRTKIT_REGISTRY=registry.vk");
-                Some((SENTINEL, addr))
+                Some((SENTINEL, socket))
             }
             None => None,
         };
@@ -5791,7 +5791,7 @@ pub(crate) async fn spawn_vm_switch(
     reservations: &[(String, String)],
     // Addresses leased without a router or resolver: the switch ports of tap guests.
     unrouted: &[std::net::Ipv4Addr],
-    registry_proxy: Option<(std::net::Ipv4Addr, std::net::SocketAddr)>,
+    registry_proxy: Option<(std::net::Ipv4Addr, crate::regproxy::ProxySocket)>,
     audit_log: Option<PathBuf>,
     // Where this switch publishes what it forwarded, for the phase's resource line. A build
     // passes its shared scratch, so every stage's switch appends to the one file the build

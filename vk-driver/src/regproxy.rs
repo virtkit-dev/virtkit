@@ -1,12 +1,19 @@
 //! Per-VM credential-injecting registry proxy.
 //!
 //! When enabled (per-VM `vk run --registry-proxy`, or runner-wide `[registry] proxy_guests`
-//! for the executor), `vk` runs this HTTP reverse proxy on the host loopback and forwards
-//! the guest to it (the switch redirects a sentinel address — `registry.vk` — to it; see
-//! switch.rs). The guest's registry client talks plain, credential-free HTTP to it; the
-//! proxy adds the runner's registry credential on the way to the real (central) registry.
-//! So the job never holds the secret, and the proxy is never exposed on a network
-//! interface — only reachable through the switch's per-VM redirect.
+//! for the executor), `vk` runs this HTTP reverse proxy on a Unix socket of the host and
+//! forwards the guest to it (the switch redirects a sentinel address — `registry.vk` — to
+//! it; see switch.rs). The guest's registry client talks plain, credential-free HTTP to it;
+//! the proxy adds the credential it was given on the way to the real (central) registry. So
+//! the job never holds the secret, and the proxy is never exposed on a network interface:
+//! the guest reaches it through the switch's per-VM redirect only.
+//!
+//! The socket is an abstract one ([`ProxySocket`]), a namespace with no permissions, so each
+//! end requires the other's uid to be its own: the proxy serves no other peer, which keeps
+//! the credential from the host's other users, and the switch forwards a guest to no other
+//! listener ([`connect`]). The overflow uid, which the kernel reports for any user it cannot
+//! map into the asking user namespace, passes at neither end: a `vk` running as it gets no
+//! proxy.
 //!
 //! Bodies stream both ways (`bytes_stream`), so pushing/pulling multi-GB layers through
 //! the proxy never buffers a whole blob in memory, and no response has a deadline: a lock
@@ -41,8 +48,9 @@
 //! against the root it asked for.
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::os::linux::net::SocketAddrExt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -54,12 +62,13 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
+use tokio::net::{UnixListener, UnixStream};
 
 use vk_hub_proto::dispatch::Area;
 use vk_hub_proto::token::{ALIAS_ROOT, under, valid_component, valid_prefix};
 
 use crate::oci::Creds;
+use vk_registry::hostlock;
 
 /// The proxy's streaming response body: not `Sync` because [`Resume`] holds the request
 /// for the remaining bytes across an await.
@@ -259,50 +268,268 @@ pub fn usable_areas(areas: &[Area], mut skipped: impl FnMut(&Area, &str)) -> Vec
     kept
 }
 
-/// Bind an ephemeral loopback port and serve the proxy on the current runtime, returning
-/// the bound address (handed to the switch as the redirect target).
-pub async fn spawn(cfg: ProxyCfg) -> Result<SocketAddr> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
+/// The proxy's abstract Unix socket, written `@virtkit-regproxy-<32 lowercase hex digits>`
+/// as the switch takes it on its command line. The digits are random, so the name cannot be
+/// guessed and bound before the proxy binds it. It is no secret afterward (a command line is
+/// readable by the host's other users): what keeps them out is the check each end makes of
+/// the other's uid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxySocket {
+    name: String,
+}
+
+impl ProxySocket {
+    const PREFIX: &str = "virtkit-regproxy-";
+
+    /// A name with 128 bits of `/dev/urandom`.
+    pub(crate) fn random() -> Result<Self> {
+        let name = format!(
+            "{}{}{}",
+            Self::PREFIX,
+            crate::scratch::random_nonce()?,
+            crate::scratch::random_nonce()?
+        );
+        Ok(Self { name })
+    }
+
+    fn addr(&self) -> std::io::Result<std::os::unix::net::SocketAddr> {
+        std::os::unix::net::SocketAddr::from_abstract_name(&self.name)
+    }
+}
+
+impl std::fmt::Display for ProxySocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "@{}", self.name)
+    }
+}
+
+impl std::str::FromStr for ProxySocket {
+    type Err = anyhow::Error;
+
+    /// Only what [`ProxySocket::random`] produces, as `Display` writes it.
+    fn from_str(s: &str) -> Result<Self> {
+        let digits = s
+            .strip_prefix('@')
+            .and_then(|name| name.strip_prefix(Self::PREFIX));
+        match digits {
+            Some(d)
+                if d.len() == 32 && d.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+            {
+                Ok(Self {
+                    name: s[1..].to_string(),
+                })
+            }
+            _ => bail!("want @{}<32 lowercase hex digits>", Self::PREFIX),
+        }
+    }
+}
+
+/// The uid the kernel reports in place of one that has no mapping in the user namespace
+/// asking (`/proc/sys/kernel/overflowuid`, 65534 unless the host changed it), read once.
+/// It names no user: every peer from outside the namespace's mappings reads as it.
+fn overflow_uid() -> u32 {
+    static UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *UID.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/kernel/overflowuid")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(65534)
+    })
+}
+
+/// Whether the other end of a proxy connection, running as `peer` (`None` when the kernel
+/// does not say), is the user `me`. Never when `me` is the `overflow` uid: a peer the kernel
+/// cannot name reads as that uid too.
+fn same_user(peer: Option<u32>, me: u32, overflow: u32) -> bool {
+    me != overflow && peer == Some(me)
+}
+
+/// How a refusal names the other end of a connection.
+fn uid_label(peer: Option<u32>) -> String {
+    peer.map_or_else(|| "an unknown user".to_string(), |uid| format!("uid {uid}"))
+}
+
+/// The uid this process runs as, which each end of a proxy connection requires of the other.
+pub fn euid() -> u32 {
+    // SAFETY: geteuid(2) has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// [`euid`], for a proxy to serve as. Refused when it is the overflow uid, under which the
+/// proxy could not tell its own user from another ([`same_user`]).
+fn serving_uid() -> Result<u32> {
+    let me = euid();
+    if me == overflow_uid() {
+        bail!(
+            "the registry proxy cannot run as uid {me}: the kernel also reports that uid for \
+             users it cannot identify"
+        );
+    }
+    Ok(me)
+}
+
+/// Bind a proxy socket under a fresh name, not yet accepting.
+fn bind() -> Result<(ProxySocket, std::os::unix::net::UnixListener)> {
+    let socket = ProxySocket::random()?;
+    let listener = std::os::unix::net::UnixListener::bind_addr(&socket.addr()?)
         .context("binding the registry proxy")?;
-    let addr = listener.local_addr()?;
-    tokio::spawn(serve_on(listener, Arc::new(cfg)));
-    Ok(addr)
+    listener.set_nonblocking(true)?;
+    Ok((socket, listener))
+}
+
+/// Serve on the current runtime and return the socket the switch redirects to.
+pub async fn spawn(cfg: ProxyCfg) -> Result<ProxySocket> {
+    let me = serving_uid()?;
+    let (socket, listener) = bind()?;
+    let listener = UnixListener::from_std(listener).context("adopting the registry proxy")?;
+    tokio::spawn(serve_on(listener, Arc::new(cfg), me));
+    Ok(socket)
 }
 
 /// Like [`spawn`], but from a synchronous context (the executor's `spawn_switch`): binds
 /// synchronously and serves on a dedicated thread + runtime for the process's lifetime.
-pub fn spawn_blocking(cfg: ProxyCfg) -> Result<SocketAddr> {
-    // A loopback TCP port: any process on the host can use the credential through it, as it
-    // could the node's own. A 0600 unix socket would confine it to this user.
-    let listener =
-        std::net::TcpListener::bind(("127.0.0.1", 0)).context("binding the registry proxy")?;
-    listener.set_nonblocking(true)?;
-    let addr = listener.local_addr()?;
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("building the registry proxy runtime");
-        rt.block_on(async move {
-            match TcpListener::from_std(listener) {
-                Ok(l) => serve_on(l, Arc::new(cfg)).await,
-                Err(e) => eprintln!("registry proxy: adopting the listener: {e}"),
-            }
-        });
-    });
-    Ok(addr)
+/// Returns once that thread serves the socket, or with what kept it from serving.
+pub fn spawn_blocking(cfg: ProxyCfg) -> Result<ProxySocket> {
+    let me = serving_uid()?;
+    let (socket, listener) = bind()?;
+    let (ready, started) = std::sync::mpsc::channel::<Result<()>>();
+    std::thread::Builder::new()
+        .name("regproxy".to_string())
+        .spawn(move || {
+            // A failed send means `spawn_blocking` is gone, and with it whoever would have
+            // used the proxy.
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let e = anyhow::Error::new(e).context("building the registry proxy runtime");
+                    let _ = ready.send(Err(e));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                match UnixListener::from_std(listener) {
+                    Ok(listener) => {
+                        let _ = ready.send(Ok(()));
+                        serve_on(listener, Arc::new(cfg), me).await;
+                    }
+                    Err(e) => {
+                        let e = anyhow::Error::new(e).context("adopting the registry proxy");
+                        let _ = ready.send(Err(e));
+                    }
+                }
+            });
+        })
+        .context("starting the registry proxy thread")?;
+    started
+        .recv()
+        .context("the registry proxy thread ended before serving")??;
+    Ok(socket)
 }
 
-async fn serve_on(listener: TcpListener, cfg: Arc<ProxyCfg>) {
-    loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            break;
+/// The first and the longest pause between two dials of a proxy whose backlog is full.
+const DIAL_BACKOFF: (Duration, Duration) = (Duration::from_millis(1), Duration::from_millis(100));
+
+/// Connect to the proxy listening on `socket`, for the switch to carry a guest's flow to.
+/// A proxy whose backlog is full is dialed again for up to `within`; a socket nothing listens
+/// on is refused at once. Refused too unless the listener runs as `me`, the caller's own uid
+/// ([`same_user`]): another user could bind the name once the proxy is gone, and would be
+/// handed the guest's requests to answer.
+pub async fn connect(
+    socket: &ProxySocket,
+    me: u32,
+    within: Duration,
+) -> std::io::Result<UnixStream> {
+    use std::io::{Error, ErrorKind};
+    let addr = socket.addr()?;
+    let deadline = tokio::time::Instant::now() + within;
+    let mut pause = DIAL_BACKOFF.0;
+    let stream = loop {
+        match hostlock::dial(&addr)? {
+            hostlock::Dial::Connected(stream) => break stream,
+            hostlock::Dial::Absent => {
+                return Err(Error::new(
+                    ErrorKind::ConnectionRefused,
+                    "nothing listens on the registry proxy's socket",
+                ));
+            }
+            hostlock::Dial::Busy => {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if left.is_zero() {
+                    return Err(Error::new(
+                        ErrorKind::TimedOut,
+                        format!(
+                            "the registry proxy took no connection for {}s",
+                            within.as_secs()
+                        ),
+                    ));
+                }
+                tokio::time::sleep(pause.min(left)).await;
+                pause = (pause * 2).min(DIAL_BACKOFF.1);
+            }
+        }
+    };
+    let peer = hostlock::peer_uid(&stream);
+    let overflow = overflow_uid();
+    if !same_user(peer, me, overflow) {
+        let why = if me == overflow {
+            format!(
+                "uid {me} is also what the kernel reports for users it cannot identify, so the \
+                 registry proxy's listener cannot be told from another user's"
+            )
+        } else {
+            format!(
+                "the registry proxy's socket is held by {}, not this user",
+                uid_label(peer)
+            )
         };
-        // A streamed response's head is written before its body exists; with Nagle on, a
-        // small body then waits for the guest's delayed ACK, about 40 ms on Linux. Best
-        // effort: without it the connection is only slower.
-        let _ = stream.set_nodelay(true);
+        return Err(Error::new(ErrorKind::PermissionDenied, why));
+    }
+    stream.set_nonblocking(true)?;
+    UnixStream::from_std(stream)
+}
+
+/// How long the accept loop waits after its `failures`-th failure in a row (from 0): 10 ms,
+/// doubling up to a second.
+fn accept_backoff(failures: u32) -> Duration {
+    Duration::from_millis(10u64.saturating_mul(1 << failures.min(7)).min(1000))
+}
+
+/// Serve `cfg` to the connections `listener` takes from the user `me`.
+async fn serve_on(listener: UnixListener, cfg: Arc<ProxyCfg>, me: u32) {
+    static REFUSED: std::sync::Once = std::sync::Once::new();
+    let overflow = overflow_uid();
+    let mut failures = 0u32;
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            // The listener outlives a failed accept: the host out of descriptors or memory,
+            // or a connection gone before it was taken. Wait, so that a lasting shortage is
+            // not spun on, and log the first failure of a run.
+            Err(e) => {
+                if failures == 0 {
+                    eprintln!("virtkit: registry proxy: accepting a connection: {e}; retrying");
+                }
+                tokio::time::sleep(accept_backoff(failures)).await;
+                failures = failures.saturating_add(1);
+                continue;
+            }
+        };
+        failures = 0;
+        // Before anything is read: another user's process gets nothing of the credential.
+        let peer = stream.peer_cred().ok().map(|c| c.uid());
+        if !same_user(peer, me, overflow) {
+            REFUSED.call_once(|| {
+                eprintln!(
+                    "virtkit: registry proxy: refused a connection from {}: it serves its own \
+                     user only",
+                    uid_label(peer)
+                );
+            });
+            continue;
+        }
         let cfg = cfg.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
@@ -982,6 +1209,8 @@ fn resumed_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
 
     // A fake upstream that records the Authorization header + path and query of the last
     // request and replies 200 with a marker body. It runs on its own dedicated thread + runtime
@@ -1039,6 +1268,248 @@ mod tests {
         (addr, seen)
     }
 
+    /// What keeps a [`proxy_on_tcp`] serving. Its thread, like [`fake_upstream`]'s, is its
+    /// own; dropping this ends it with the proxy and the port, and fails the test if a
+    /// connection could not be carried.
+    struct Served {
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<Result<()>>>,
+    }
+
+    impl Drop for Served {
+        fn drop(&mut self) {
+            drop(self.stop.take());
+            let ended = self.thread.take().unwrap().join();
+            if !std::thread::panicking() {
+                ended.unwrap().unwrap();
+            }
+        }
+    }
+
+    /// A proxy for `cfg` behind a loopback port, for the tests' HTTP clients: each connection
+    /// is carried to the proxy's socket, dialed as the switch dials it. Returns the port's
+    /// address and what serves it.
+    fn proxy_on_tcp(cfg: ProxyCfg) -> (SocketAddr, Served) {
+        proxy_on_tcp_as(cfg, euid())
+    }
+
+    /// [`proxy_on_tcp`], the proxy serving the user `me` rather than its own.
+    fn proxy_on_tcp_as(cfg: ProxyCfg, me: u32) -> (SocketAddr, Served) {
+        let (socket, proxy) = bind().unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            // Dropping the runtime ends the proxy and the flows still open.
+            rt.block_on(async move {
+                tokio::spawn(serve_on(UnixListener::from_std(proxy)?, Arc::new(cfg), me));
+                let listener = TcpListener::from_std(listener)?;
+                loop {
+                    let mut client = tokio::select! {
+                        _ = &mut stopped => return Ok(()),
+                        accepted = listener.accept() => accepted?.0,
+                    };
+                    let mut proxy = connect(&socket, euid(), Duration::from_secs(10)).await?;
+                    tokio::spawn(async move {
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut proxy).await;
+                    });
+                }
+            })
+        });
+        let served = Served {
+            stop: Some(stop),
+            thread: Some(thread),
+        };
+        (addr, served)
+    }
+
+    #[test]
+    fn only_the_same_user_is_on_the_other_end() {
+        assert!(same_user(Some(1000), 1000, 65534));
+        assert!(same_user(Some(0), 0, 65534));
+        assert!(!same_user(Some(1001), 1000, 65534));
+        // Root is another user too.
+        assert!(!same_user(Some(0), 1000, 65534));
+        assert!(!same_user(None, 1000, 65534));
+        // The overflow uid is every user the kernel cannot name, at either end.
+        assert!(!same_user(Some(65534), 65534, 65534));
+        assert!(!same_user(Some(65534), 1000, 65534));
+        assert!(same_user(Some(65534), 65534, 4242));
+        assert!(!same_user(Some(4242), 4242, 4242));
+    }
+
+    #[test]
+    fn a_socket_round_trips_and_parses_strictly() {
+        let socket = ProxySocket::random().unwrap();
+        let text = socket.to_string();
+        assert_eq!(text.len(), "@virtkit-regproxy-".len() + 32);
+        assert_eq!(text.parse::<ProxySocket>().unwrap(), socket);
+        assert_ne!(ProxySocket::random().unwrap(), socket);
+        let digits = "0123456789abcdef0123456789abcdef";
+        for bad in [
+            String::new(),
+            "127.0.0.1:5000".to_string(),
+            format!("virtkit-regproxy-{digits}"),
+            format!("@virtkit-pull-{digits}"),
+            format!("@virtkit-regproxy-{}", &digits[1..]),
+            format!("@virtkit-regproxy-{digits}0"),
+            format!("@virtkit-regproxy-{}", digits.to_uppercase()),
+            format!("@virtkit-regproxy-{}/", &digits[1..]),
+        ] {
+            assert!(bad.parse::<ProxySocket>().is_err(), "{bad:?}");
+        }
+    }
+
+    /// A socket nothing listens on refuses the dial at once, whatever time it was given.
+    #[tokio::test]
+    async fn a_socket_without_a_proxy_refuses_the_dial() {
+        let socket = ProxySocket::random().unwrap();
+        let asked = std::time::Instant::now();
+        let err = connect(&socket, euid(), Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert!(asked.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A listener on a fresh proxy socket with no backlog, and the connections that fill it.
+    fn full_listener() -> (
+        ProxySocket,
+        std::os::unix::net::UnixListener,
+        Vec<std::os::unix::net::UnixStream>,
+    ) {
+        use std::os::fd::FromRawFd;
+        let socket = ProxySocket::random().unwrap();
+        let addr = socket.addr().unwrap();
+        let (sa, len) = hostlock::abstract_sockaddr(&addr).unwrap();
+        // SAFETY: plain socket calls on a fresh descriptor, owned by the listener returned;
+        // `sa` and `len` describe exactly the address filled in.
+        let listener = unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            assert!(fd >= 0);
+            assert_eq!(
+                libc::bind(fd, (&raw const sa).cast(), len as libc::socklen_t),
+                0
+            );
+            assert_eq!(libc::listen(fd, 0), 0);
+            std::os::unix::net::UnixListener::from_raw_fd(fd)
+        };
+        let mut queued = Vec::new();
+        while let hostlock::Dial::Connected(c) = hostlock::dial(&addr).unwrap() {
+            queued.push(c);
+            assert!(queued.len() < 8, "a backlog of 0 never filled");
+        }
+        (socket, listener, queued)
+    }
+
+    /// A proxy that is there but behind on its accepts is waited for, not taken for absent.
+    #[tokio::test]
+    async fn a_dial_waits_for_a_full_backlog_to_drain() {
+        let (socket, listener, queued) = full_listener();
+        assert!(matches!(
+            hostlock::dial(&socket.addr().unwrap()).unwrap(),
+            hostlock::Dial::Busy
+        ));
+        let accepting = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let taken: Vec<_> = (0..queued.len())
+                .map(|_| listener.accept().unwrap().0)
+                .collect();
+            // The dial waited for is the next one in.
+            (listener.accept().unwrap().0, taken, queued)
+        });
+        connect(&socket, euid(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        accepting.join().unwrap();
+    }
+
+    /// The wait for a full backlog ends at the caller's deadline.
+    #[tokio::test]
+    async fn a_dial_gives_up_on_a_backlog_that_stays_full() {
+        let (socket, _listener, _queued) = full_listener();
+        let err = connect(&socket, euid(), Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// The dial checks the listener's uid: one that is not the caller's is not connected to.
+    #[tokio::test]
+    async fn a_dial_refuses_a_listener_of_another_user() {
+        let (socket, _listener) = bind().unwrap();
+        let other = euid().wrapping_add(1);
+        let err = connect(&socket, other, Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        // The overflow uid is refused as the caller's own too.
+        let err = connect(&socket, overflow_uid(), Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        connect(&socket, euid(), Duration::from_secs(30))
+            .await
+            .unwrap();
+    }
+
+    /// The proxy checks its client's uid: a connection from any other is closed with nothing
+    /// read from it, sent to it, or forwarded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_from_another_user_is_served_nothing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = fake_upstream();
+        let (proxy, served) = proxy_on_tcp_as(basic_cfg(up_addr), euid().wrapping_add(1));
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        client
+            .write_all(b"GET /v2/ HTTP/1.1\r\nHost: registry.vk\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        // A reset is as good as an end: either way the proxy closed without answering.
+        let _ = client.read_to_end(&mut answer).await;
+        assert!(answer.is_empty(), "{answer:?}");
+        assert_eq!(*seen.lock().unwrap(), (String::new(), String::new()));
+        drop(served);
+
+        // The same request, to a proxy serving this user.
+        let (proxy, _served) = proxy_on_tcp(basic_cfg(up_addr));
+        let r = reqwest::get(format!("http://{proxy}/v2/")).await.unwrap();
+        assert!(r.status().is_success());
+        assert_eq!(seen.lock().unwrap().1, "/v2/");
+    }
+
+    /// The executor's proxy answers as soon as it is returned.
+    #[test]
+    fn a_proxy_spawned_from_a_thread_is_serving_when_returned() {
+        use std::io::{Read, Write};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cfg = ProxyCfg::build("http://127.0.0.1:1".to_string(), Creds::anonymous()).unwrap();
+        let socket = spawn_blocking(cfg).unwrap();
+        let mut client =
+            std::os::unix::net::UnixStream::connect_addr(&socket.addr().unwrap()).unwrap();
+        client
+            .write_all(b"GET /outside HTTP/1.1\r\nHost: registry.vk\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut answer = String::new();
+        client.read_to_string(&mut answer).unwrap();
+        assert!(answer.starts_with("HTTP/1.1 4"), "{answer}");
+    }
+
+    #[test]
+    fn the_accept_loop_backs_off_up_to_a_second() {
+        assert_eq!(accept_backoff(0), Duration::from_millis(10));
+        assert_eq!(accept_backoff(1), Duration::from_millis(20));
+        assert_eq!(accept_backoff(6), Duration::from_millis(640));
+        assert_eq!(accept_backoff(7), Duration::from_secs(1));
+        assert_eq!(accept_backoff(u32::MAX), Duration::from_secs(1));
+    }
+
     /// A proxy to the upstream at `up_addr` that injects the Basic pair `robot:s3cret`.
     fn basic_cfg(up_addr: SocketAddr) -> ProxyCfg {
         ProxyCfg::build(
@@ -1057,7 +1528,7 @@ mod tests {
         // reqwest (rustls-no-provider) needs a crypto provider before a client builds.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (up_addr, seen) = fake_upstream();
-        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let (proxy, _served) = proxy_on_tcp(basic_cfg(up_addr));
 
         // the "guest" hits the proxy with NO credentials.
         let r = reqwest::Client::new()
@@ -1080,72 +1551,6 @@ mod tests {
         );
     }
 
-    /// The proxy turns Nagle off on each connection it accepts: it writes a response's head as
-    /// soon as the upstream's arrives and its body when that follows, which Nagle would hold
-    /// for the guest's delayed ACK (about 40 ms on Linux) on every small read.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn accepted_connections_have_nagle_off() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let (up_addr, _) = fake_upstream();
-        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
-        let client = tokio::net::TcpStream::connect(proxy).await.unwrap();
-        let me = client.local_addr().unwrap();
-        // Until the accept loop reaches the connection; the deadline only bounds a failure.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while server_nodelay(proxy, me) != Some(true) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the proxy's end of the connection has Nagle on"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    /// Whether `TCP_NODELAY` is set on the server's end of the connection from `client` to
-    /// `server`, found among this process's descriptors; `None` until the server accepts it.
-    fn server_nodelay(server: std::net::SocketAddr, client: std::net::SocketAddr) -> Option<bool> {
-        type Name = unsafe extern "C" fn(
-            libc::c_int,
-            *mut libc::sockaddr,
-            *mut libc::socklen_t,
-        ) -> libc::c_int;
-        // The IPv4 port `name` gives `fd`, if `fd` is an IPv4 socket that has one.
-        fn port(fd: libc::c_int, name: Name) -> Option<u16> {
-            // SAFETY: all-zero is a valid `sockaddr_in`.
-            let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-            let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-            // SAFETY: `addr` and `len` are valid for writes and `len` is `addr`'s size; a stale or
-            // non-socket `fd` only makes the call fail.
-            let r = unsafe { name(fd, (&raw mut addr).cast(), &mut len) };
-            (r == 0 && i32::from(addr.sin_family) == libc::AF_INET)
-                .then(|| u16::from_be(addr.sin_port))
-        }
-        for entry in std::fs::read_dir("/proc/self/fd").ok()?.flatten() {
-            let Ok(fd) = entry.file_name().to_string_lossy().parse::<libc::c_int>() else {
-                continue;
-            };
-            if port(fd, libc::getsockname) != Some(server.port())
-                || port(fd, libc::getpeername) != Some(client.port())
-            {
-                continue;
-            }
-            let mut on: libc::c_int = 0;
-            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            // SAFETY: `on` and `len` are valid for writes and `len` is `on`'s size.
-            let r = unsafe {
-                libc::getsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_NODELAY,
-                    (&raw mut on).cast(),
-                    &mut len,
-                )
-            };
-            return (r == 0).then_some(on != 0);
-        }
-        None
-    }
-
     /// A `[registry]` gated by a bearer token — a vk-registry in `mode = "accounts"`, whose
     /// API keys are exactly that — is what the proxy has to lend the guest. It used to
     /// inject nothing at all for one, since it only ever knew about the Basic pair.
@@ -1164,7 +1569,7 @@ mod tests {
             },
         )
         .unwrap();
-        let proxy = spawn_blocking(cfg).unwrap();
+        let (proxy, _served) = proxy_on_tcp(cfg);
 
         let r = reqwest::Client::new()
             .get(format!("http://{proxy}/v2/app/manifests/latest"))
@@ -1184,7 +1589,7 @@ mod tests {
     async fn refuses_paths_outside_v2() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (up_addr, seen) = fake_upstream();
-        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let (proxy, _served) = proxy_on_tcp(basic_cfg(up_addr));
 
         // a path outside /v2/ (here the lock control plane) is refused with 403 and never
         // reaches the upstream — the host credential is never lent to it.
@@ -1259,7 +1664,7 @@ mod tests {
         let none = ProxyCfg::for_guests(&rg).unwrap();
         assert_eq!(none.scope, Scope::Deny);
         rg.node_access = Some(held(None, far));
-        let proxy = spawn_blocking(ProxyCfg::for_guests(&rg).unwrap()).unwrap();
+        let (proxy, _served) = proxy_on_tcp(ProxyCfg::for_guests(&rg).unwrap());
         let get = "/v2/build-cache/app/manifests/latest";
         let (status, auth, _) = status_and_auth(proxy, "GET", get, &seen).await;
         assert_eq!((status, auth.as_str()), (403, ""));
@@ -1290,7 +1695,7 @@ mod tests {
         let (up_addr, seen) = fake_upstream();
         let cfg = ProxyCfg::for_job(&registry(up_addr), Some("vkt_job")).unwrap();
         assert_eq!(cfg.scope, Scope::Job);
-        let proxy = spawn_blocking(cfg).unwrap();
+        let (proxy, _served) = proxy_on_tcp(cfg);
         for (method, target) in [
             ("GET", "/v2/p/gl/42/app/manifests/latest"),
             ("POST", "/lock/acquire?name=p/gl/42:k"),
@@ -1339,7 +1744,7 @@ mod tests {
         let cfg = ProxyCfg::for_job(&registry(up_addr), Some("vkt_job"))
             .unwrap()
             .with_areas(&[area("task-cache", "task-cache/gl/42/protected")]);
-        let proxy = spawn_blocking(cfg).unwrap();
+        let (proxy, _served) = proxy_on_tcp(cfg);
         for (method, target, want) in [
             (
                 "GET",
@@ -1475,7 +1880,7 @@ mod tests {
         let cfg = ProxyCfg::for_job(&registry(up_addr), Some("vkt_job"))
             .unwrap()
             .with_areas(&[area("task-cache", "task-cache/gl/42/protected")]);
-        let proxy = spawn_blocking(cfg).unwrap();
+        let (proxy, _served) = proxy_on_tcp(cfg);
         let status = raw_status(proxy, "GET", "/dav/files/job/task-cache/../../other").await;
         assert_eq!(status, 200);
         assert_eq!(seen.lock().unwrap().1, "/dav/files/other");
@@ -1497,7 +1902,7 @@ mod tests {
         let cfg = ProxyCfg::for_job(&registry(up_addr), Some("vkt_job"))
             .unwrap()
             .with_areas(&[area("task-cache", "task-cache/gl/42/protected")]);
-        let proxy = spawn_blocking(cfg).unwrap();
+        let (proxy, _served) = proxy_on_tcp(cfg);
         let body = |method: &'static str, target: &'static str| async move {
             reqwest::Client::new()
                 .request(
@@ -1550,7 +1955,7 @@ mod tests {
         let (up_addr, seen) = fake_upstream();
         let cfg = ProxyCfg::for_job(&registry(up_addr), None).unwrap();
         assert_eq!(cfg.scope, Scope::Deny);
-        let proxy = spawn_blocking(cfg).unwrap();
+        let (proxy, _served) = proxy_on_tcp(cfg);
         let (status, _, path) =
             status_and_auth(proxy, "GET", "/v2/app/manifests/latest", &seen).await;
         assert_eq!(status, 403);
@@ -1639,7 +2044,7 @@ mod tests {
 
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (up_addr, seen) = fake_upstream();
-        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let (proxy, _served) = proxy_on_tcp(basic_cfg(up_addr));
         for target in [
             "/v2/../lock/acquire?name=x",
             "/v2/%2e%2e/lock/acquire?name=x",
@@ -1672,8 +2077,8 @@ mod tests {
 
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (up_addr, seen) = fake_upstream();
-        let proxy = spawn_blocking(ProxyCfg::for_job(&registry(up_addr), Some("vkt_job")).unwrap())
-            .unwrap();
+        let (proxy, _served) =
+            proxy_on_tcp(ProxyCfg::for_job(&registry(up_addr), Some("vkt_job")).unwrap());
         for target in [
             "/lock/../settings/keys",
             "/dav/files/../../browse",
@@ -1703,8 +2108,8 @@ mod tests {
     async fn plain_files_take_the_registrys_verbs_and_their_bodies() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (up_addr, seen) = body_upstream();
-        let proxy = spawn_blocking(ProxyCfg::for_job(&registry(up_addr), Some("vkt_job")).unwrap())
-            .unwrap();
+        let (proxy, _served) =
+            proxy_on_tcp(ProxyCfg::for_job(&registry(up_addr), Some("vkt_job")).unwrap());
         let client = reqwest::Client::new();
         for method in ["MOVE", "COPY", "PROPPATCH", "LOCK", "POST"] {
             let r = client
@@ -1890,7 +2295,7 @@ mod tests {
     async fn a_request_safe_to_repeat_is_sent_again_until_answered() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (up_addr, took) = scripted_upstream(vec![Act::Close, answer(2, b"ok")]);
-        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let (proxy, _served) = proxy_on_tcp(basic_cfg(up_addr));
         let client = reqwest::Client::new();
         let r = client
             .put(format!("http://{proxy}/v2/app/manifests/latest"))
@@ -1920,7 +2325,7 @@ mod tests {
             (reqwest::Method::DELETE, "/v2/app/manifests/sha256:ab", ""),
         ] {
             let (up_addr, took) = scripted_upstream(vec![Act::Close, answer(2, b"ok")]);
-            let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+            let (proxy, _served) = proxy_on_tcp(basic_cfg(up_addr));
             let r = client
                 .request(method.clone(), format!("http://{proxy}{target}"))
                 .body(body)
@@ -1980,7 +2385,7 @@ mod tests {
         ranged.extend_from_slice(&blob[30_000..]);
         for rest in [Act::Write(ranged), answer(blob.len(), &blob)] {
             let (up_addr, took) = scripted_upstream(vec![cut.clone(), rest]);
-            let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+            let (proxy, _served) = proxy_on_tcp(basic_cfg(up_addr));
             let r = reqwest::Client::new()
                 .get(format!("http://{proxy}/v2/app/blobs/sha256:ab"))
                 .send()
@@ -2007,7 +2412,7 @@ mod tests {
         let blob = blob();
         let cut = answer(blob.len(), &blob[..30_000]);
         let (up_addr, took) = scripted_upstream(vec![cut.clone(), answer(blob.len(), &blob)]);
-        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let (proxy, _served) = proxy_on_tcp(basic_cfg(up_addr));
         let r = reqwest::Client::new()
             .get(format!("http://{proxy}/v2/app/manifests/latest"))
             .send()
@@ -2017,7 +2422,7 @@ mod tests {
         assert_eq!(took.lock().unwrap().len(), 1);
 
         let (up_addr, took) = scripted_upstream(vec![cut, answer(5, b"other")]);
-        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let (proxy, _served) = proxy_on_tcp(basic_cfg(up_addr));
         let r = reqwest::Client::new()
             .get(format!("http://{proxy}/v2/app/blobs/sha256:ab"))
             .send()
@@ -2037,7 +2442,7 @@ mod tests {
                 .to_vec(),
         );
         let (up_addr, took) = scripted_upstream(vec![busy, answer(2, b"ok")]);
-        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let (proxy, _served) = proxy_on_tcp(basic_cfg(up_addr));
         let r = reqwest::get(format!("http://{proxy}/v2/app/manifests/latest"))
             .await
             .unwrap();
@@ -2052,7 +2457,7 @@ mod tests {
     async fn a_body_past_what_is_held_is_sent_once_whole() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (up_addr, took) = scripted_upstream(vec![Act::Close, answer(2, b"ok")]);
-        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let (proxy, _served) = proxy_on_tcp(basic_cfg(up_addr));
         let big: Vec<u8> = (0..MAX_HELD + 10).map(|i| (i % 253) as u8).collect();
         // Streamed by the guest, so its size is known only once read.
         let chunks: Vec<std::io::Result<Vec<u8>>> =
@@ -2086,7 +2491,7 @@ mod tests {
         };
 
         let (up_addr, took) = scripted_upstream(vec![cut.clone()]);
-        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let (proxy, _served) = proxy_on_tcp(basic_cfg(up_addr));
         assert!(get(proxy, false).await.is_err());
         assert_eq!(took.lock().unwrap().len(), 1 + MAX_RESUMES as usize);
 
@@ -2101,13 +2506,13 @@ mod tests {
         let other_digest = answer_named(blob.len(), &blob, "sha256:cd");
         for rest in [wrong_range, other_digest] {
             let (up_addr, took) = scripted_upstream(vec![cut.clone(), rest]);
-            let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+            let (proxy, _served) = proxy_on_tcp(basic_cfg(up_addr));
             assert!(get(proxy, false).await.is_err());
             assert_eq!(took.lock().unwrap().len(), 2);
         }
 
         let (up_addr, took) = scripted_upstream(vec![cut, answer(blob.len(), &blob)]);
-        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        let (proxy, _served) = proxy_on_tcp(basic_cfg(up_addr));
         assert!(get(proxy, true).await.is_err());
         assert_eq!(took.lock().unwrap().len(), 1);
     }

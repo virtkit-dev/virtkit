@@ -34,6 +34,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use vk_hub_proto::egress::{EgressLayer, EgressOutcome, EgressPhase, HubEgress, HubPhase};
 
 use crate::egress_report::Attrs;
+use crate::regproxy::ProxySocket;
 
 /// Gateway MAC — locally administered, unicast. The guest learns it via ARP.
 const GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x01];
@@ -705,9 +706,15 @@ struct EgressGuard {
     /// admits a connection from another VM with a different policy (per-source isolation).
     /// Bounded, as [`Pins`] says.
     pinned: Mutex<Pins>,
-    /// `(sentinel, host)`: a guest flow to `sentinel` is redirected to the host-local
-    /// credential registry proxy at `host` (see regproxy.rs). `None` = disabled.
-    registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
+    /// `(sentinel, socket)`: a guest flow to `sentinel` is redirected to the host-local
+    /// credential registry proxy listening on `socket` (see regproxy.rs). `None` = disabled.
+    registry_proxy: Option<(Ipv4Addr, ProxySocket)>,
+    /// The uid that proxy's listener must run as: the switch's own.
+    proxy_uid: u32,
+    /// A guest flow to the address is carried to the loopback one instead, for a test to
+    /// stand as its destination.
+    #[cfg(test)]
+    tcp_redirect: Option<(Ipv4Addr, SocketAddr)>,
     /// Where denials are appended as typed records for the job trace (see egress_report).
     /// `None` = don't record (dev `vk run`, or an unrestricted policy that denies nothing).
     denied_log: Option<PathBuf>,
@@ -777,6 +784,9 @@ impl EgressGuard {
             dry_run: false,
             pinned: Mutex::default(),
             registry_proxy: None,
+            proxy_uid: crate::regproxy::euid(),
+            #[cfg(test)]
+            tcp_redirect: None,
             denied_log: None,
             audit_log: None,
             dns_ips: Mutex::new(HashSet::new()),
@@ -809,8 +819,18 @@ impl EgressGuard {
         self.dry_run = dry_run;
         self
     }
-    fn with_registry_proxy(mut self, redirect: Option<(Ipv4Addr, SocketAddr)>) -> Self {
+    fn with_registry_proxy(mut self, redirect: Option<(Ipv4Addr, ProxySocket)>) -> Self {
         self.registry_proxy = redirect;
+        self
+    }
+    #[cfg(test)]
+    fn with_proxy_uid(mut self, uid: u32) -> Self {
+        self.proxy_uid = uid;
+        self
+    }
+    #[cfg(test)]
+    fn with_tcp_redirect(mut self, from: Ipv4Addr, to: SocketAddr) -> Self {
+        self.tcp_redirect = Some((from, to));
         self
     }
     fn with_denied_log(mut self, path: Option<PathBuf>) -> Self {
@@ -1547,8 +1567,8 @@ impl EgressGuard {
         let syn = parse_tcp_syn(ip)?;
         // The registry-proxy sentinel bypasses the allowlist (a host-local
         // service, spliced in proxy_tcp), so it must never be rejected here.
-        if let Some((sentinel, _)) = self.registry_proxy
-            && *syn.dst.ip() == sentinel
+        if let Some((sentinel, _)) = &self.registry_proxy
+            && syn.dst.ip() == sentinel
         {
             return None;
         }
@@ -1870,9 +1890,9 @@ pub struct Spawn {
     /// Take the default policy from this [`EgressFile`] instead of `allow_ip`/`allow_name`,
     /// and follow its edits for the switch's life. `None` = the lists above, fixed.
     pub egress_file: Option<PathBuf>,
-    /// `(sentinel, host)`: redirect a guest flow to `sentinel` to the host-local
-    /// credential registry proxy at `host` (see regproxy.rs). `None` = disabled.
-    pub registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
+    /// `(sentinel, socket)`: redirect a guest flow to `sentinel` to the host-local
+    /// credential registry proxy listening on `socket` (see regproxy.rs). `None` = disabled.
+    pub registry_proxy: Option<(Ipv4Addr, ProxySocket)>,
     pub log: PathBuf,
     /// Where the switch appends typed egress-denial records for the job trace (see
     /// egress_report). `None` = don't record (dev `vk run`).
@@ -2105,9 +2125,9 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
         hub.write(&path)?;
         cmd.arg("--hub-egress").arg(&path);
     }
-    if let Some((sentinel, host)) = opts.registry_proxy {
+    if let Some((sentinel, socket)) = &opts.registry_proxy {
         cmd.arg("--registry-proxy")
-            .arg(format!("{sentinel}={host}"));
+            .arg(format!("{sentinel}={socket}"));
     }
     if let Some(denied) = &opts.denied_log {
         cmd.arg("--denied-log").arg(denied);
@@ -2182,7 +2202,7 @@ pub async fn run(
     unrouted: HashSet<Ipv4Addr>,
     egress: Egress,
     per_source: HashMap<Ipv4Addr, Egress>,
-    registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
+    registry_proxy: Option<(Ipv4Addr, ProxySocket)>,
     denied_log: Option<PathBuf>,
     audit_log: Option<PathBuf>,
     bytes_log: Option<PathBuf>,
@@ -2795,8 +2815,29 @@ fn proxy_tcp(
         // Registry proxy: a flow to the sentinel address is spliced to the host-local
         // credential proxy instead of egressing (it bypasses the egress allowlist — it is our
         // own host service, and it never touches the guest's credentials).
-        let target = match egress.registry_proxy {
-            Some((sentinel, host)) if dst.ip() == IpAddr::V4(sentinel) => host,
+        if let Some((sentinel, socket)) = &egress.registry_proxy
+            && dst.ip() == IpAddr::V4(*sentinel)
+        {
+            // A proxy behind on its accepts gets the time any other destination gets to
+            // answer a dial.
+            match crate::regproxy::connect(socket, egress.proxy_uid, CONNECT_TIMEOUT).await {
+                Ok(host) => carry(&mut guest, host, dst, &egress, &drain).await,
+                // No proxy, one that takes no connection, or a listener that is not ours:
+                // return so the guest stream drops, which resets a flow still open.
+                Err(e) => {
+                    eprintln!("switch: registry proxy {socket}: {e} — dropping the guest flow")
+                }
+            }
+            return;
+        }
+        #[cfg(test)]
+        let redirected = egress
+            .tcp_redirect
+            .filter(|(from, _)| dst.ip() == IpAddr::V4(*from));
+        #[cfg(not(test))]
+        let redirected: Option<(Ipv4Addr, SocketAddr)> = None;
+        let target = match redirected {
+            Some((_, to)) => to,
             _ if refuse_unroutable("tcp", dst) => return,
             // Fallback deny path: a denied SYN is normally RST'd earlier in
             // `reject_denied_syn` before ipstack completes the handshake, so a denial here only
@@ -2806,36 +2847,45 @@ fn proxy_tcp(
             _ => return,
         };
         match connect_egress(target, CONNECT_TIMEOUT).await {
-            Ok(host) => {
-                // Counted as the bytes pass rather than from what the copy returns: a flow torn
-                // down by either end — which is how most of them end — reports an error and no
-                // counts at all, and a job's traffic would read as zero.
-                let mut host = Counted {
-                    inner: host,
-                    egress: egress.clone(),
-                };
-                // The splice errors when a side tears the flow down rather than closing it
-                // cleanly. A reset is how a peer routinely closes — an HTTP server without keepalive,
-                // a client that aborts — so it is left unlogged; the rarer faults are worth a line: a
-                // timeout, a broken pipe, the upstream gone (see `detect_dead_peer`). Either way,
-                // returning drops `guest` and resets its connection, which is all the guest sees.
-                if let Err(e) = splice(
-                    &mut guest,
-                    &mut host,
-                    HOST_BOUND_CHUNK,
-                    GUEST_BOUND_CHUNK,
-                    Some(&drain),
-                )
-                .await
-                    && e.kind() != std::io::ErrorKind::ConnectionReset
-                {
-                    egress.log_flow_failure(guest.local_addr(), dst, &e);
-                }
-            }
+            Ok(host) => carry(&mut guest, host, dst, &egress, &drain).await,
             // Connect refused, failed, or timed out: return so the guest stream drops and
             // ipstack RSTs it, failing the guest's flow at once instead of leaving it hung.
             Err(e) => eprintln!("switch: tcp connect {target}: {e} — resetting the guest flow"),
         }
+    }
+}
+
+/// Splice a guest flow to `dst` with `host`, the connection standing for that destination.
+async fn carry<H: AsyncRead + AsyncWrite + Unpin>(
+    guest: &mut ipstack::IpStackTcpStream,
+    host: H,
+    dst: SocketAddr,
+    egress: &Arc<EgressGuard>,
+    drain: &Drain,
+) {
+    // Counted as the bytes pass rather than from what the copy returns: a flow torn down by
+    // either end — which is how most of them end — reports an error and no counts at all, and
+    // a job's traffic would read as zero.
+    let mut host = Counted {
+        inner: host,
+        egress: egress.clone(),
+    };
+    // The splice errors when a side tears the flow down rather than closing it cleanly. A
+    // reset is how a peer routinely closes — an HTTP server without keepalive, a client that
+    // aborts — so it is left unlogged; the rarer faults are worth a line: a timeout, a broken
+    // pipe, the upstream gone (see `detect_dead_peer`). Either way the caller then drops
+    // `guest`, which resets a connection still open: all the guest sees.
+    if let Err(e) = splice(
+        guest,
+        &mut host,
+        HOST_BOUND_CHUNK,
+        GUEST_BOUND_CHUNK,
+        Some(drain),
+    )
+    .await
+        && e.kind() != std::io::ErrorKind::ConnectionReset
+    {
+        egress.log_flow_failure(guest.local_addr(), dst, &e);
     }
 }
 
@@ -4897,7 +4947,7 @@ mod tests {
                 panic!("expected TCP stream");
             };
             let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
-                .with_registry_proxy(Some((remote.into(), listener.local_addr().unwrap())));
+                .with_tcp_redirect(remote.into(), listener.local_addr().unwrap());
             // Poll the proxy together with the peer so it is dropped even on a timeout.
             let (drain, _drained) = Drain::new();
             let proxy = proxy_tcp(stream, Arc::new(guard), drain);
@@ -4988,7 +5038,7 @@ mod tests {
                 panic!("expected TCP stream");
             };
             let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
-                .with_registry_proxy(Some((remote.into(), listener.local_addr().unwrap())));
+                .with_tcp_redirect(remote.into(), listener.local_addr().unwrap());
             // Poll the proxy together with the peer so it is dropped even on a timeout.
             let (drain, _drained) = Drain::new();
             let proxy = proxy_tcp(stream, Arc::new(guard), drain);
@@ -5034,6 +5084,9 @@ mod tests {
         .await
         .unwrap();
     }
+
+    /// A registry proxy socket's name, for the tests that dial none.
+    const PROXY_SOCKET: &str = "@virtkit-regproxy-000102030405060708090a0b0c0d0e0f";
 
     /// The addresses the drain tests' guest flow runs between.
     const FLOW_GUEST: [u8; 4] = [192, 168, 127, 2];
@@ -5121,6 +5174,24 @@ mod tests {
                 .unwrap();
             self.tx.send(fin).unwrap();
         }
+
+        /// Wait for the gateway to reset the flow. Returns the payload it sent before that.
+        async fn reset(&mut self) -> Vec<u8> {
+            use etherparse::{PacketHeaders, TransportHeader};
+            let mut payload = Vec::new();
+            loop {
+                let packet = self
+                    ._replies
+                    .recv()
+                    .await
+                    .expect("the flow was never reset");
+                let headers = PacketHeaders::from_ip_slice(reply_ip(&packet)).unwrap();
+                payload.extend_from_slice(headers.payload.slice());
+                if matches!(headers.transport, Some(TransportHeader::Tcp(tcp)) if tcp.rst) {
+                    return payload;
+                }
+            }
+        }
     }
 
     /// The VM is torn down with the tail of its last upload still in the switch, and the
@@ -5151,7 +5222,7 @@ mod tests {
             .unwrap();
             let mut flow = GuestFlow::open().await;
             let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
-                .with_registry_proxy(Some((FLOW_REMOTE.into(), listener.local_addr().unwrap())));
+                .with_tcp_redirect(FLOW_REMOTE.into(), listener.local_addr().unwrap());
             let (drain, mut drained) = Drain::new();
             let proxy = tokio::spawn(proxy_tcp(
                 flow.stream.take().unwrap(),
@@ -5217,7 +5288,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let mut flow = GuestFlow::open().await;
             let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
-                .with_registry_proxy(Some((FLOW_REMOTE.into(), listener.local_addr().unwrap())));
+                .with_tcp_redirect(FLOW_REMOTE.into(), listener.local_addr().unwrap());
             let (drain, mut drained) = Drain::new();
             // Keep the proxy unpolled until after shutdown starts. The stack can still
             // acknowledge the entire upload before its upstream connection is opened.
@@ -5281,7 +5352,7 @@ mod tests {
             let (reply_tx, mut replies) = unbounded_channel();
             let stack = IpStack::new(ip_stack_config(), ChannelDevice { rx, tx: reply_tx });
             let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
-                .with_registry_proxy(Some((FLOW_REMOTE.into(), listener.local_addr().unwrap())));
+                .with_tcp_redirect(FLOW_REMOTE.into(), listener.local_addr().unwrap());
             let (drain, _drained) = Drain::new();
             tokio::spawn(accept_loop(stack, Arc::new(guard), drain, 1));
             // The guest opens a flow from `port`: SYN, then an ACK of the SYN-ACK if one comes.
@@ -5362,6 +5433,110 @@ mod tests {
         .unwrap();
     }
 
+    /// A registry that answers one request with the body `registry`, for a proxy lending the
+    /// Basic pair `robot:s3cret`: the listener, and the proxy's configuration.
+    async fn registry_behind_a_proxy() -> (tokio::net::TcpListener, crate::regproxy::ProxyCfg) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let registry = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", registry.local_addr().unwrap());
+        let creds = crate::oci::Creds {
+            username: Some("robot".to_string()),
+            password: Some("s3cret".to_string()),
+            ..crate::oci::Creds::anonymous()
+        };
+        let cfg = crate::regproxy::ProxyCfg::from_parts(&upstream, creds).unwrap();
+        (registry, cfg)
+    }
+
+    /// A guest's flow to the sentinel reaches the registry proxy over the proxy's own socket:
+    /// the registry gets the request with a credential, and the guest gets its answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flow_to_the_sentinel_reaches_the_registry_proxy() {
+        use etherparse::PacketHeaders;
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (registry, cfg) = registry_behind_a_proxy().await;
+            let seen = tokio::spawn(async move {
+                let (mut conn, _) = registry.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(conn.read_u8().await.unwrap());
+                }
+                conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nregistry")
+                    .await
+                    .unwrap();
+                String::from_utf8(head).unwrap()
+            });
+            let socket = crate::regproxy::spawn(cfg).await.unwrap();
+
+            let mut flow = GuestFlow::open().await;
+            let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
+                .with_registry_proxy(Some((FLOW_REMOTE.into(), socket)));
+            let (drain, _drained) = Drain::new();
+            let proxy = tokio::spawn(proxy_tcp(
+                flow.stream.take().unwrap(),
+                Arc::new(guard),
+                drain,
+            ));
+            flow.send(b"GET /v2/ HTTP/1.1\r\nHost: registry.vk\r\n\r\n");
+            let mut reply = Vec::new();
+            // However the proxy frames the body.
+            while !reply.windows(8).any(|w| w == b"registry") {
+                let packet = flow._replies.recv().await.unwrap();
+                let headers = PacketHeaders::from_ip_slice(reply_ip(&packet)).unwrap();
+                reply.extend_from_slice(headers.payload.slice());
+            }
+            assert!(reply.starts_with(b"HTTP/1.1 200 OK"), "{reply:?}");
+            let head = seen.await.unwrap().to_ascii_lowercase();
+            assert!(head.starts_with("get /v2/ "), "{head}");
+            assert!(head.contains("authorization: basic "), "{head}");
+            proxy.abort();
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A sentinel whose proxy is gone, or was never there, resets the guest's flow rather
+    /// than leaving it open.
+    #[tokio::test]
+    async fn a_flow_to_a_sentinel_without_a_proxy_is_reset() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut flow = GuestFlow::open().await;
+            let socket = ProxySocket::random().unwrap();
+            let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
+                .with_registry_proxy(Some((FLOW_REMOTE.into(), socket)));
+            let (drain, _drained) = Drain::new();
+            proxy_tcp(flow.stream.take().unwrap(), Arc::new(guard), drain).await;
+            assert!(flow.reset().await.is_empty());
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The switch checks who listens on the proxy's socket: a listener that does not run as
+    /// the uid the switch expects is handed nothing of the guest's flow, which is reset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flow_to_a_proxy_of_another_user_is_reset() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (registry, cfg) = registry_behind_a_proxy().await;
+            let socket = crate::regproxy::spawn(cfg).await.unwrap();
+
+            let mut flow = GuestFlow::open().await;
+            let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
+                .with_registry_proxy(Some((FLOW_REMOTE.into(), socket)))
+                .with_proxy_uid(crate::regproxy::euid().wrapping_add(1));
+            let (drain, _drained) = Drain::new();
+            flow.send(b"GET /v2/ HTTP/1.1\r\nHost: registry.vk\r\n\r\n");
+            proxy_tcp(flow.stream.take().unwrap(), Arc::new(guard), drain).await;
+            assert!(flow.reset().await.is_empty());
+            // The proxy, which would have served this user, was sent no request to forward.
+            let forwarded = tokio::time::timeout(Duration::from_millis(300), registry.accept());
+            assert!(forwarded.await.is_err());
+        })
+        .await
+        .unwrap();
+    }
+
     /// An idle connection sends EOF after settling instead of waiting for the guest to
     /// close. A cooperating host then lets the drain finish before its deadline.
     #[tokio::test]
@@ -5370,7 +5545,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let mut flow = GuestFlow::open().await;
             let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
-                .with_registry_proxy(Some((FLOW_REMOTE.into(), listener.local_addr().unwrap())));
+                .with_tcp_redirect(FLOW_REMOTE.into(), listener.local_addr().unwrap());
             let (drain, _drained) = Drain::new();
             let proxy = tokio::spawn(proxy_tcp(
                 flow.stream.take().unwrap(),
@@ -5518,7 +5693,7 @@ mod tests {
 
         // Allow 10.20.0.0/16; redirect a sentinel flow to the registry proxy.
         let guard = EgressGuard::new(Egress::new(&["10.20.0.0/16".into()], &[]).unwrap(), gw)
-            .with_registry_proxy(Some((sentinel, "127.0.0.1:9000".parse().unwrap())));
+            .with_registry_proxy(Some((sentinel, PROXY_SOCKET.parse().unwrap())));
 
         // A denied dst is refused with a RST frame.
         assert!(
@@ -6331,7 +6506,7 @@ mod tests {
             .with_cap(Some(cap))
             .with_hub(Some(hub), Vec::new())
             .with_denied_log(Some(log.clone()))
-            .with_registry_proxy(Some((sentinel, "127.0.0.1:5000".parse().unwrap())));
+            .with_registry_proxy(Some((sentinel, PROXY_SOCKET.parse().unwrap())));
         assert!(guard.restricted() && guard.restricted_for(guest) && !guard.soft());
         let at = |ip: [u8; 4], port| SocketAddr::from((ip, port));
         assert_eq!(

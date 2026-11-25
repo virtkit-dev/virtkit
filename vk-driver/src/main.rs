@@ -1777,9 +1777,9 @@ enum Cmd {
         record_limit: Option<u64>,
         /// redirect guest flows aimed at a sentinel address to a host-local registry proxy
         ///
-        /// The value is `<sentinel-ip>=<host:port>`, set internally by
-        /// `vk run --registry-proxy`.
-        #[arg(long = "registry-proxy", value_name = "IP=ADDR")]
+        /// The value is `<sentinel-ip>=@<socket-name>`, the proxy's abstract Unix socket, set
+        /// internally by `vk`.
+        #[arg(long = "registry-proxy", value_name = "IP=@NAME")]
         registry_proxy: Option<String>,
         /// append each egress denial as a typed record here
         ///
@@ -7265,18 +7265,18 @@ fn resolve_service_addr(entry: &vms::VmEntry, service: &str) -> anyhow::Result<S
     vms::service_exec_addr(entry, service)
 }
 
-/// Parse a switch `--registry-proxy` value `<sentinel-ip>=<host:port>`.
-fn parse_registry_proxy(s: &str) -> anyhow::Result<(std::net::Ipv4Addr, std::net::SocketAddr)> {
-    let (ip, addr) = s
+/// Parse a switch `--registry-proxy` value `<sentinel-ip>=@<socket-name>`.
+fn parse_registry_proxy(s: &str) -> anyhow::Result<(std::net::Ipv4Addr, regproxy::ProxySocket)> {
+    let (ip, socket) = s
         .split_once('=')
-        .ok_or_else(|| anyhow::anyhow!("registry-proxy {s:?}: want <ip>=<host:port>"))?;
+        .ok_or_else(|| anyhow::anyhow!("registry-proxy {s:?}: want <ip>=@<socket-name>"))?;
     let ip = ip
         .parse::<std::net::Ipv4Addr>()
         .map_err(|e| anyhow::anyhow!("registry-proxy sentinel {ip:?}: {e}"))?;
-    let addr = addr
-        .parse::<std::net::SocketAddr>()
-        .map_err(|e| anyhow::anyhow!("registry-proxy addr {addr:?}: {e}"))?;
-    Ok((ip, addr))
+    let socket = socket
+        .parse::<regproxy::ProxySocket>()
+        .map_err(|e| anyhow::anyhow!("registry-proxy socket {socket:?}: {e}"))?;
+    Ok((ip, socket))
 }
 
 /// Parse the repeatable `--source-egress <ip>;<cidr,cidr>;<name,name>` into a per-source

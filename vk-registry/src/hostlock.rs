@@ -34,12 +34,21 @@ fn fnv64(bytes: &[u8]) -> u64 {
     })
 }
 
-/// Connect to the abstract socket `addr` without waiting: a holder that never accepts, its
-/// backlog full, refuses at once (`EAGAIN`) rather than hanging the waiter. The stream is
-/// returned blocking. `Ok(None)` when nothing listens on the name (`ECONNREFUSED`: the
-/// holder is gone, or bound and not listening yet) or its backlog is full (`EAGAIN`); any
-/// other failure is an error.
-pub fn connect_nonblocking(addr: &SocketAddr) -> std::io::Result<Option<UnixStream>> {
+/// What a connection attempt to an abstract socket found there.
+pub enum Dial {
+    /// A listener took the connection. The stream is blocking.
+    Connected(UnixStream),
+    /// Nothing listens on the name (`ECONNREFUSED`): its owner is gone, or bound and not
+    /// listening yet.
+    Absent,
+    /// A listener is there with its backlog full (`EAGAIN`).
+    Busy,
+}
+
+/// Connect to the abstract socket `addr` without waiting: a listener that never accepts,
+/// its backlog full, answers [`Dial::Busy`] at once rather than hanging the caller. Any
+/// failure [`Dial`] does not name is an error.
+pub fn dial(addr: &SocketAddr) -> std::io::Result<Dial> {
     use std::os::fd::FromRawFd;
     let (sa, len) = abstract_sockaddr(addr).ok_or_else(|| {
         std::io::Error::new(
@@ -65,12 +74,22 @@ pub fn connect_nonblocking(addr: &SocketAddr) -> std::io::Result<Option<UnixStre
     if rc != 0 {
         let e = std::io::Error::last_os_error();
         return match e.raw_os_error() {
-            Some(libc::ECONNREFUSED | libc::EAGAIN) => Ok(None),
+            Some(libc::ECONNREFUSED) => Ok(Dial::Absent),
+            Some(libc::EAGAIN) => Ok(Dial::Busy),
             _ => Err(e),
         };
     }
     stream.set_nonblocking(false)?;
-    Ok(Some(stream))
+    Ok(Dial::Connected(stream))
+}
+
+/// [`dial`] for a lock's waiter, to which a holder that is gone and one that does not
+/// accept are the same: `Ok(None)` for both.
+pub fn connect_nonblocking(addr: &SocketAddr) -> std::io::Result<Option<UnixStream>> {
+    Ok(match dial(addr)? {
+        Dial::Connected(stream) => Some(stream),
+        Dial::Absent | Dial::Busy => None,
+    })
 }
 
 /// `addr`'s abstract name as a `sockaddr_un` and its length: the leading NUL that marks the

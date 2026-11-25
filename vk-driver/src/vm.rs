@@ -3015,13 +3015,13 @@ fn spawn_switch(
     let registry_proxy = match proxy_cfg {
         Some(proxy_cfg) => {
             const SENTINEL: Ipv4Addr = Ipv4Addr::new(240, 0, 0, 1);
-            let addr = crate::regproxy::spawn_blocking(proxy_cfg)
+            let socket = crate::regproxy::spawn_blocking(proxy_cfg)
                 .context("starting the job registry proxy")?;
             hosts.push((
                 crate::regproxy::GUEST_HOST.to_string(),
                 SENTINEL.to_string(),
             ));
-            Some((SENTINEL, addr))
+            Some((SENTINEL, socket))
         }
         None => None,
     };
