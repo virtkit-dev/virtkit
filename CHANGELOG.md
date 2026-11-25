@@ -31,6 +31,9 @@ All notable changes to virtkit will be documented in this file.
 - **Security: the guest registry proxy (`vk run --registry-proxy`, `[registry] proxy_guests`)
   now serves only the user running `vk`.** It listened on a loopback port, through which any
   user of the host could use the registry credential it lends guests.
+- The guest registry proxy no longer passes on the headers that describe one connection
+  (`Keep-Alive`, `TE`, `Upgrade` and the like, and any header `Connection` names), in
+  requests or in responses.
 - Concurrent `vk build` runs on one host that share a local build cache now build a stage
   once: the others wait for it, showing who builds it, then restore the result. Previously
   only builds sharing a `vk-registry` cache did.

@@ -778,8 +778,26 @@ fn is_skipped(name: &str) -> bool {
             | "cookie"
             | "content-length"
             | "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
             | "transfer-encoding"
+            | "upgrade"
     )
+}
+
+/// The header names `headers`' `Connection` lists, lowercased: that connection's own, so
+/// never copied across the proxy.
+fn connection_scoped(headers: &hyper::HeaderMap) -> Vec<String> {
+    headers
+        .get_all(hyper::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<ProxyBody>> {
@@ -857,10 +875,14 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     let bodyful = matches!(method, Method::POST | Method::PUT | Method::PATCH)
         || method.as_str() == "PROPFIND"
         || !hyper::body::Body::is_end_stream(&incoming);
+    let scoped = connection_scoped(&parts.headers);
     let headers: Vec<_> = parts
         .headers
         .iter()
-        .filter(|(k, _)| !is_skipped(&k.as_str().to_ascii_lowercase()))
+        .filter(|(k, _)| {
+            let name = k.as_str();
+            !is_skipped(name) && !scoped.iter().any(|s| s == name)
+        })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let sent = match (repeatable(&method, path), bodyful) {
@@ -956,8 +978,9 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     };
 
     let mut out = Response::builder().status(status);
+    let scoped = connection_scoped(&headers_out);
     for (k, v) in headers_out.iter() {
-        if !is_skipped(&k.as_str().to_ascii_lowercase()) {
+        if !is_skipped(k.as_str()) && !scoped.iter().any(|s| s == k.as_str()) {
             out = out.header(k, v);
         }
     }
@@ -2545,5 +2568,35 @@ mod tests {
         for name in ["x-amz-date", "x-amz-content-sha256", "content-type"] {
             assert!(!is_skipped(name), "{name}");
         }
+    }
+
+    /// The proxy copies no hop-by-hop header, nor any a `Connection` names, from a guest's
+    /// request or from a registry's response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn headers_a_connection_names_stay_on_it() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Up-Kept: 1\r\n\
+                       X-Up-Dropped: 1\r\nKeep-Alive: timeout=5\r\n\
+                       Connection: X-Up-Dropped, close\r\n\r\nok";
+        let (up_addr, took) = scripted_upstream(vec![Act::Write(answer.to_vec())]);
+        let (proxy, _served) = proxy_on_tcp(basic_cfg(up_addr));
+        let r = reqwest::Client::new()
+            .get(format!("http://{proxy}/v2/app/manifests/latest"))
+            .header("x-kept", "1")
+            .header("x-dropped", "1")
+            .header("proxy-connection", "keep-alive")
+            .header("connection", "X-Dropped")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert!(r.headers().contains_key("x-up-kept"));
+        assert!(!r.headers().contains_key("x-up-dropped"));
+        assert!(!r.headers().contains_key("keep-alive"));
+        let took = took.lock().unwrap();
+        let head = &took[0].0;
+        assert!(head.contains("\r\nx-kept: 1\r\n"), "{head}");
+        assert!(!head.contains("x-dropped"), "{head}");
+        assert!(!head.contains("proxy-connection"), "{head}");
     }
 }
