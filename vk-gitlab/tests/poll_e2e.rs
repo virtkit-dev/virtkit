@@ -62,7 +62,11 @@ both!(
 );
 
 async fn job_runs_and_reports(via: Via) {
-    let h = Harness::start(2, via).await;
+    // A lease no loaded machine outlasts between the reservation and the submission, which
+    // this test expects on it.
+    let mut h = Harness::unstarted(2, via).await;
+    h.options.hub.lease = Duration::from_secs(10);
+    h.daemon = h.spawn_daemon();
     h.hub.set_slots("r1", 1);
     h.gl.push_job(job_json(5));
     let (hub_id, sub) = within("a submitted job", h.hub.wait_for_job(1)).await;

@@ -286,6 +286,9 @@ mod fake {
         capacity_revision: u64,
         /// Reservation ID → runner.
         reservations: HashMap<String, String>,
+        /// Reservation ID → when its lease lapses, as the hub's does: a reservation neither
+        /// renewed nor released in time frees its room.
+        leases: HashMap<String, tokio::time::Instant>,
         next_id: u64,
         jobs: Vec<FakeJob>,
         calls: Vec<FakeCall>,
@@ -302,6 +305,21 @@ mod fake {
     }
 
     impl Inner {
+        /// Drops the reservations whose lease has lapsed.
+        fn expire(&mut self) {
+            let now = tokio::time::Instant::now();
+            let lapsed: Vec<String> = self
+                .leases
+                .iter()
+                .filter(|(_, until)| **until <= now)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in lapsed {
+                self.leases.remove(&id);
+                self.reservations.remove(&id);
+            }
+        }
+
         /// `runner`'s room: its slots less its reservations and unfinished jobs, as the hub
         /// grants a runner's lane.
         fn fits(&self, runner: &str) -> u32 {
@@ -477,8 +495,11 @@ mod fake {
             self.lock().calls.clone()
         }
 
+        /// The reservations held: neither released nor lapsed.
         pub fn reservations(&self) -> Vec<String> {
-            self.lock().reservations.keys().cloned().collect()
+            let mut inner = self.lock();
+            inner.expire();
+            inner.reservations.keys().cloned().collect()
         }
 
         /// Waits for the `n`th submitted job; returns its hub ID and submission.
@@ -621,12 +642,15 @@ mod fake {
         ) -> DispatchResult<Reservation> {
             self.lock().runners.push(runner.to_owned());
             let id = self.change(|i| {
+                i.expire();
                 if i.fits(runner) == 0 {
                     return None;
                 }
                 i.next_id += 1;
                 let id = format!("{:032x}", i.next_id);
                 i.reservations.insert(id.clone(), runner.to_owned());
+                i.leases
+                    .insert(id.clone(), tokio::time::Instant::now() + lease);
                 i.calls.push(FakeCall::Reserve(id.clone()));
                 Some(id)
             });
@@ -649,9 +673,13 @@ mod fake {
         async fn renew(&self, reservation: &str, lease: Duration) -> DispatchResult<Duration> {
             let mut inner = self.lock();
             inner.calls.push(FakeCall::Renew(reservation.to_owned()));
+            inner.expire();
             if let Some(err) = inner.refuse_renew.clone() {
                 Err(err)
             } else if inner.reservations.contains_key(reservation) {
+                inner
+                    .leases
+                    .insert(reservation.to_owned(), tokio::time::Instant::now() + lease);
                 Ok(lease)
             } else {
                 Err(DispatchError::new(
