@@ -376,7 +376,9 @@ fn run_args(
         && let Some(folder) = &plan.workspace_folder
     {
         // `overlay`: the checkout goes in read-only under a tmpfs the guest writes to, so a
-        // task can normalize files in place without touching the host tree.
+        // task can normalize files in place without touching the host tree. Either way the
+        // share is `ShareCache::Auto`: a host change to a name the guest looked up in the
+        // last 5 seconds can go unseen for the rest of them (see docs/dev.md).
         let spec = match share {
             CheckoutMode::Shared => format!("{}:{folder}", plan.workspace.display()),
             CheckoutMode::Overlay => format!("{}:{folder}:overlay", plan.workspace.display()),

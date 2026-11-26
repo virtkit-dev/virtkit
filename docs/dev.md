@@ -491,6 +491,17 @@ The restriction is a project default, not a sandbox the checkout enforces: a
 sessions write through to the host files. Linked Git worktrees receive the Git
 metadata mapping needed to use the checkout from the guest.
 
+The guest sees its own changes to the checkout at once, as it does a file the host
+creates and a directory listing. A name it has looked up, with its size and times,
+it keeps for up to 5 seconds without asking the host: for that long, a file removed
+or replaced on the host can still open in the guest, with its old contents, and a
+file grown in place can read cut at its old size. So a tool that decides from what
+is on disk, such as a task runner's up-to-date check, can miss a host change made in
+the last 5 seconds: wait that long, or make the change from the guest. Directory
+mounts behave the same; a single-file mount asks the host on every lookup. The
+cache saves host lookups on repeated passes over the tree, such as `git status` or a
+build's dependency check.
+
 Additional mounts are named entries:
 
 ```toml

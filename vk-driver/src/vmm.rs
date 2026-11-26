@@ -405,10 +405,14 @@ pub struct FsShare {
     clap::ValueEnum,
 )]
 pub enum ShareCache {
-    /// Close-to-open consistency, for a tree the host may change while the VM runs.
+    /// For a tree the host may change while the VM runs.
     ///
-    /// Entries and attributes stay valid for seconds and misses are not cached, so a change
-    /// the host makes shows in the guest promptly.
+    /// Misses are not cached, so a file the host creates shows in the guest at once, and a
+    /// directory listing shows a host change at once. A name the guest looked up, and its
+    /// attributes, stay valid for [`DEFAULT_TIMEOUT_MS`] without asking the host again: for
+    /// that long, a file the host removed or replaced can still open in the guest, with its
+    /// old contents, and one the host grew in place can read cut at its old size. The
+    /// validity saves host lookups on repeated passes over the tree.
     #[default]
     Auto,
     /// The host does not change the tree while it is shared, so the guest keeps every entry,
