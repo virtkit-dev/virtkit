@@ -3334,6 +3334,23 @@ pub struct GcReport {
     pub incomplete: bool,
 }
 
+impl GcReport {
+    /// Removal counts and blob size for the `gc` command and hub log, including dry runs.
+    pub(crate) fn dropped(&self, dry_run: bool) -> String {
+        format!(
+            "{} {} tag(s), {} manifest(s), {} blob(s) ({:.1} MiB), {} upload(s), \
+             {} membership record(s)",
+            if dry_run { "would drop" } else { "dropped" },
+            self.tags_dropped,
+            self.manifests_dropped,
+            self.blobs_dropped,
+            self.bytes_freed as f64 / f64::from(1u32 << 20),
+            self.uploads_dropped,
+            self.blob_markers_dropped,
+        )
+    }
+}
+
 /// How [`Store::gc_with`] takes the store lock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wait {
@@ -6840,16 +6857,9 @@ fn gc_to(
     let r = store.gc(retention, grace, dry_run)?;
     writeln!(
         out,
-        "{cmd}: gc {}: {} {} tag(s), {} manifest(s), {} blob(s) ({:.1} MiB), \
-         {} upload(s), {} membership record(s)",
+        "{cmd}: gc {}: {}",
         store.root.display(),
-        if dry_run { "would drop" } else { "dropped" },
-        r.tags_dropped,
-        r.manifests_dropped,
-        r.blobs_dropped,
-        r.bytes_freed as f64 / f64::from(1u32 << 20),
-        r.uploads_dropped,
-        r.blob_markers_dropped,
+        r.dropped(dry_run)
     )?;
     writeln!(
         out,
@@ -8047,6 +8057,13 @@ mod tests {
         // The standalone binary names itself, in the report prefix, the gc summary, and the
         // cleanup hint — and never the driver's `vk registry` spelling.
         let (s, g) = render("vk-registry");
+        assert!(
+            g.lines().next().unwrap().ends_with(
+                ": would drop 0 tag(s), 0 manifest(s), 1 blob(s) (0.0 MiB), 0 upload(s), \
+                 0 membership record(s)"
+            ),
+            "{g}"
+        );
         assert!(s.starts_with("vk-registry:"), "{s}");
         assert!(s.contains("`vk-registry gc --dry-run`"), "{s}");
         assert!(!s.contains("vk registry gc"), "{s}");

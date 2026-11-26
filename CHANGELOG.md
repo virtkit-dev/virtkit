@@ -10,6 +10,8 @@ All notable changes to virtkit will be documented in this file.
   also hosts a WebDAV compiler cache.
 - `vk-registry` answers requests from users and API keys faster when a blob or
   digest-addressed manifest is absent from the registry.
+- `vk-registry` logs how long each hub-run garbage collection took and what it removed,
+  would remove in a dry run, or why it failed.
 
 ### Fixed
 

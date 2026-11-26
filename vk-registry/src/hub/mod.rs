@@ -21,7 +21,7 @@ mod update;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -716,6 +716,7 @@ impl Link {
             "vk-registry: hub: gc{} (retention {retention_days} days, grace {grace_days})",
             if dry_run { " dry run" } else { "" }
         );
+        let started = Instant::now();
         let report = tokio::task::spawn_blocking(move || {
             store.gc(
                 Duration::from_secs(retention_days.saturating_mul(86_400)),
@@ -726,6 +727,10 @@ impl Link {
         .await
         .map_err(anyhow::Error::from)
         .and_then(|r| r);
+        eprintln!(
+            "vk-registry: hub: {}",
+            gc_outcome(&report, dry_run, started.elapsed())
+        );
         let run = match report {
             Ok(r) => GcRun {
                 command,
@@ -826,6 +831,30 @@ impl Link {
             locks: u32::try_from(self.state.locks.held_count()).unwrap_or(u32::MAX),
             store_free_bytes: self.state.store.space().1,
         }
+    }
+}
+
+/// A panic in the gc task is logged as a failed run.
+fn gc_outcome(report: &Result<crate::GcReport>, dry_run: bool, took: Duration) -> String {
+    let took = took.as_secs_f64();
+    let gc = if dry_run { "gc dry run" } else { "gc" };
+    match report {
+        Ok(r) => {
+            let mut line = format!(
+                "{gc} done in {took:.1} s: {}; held the store lock exclusive for {} ms at most",
+                r.dropped(dry_run),
+                r.longest_hold.as_millis(),
+            );
+            if r.blobs_leased > 0 {
+                line += &format!(
+                    "; kept {} leased blob(s) ({:.1} MiB) that running builds read",
+                    r.blobs_leased,
+                    r.bytes_leased as f64 / f64::from(1u32 << 20),
+                );
+            }
+            line
+        }
+        Err(e) => format!("{gc} failed after {took:.1} s: {e:#}"),
     }
 }
 
@@ -1013,6 +1042,43 @@ mod tests {
         }
         let ack = link.command(gc("c", 30, 2)).unwrap();
         assert_eq!(ack.outcome, Outcome::Accepted);
+    }
+
+    #[test]
+    fn gc_outcome_names_duration_and_counts() {
+        let report = || crate::GcReport {
+            tags_dropped: 3,
+            blobs_dropped: 5,
+            bytes_freed: 3 << 20,
+            longest_hold: Duration::from_millis(42),
+            ..Default::default()
+        };
+        assert_eq!(
+            gc_outcome(&Ok(report()), false, Duration::from_millis(12_340)),
+            "gc done in 12.3 s: dropped 3 tag(s), 0 manifest(s), 5 blob(s) (3.0 MiB), \
+             0 upload(s), 0 membership record(s); held the store lock exclusive for 42 ms \
+             at most"
+        );
+        let leased = crate::GcReport {
+            blobs_leased: 2,
+            bytes_leased: 1 << 20,
+            ..report()
+        };
+        assert_eq!(
+            gc_outcome(&Ok(leased), true, Duration::from_secs(1)),
+            "gc dry run done in 1.0 s: would drop 3 tag(s), 0 manifest(s), 5 blob(s) \
+             (3.0 MiB), 0 upload(s), 0 membership record(s); held the store lock exclusive \
+             for 42 ms at most; kept 2 leased blob(s) (1.0 MiB) that running builds read"
+        );
+        let failed = || anyhow::anyhow!("the store lock stayed taken");
+        assert_eq!(
+            gc_outcome(&Err(failed()), false, Duration::from_secs(2)),
+            "gc failed after 2.0 s: the store lock stayed taken"
+        );
+        assert_eq!(
+            gc_outcome(&Err(failed()), true, Duration::from_secs(2)),
+            "gc dry run failed after 2.0 s: the store lock stayed taken"
+        );
     }
 
     fn gc_command(id: &str, retention_days: u64) -> Command {
