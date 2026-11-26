@@ -210,7 +210,8 @@ has a membership record, or when the principal may read another repository that 
 The second rule preserves cross-repository deduplication without disclosing bytes the
 principal could not already fetch. The common pull path is one membership lookup; only a
 miss searches the repositories the principal may read, the `files/` tree last, so a digest
-an image repository holds is found without listing the WebDAV directories.
+an image repository holds is found without listing the WebDAV directories. A manifest
+`PUT` lists readable repositories only if a reference needs a cross-repository check.
 
 A manifest `PUT` naming a digest that is not `sha256:<64 lowercase hex>` — config, layer,
 index child or subject — is refused with `DIGEST_INVALID`, in every mode, rather than having

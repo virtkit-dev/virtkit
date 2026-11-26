@@ -1538,6 +1538,23 @@ impl Store {
             .collect()
     }
 
+    /// Every repository in `tree` with a membership directory (`manifests/` or `blobs/`), in
+    /// walk order, each once.
+    fn member_repo_names(&self, tree: RepoTree) -> Vec<String> {
+        let repos = self.root.join("repos");
+        let mut seen = HashSet::new();
+        let mut names = Vec::new();
+        self.walk_repo_dirs(tree, MEMBER_SUBDIRS, &mut |d| {
+            if let Some(name) = repo_of(&repos, d)
+                && seen.insert(name.clone())
+            {
+                names.push(name);
+            }
+            ControlFlow::Continue(())
+        });
+        names
+    }
+
     /// Whether a repository in `tree` that `readable` accepts holds `hex`, stopping at the
     /// first. Only readable repositories get membership checks, each for the record type
     /// whose directory the walk found.
@@ -5983,13 +6000,13 @@ pub(crate) fn readable_through(authz: &Authz<'_>, store: &Store, name: &str, hex
 /// `repos/` in the order a cross-repository lookup searches it: see [`readable_through`].
 const TREES_IN_LOOKUP_ORDER: [RepoTree; 2] = [RepoTree::OutsideFiles, RepoTree::Files];
 
-/// The other repositories this caller may read — computed before any per-digest work, so
-/// a manifest with hundreds of layers walks `repos/` once rather than once per layer, and
-/// so no repository the caller may not read is ever consulted on disk.
+/// Other readable repositories with membership directories, `files/` last. A manifest
+/// push reuses this list across layers so each digest check probes only readable
+/// repositories without walking `repos/` again.
 fn readable_repos(authz: &Authz<'_>, store: &Store, name: &str) -> Vec<String> {
-    store
-        .all_repo_names()
-        .into_iter()
+    TREES_IN_LOOKUP_ORDER
+        .iter()
+        .flat_map(|&tree| store.member_repo_names(tree))
         .filter(|r| r != name && authz.may_read(r))
         .collect()
 }
@@ -6048,7 +6065,8 @@ fn authorize_and_mount_manifest_blobs(
     if matches!(authz, Authz::NoScopes) {
         return Ok(Mount::Done);
     }
-    let elsewhere = readable_repos(authz, store, name);
+    // Skip the repository walk when the target already holds every reference.
+    let mut elsewhere: Option<Vec<String>> = None;
     // See the shortcut below: not taken for a hub token.
     let shortcut = !matches!(authz, Authz::Token(_));
     let mut to_mount = Vec::new();
@@ -6069,7 +6087,11 @@ fn authorize_and_mount_manifest_blobs(
         // and the store's holdings outside them are none of its business, by timing or
         // otherwise. It pays the walk over the repositories its grants make readable for
         // every reference, and `readable_repos` lists every repository once per manifest.
-        if (shortcut && store.find_blob(&hex).is_none()) || !store.any_holds(&elsewhere, &hex) {
+        if shortcut && store.find_blob(&hex).is_none() {
+            return Ok(Mount::Unreadable(hex));
+        }
+        let elsewhere = elsewhere.get_or_insert_with(|| readable_repos(authz, store, name));
+        if !store.any_holds(elsewhere, &hex) {
             return Ok(Mount::Unreadable(hex));
         }
         // Readable elsewhere, so mounting it here grants nothing new.
@@ -11539,6 +11561,33 @@ mod tests {
         store.record_blob("other/app", &other).unwrap();
         assert!(!readable_through(&authz, &store, "team/app", &other));
         assert!(!readable_through(&authz, &store, "files/team/iso", &other));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pushing references the target already holds skips the repository walk even in a large store.
+    #[test]
+    fn a_manifest_push_of_its_own_references_walks_nothing() {
+        let dir = testtmp::root().join("regserve-push-own-refs");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        with_cache_shards(&store, "team/sccache", 256);
+        let c = claims(&[("team", "rw")]);
+        let authz = Authz::Token(&c);
+        let config = hex(&store.put_blob(b"a config").unwrap());
+        let layer = hex(&store.put_blob(b"a layer").unwrap());
+        store.record_blob("team/app", &config).unwrap();
+        store.record_blob("team/app", &layer).unwrap();
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"config":{{"digest":"sha256:{config}","size":8}},"layers":[{{"digest":"sha256:{layer}","size":7}}]}}"#
+        );
+
+        let before = store.repo_dir_reads();
+        let outcome =
+            authorize_and_mount_manifest_blobs(&authz, &store, "team/app", manifest.as_bytes())
+                .unwrap();
+        assert!(matches!(outcome, Mount::Done));
+        assert_eq!(store.repo_dir_reads(), before);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
