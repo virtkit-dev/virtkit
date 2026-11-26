@@ -1895,11 +1895,13 @@ async fn a_zstd_stored_blob_varies_on_accept_encoding() {
 async fn a_server_side_failure_does_not_tell_the_client_why() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tmp("leak");
-    // A port just freed, so nothing listens there: every relayed request fails on this side.
-    let closed = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    // Bound but never listened on, so every relayed request is refused upstream and fails on
+    // this side. Held through the assertions with SO_REUSEADDR off, so no other test can bind
+    // and listen there.
+    let held = tokio::net::TcpSocket::new_v4().unwrap();
+    held.set_reuseaddr(false).unwrap();
+    held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let closed = held.local_addr().unwrap();
     let url = spawn(mirror_of(closed, &dir));
     let client = reqwest::Client::new();
 
@@ -1928,5 +1930,6 @@ async fn a_server_side_failure_does_not_tell_the_client_why() {
     assert!(body.contains("\"INTERNAL\""), "{body}");
     assert!(!body.contains(&dir.display().to_string()), "{body}");
 
+    drop(held);
     let _ = std::fs::remove_dir_all(&dir);
 }
