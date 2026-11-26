@@ -8,6 +8,8 @@ All notable changes to virtkit will be documented in this file.
 
 - `vk-registry` stores ZIP uploads as received, saving compression and decompression work
   on sccache writes and reads.
+- The `vk-registry` web UI stores gzip, zstd, xz, bzip2 and ZIP uploads as received,
+  matching streamed pushes.
 
 ## [0.117.0] - 2026-11-26
 

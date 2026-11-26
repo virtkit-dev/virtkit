@@ -285,7 +285,16 @@ pub const TRANSPARENT_ZSTD_HEADER: &str = "x-virtkit-transparent-zstd";
 /// ZIP members are usually compressed. Recompressing sccache's zstd-compressed
 /// members saved under 0.1%. ZIPs with uncompressed members may use more disk space.
 ///
-/// Files too short to hold a full magic are treated as uncompressed; I/O errors propagate.
+/// A partial signature does not match.
+fn has_compressed_magic(head: &[u8]) -> bool {
+    head.starts_with(&[0x1f, 0x8b])                                // gzip
+        || head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])             // zstd
+        || head.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) // xz
+        || head.starts_with(b"BZh")                                // bzip2
+        || head.starts_with(b"PK\x03\x04") // ZIP local file header
+}
+
+/// Check the file header with [`has_compressed_magic`], propagating I/O errors.
 fn already_compressed(path: &Path) -> Result<bool> {
     use std::io::Read;
     let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -295,13 +304,7 @@ fn already_compressed(path: &Path) -> Result<bool> {
     f.take(6)
         .read_to_end(&mut head)
         .with_context(|| format!("reading the header of {}", path.display()))?;
-    Ok(
-        head.starts_with(&[0x1f, 0x8b])                            // gzip
-        || head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])             // zstd
-        || head.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) // xz
-        || head.starts_with(b"BZh")                                // bzip2
-        || head.starts_with(b"PK\x03\x04"), // ZIP local file header
-    )
+    Ok(has_compressed_magic(&head))
 }
 
 /// zstd `tmp` into a sibling temp file, returning its path — or `None`, having removed it,
@@ -1171,8 +1174,9 @@ impl Store {
     }
 
     /// Store raw canonical bytes content-addressed, adaptively compressed (the zstd
-    /// form only when it actually shrinks). Idempotent: a present blob is only
-    /// touched, and the compression is skipped. Returns the `sha256:<hex>` digest.
+    /// form only if the header is unrecognized and zstd saves space). Idempotent: an
+    /// existing blob is only touched, and the compression is skipped. Returns the
+    /// `sha256:<hex>` digest.
     pub fn put_blob(&self, raw: &[u8]) -> Result<String> {
         let hex = sha256_hex_raw(raw);
         self.put_blob_at(&hex, raw)?;
@@ -1182,12 +1186,13 @@ impl Store {
     /// [`Store::put_blob`] under an already-known digest hex.
     fn put_blob_at(&self, hex: &str, raw: &[u8]) -> Result<()> {
         if !self.has_blob(hex) {
-            let z = zstd_with_size(raw)?;
-            if z.len() < raw.len() {
-                atomic_write(&self.zstd_blob_path(hex), &z)?;
-            } else {
-                atomic_write(&self.blob_path(hex), raw)?;
+            if !has_compressed_magic(raw) {
+                let z = zstd_with_size(raw)?;
+                if z.len() < raw.len() {
+                    return atomic_write(&self.zstd_blob_path(hex), &z);
+                }
             }
+            atomic_write(&self.blob_path(hex), raw)?;
         }
         Ok(())
     }
@@ -9060,6 +9065,33 @@ mod tests {
             "{:?}",
             upload_files(&store)
         );
+    }
+
+    /// A gzip header keeps a compressible blob raw. An all-zero blob of the same size uses zstd.
+    #[test]
+    fn put_blob_stores_an_already_compressed_blob_as_it_is() {
+        let dir = testtmp::root().join("compressed-put-blob");
+        let store = Store::new(dir).unwrap();
+        // A gzip magic number over bytes zstd would shrink.
+        let mut gz = vec![0x1f, 0x8b, 0x08, 0x00];
+        gz.resize(4096, 0);
+        let hex = store
+            .put_blob(&gz)
+            .unwrap()
+            .trim_start_matches("sha256:")
+            .to_string();
+        assert_eq!(std::fs::read(store.blob_path(&hex)).unwrap(), gz);
+        assert!(!store.zstd_blob_path(&hex).exists());
+
+        let plain = vec![0u8; 4096];
+        let hex = store
+            .put_blob(&plain)
+            .unwrap()
+            .trim_start_matches("sha256:")
+            .to_string();
+        assert!(store.zstd_blob_path(&hex).exists());
+        assert!(!store.blob_path(&hex).exists());
+        assert_eq!(store.get_blob(&hex).unwrap().unwrap(), plain);
     }
 
     /// A raw push in a recognized compressed format is stored as it is, without a
