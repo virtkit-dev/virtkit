@@ -196,7 +196,7 @@ pub(crate) struct Collected {
 /// on it runs (read before taking its lock, which would make the registry think the run
 /// alive), while anyone holds its lock, and when it is no longer the directory noted; a file
 /// is left unless it is still the one the run built, and only those [`ARTIFACTS`] go. With
-/// `only_on`, only dirs on that device. A note whose dir is gone or replaced is dropped. With
+/// `only_on`, only dirs on that filesystem ([`crate::usage::fs_id`]). A note whose dir is gone or replaced is dropped. With
 /// `dry_run`, what it would remove.
 pub(crate) fn collect(idle: Duration, only_on: Option<u64>, dry_run: bool) -> Collected {
     // A dry run reads the registry without pruning the dead registrations it finds.
@@ -251,7 +251,7 @@ fn collect_in(
         };
         // Looked at unlocked first, so a dir in use is never locked: only one that looks idle
         // is, and read again then.
-        if only_on.is_some_and(|dev| dev != meta.dev())
+        if only_on.is_some_and(|fs| crate::usage::fs_id(dir) != Some(fs))
             || running.iter().any(|r| r == dir)
             || !quiet()
         {
@@ -447,7 +447,10 @@ mod tests {
         let running = std::slice::from_ref(&running);
 
         let elsewhere = collect_in(&ledger, running, day * 14, Some(u64::MAX), now, true);
-        assert!(elsewhere.dirs.is_empty(), "nothing on another device");
+        assert!(elsewhere.dirs.is_empty(), "nothing on another filesystem");
+        let here = crate::usage::fs_id(&idle);
+        let on_it = collect_in(&ledger, running, day * 14, here, now, true);
+        assert_eq!(on_it.dirs.len(), 1, "{:?}", on_it.dirs);
 
         let dry = collect_in(&ledger, running, day * 14, None, now, true);
         assert_eq!(dry.dirs.len(), 1);

@@ -46,7 +46,8 @@ Repository names and tags are metadata over that shared blob pool.
   repos/<name>/blobs/<hex>      blob membership marker
   uploads/<id>                  in-progress upload, or a request body being staged
   uploads/owners/<id>           repository that opened the upload
-  accounts/accounts.db          account data, when accounts mode is enabled
+  accounts/accounts.db          account data when accounts mode is enabled
+                                (for the default store, see "The default store")
 ```
 
 The plain-file area `/dav/files/` uses the same pool: each object is a tag on a raw-file
@@ -275,7 +276,8 @@ Accounts mode separates human and machine credentials:
 - operators manage administrators and system keys through a local Unix socket, or directly
   through the accounts database while the server is stopped.
 
-The account database is a `redb` file at `<root>/accounts/accounts.db` by default. `redb` is
+The account database is a `redb` file at `<root>/accounts/accounts.db` by default (for the
+default store, see "The default store"). `redb` is
 pure Rust and fits the project's static-musl build. The containing directory is created with
 mode `0700`; protecting only the file would not prevent replacement by a user who can write
 its parent directory.
@@ -476,6 +478,34 @@ after a wait or renewed, ends by the token's expiry. The tokens of one subject (
 at most 256 live locks together: an acquire that would take more is answered 429 at once,
 without waiting. A token past its expiry, though within the skew it is otherwise taken with,
 is refused here with the mode's challenge.
+
+### The default store
+
+Without an explicit root, `vk-registry` shares `vk`'s default build store at
+`$XDG_CACHE_HOME/virtkit/registry` (normally `~/.cache/virtkit/registry`). `--root` and the
+config's `root` override it; `status`, `gc` and the commands that read the accounts database
+also take `VK_REGISTRY_ROOT`. Releases through 0.116 kept the store at
+`$XDG_DATA_HOME/virtkit/registry`.
+
+`serve` and `install-service` migrate the legacy store when they resolve the default.
+Resolving `vk`'s image-cache root also migrates `docker/` and `build/`. On the same
+filesystem, `renameat2(RENAME_EXCHANGE)` swaps the directory with a symlink to its new
+path. Without exchange support, migration renames the directory before creating the
+link, and a migration interrupted in between creates it next time. Older binaries can use
+the old path once the link exists. A migration that fails leaves the store where it is,
+and it is used there.
+
+Across filesystems, nothing is copied: the old directory stays, and the new path links to
+it. If the old path is a user symlink, the new path links to its target. If both paths hold
+separate directories, migration keeps both, uses the new one and warns. Selecting an
+explicit root, reporting status and collecting garbage do not migrate the store.
+
+Set an explicit root for content that must survive cache cleanup. A server using the
+default store, including through an alias, keeps its accounts database and hub enrollment
+under `$XDG_DATA_HOME/virtkit/registry-server/{accounts,hub}`. `serve` moves there, by one
+rename, either one an older release kept inside the store, when its user owns the store
+and no other process holds the accounts database; otherwise the server uses it where it
+is, and a note says where to move it while no server runs.
 
 ### Locks of a local store
 
@@ -846,7 +876,8 @@ A registry may enroll with a `vk-hub` (`vk-registry join`), which then sees its 
 load and usage and, within what `[hub] allow` lists, makes it read-only, schedules and runs
 its gc, and updates it on trial. The registry's authentication and its accounts database are
 not involved: the session is an outbound WebSocket to the hub, authenticated with the
-registry's own ed25519 key, and everything kept for it is under `<root>/hub/`. Read-only is
+registry's own ed25519 key, and everything kept for it is under `<root>/hub/` (for the default
+store, see "The default store"). Read-only is
 enforced after authentication: every write a client asks for — pushes, uploads, deletions,
 including a tag deleted from the settings pages — is answered 503, while keys and captions,
 which live in the accounts database, and the lock service go on. The pull-through relay is

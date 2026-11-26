@@ -905,12 +905,9 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
     // The host config (loaded once in cli_main) drives image resolution (registry/docker
     // proxy, local dir) and the shared image cache location. `vk run` is rootless and
     // usually has no config file, so defaults apply; its cache then lives under
-    // $XDG_DATA_HOME rather than the CI default /var/lib/virtkit (unwritable for a dev),
+    // $XDG_CACHE_HOME rather than the CI default /var/lib/virtkit (unwritable for a dev),
     // unless the config pins a state_dir.
-    let state_dir = match &cfg.state_dir {
-        Some(dir) => dir.clone(),
-        None => default_data_base()?,
-    };
+    let state_dir = cache_root(cfg)?;
     // Started once this run holds its work dir — its state dir, for a `vk dev` boot — so the
     // pass finds it in use rather than an environment to reclaim.
     crate::autogc::maybe_start(cfg, &state_dir);
@@ -933,17 +930,64 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
     }
 }
 
-/// Default base for `vk run`'s durable shared image cache: `$XDG_DATA_HOME/virtkit`, else
-/// `~/.local/share/virtkit`. Distinct from `default_scratch_base` (the transient launch
-/// scratch under `$XDG_CACHE_HOME`): the materialized image bases and built stages here
-/// persist across runs (bounded by idle eviction), so they belong in the data dir — the
-/// same home the instruction store (`vk_registry::default_root`) uses.
+/// The data dir: `$XDG_DATA_HOME/virtkit`, else `~/.local/share/virtkit`. What `vk` must not
+/// lose lives here — the VM registry, the runs ledger, the baked `local/<name>` bundles of a
+/// run with no `state_dir` — apart from its caches ([`cache_root`]).
 pub(crate) fn default_data_base() -> Result<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(xdg).join("virtkit"));
+    vk_registry::cachehome::data_base().context("neither XDG_DATA_HOME nor HOME is set")
+}
+
+/// The image caches' tiers, each a directory of the cache root.
+const CACHE_TIERS: [&str; 3] = [vk_registry::cachehome::REGISTRY, "docker", "build"];
+
+/// The caches a configuration names, which no lookup moves: the tiers of a configured
+/// `state_dir`, and an in-process store `[build] cache_registry` names.
+pub(crate) fn configured_caches(cfg: &crate::config::Config) -> Vec<PathBuf> {
+    let mut kept: Vec<PathBuf> = match &cfg.state_dir {
+        Some(dir) => CACHE_TIERS.iter().map(|t| dir.join(t)).collect(),
+        None => Vec::new(),
+    };
+    if let Some(repo) = cfg.build.cache_registry.as_deref()
+        && let Some(dir) = crate::config::Registry::local_root_of(repo)
+    {
+        kept.push(dir);
     }
-    let home = std::env::var_os("HOME").context("neither XDG_DATA_HOME nor HOME is set")?;
-    Ok(PathBuf::from(home).join(".local/share/virtkit"))
+    kept
+}
+
+/// The dir `vk run` and the builds keep the image caches under: a configured `state_dir`,
+/// else the default ([`vk_registry::cachehome::resolve_base`]), migrating the caches an older
+/// release left in the data dir.
+pub(crate) fn cache_root(cfg: &crate::config::Config) -> Result<PathBuf> {
+    match &cfg.state_dir {
+        Some(dir) => Ok(dir.clone()),
+        None => Ok(
+            vk_registry::cachehome::resolve_base(&CACHE_TIERS, &configured_caches(cfg))?
+                .into_path(),
+        ),
+    }
+}
+
+/// [`cache_root`], changing nothing: for `vk gc` and `vk paths`, which use the caches where
+/// they are.
+pub(crate) fn located_cache_root(cfg: &crate::config::Config) -> Result<PathBuf> {
+    match &cfg.state_dir {
+        Some(dir) => Ok(dir.clone()),
+        None => Ok(located_default_cache_root(cfg)?.into_path()),
+    }
+}
+
+/// The default image-cache root where it is now: `$XDG_CACHE_HOME/virtkit` (else
+/// `~/.cache/virtkit`) once each tier is there, else the data dir.
+pub(crate) fn located_default_cache_root(
+    cfg: &crate::config::Config,
+) -> Result<vk_registry::cachehome::Home> {
+    vk_registry::cachehome::locate_base(&CACHE_TIERS, &configured_caches(cfg))
+}
+
+/// Resolve the host's default `windows` cache, migrating it from the data dir if possible.
+pub(crate) fn windows_cache() -> Result<PathBuf> {
+    Ok(vk_registry::cachehome::resolve("windows", &[])?.into_path())
 }
 
 /// This run's launch dir under `base`, `launch-<pid>`, holding its lock — what `vk gc` tells
@@ -1111,10 +1155,9 @@ fn dead_launch_dirs_in(base: &Path, grace: Duration, dry_run: bool) -> DeadLaunc
 /// `~/.cache/virtkit`. Deliberately NOT `std::env::temp_dir()`: that is often a small
 /// RAM-backed tmpfs (e.g. a 16 GiB `/tmp`), and a `-f` build writes its stage ext4s and the
 /// assembled `root.ext4` here — a large build would exhaust the tmpfs (ENOSPC) while the
-/// real disk sits idle. Cache semantics fit (transient, regenerable, removed on drop); the
-/// durable instruction store lives under `$XDG_DATA_HOME` instead. `--state-dir` overrides
-/// this with a caller-chosen path. The short `launch-<pid>` leaf keeps the AF_UNIX socket
-/// paths created under here within the 108-byte `sun_path` limit.
+/// real disk sits idle. Launch scratch is regenerable and removed on drop. `--state-dir`
+/// overrides the base. The short `launch-<pid>` leaf leaves more of the 108-byte AF_UNIX
+/// `sun_path` field for the base and socket name.
 /// Shared with the build path (`build_units`), which anchors a cache-only build's scratch
 /// here for the same reason.
 pub(crate) fn default_scratch_base() -> Result<PathBuf> {

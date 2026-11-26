@@ -8,7 +8,7 @@
 //! virtio-win and qemu-ga and powers off. A settle boot then waits out the servicing Windows does
 //! on its first boots, gives the Administrator a random password and turns autologon off.
 //!
-//! Everything is cached under the data dir by content: the medium by the ISOs and the answer
+//! Everything is cached under the cache dir by content: the medium by the ISOs and the answer
 //! file (it takes minutes to build), the install by the medium and the disk size, the base layer
 //! by the install and the settle step. Each is made in a directory of its own and renamed into
 //! place whole, so a concurrent build sees either nothing or the finished entry.

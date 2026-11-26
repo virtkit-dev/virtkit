@@ -12,7 +12,7 @@
 //! network, and a loopback deployment can still run open. Install it as a `systemd --user`
 //! service with `vk-registry install-service`. See `DESIGN.md` and the `config` module.
 //!
-//! Store layout under `--root` (default `$XDG_DATA_HOME/virtkit/registry`):
+//! Store layout under `--root` (default `$XDG_CACHE_HOME/virtkit/registry`):
 //!   blobs/sha256/<hex>            content-addressed blobs (chunks, configs,
 //!                                 manifests, any kernel/initrd) — shared by all repos
 //!   repos/<name>/tags/<tag>       file holding the tagged manifest's digest
@@ -48,6 +48,7 @@ pub mod accounts;
 pub mod admin;
 pub mod auth;
 pub(crate) mod browse;
+pub mod cachehome;
 pub(crate) mod captions;
 pub(crate) mod chunks;
 pub mod client;
@@ -1770,7 +1771,7 @@ impl Store {
     /// `put_manifest`), so a `vk registry gc` holding it *exclusive* can never
     /// delete a blob between a dedup check and the manifest that references it.
     /// Shared holders never block each other. flock is advisory and
-    /// filesystem-local — fine for `$XDG_DATA_HOME`; a store root on NFS is
+    /// filesystem-local. A store root on NFS is
     /// unsupported.
     pub fn lock_shared(&self) -> Result<LockGuard> {
         self.flock(libc::LOCK_SH)
@@ -1835,7 +1836,7 @@ impl Store {
     }
 
     fn flock(&self, op: libc::c_int) -> Result<LockGuard> {
-        self.flock_at(".lock", op)
+        self.flock_at(STORE_LOCK, op)
     }
 
     /// Serialize WebDAV's `files/` path checks and namespace changes across processes.
@@ -3630,6 +3631,8 @@ const TRY_PATIENCE: Duration = Duration::from_millis(50);
 /// Held by the [`Store::gc_with`] pass that runs, so a second one waits or gives up rather than
 /// read the whole store alongside it.
 const GC_LOCK: &str = ".gc.lock";
+/// The store lock: see [`Store::lock_shared`].
+pub(crate) const STORE_LOCK: &str = ".lock";
 /// Serializes [`Store::put_manifest`]'s sidecar/tag writes with
 /// [`Store::delete_manifest`]'s tag reads and unlinks. Index children are mounted before
 /// the push acquires this exclusive lock.
@@ -4023,6 +4026,10 @@ pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
             .into_iter()
             .collect();
         return Err(vk_peer::update::exec_with(&binary, deadline, &env));
+    }
+    // Not in a hand-over, when the registry handing over may still use the state where it is.
+    if std::env::var_os(vk_peer::handoff::ENV).is_none() {
+        cachehome::adopt_server_state(&cfg.root);
     }
     // What a registry handing over to this release passed it: its sockets, its lock table.
     let mut taken = handover::Taken::from_env();
@@ -7032,13 +7039,15 @@ pub(crate) fn human_bytes(n: u64) -> String {
     }
 }
 
-/// Default store root: `$XDG_DATA_HOME/virtkit/registry`, else `~/.local/share/...`.
+/// Resolve the default store at `$XDG_CACHE_HOME/virtkit/registry` (else
+/// `~/.cache/virtkit/registry`), migrating the legacy store when possible. See [`cachehome`].
 pub fn default_root() -> Result<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(xdg).join("virtkit/registry"));
-    }
-    let home = std::env::var_os("HOME").context("neither XDG_DATA_HOME nor HOME is set")?;
-    Ok(PathBuf::from(home).join(".local/share/virtkit/registry"))
+    Ok(cachehome::resolve(cachehome::REGISTRY, &[])?.into_path())
+}
+
+/// Where [`default_root`] is, changing nothing: for the commands that only look at a store.
+pub fn located_default_root() -> Result<PathBuf> {
+    Ok(cachehome::locate(cachehome::REGISTRY, &[])?.into_path())
 }
 
 /// The unit name both shapes use — the one [`install_service`] writes, and the one an admin

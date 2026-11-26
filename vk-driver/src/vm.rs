@@ -1414,19 +1414,13 @@ fn build_windows_unit(
         .map_err(|_| anyhow!("the Windows build panicked"))?
         .with_context(|| format!("service {}: building its Windows image", unit.name))?;
     // Bound what the host's Windows cache costs, holding this job's own chain.
-    crate::wincache::gc_all(
-        &crate::run::default_data_base()?.join("windows"),
-        cfg.windows_cache_idle(),
-    );
+    crate::wincache::gc_all(&crate::run::windows_cache()?, cfg.windows_cache_idle());
     Ok((out, refs))
 }
 
 /// The job's local Windows cache: scoped or unscoped.
 fn job_windows_root(local: &crate::jobctx::LocalScope) -> Result<PathBuf> {
-    Ok(windows_root_in(
-        &crate::run::default_data_base()?.join("windows"),
-        local,
-    ))
+    Ok(windows_root_in(&crate::run::windows_cache()?, local))
 }
 
 /// [`job_windows_root`] under the unscoped cache `shared`.

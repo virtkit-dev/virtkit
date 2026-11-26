@@ -1071,18 +1071,10 @@ pub(crate) fn sweep_orphaned_staging(state_dir: &Path, leftovers: Leftovers) {
     }
 }
 
-/// [`sweep_orphaned_build_tmp`] on both staging tiers under `state_dir`, without the report.
-/// With `dry_run`, count the dead dirs it would remove and leave them.
-pub(crate) fn collect_orphaned_staging(state_dir: &Path, dry_run: bool) -> Swept {
-    let mut all = Swept::default();
-    for tier in ["build", "docker"] {
-        let swept = sweep_dead_tmp(&state_dir.join(tier), DEAD_TMP_GRACE, dry_run);
-        all.dirs += swept.dirs;
-        all.bytes = all.bytes.saturating_add(swept.bytes);
-        all.foreign.extend(swept.foreign);
-        all.left.extend(swept.left);
-    }
-    all
+/// [`sweep_orphaned_build_tmp`] on the staging tier at `root` (`build/` or `docker/`), without
+/// the report. With `dry_run`, count the dead dirs it would remove and leave them.
+pub(crate) fn collect_orphaned_staging(root: &Path, dry_run: bool) -> Swept {
+    sweep_dead_tmp(root, DEAD_TMP_GRACE, dry_run)
 }
 
 /// [`sweep_orphaned_build_tmp`] with the grace spelled out, without the report.
@@ -2488,7 +2480,7 @@ mod tests {
             idle.join("runner.ext4").is_file(),
             "a dry run removes nothing"
         );
-        let dry_tmp = collect_orphaned_staging(&state, true);
+        let dry_tmp = collect_orphaned_staging(&root, true);
         assert_eq!(dry_tmp.dirs, 1);
         assert!(dry_tmp.bytes >= 32 * 1024, "{}", dry_tmp.bytes);
         assert!(dead.is_dir(), "a dry run removes nothing");
@@ -2503,7 +2495,7 @@ mod tests {
             dry.bytes
         );
         assert!(busy.is_dir(), "a base in use stays");
-        let real_tmp = collect_orphaned_staging(&state, false);
+        let real_tmp = collect_orphaned_staging(&root, false);
         assert_eq!(real_tmp.dirs, dry_tmp.dirs);
         assert!(!dead.exists());
 

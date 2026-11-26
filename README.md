@@ -899,8 +899,8 @@ sharing images built from it.
   reclaimed once no build or job has used them for `[executor] windows_cache_idle_secs` (7
   days by default), and a bundle built on them, which holds no reference once its build ends,
   stops booting once its layers are reclaimed. Elsewhere nothing removes them: once no bundle
-  uses the Windows build cache, `rm -rf ~/.local/share/virtkit/windows`
-  (`$XDG_DATA_HOME/virtkit/windows` when that is set) frees it all, and the next build
+  uses the Windows build cache, emptying `~/.cache/virtkit/windows`
+  (`$XDG_CACHE_HOME/virtkit/windows` when that is set) frees it all, and the next build
   installs from the ISO again.
 
 **Run it.** `vk run ./web-out` boots the bundle on fresh copy-on-write overlays (`--net`
@@ -1115,8 +1115,15 @@ optional. With no configuration file, local `run` and `build` workflows use defa
 vk config             # print the effective TOML and its source
 vk config --example   # print the annotated reference configuration
 vk config --path      # print the resolved configuration path
-vk paths              # print the data dir, caches, VM state dirs and registry paths
+vk paths              # print the cache and data dirs, VM state dirs and registry paths
 ```
+
+By default, the image caches, build store, Windows build cache and shared caches use
+`$XDG_CACHE_HOME/virtkit` (normally `~/.cache/virtkit`). The VM registry, runs ledger and
+baked `local/<name>` bundles use `$XDG_DATA_HOME/virtkit` (normally `~/.local/share/virtkit`).
+On first use, `vk` moves a cache an older release kept there and leaves a link at its old
+path; on another filesystem it links the new path to the old directory instead of copying
+it. If you already moved a cache and linked it there, `vk` follows your link.
 
 [`vk-driver/config.example.toml`](vk-driver/config.example.toml) documents every key.
 The small environment-variable surface is:

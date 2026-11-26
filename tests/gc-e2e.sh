@@ -96,46 +96,46 @@ echo "== 4. the background pass =="
 pull() { "$VK" registry pull virtkit/none:x 2>&1 || true; }
 wait_for() { for _ in $(seq 600); do [ -e "$1" ] && return 0; sleep 0.1; done; return 1; }
 # The manual passes above dated themselves; this section starts from a host none has.
-rm -f "$DATA/.gc-done" "$DATA/.gc-started"
+rm -f "$SCRATCH/.gc-done" "$SCRATCH/.gc-started"
 VK_GC_AUTO=0 pull >/dev/null
-[ ! -e "$DATA/gc.log" ] && ok "VK_GC_AUTO=0 starts none" || bad "VK_GC_AUTO=0 started a pass"
+[ ! -e "$SCRATCH/gc.log" ] && ok "VK_GC_AUTO=0 starts none" || bad "VK_GC_AUTO=0 started a pass"
 printf '[gc]\nauto = false\n' > "$XDG_CONFIG_HOME/virtkit/config.toml"
 pull >/dev/null
-[ ! -e "$DATA/gc.log" ] && ok "[gc] auto = false starts none" || bad "auto = false started a pass"
+[ ! -e "$SCRATCH/gc.log" ] && ok "[gc] auto = false starts none" || bad "auto = false started a pass"
 rm "$XDG_CONFIG_HOME/virtkit/config.toml"
 pull >/dev/null
-if wait_for "$DATA/.gc-done"; then
+if wait_for "$SCRATCH/.gc-done"; then
   ok "a due pass ran to its end"
 else
   bad "no pass finished"
 fi
-grep -q '^virtkit: background gc at ' "$DATA/gc.log" && ok "it logged itself" || { bad "no log"; cat "$DATA/gc.log" || true; }
-touch -d '5 minutes ago' "$DATA/.gc-started"
-touch -d '2 days ago' "$DATA/.gc-done"
-before=$(stat -c %Y "$DATA/.gc-started")
+grep -q '^virtkit: background gc at ' "$SCRATCH/gc.log" && ok "it logged itself" || { bad "no log"; cat "$SCRATCH/gc.log" || true; }
+touch -d '5 minutes ago' "$SCRATCH/.gc-started"
+touch -d '2 days ago' "$SCRATCH/.gc-done"
+before=$(stat -c %Y "$SCRATCH/.gc-started")
 pull >/dev/null
 sleep 1
-[ "$(stat -c %Y "$DATA/.gc-started")" = "$before" ] && ok "none starts within minutes of the last" || bad "a second pass started at once"
+[ "$(stat -c %Y "$SCRATCH/.gc-started")" = "$before" ] && ok "none starts within minutes of the last" || bad "a second pass started at once"
 
 echo
 echo "== 5. short of space =="
 printf '[gc]\nmin_free = "100%%"\n' > "$XDG_CONFIG_HOME/virtkit/config.toml"
-touch -d '1 hour ago' "$DATA/.gc-started"
-touch "$DATA/.gc-done"
-rm -f "$DATA/.gc-short"
+touch -d '1 hour ago' "$SCRATCH/.gc-started"
+touch "$SCRATCH/.gc-done"
+rm -f "$SCRATCH/.gc-short"
 out=$(pull)
 grep -q 'reclaiming unused caches in the background' <<<"$out" && ok "the command says it" || { bad "no word of it"; echo "$out"; }
-if wait_for "$DATA/.gc-short"; then
+if wait_for "$SCRATCH/.gc-short"; then
   ok "a pass that cannot reach the floor says so"
 else
-  bad "no pass marked itself short"; cat "$DATA/gc.log" || true
+  bad "no pass marked itself short"; cat "$SCRATCH/gc.log" || true
 fi
-grep -q 'still short of space' "$DATA/gc.log" && ok "and logs why" || bad "no word of it in the log"
-touch -d '1 hour ago' "$DATA/.gc-started"
-before=$(stat -c %Y "$DATA/.gc-started")
+grep -q 'still short of space' "$SCRATCH/gc.log" && ok "and logs why" || bad "no word of it in the log"
+touch -d '1 hour ago' "$SCRATCH/.gc-started"
+before=$(stat -c %Y "$SCRATCH/.gc-started")
 out=$(pull)
 sleep 1
-[ "$(stat -c %Y "$DATA/.gc-started")" = "$before" ] && ok "the next pass short of space is held off" || { bad "another started at once"; echo "$out"; }
+[ "$(stat -c %Y "$SCRATCH/.gc-started")" = "$before" ] && ok "the next pass short of space is held off" || { bad "another started at once"; echo "$out"; }
 rm "$XDG_CONFIG_HOME/virtkit/config.toml"
 
 echo

@@ -452,7 +452,7 @@ fn build_with(opts: &Options) -> Result<Vec<crate::cachelock::Guard>> {
         stages(parser::parse(&text)?).with_context(|| format!("{}", opts.dockerfile.display()))?;
     let target = target_index(&stages, opts.target.as_deref())
         .with_context(|| format!("{}", opts.dockerfile.display()))?;
-    let shared = crate::run::default_data_base()?.join("windows");
+    let shared = crate::run::windows_cache()?;
     let cache = match &opts.scope {
         Some(scope) => scope_root(&shared, scope),
         None => shared.clone(),

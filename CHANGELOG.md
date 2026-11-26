@@ -42,6 +42,14 @@ All notable changes to virtkit will be documented in this file.
   digest-addressed manifest is absent from the registry.
 - `vk-registry` logs how long each hub-run garbage collection took and what it removed,
   would remove in a dry run, or why it failed.
+- The image caches, Windows build cache and default store shared by builds and
+  `vk-registry` now use `$XDG_CACHE_HOME/virtkit` (normally `~/.cache/virtkit`). On
+  first use, `vk` moves the ones an older release left in `~/.local/share/virtkit` and
+  leaves a link at the old path; one on another filesystem stays there, linked from the new
+  path rather than copied. It follows a cache you relocated and linked, and leaves the
+  cache locations in its configuration where they are. A `vk-registry` serving the default
+  store keeps its accounts and hub enrollment in `~/.local/share/virtkit/registry-server`,
+  and moves there the ones an older release kept in the store.
 - **Security: the guest registry proxy (`vk run --registry-proxy`, `[registry] proxy_guests`)
   now serves only the user running `vk`.** It listened on a loopback port, through which any
   user of the host could use the registry credential it lends guests.

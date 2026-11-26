@@ -257,7 +257,7 @@ EOF
 runner_job() {
   local n=$1 image=$2 rc=0
   stage() {
-    env VIRTKIT_CONFIG="$FLEET/kvm/config.toml" XDG_DATA_HOME="$FLEET/gl/data" \
+    env VIRTKIT_CONFIG="$FLEET/kvm/config.toml" XDG_DATA_HOME="$FLEET/gl/data" XDG_CACHE_HOME="$FLEET/gl/cache" \
       CUSTOM_ENV_MICROVM_IMAGE="$image" CUSTOM_ENV_CI_JOB_ID="runner-e2e-$$-$n" \
       CUSTOM_ENV_CI_PROJECT_ID=1 CUSTOM_ENV_CI_PROJECT_PATH=e2e/runner \
       CUSTOM_ENV_CI_PROJECT_PATH_SLUG=e2e-runner CUSTOM_ENV_CI_PROJECT_DIR=/builds/e2e/runner \

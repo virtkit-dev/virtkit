@@ -300,7 +300,7 @@ A job the hub places on such a node builds its `dockerfile:` and `compose:` imag
   repository name, the token has expired, or the node has no `[registry]` or a local one. The
   job's trace says why once.
 
-Local build-tier entries and Windows caches (`<data>/windows/scopes/<scope>`) are isolated
+Local build-tier entries and Windows caches (`<cache>/windows/scopes/<scope>`) are isolated
 by prefix. Jobs sharing a prefix share these caches, which are swept when idle. With the
 build cache off, they belong to the job alone and are removed when it ends. A Windows build
 of such a job fetches install media missing from its build context only when

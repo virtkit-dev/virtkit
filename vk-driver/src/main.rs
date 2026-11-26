@@ -579,7 +579,7 @@ enum RegistryCmd {
         /// store directory [default: the store the build cache uses]
         ///
         /// The build cache's store is `[build] cache_registry`, else
-        /// $XDG_DATA_HOME/virtkit/registry.
+        /// $XDG_CACHE_HOME/virtkit/registry.
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
     },
@@ -594,7 +594,7 @@ enum RegistryCmd {
         /// store directory [default: the store the build cache uses]
         ///
         /// The build cache's store is `[build] cache_registry`, else
-        /// $XDG_DATA_HOME/virtkit/registry.
+        /// $XDG_CACHE_HOME/virtkit/registry.
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
         /// drop tags unused for more than this many days
@@ -885,7 +885,7 @@ enum Cmd {
     },
     /// Print the effective host paths and where each comes from
     ///
-    /// Show the config file, data dir, image caches, VM state dirs, runs ledger and registry
+    /// Show the config file, cache and data dirs, image caches, VM state dirs, runs ledger and registry
     /// store, with overrides where available.
     #[command(hide = true)]
     Paths {
@@ -3570,16 +3570,6 @@ async fn service_cmd(cmd: &ServiceCmd) -> ExitCode {
     }
 }
 
-/// The state dir `vk run`/`vk gc` cache under: a configured `state_dir` (the CI
-/// runner), else the rootless dev default (`$XDG_DATA_HOME/virtkit`). Distinct
-/// from `Config::state_dir()`, the executor's root-owned `/var/lib/virtkit` default.
-fn effective_state_dir(cfg: &Config) -> anyhow::Result<PathBuf> {
-    match &cfg.state_dir {
-        Some(d) => Ok(d.clone()),
-        None => run::default_data_base(),
-    }
-}
-
 /// `vk config`: print the effective configuration as TOML (defaults merged with the
 /// loaded file), headed by which file it came from; or with `path`, just that file's
 /// path (exit 1 when no file is in use). `--example` is handled before Config::load.
@@ -3658,16 +3648,22 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
         config::DEFAULT_PATH
     )?;
     writeln!(out)?;
-    let state_note = match &cfg.state_dir {
-        Some(_) => "`state_dir` in the config",
-        None => "default: $XDG_DATA_HOME/virtkit",
+    // Report caches without migrating them. Baked bundles normally use the data directory.
+    // A configured state_dir also holds bundles unless [local] dir overrides it.
+    let (state_dir, label, note) = match &cfg.state_dir {
+        Some(dir) => (dir.clone(), "data dir ", "`state_dir` in the config"),
+        None => match run::located_default_cache_root(cfg)? {
+            vk_registry::cachehome::Home::New(dir) => {
+                (dir, "cache dir", "default: $XDG_CACHE_HOME/virtkit")
+            }
+            vk_registry::cachehome::Home::Old(dir) => (
+                dir,
+                "cache dir",
+                "default, still in the data dir: not yet under $XDG_CACHE_HOME/virtkit",
+            ),
+        },
     };
-    let state_dir = effective_state_dir(cfg)?;
-    writeln!(
-        out,
-        "data dir        {} ({state_note})",
-        state_dir.display()
-    )?;
+    writeln!(out, "{label}       {} ({note})", state_dir.display())?;
     writeln!(
         out,
         "                the root of the registry/, docker/ and build/ image caches"
@@ -3688,27 +3684,32 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
         out,
         "  build/        image cache: compose `build:` stage snapshots"
     )?;
-    let images = cfg.local_dir_under(&state_dir);
-    if images == state_dir.join("images") {
-        writeln!(
-            out,
-            "  images/       baked `local/<name>` bundles (override: `[local] dir`)"
-        )?;
-    } else {
-        writeln!(
-            out,
-            "  images        {} (`[local] dir`) — baked `local/<name>` bundles",
-            images.display()
-        )?;
-    }
     writeln!(
         out,
         "                the three image-cache tiers hold ready-to-boot disks; `vk gc` reclaims"
     )?;
-    writeln!(
-        out,
-        "                idle ones. images/ is never reclaimed."
-    )?;
+    writeln!(out, "                idle ones")?;
+    if cfg.state_dir.is_none() {
+        writeln!(out)?;
+        writeln!(
+            out,
+            "data dir        {} (default: $XDG_DATA_HOME/virtkit)",
+            run::default_data_base()?.display()
+        )?;
+    }
+    let images = cfg.local_dir_under(&state_dir);
+    if cfg.local.dir.is_none() {
+        writeln!(
+            out,
+            "  images/       baked `local/<name>` bundles, never reclaimed (override: `[local] dir`)"
+        )?;
+    } else {
+        writeln!(
+            out,
+            "  images        {} (`[local] dir`) — baked `local/<name>` bundles, never reclaimed",
+            images.display()
+        )?;
+    }
     writeln!(out)?;
     // The instruction cache and `vk registry status`/`gc` use this store, so it is
     // resolved the way they resolve it: `[build] cache_registry` moves it when it names a
@@ -3718,13 +3719,23 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
     let configured = cfg.build.cache_registry.as_deref();
     match crate::build::cache_store(configured)? {
         crate::build::CacheStore::Dir(store) => {
+            let pending = matches!(
+                vk_registry::cachehome::locate(
+                    vk_registry::cachehome::REGISTRY,
+                    &run::configured_caches(cfg)
+                ),
+                Ok(vk_registry::cachehome::Home::Old(_))
+            );
             let from = match configured {
                 // caching off: the builtin store is named because that is where whatever
                 // was cached before still is, not because a setting put it there
                 Some("none") => "`[build] cache_registry = \"none\"`: caching off",
                 // name the key that moved it, rather than calling it the default it is not
                 Some(_) => "`[build] cache_registry`",
-                None => "default: $XDG_DATA_HOME/virtkit/registry",
+                None if pending => {
+                    "default, still in the data dir: not yet under $XDG_CACHE_HOME/virtkit/registry"
+                }
+                None => "default: $XDG_CACHE_HOME/virtkit/registry",
             };
             writeln!(out, "registry store  {} ({from})", store.display())?;
             writeln!(
@@ -4058,6 +4069,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
         Ok(cfg) => cfg,
         Err(e) => return fail(&e, 2),
     };
+    // Exempt this command's configured cache paths from default-cache migration.
+    vk_registry::cachehome::keep_in_place(run::configured_caches(&cfg));
     // Apply the host's `[build]` tuning process-wide, before any build or boot path runs.
     build::set_tuning(&cfg.build);
     vmm::warn_if_cloud_hypervisor_requested(cfg.vmm);
@@ -4073,7 +4086,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 cmd: RegistryCmd::Pull { .. },
             }
     );
-    if fills && let Ok(state_dir) = effective_state_dir(&cfg) {
+    if fills && let Ok(state_dir) = run::cache_root(&cfg) {
         autogc::maybe_start(&cfg, &state_dir);
     }
     if let Cmd::Config {
@@ -4295,8 +4308,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
         } else {
             idle_secs.map(std::time::Duration::from_secs)
         };
-        // Sweep the same state dir `vk run`/the executor cache under.
-        let state_dir = match effective_state_dir(&cfg) {
+        // Sweep the configured image root or the local run default without migrating it.
+        let state_dir = match run::located_cache_root(&cfg) {
             Ok(d) => d,
             Err(e) => return fail(&e, 2),
         };
@@ -6263,8 +6276,8 @@ fn store_root(cfg: &Config, root: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
             "the instruction cache is the registry {repo}, whose store is on that host — \
              pass --root to name a store in this filesystem (a `vk-registry` on this host \
              with no --root and no `root` in its --config serves {})",
-            vk_registry::default_root().map_or_else(
-                |_| "$XDG_DATA_HOME/virtkit/registry".to_string(),
+            vk_registry::located_default_root().map_or_else(
+                |_| "$XDG_CACHE_HOME/virtkit/registry".to_string(),
                 |d| d.display().to_string()
             )
         ),
@@ -7767,6 +7780,10 @@ mod tests {
         let data = homes.dir().join("XDG_DATA_HOME/virtkit");
         let state = homes.dir().join("XDG_STATE_HOME/virtkit");
         for line in [
+            format!(
+                "\ncache dir       {} (",
+                homes.dir().join("XDG_CACHE_HOME/virtkit").display()
+            ),
             format!("\ndata dir        {} (", data.display()),
             format!("\nruns ledger     {} (", data.join("runs").display()),
             format!(
@@ -7784,6 +7801,138 @@ mod tests {
             assert!(report.contains(&line), "{line}: {report}");
         }
         assert!(!report.contains("\nstate dir "), "{report}");
+    }
+
+    /// `vk paths` reports a pending migration without moving caches, then reports their
+    /// new paths after migration. Bundles and the VM registry stay in the data directory.
+    #[test]
+    fn paths_report_names_a_pending_move_and_moves_nothing() {
+        let homes = crate::dev::testutil::Homes::new("paths-moved");
+        let data = homes.dir().join("XDG_DATA_HOME/virtkit");
+        let cache = homes.dir().join("XDG_CACHE_HOME/virtkit");
+        for tier in ["registry", "docker", "build", "vms"] {
+            std::fs::create_dir_all(data.join(tier)).unwrap();
+        }
+        let elsewhere = homes.dir().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, data.join("windows")).unwrap();
+        let cfg = config::Config::default();
+
+        let report = paths_report(&cfg, false).unwrap();
+        for line in [
+            format!(
+                "\ncache dir       {} (default, still in the data dir: not yet under",
+                data.display()
+            ),
+            format!(
+                "\nregistry store  {} (default, still in the data dir: not yet under",
+                data.join("registry").display()
+            ),
+        ] {
+            assert!(report.contains(&line), "{line}: {report}");
+        }
+        assert!(!cache.exists(), "a report moves nothing");
+
+        assert_eq!(run::cache_root(&cfg).unwrap(), cache);
+        let report = paths_report(&cfg, false).unwrap();
+        for line in [
+            format!(
+                "\ncache dir       {} (default: $XDG_CACHE_HOME/virtkit)",
+                cache.display()
+            ),
+            format!("\ndata dir        {} (", data.display()),
+            format!(
+                "\nregistry store  {} (default: $XDG_CACHE_HOME",
+                cache.join("registry").display()
+            ),
+            format!("\nvm registry     {} (", data.join("vms").display()),
+        ] {
+            assert!(report.contains(&line), "{line}: {report}");
+        }
+        for tier in ["registry", "docker", "build"] {
+            assert!(
+                cache.join(tier).symlink_metadata().unwrap().is_dir(),
+                "{tier}"
+            );
+            assert_eq!(
+                std::fs::read_link(data.join(tier)).unwrap(),
+                cache.join(tier)
+            );
+        }
+        assert!(data.join("vms").symlink_metadata().unwrap().is_dir());
+        assert!(!cache.join("vms").exists());
+        // Resolving the image tiers leaves the user-linked Windows cache for its first use.
+        assert!(!cache.join("windows").exists());
+        assert_eq!(run::windows_cache().unwrap(), cache.join("windows"));
+        assert_eq!(
+            std::fs::read_link(cache.join("windows")).unwrap(),
+            elsewhere
+        );
+        assert_eq!(std::fs::read_link(data.join("windows")).unwrap(), elsewhere);
+    }
+
+    /// Pinning either `state_dir` or the build store to the data directory keeps the
+    /// shared `registry/` there even when the other uses its default.
+    #[test]
+    fn a_configured_cache_location_is_never_moved() {
+        let homes = crate::dev::testutil::Homes::new("paths-configured");
+        let data = homes.dir().join("XDG_DATA_HOME/virtkit");
+        let cache = homes.dir().join("XDG_CACHE_HOME/virtkit");
+        for tier in ["registry", "docker", "build"] {
+            std::fs::create_dir_all(data.join(tier)).unwrap();
+        }
+        let pinned_state = config::Config {
+            state_dir: Some(data.clone()),
+            ..config::Config::default()
+        };
+        vk_registry::cachehome::keep_in_place(run::configured_caches(&pinned_state));
+        let report = paths_report(&pinned_state, false).unwrap();
+        assert!(
+            report.contains(&format!(
+                "\ndata dir        {} (`state_dir`",
+                data.display()
+            )),
+            "{report}"
+        );
+        assert_eq!(run::cache_root(&pinned_state).unwrap(), data);
+        let store = build::cache_repo(None).unwrap().unwrap();
+        assert_eq!(PathBuf::from(store), data.join("registry"));
+        for tier in ["registry", "docker", "build"] {
+            assert!(
+                data.join(tier).symlink_metadata().unwrap().is_dir(),
+                "{tier}"
+            );
+            assert!(!cache.join(tier).exists(), "{tier}");
+        }
+
+        let other = homes.dir().join("other-data");
+        std::fs::create_dir_all(other.join("registry")).unwrap();
+        // SAFETY: serialized by the Homes guard, which puts XDG_DATA_HOME back.
+        unsafe { std::env::set_var("XDG_DATA_HOME", &other) };
+        let data = other.join("virtkit");
+        for tier in ["registry", "docker", "build"] {
+            std::fs::create_dir_all(data.join(tier)).unwrap();
+        }
+        let pinned_store = config::Config {
+            build: config::Build {
+                cache_registry: Some(format!("file://{}", data.join("registry").display())),
+                ..config::Build::default()
+            },
+            ..config::Config::default()
+        };
+        assert_eq!(run::cache_root(&pinned_store).unwrap(), data);
+        assert!(data.join("registry").symlink_metadata().unwrap().is_dir());
+        assert!(!cache.join("registry").exists());
+        for tier in ["docker", "build"] {
+            assert!(
+                data.join(tier).symlink_metadata().unwrap().is_symlink(),
+                "{tier}"
+            );
+            assert!(
+                cache.join(tier).symlink_metadata().unwrap().is_dir(),
+                "{tier}"
+            );
+        }
     }
 
     #[test]
@@ -7850,13 +7999,13 @@ mod tests {
         assert!(
             report.contains(&format!(
                 "registry store  {} (default:",
-                vk_registry::default_root().unwrap().display()
+                vk_registry::located_default_root().unwrap().display()
             )),
             "{report}"
         );
         assert_eq!(
             store_root(&cfg, &None).unwrap(),
-            vk_registry::default_root().unwrap()
+            vk_registry::located_default_root().unwrap()
         );
 
         cfg.build.cache_registry = Some("file:///srv/vk-cache".to_string());

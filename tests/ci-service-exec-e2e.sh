@@ -82,7 +82,7 @@ mode = "switch"
 EOF
 }
 export VIRTKIT_CONFIG="$root/config.toml"
-export XDG_DATA_HOME="$root/data"
+export XDG_DATA_HOME="$root/data" XDG_CACHE_HOME="$root/cache"
 export CUSTOM_ENV_MICROVM_IMAGE="compose:ci/lab.compose.yaml#job"
 export CUSTOM_ENV_CI_REPOSITORY_URL="http://127.0.0.1:$port/repo.git"
 export CUSTOM_ENV_CI_COMMIT_SHA=$(git -C "$src" rev-parse HEAD)

@@ -732,8 +732,7 @@ pub(crate) fn acceptor(
     Ok(TlsAcceptor::from(Arc::new(sc)))
 }
 
-/// `$XDG_DATA_HOME/virtkit/hub`, else `~/.local/share/virtkit/hub` — beside the registry's
-/// default store.
+/// `$XDG_DATA_HOME/virtkit/hub`, else `~/.local/share/virtkit/hub`.
 fn default_data_dir() -> Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(xdg).join("virtkit/hub"));

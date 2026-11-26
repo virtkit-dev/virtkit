@@ -334,16 +334,17 @@ struct FileUpstream {
     ca_file: Option<PathBuf>,
 }
 
-/// The accounts db under a store root, when no `accounts_db` names one. A directory of
-/// its own rather than the root itself: `Db::open` creates that one at 0700 whatever the
-/// umask, whereas `Store::new` makes the root with `create_dir_all` and so leaves its mode
-/// to the ambient umask — and a root a group member can write to lets them rename the db
-/// aside and plant one naming themselves admin, `0600` on the file notwithstanding.
+/// The accounts db of a server of the store at `root`, when no `accounts_db` names one;
+/// [`crate::cachehome::server_dir`] picks its directory. A directory of its own rather than
+/// the root itself: `Db::open` requests 0700 when creating it, whereas `Store::new` makes the
+/// root with `create_dir_all` and so leaves its mode to the ambient umask — and a root a
+/// group member can write to lets them rename the db aside and plant one naming themselves
+/// admin, `0600` on the file notwithstanding.
 ///
 /// The single source of the default: `into_state` opens the db here, and the `vk-registry
 /// accounts` CLI finds it here, so the two cannot drift onto different files.
 pub fn default_accounts_db(root: &Path) -> PathBuf {
-    root.join("accounts").join("accounts.db")
+    crate::cachehome::server_dir(root, "accounts").join("accounts.db")
 }
 
 /// The admin socket beside an accounts db, in the db's own directory: filesystem access to
@@ -416,7 +417,7 @@ impl ServerConfig {
         check_gc_prefixes(&prefixes)?;
         let root = match f.root {
             Some(r) => r,
-            None => crate::default_root()?,
+            None => crate::located_default_root()?,
         };
         Ok((
             root,
@@ -511,7 +512,7 @@ impl ServerConfig {
     /// the config file's, then the shared default — so a store configured for the server is
     /// the one they report on and sweep, instead of a default store the server never touches.
     /// Only the root is taken: a file whose `addr`/TLS/auth keys `serve` would reject still
-    /// answers where the store is.
+    /// answers where the store is. Looking up the default does not migrate it.
     pub fn root_of(config: Option<&Path>, root: Option<PathBuf>) -> Result<PathBuf> {
         if let Some(r) = root {
             return Ok(r);
@@ -521,7 +522,7 @@ impl ServerConfig {
         {
             return Ok(r);
         }
-        crate::default_root()
+        crate::located_default_root()
     }
 
     /// Where the accounts db lives, resolved the same way [`ServerConfig::into_state`]
@@ -1397,7 +1398,7 @@ mod tests {
         std::fs::write(&bare, "addr = \"127.0.0.1:5001\"\n").unwrap();
         assert_eq!(
             ServerConfig::root_of(Some(&bare), None).unwrap(),
-            crate::default_root().unwrap()
+            crate::located_default_root().unwrap()
         );
         assert_eq!(
             ServerConfig::load(&bare, None, None).unwrap().root,
@@ -1405,7 +1406,7 @@ mod tests {
         );
         assert_eq!(
             ServerConfig::root_of(None, None).unwrap(),
-            crate::default_root().unwrap()
+            crate::located_default_root().unwrap()
         );
         // and a config file that is not there is an error, not a silent default
         assert!(ServerConfig::root_of(Some(&dir.join("absent.toml")), None).is_err());

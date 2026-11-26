@@ -143,7 +143,7 @@ cache_registry = "$REGISTRY"
 cache_insecure = true
 EOF
 export VIRTKIT_CONFIG="$root/config.toml"
-export XDG_DATA_HOME="$root/data"
+export XDG_DATA_HOME="$root/data" XDG_CACHE_HOME="$root/cache"
 export CUSTOM_ENV_MICROVM_IMAGE="compose:ci/lab.compose.yaml#job"
 export CUSTOM_ENV_CI_REPOSITORY_URL=$repo_url
 CUSTOM_ENV_CI_COMMIT_SHA=$(cat "$root/commit")
@@ -189,7 +189,7 @@ echo "ok: the job reached its Windows service ($((SECONDS - t))s)"
 echo "== 2. the next job builds nothing =="
 # The layers and installs the host's Windows cache holds: a job that builds one adds an entry.
 cached() {
-  find "$root/data" -mindepth 1 -type d \
+  find "$root/cache" -mindepth 1 -type d \
     \( -path '*/windows/layers/*' -o -path '*/windows/winiso/settled/*' \) -prune -print | sort
 }
 before=$(cached)

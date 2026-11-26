@@ -30,13 +30,39 @@ pub(crate) struct Request {
     /// Ignore the configured retention and idle windows; the floors above still hold.
     pub(crate) all_unused: bool,
     /// A background pass ([`crate::autogc`]): looks at no workspace, waits at most
-    /// [`AUTO_STORE_WAIT`] for each store lock, and goes on past the idle windows while the data
-    /// dir's filesystem is under `[gc] min_free`.
+    /// [`AUTO_STORE_WAIT`] for each store lock, and goes past the idle windows, on each
+    /// filesystem of the image caches below `[gc] min_free`, while it is.
     pub(crate) auto: bool,
     /// How long a materialized base must sit unused.
     pub(crate) image_idle: Duration,
     /// How long a host checkout must sit unused.
     pub(crate) checkout_idle: Duration,
+}
+
+/// The image caches under `state_dir`.
+const TIERS: [&str; 3] = ["registry", "docker", "build"];
+
+/// The image tiers under `state_dir`, each of which may be a link to another filesystem.
+fn tiers(state_dir: &Path) -> [PathBuf; 3] {
+    TIERS.map(|t| state_dir.join(t))
+}
+
+/// Paths for checking `[gc] min_free` on each image-tier filesystem. Use `state_dir`
+/// until a tier exists.
+pub(crate) fn tier_filesystems(state_dir: &Path) -> Vec<PathBuf> {
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for tier in tiers(state_dir).into_iter().filter(|t| t.exists()) {
+        let id = crate::usage::fs_id(&tier);
+        if id.is_none() || !seen.contains(&id) {
+            seen.push(id);
+            out.push(tier);
+        }
+    }
+    if out.is_empty() {
+        out.push(state_dir.to_path_buf());
+    }
+    out
 }
 
 /// Run a pass over the image tiers under `state_dir` (the one `vk run` caches under) and the
@@ -45,7 +71,9 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
     let checkout_root = cfg.checkout_root();
     let store = cache_store(cfg);
     // Every filesystem the pass may free space on, its space read before anything goes.
+    let tiers = tiers(state_dir);
     let mut roots = vec![state_dir, checkout_root.as_path()];
+    roots.extend(tiers.iter().map(PathBuf::as_path));
     if let Ok(crate::build::CacheStore::Dir(dir)) = &store {
         roots.push(dir);
     }
@@ -72,37 +100,45 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
     let mut sum = Summary::new(req.dry_run, &roots);
     sum.lazy = req.auto;
 
+    // Each tier's bytes on its own filesystem: one may be a link to another.
     let mut images = crate::image::Evicted::default();
-    for tier in ["registry", "docker", "build"] {
-        let got = crate::image::collect_idle(&state_dir.join(tier), req.image_idle, req.dry_run);
+    let mut freed = Vec::new();
+    for tier in &tiers {
+        let got = crate::image::collect_idle(tier, req.image_idle, req.dry_run);
         images.bases += got.bases;
         images.bytes = images.bytes.saturating_add(got.bytes);
         images.would_evict.extend(got.would_evict);
+        freed.push((tier.as_path(), got.bytes));
     }
-    sum.row(
+    sum.tier_row(
         "images",
         images.bases,
-        images.bytes,
+        &freed,
         state_dir,
         unused_for(req.image_idle),
     );
-    let (chunks, chunk_bytes) = crate::image::collect_chunks(
-        &state_dir.join("registry"),
-        req.dry_run,
-        &images.would_evict,
-    );
+    let (chunks, chunk_bytes) =
+        crate::image::collect_chunks(&tiers[0], req.dry_run, &images.would_evict);
     sum.row(
         "chunks",
         chunks,
         chunk_bytes,
-        state_dir,
+        &tiers[0],
         "no cached image uses them".into(),
     );
-    let staging = crate::image::collect_orphaned_staging(state_dir, req.dry_run);
-    sum.row(
+    let mut staging = crate::image::Swept::default();
+    let mut freed = Vec::new();
+    for tier in &tiers[1..] {
+        let got = crate::image::collect_orphaned_staging(tier, req.dry_run);
+        staging.dirs += got.dirs;
+        freed.push((tier.as_path(), got.bytes));
+        staging.foreign.extend(got.foreign);
+        staging.left.extend(got.left);
+    }
+    sum.tier_row(
         "leftovers",
         staging.dirs,
-        staging.bytes,
+        &freed,
         state_dir,
         "staging of dead builds and pulls".into(),
     );
@@ -150,7 +186,9 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
         ));
     }
     if req.auto {
-        pressure(cfg, state_dir, &store, req, &mut sum);
+        pressure(cfg, state_dir, &store, req, &mut sum, &|path| {
+            short_of(cfg, path)
+        });
     }
     sum.finish();
     sum
@@ -158,78 +196,98 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
 
 const DAY: Duration = Duration::from_secs(86_400);
 
-/// What a background pass does while `state_dir`'s filesystem stays under `[gc] min_free`, on
-/// that filesystem only: past the idle windows, cheapest to recreate first, stopping once
-/// enough is free — images unused for the eviction grace, then the build cache's least recently
-/// used entries, then the root images of run state dirs unused for a day. A category turned off
-/// in `[gc]` stays off; dev environments' images keep their own window, as rebuilding them can
-/// run their create hooks again.
+/// Reclaim extra space on image-tier filesystems below `[gc] min_free`, and only there,
+/// cheapest to rebuild first, stopping once enough is free: images past the eviction grace,
+/// least recently used build entries, then root images from run state directories unused for
+/// a day. Disabled categories stay off. Dev images keep their idle window because rebuilding
+/// them can rerun create hooks.
 fn pressure(
     cfg: &Config,
     state_dir: &Path,
     store: &anyhow::Result<crate::build::CacheStore>,
     req: &Request,
     sum: &mut Summary,
+    short: &dyn Fn(&Path) -> Option<u64>,
 ) {
-    use std::os::unix::fs::MetadataExt;
-    let short = || {
-        let space = crate::usage::fs_space(state_dir).ok()?;
-        let floor = cfg.gc.min_free(space.total)?;
-        floor.checked_sub(space.avail).filter(|&need| need > 0)
+    let filesystems = tier_filesystems(state_dir);
+    let on_short = |path: &Path| {
+        let id = crate::usage::fs_id(path);
+        id.is_some()
+            && filesystems
+                .iter()
+                .any(|f| crate::usage::fs_id(f) == id && short(f).is_some())
     };
-    if short().is_none() {
+    if !filesystems.iter().any(|f| short(f).is_some()) {
         return;
     }
     let grace = crate::image::EVICT_GRACE;
     let mut images = crate::image::Evicted::default();
-    for tier in ["registry", "docker", "build"] {
-        let got = crate::image::collect_idle(&state_dir.join(tier), grace, req.dry_run);
+    let mut freed = Vec::new();
+    for tier in tiers(state_dir).iter().filter(|t| on_short(t)) {
+        let got = crate::image::collect_idle(tier, grace, req.dry_run);
         images.bases += got.bases;
-        images.bytes = images.bytes.saturating_add(got.bytes);
+        freed.push((tier.clone(), got.bytes));
     }
-    sum.row(
-        "images",
-        images.bases,
-        images.bytes,
-        state_dir,
-        format!("short of space: {}", unused_for(grace)),
-    );
-    let fs = crate::usage::fs_id(state_dir);
-    if let Some(need) = short()
-        && let Ok(crate::build::CacheStore::Dir(dir)) = store
-        && fs.is_some()
-        && crate::usage::fs_id(dir) == fs
+    if !freed.is_empty() {
+        let parts: Vec<(&Path, u64)> = freed.iter().map(|(p, b)| (p.as_path(), *b)).collect();
+        sum.row_on(
+            "images",
+            images.bases,
+            &parts,
+            format!("short of space: {}", unused_for(grace)),
+        );
+    }
+    if let Ok(crate::build::CacheStore::Dir(dir)) = store
+        && on_short(dir)
+        && let Some(need) = short(dir)
         && (cfg.gc.build_cache_retention().is_some() || cfg.gc.build_cache_max(u64::MAX).is_some())
     {
         build_cache(cfg, store, req, Some(need), sum);
     }
-    if short().is_some()
-        && cfg.gc.run_image_idle().is_some()
-        && let Ok(dev) = std::fs::metadata(state_dir).map(|m| m.dev())
-    {
-        let done = crate::rundirs::collect(DAY, Some(dev), req.dry_run);
-        let parts: Vec<(&Path, u64)> = done
-            .dirs
-            .iter()
-            .map(|(dir, bytes)| (dir.as_path(), *bytes))
-            .collect();
-        sum.row_on(
-            "run images",
-            u64::try_from(parts.len()).unwrap_or(u64::MAX),
-            &parts,
-            format!("short of space: state dirs unused for {}", fmt_secs(DAY)),
-        );
-        sum.kept.extend(done.kept);
+    if cfg.gc.run_image_idle().is_some() {
+        // The identity tier_filesystems tells filesystems apart by: btrfs subvolumes drawing
+        // on one pool are one.
+        let mut ids = Vec::new();
+        for f in &filesystems {
+            if short(f).is_some()
+                && let Some(id) = crate::usage::fs_id(f)
+                && !ids.contains(&id)
+            {
+                ids.push(id);
+            }
+        }
+        for id in ids {
+            let done = crate::rundirs::collect(DAY, Some(id), req.dry_run);
+            let parts: Vec<(&Path, u64)> = done
+                .dirs
+                .iter()
+                .map(|(dir, bytes)| (dir.as_path(), *bytes))
+                .collect();
+            sum.row_on(
+                "run images",
+                u64::try_from(parts.len()).unwrap_or(u64::MAX),
+                &parts,
+                format!("short of space: state dirs unused for {}", fmt_secs(DAY)),
+            );
+            sum.kept.extend(done.kept);
+        }
     }
-    let still = short().is_some();
-    if still {
+    let still: Vec<&PathBuf> = filesystems.iter().filter(|f| short(f).is_some()).collect();
+    for f in &still {
         sum.keep(format!(
             "{} is still short of space: what is left is in use, recent, turned off in [gc], \
              or not virtkit's to remove",
-            state_dir.display()
+            f.display()
         ));
     }
-    sum.still_short = Some(still);
+    sum.still_short = Some(!still.is_empty());
+}
+
+/// What `path`'s filesystem lacks of its `[gc] min_free` floor, if anything.
+fn short_of(cfg: &Config, path: &Path) -> Option<u64> {
+    let space = crate::usage::fs_space(path).ok()?;
+    let floor = cfg.gc.min_free(space.total)?;
+    floor.checked_sub(space.avail).filter(|&need| need > 0)
 }
 
 /// Remove the boot images of the `vk dev` environments under `base` stopped longer than
@@ -661,6 +719,23 @@ impl Summary {
         self.row_on(category, count, &[(on, bytes)], why);
     }
 
+    /// [`Self::row`] for a category collected tier by tier: `parts`, each a tier and the bytes
+    /// freed there, on its own filesystem. Left out like [`Self::row`] when there is nothing to
+    /// show and `root` does not exist.
+    fn tier_row(
+        &mut self,
+        category: &'static str,
+        count: u64,
+        parts: &[(&Path, u64)],
+        root: &Path,
+        why: String,
+    ) {
+        if count == 0 && parts.iter().all(|(_, b)| *b == 0) && !root.exists() {
+            return;
+        }
+        self.row_on(category, count, parts, why);
+    }
+
     /// Add a category's row whose bytes came off several filesystems: `parts`, each a path on
     /// one and the bytes freed there.
     pub(crate) fn row_on(
@@ -759,7 +834,7 @@ impl Summary {
                 let _ = writeln!(out, "  {k}");
             }
         }
-        // The filesystems something came off, else the first: the data dir's.
+        // The filesystems something came off; with nothing freed, the first one registered.
         let freed = |i: usize| self.freed_on(i) > 0;
         let any = (0..self.space.len()).any(freed);
         for (i, s) in self.space.iter().enumerate() {
@@ -1098,7 +1173,7 @@ mod tests {
     }
 
     /// Only the filesystems something came off show their space; one that freed nothing is
-    /// left out, and with nothing freed anywhere the data dir's still shows.
+    /// left out, and with nothing freed anywhere the first one registered still shows.
     #[test]
     fn only_filesystems_that_freed_space_show_it() {
         let mut sum = summary(false);
@@ -1262,6 +1337,146 @@ mod tests {
         assert!(!run_dir.join("root.qcow2").exists());
         assert!(!dev_dir.join("root.qcow2").exists());
         assert!(crate::vms::registered().1.is_empty(), "a real pass prunes");
+    }
+
+    /// Dry-run and real GC each count the migrated build entry once and preserve the old link.
+    #[test]
+    fn a_pass_after_the_move_collects_each_tier_once() {
+        let homes = crate::dev::testutil::Homes::new("gc-moved");
+        let data = homes.dir().join("XDG_DATA_HOME/virtkit");
+        let cache = homes.dir().join("XDG_CACHE_HOME/virtkit");
+        let base = data.join("build/fp");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("runner.ext4"), vec![1u8; 64 * 1024]).unwrap();
+        crate::image::mark_used(&base);
+        std::fs::File::open(base.join(".used"))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600)),
+            )
+            .unwrap();
+        let cfg = Config::default();
+        let root = crate::run::cache_root(&cfg).unwrap();
+        assert_eq!(root, cache);
+        let req = |dry_run| Request {
+            dry_run,
+            all_unused: true,
+            auto: false,
+            image_idle: crate::image::EVICT_GRACE,
+            checkout_idle: crate::image::EVICT_GRACE,
+        };
+        let images = |sum: &Summary| {
+            sum.rows
+                .iter()
+                .filter(|r| r.category == "images")
+                .map(|r| r.count)
+                .sum::<u64>()
+        };
+        let dry = run(&cfg, &root, &req(true));
+        assert_eq!(images(&dry), 1, "{}", dry.render());
+        let real = run(&cfg, &root, &req(false));
+        assert_eq!(images(&real), 1, "{}", real.render());
+        assert!(!cache.join("build/fp").exists());
+        assert_eq!(
+            std::fs::read_link(data.join("build")).unwrap(),
+            cache.join("build")
+        );
+    }
+
+    /// A directory on a filesystem other than `base`'s, or `None` where the host has none to
+    /// test with.
+    fn elsewhere(base: &Path, tag: &str) -> Option<PathBuf> {
+        let ours = crate::usage::fs_id(base)?;
+        ["/dev/shm", "/var/tmp", "/run/user"]
+            .iter()
+            .map(|d| Path::new(d).join(format!("vk-gc-{tag}-{}", std::process::id())))
+            .find(|d| {
+                std::fs::create_dir_all(d).is_ok()
+                    && crate::usage::fs_id(d).is_some_and(|id| id != ours)
+            })
+    }
+
+    /// GC credits a linked tier's bytes to its filesystem. The pressure sweep leaves
+    /// tiers on filesystems with enough space alone.
+    #[test]
+    fn each_tier_is_accounted_on_its_own_filesystem() {
+        use std::os::unix::fs::MetadataExt;
+        let homes = crate::dev::testutil::Homes::new("gc-devices");
+        let root = homes.dir().join("XDG_CACHE_HOME/virtkit");
+        let Some(other) = elsewhere(homes.dir(), "devices") else {
+            eprintln!("no second filesystem to test with");
+            return;
+        };
+        std::fs::create_dir_all(root.join("docker")).unwrap();
+        std::os::unix::fs::symlink(&other, root.join("build")).unwrap();
+        let idle = |base: &Path| {
+            std::fs::create_dir_all(base).unwrap();
+            std::fs::write(base.join("runner.ext4"), vec![1u8; 64 * 1024]).unwrap();
+            crate::image::mark_used(base);
+            std::fs::File::open(base.join(".used"))
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600)),
+                )
+                .unwrap();
+        };
+        idle(&root.join("docker/img/d"));
+        idle(&root.join("build/fp"));
+        let fs = tier_filesystems(&root);
+        assert_eq!(fs, [root.join("docker"), root.join("build")]);
+
+        let cfg = Config::default();
+        let req = Request {
+            dry_run: true,
+            all_unused: true,
+            auto: false,
+            image_idle: crate::image::EVICT_GRACE,
+            checkout_idle: crate::image::EVICT_GRACE,
+        };
+        let sum = run(&cfg, &root, &req);
+        let images = sum.rows.iter().find(|r| r.category == "images").unwrap();
+        let on = |path: &Path| {
+            let id = crate::usage::fs_id(path);
+            sum.space.iter().position(|s| s.id == id)
+        };
+        let credited = |path: &Path| {
+            images
+                .on
+                .iter()
+                .filter(|(i, _)| *i == on(path) && i.is_some())
+                .map(|(_, b)| *b)
+                .sum::<u64>()
+        };
+        assert!(credited(&other) >= 64 * 1024, "{}", sum.render());
+        assert!(credited(&root) >= 64 * 1024, "{}", sum.render());
+
+        // Short of space where `build` is, and only there.
+        let dev = std::fs::metadata(&other).unwrap().dev();
+        let short = |p: &Path| {
+            std::fs::metadata(p)
+                .is_ok_and(|m| m.dev() == dev)
+                .then_some(1u64)
+        };
+        let mut sum = Summary::new(false, &[&root, &root.join("docker"), &root.join("build")]);
+        sum.lazy = true;
+        let req = Request {
+            dry_run: false,
+            auto: true,
+            ..req
+        };
+        pressure(
+            &cfg,
+            &root,
+            &Err(anyhow::anyhow!("no store")),
+            &req,
+            &mut sum,
+            &short,
+        );
+        assert!(!root.join("build/fp").exists(), "{}", sum.render());
+        assert!(root.join("docker/img/d").exists(), "{}", sum.render());
+        let _ = std::fs::remove_dir_all(&other);
     }
 
     #[test]

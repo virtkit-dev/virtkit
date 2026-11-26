@@ -11,8 +11,8 @@
 //!
 //! The registry is advisory. An entry can outlive its VM if the run was `SIGKILL`ed before its
 //! removal ran, so readers reconcile liveness by probing the state-dir lock (`alive`) and prune
-//! entries whose owner is gone. Entries live under `<data base>/vms/` (the same
-//! `$XDG_DATA_HOME/virtkit` home `vk run`'s image cache uses), one JSON file per VM.
+//! entries whose owner is gone. Entries live under `<data base>/vms/`
+//! (`$XDG_DATA_HOME/virtkit`), one JSON file per VM.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;

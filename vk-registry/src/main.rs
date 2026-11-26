@@ -59,7 +59,9 @@ enum Cmd {
         addr: Option<SocketAddr>,
         /// Store directory [default: the `root` in --config, else the shared virtkit store]
         ///
-        /// The shared store is $XDG_DATA_HOME/virtkit/registry.
+        /// The shared store at $XDG_CACHE_HOME/virtkit/registry is a cache. Set an explicit
+        /// root for content that must survive cache cleanup. The shared store's server keeps
+        /// its accounts and hub enrollment under $XDG_DATA_HOME/virtkit/registry-server.
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
         /// TOML config file with `[[upstream]]` relay entries, addr/root, TLS and auth
@@ -86,7 +88,7 @@ enum Cmd {
         addr: SocketAddr,
         /// Store directory to bake into the unit [default: the shared virtkit store]
         ///
-        /// The shared store is $XDG_DATA_HOME/virtkit/registry, which a --system unit cannot
+        /// The shared store is $XDG_CACHE_HOME/virtkit/registry, which a --system unit cannot
         /// use — that shape needs this flag, or a --config that sets `root`.
         #[arg(long, conflicts_with = "config", value_name = "DIR")]
         root: Option<PathBuf>,
@@ -156,7 +158,7 @@ enum Cmd {
     Status {
         /// Store directory [default: VK_REGISTRY_ROOT, then --config, then the shared store]
         ///
-        /// The shared store is $XDG_DATA_HOME/virtkit/registry — where `vk` keeps its own
+        /// The shared store is $XDG_CACHE_HOME/virtkit/registry — where `vk` keeps its own
         /// build cache unless `[build] cache_registry` sends it elsewhere.
         /// `VK_REGISTRY_ROOT` supplies this flag when it is not typed, and ranks where the
         /// flag does: an inherited one outranks the `root` in a --config typed by hand.
@@ -179,7 +181,7 @@ enum Cmd {
     Gc {
         /// Store directory [default: VK_REGISTRY_ROOT, then --config, then the shared store]
         ///
-        /// The shared store is $XDG_DATA_HOME/virtkit/registry — where `vk` keeps its own
+        /// The shared store is $XDG_CACHE_HOME/virtkit/registry — where `vk` keeps its own
         /// build cache unless `[build] cache_registry` sends it elsewhere.
         /// `VK_REGISTRY_ROOT` supplies this flag when it is not typed, and ranks where the
         /// flag does: an inherited one outranks the `root` in a --config typed by hand.
@@ -247,7 +249,8 @@ enum Cmd {
 
 /// Which accounts a subcommand works on, and how it reaches them. The db is an explicit
 /// `--accounts-db`, else the `serve` config's (`--config`), else
-/// `<root>/accounts/accounts.db` under the resolved store root; the running server holding
+/// `<root>/accounts/accounts.db` under the resolved store root (for the default store, the
+/// data dir's: see `cachehome::server_dir`); the running server holding
 /// it is `--admin-socket`, else the config's `admin_socket` — or, when `--accounts-db` names
 /// a db outright, neither — else the socket beside that db.
 ///
@@ -1417,7 +1420,7 @@ mod tests {
         // both empty is both unset, and nothing is left but the shared default
         assert_eq!(
             root_of(None, None, env("", "")).unwrap(),
-            vk_registry::default_root().unwrap()
+            vk_registry::located_default_root().unwrap()
         );
         // a config file inherited from the environment still has to be readable: silently
         // falling back to the default store is the behaviour this replaced

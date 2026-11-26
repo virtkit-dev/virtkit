@@ -681,27 +681,41 @@ pub(crate) fn cache_repo(cache_registry: Option<&str>) -> Result<Option<String>>
             )
         }
         Some(repo) => Some(repo.to_string()),
-        None => Some(
-            vk_registry::default_root()
-                .context("resolving the builtin cache store dir")?
-                .display()
-                .to_string(),
-        ),
+        None => {
+            let root =
+                vk_registry::default_root().context("resolving the builtin cache store dir")?;
+            // The store path is passed as text. Lossy conversion could select a different
+            // directory from the one `vk-registry` serves.
+            let Some(root) = root.to_str() else {
+                bail!(
+                    "the builtin cache store {} is not a UTF-8 path: name a store with \
+                     `[build] cache_registry`",
+                    root.display()
+                );
+            };
+            Some(root.to_string())
+        }
     };
-    // The shared cache store lends whatever it holds to guests by digest: a build cache there
-    // would be theirs to read, and its entries collected as tasks'.
     if let Some(dir) = repo
         .as_deref()
         .and_then(crate::config::Registry::local_root_of)
-        && crate::sharedcache::is_store(&dir)
     {
+        refuse_shared_store(&dir)?;
+    }
+    Ok(repo)
+}
+
+/// The shared cache store lends whatever it holds to guests by digest: a build cache there
+/// would be theirs to read, and its entries collected as tasks'.
+fn refuse_shared_store(dir: &Path) -> Result<()> {
+    if crate::sharedcache::is_store(dir) {
         bail!(
             "cache destination {} is the shared cache store: a build cache needs a store of \
              its own",
             dir.display()
         );
     }
-    Ok(repo)
+    Ok(())
 }
 
 /// Where the instruction cache keeps what it caches, as [`cache_store`] answers it.
@@ -725,8 +739,15 @@ pub enum CacheStore {
 /// `Err` keeps meaning what it means everywhere else: a `cache_registry` that names no
 /// store at all, or no place to put the builtin one.
 pub fn cache_store(cache_registry: Option<&str>) -> Result<CacheStore> {
-    let Some(repo) = cache_repo(cache_registry)? else {
-        let dir = vk_registry::default_root().context("resolving the builtin cache store dir")?;
+    // Reports and GC use the store at its current location.
+    let named = match cache_registry {
+        None | Some("none") => None,
+        named => cache_repo(named)?,
+    };
+    let Some(repo) = named else {
+        let dir =
+            vk_registry::located_default_root().context("resolving the builtin cache store dir")?;
+        refuse_shared_store(&dir)?;
         return Ok(CacheStore::Dir(dir));
     };
     Ok(match crate::config::Registry::local_root_of(&repo) {
@@ -6178,8 +6199,26 @@ mod tests {
         );
     }
 
+    /// A builtin store whose path is not UTF-8 is refused rather than carried on as another
+    /// path than the one `vk-registry` resolves, byte for byte.
+    #[test]
+    fn a_builtin_store_that_is_not_utf8_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let homes = crate::dev::testutil::Homes::new("cache-repo-bytes");
+        let odd = homes.dir().join(std::ffi::OsStr::from_bytes(b"ca\xffche"));
+        // SAFETY: serialized by the Homes guard, which puts XDG_CACHE_HOME back.
+        unsafe { std::env::set_var("XDG_CACHE_HOME", &odd) };
+        assert_eq!(
+            vk_registry::default_root().unwrap(),
+            odd.join("virtkit/registry")
+        );
+        let err = cache_repo(None).unwrap_err();
+        assert!(format!("{err:#}").contains("not a UTF-8 path"), "{err:#}");
+    }
+
     #[test]
     fn cache_repo_resolution() {
+        let _homes = crate::dev::testutil::Homes::new("cache-repo");
         assert_eq!(cache_repo(Some("none")).unwrap(), None);
         assert_eq!(
             cache_repo(Some("127.0.0.1:5000")).unwrap().as_deref(),
@@ -6216,6 +6255,14 @@ mod tests {
         std::fs::create_dir(&other).unwrap();
         let other = other.display().to_string();
         assert_eq!(cache_repo(Some(&other)).unwrap(), Some(other));
+        // Nor is the builtin store when it leads there: `vk registry gc` refuses it too.
+        let builtin = vk_registry::located_default_root().unwrap();
+        std::fs::create_dir_all(builtin.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&root, &builtin).unwrap();
+        for store in [cache_store(None), cache_store(Some("none"))] {
+            let err = store.unwrap_err();
+            assert!(format!("{err:#}").contains("shared cache store"), "{err:#}");
+        }
     }
 
     // Where `vk registry status`/`gc` and `vk paths` look when no `--root` says otherwise:
@@ -6224,8 +6271,8 @@ mod tests {
     // server it is rather than as a failure to resolve one.
     #[test]
     fn cache_store_follows_the_configured_cache() {
-        let _env = crate::dev::testutil::env_guard();
-        let default = CacheStore::Dir(vk_registry::default_root().unwrap());
+        let _homes = crate::dev::testutil::Homes::new("cache-store");
+        let default = CacheStore::Dir(vk_registry::located_default_root().unwrap());
         assert_eq!(cache_store(None).unwrap(), default);
         assert_eq!(
             cache_store(Some("/srv/vk-cache")).unwrap(),

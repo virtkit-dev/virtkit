@@ -35,9 +35,8 @@ const AREA_ROOT: &str = "dev";
 const MARKER: &str = "vk-shared-cache";
 
 /// The store: `shared-cache` under the scratch base ([`crate::run::default_scratch_base`]),
-/// so `$XDG_CACHE_HOME/virtkit/shared-cache`, else `~/.cache/virtkit/shared-cache`. Everything
-/// in it can be rebuilt, so it is a cache, unlike the build cache store under
-/// `$XDG_DATA_HOME`.
+/// so `$XDG_CACHE_HOME/virtkit/shared-cache`, else `~/.cache/virtkit/shared-cache`, beside the
+/// build cache's default store. Everything in it can be rebuilt.
 pub fn store_root() -> Result<PathBuf> {
     Ok(crate::run::default_scratch_base()
         .context("resolving the shared cache store dir")?

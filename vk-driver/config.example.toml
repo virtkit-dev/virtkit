@@ -67,7 +67,7 @@
 #                        # share it across runners; the cache_* keys below carry its TLS and
 #                        # credentials), or an absolute path / file:// URL for a store on
 #                        # this disk, accessed in-process (default:
-#                        # $XDG_DATA_HOME/virtkit/registry). `none` disables caching.
+#                        # $XDG_CACHE_HOME/virtkit/registry). `none` disables caching.
 #                        # A path here is also the store `vk registry status`/`gc` report on
 #                        # and sweep with no --root; with a registry server (the value above)
 #                        # the store is on that host, so they refuse until given a --root.
@@ -128,10 +128,10 @@
 #                        # leave it out of a config older releases also read.
 # auto = true            # `vk run` (not of a UEFI bundle), `vk build`, `vk export`,
 #                        # `vk registry pull` and a booting `vk dev` start a pass in the
-#                        # background (log: <data dir>/gc.log) at most every interval_hours,
-#                        # and sooner under min_free. VK_GC_AUTO=0 also turns it off
+#                        # background at most every interval_hours, and sooner under min_free.
+#                        # The log is gc.log in the image-cache root. VK_GC_AUTO=0 disables it.
 # interval_hours = 24    # 0 = only under min_free
-# min_free = "20G"       # below this much free space on the data dir's filesystem, a pass
+# min_free = "20G"       # below this much free space where the image caches are, a pass
 #                        # goes past the idle windows — images unused 10 min, the build
 #                        # cache's least recently used entries, run images unused a day —
 #                        # until it is free again: a size, a share ("10%"), or "none".

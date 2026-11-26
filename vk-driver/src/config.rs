@@ -276,7 +276,7 @@ pub const WAIT_TIMEOUT_SECS: u64 = 600;
 pub struct Gc {
     /// Let `vk run` (not of a UEFI bundle), `vk build`, `vk export`, `vk registry pull` and a
     /// booting `vk dev` start a `vk gc` pass in the background, at most every
-    /// `interval_hours`, and sooner when the data dir's filesystem has less than `min_free`
+    /// `interval_hours`, and sooner when a filesystem of the image caches has less than `min_free`
     /// left. Default on; `VK_GC_AUTO=0` also turns it off.
     pub auto: Option<bool>,
     /// Hours between background passes; `0`: only under `min_free`. Default 24.
@@ -856,7 +856,8 @@ pub struct Egress {
 pub struct Local {
     /// Directory of local guest bundles: each `<dir>/<name>/` is a bundle
     /// (`runner.ext4` + `boot.kind`, optionally `runner.ext4.json`). Unset =
-    /// `<state_dir>/images` (see `Local::dir`).
+    /// `<state_dir>/images`, except that a default local run uses the data directory's
+    /// `images/` when available (see [`Config::local_dir_under`]).
     pub dir: Option<PathBuf>,
 }
 
@@ -1672,10 +1673,19 @@ impl Config {
     /// The local-bundles directory resolved against a caller-chosen `state_dir`:
     /// `[local] dir` if set, else `<state_dir>/images`. Threading the state dir (rather
     /// than reading the config default) lets a non-CI caller (`vk run`) share the resolve
-    /// path while keeping its cache under its own state dir.
+    /// path. With the default cache root, a local run keeps bundles in the data directory
+    /// when available: they are no cache.
     pub fn local_dir_under(&self, state_dir: &Path) -> PathBuf {
+        use vk_registry::cachehome;
         match &self.local.dir {
             Some(dir) => dir.clone(),
+            None if self.state_dir.is_none()
+                && cachehome::cache_base().is_some_and(|c| c == state_dir) =>
+            {
+                cachehome::data_base()
+                    .unwrap_or_else(|| state_dir.to_path_buf())
+                    .join("images")
+            }
             None => state_dir.join("images"),
         }
     }
@@ -1736,6 +1746,26 @@ mod tests {
     fn registry(toml: &str) -> Registry {
         let cfg: Config = toml::from_str(&format!("[registry]\n{toml}")).unwrap();
         cfg.registry.unwrap()
+    }
+
+    /// Default local runs keep bundles in the data directory. Other roots keep their own bundles.
+    #[test]
+    fn baked_bundles_stay_in_the_data_dir() {
+        let homes = crate::dev::testutil::Homes::new("local-dir");
+        let cache = vk_registry::cachehome::cache_base().unwrap();
+        assert_eq!(
+            Config::default().local_dir_under(&cache),
+            homes.dir().join("XDG_DATA_HOME/virtkit/images")
+        );
+        assert_eq!(
+            Config::default().local_dir_under(Path::new("/var/lib/virtkit")),
+            Path::new("/var/lib/virtkit/images")
+        );
+        let pinned = Config {
+            state_dir: Some(cache.clone()),
+            ..Config::default()
+        };
+        assert_eq!(pinned.local_dir_under(&cache), cache.join("images"));
     }
 
     /// One reading of `repo` for every client: the base URL, its host lowercased and its

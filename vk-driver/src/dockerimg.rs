@@ -710,6 +710,7 @@ mod tests {
     /// and working that out never fails — an image is pulled either way.
     #[test]
     fn the_relay_target_prefers_the_build_cache_registry() {
+        let _homes = crate::dev::testutil::Homes::new("relay-target");
         let cfg = |cache: Option<&str>, registry: Option<&str>| Config {
             build: crate::config::Build {
                 cache_registry: cache.map(String::from),

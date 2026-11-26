@@ -150,7 +150,7 @@ build shares its layers as Linux build steps do (`wincache`):
   `vk-hub media add <iso>` uploads and approves a medium, retaining its source and licence
   ([install media](fleet-prototype.md#install-media)).
 - **Scopes.** Such a build keeps its installs, settled bases and layers in its local scope's
-  cache, `<data>/windows/scopes/<scope>`, laid out as the host's own, and takes layers from
+  cache, `<cache>/windows/scopes/<scope>`, laid out as the host's own, and takes layers from
   its job's build cache, so no other project's or branch's build reuses them; media stay in
   the host's media cache. The sweep after each Windows build walks every scope's cache.
 

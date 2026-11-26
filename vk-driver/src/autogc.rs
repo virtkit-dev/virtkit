@@ -1,11 +1,12 @@
 //! The `vk gc` pass the commands that fill the caches start in the background: at most every
-//! `[gc] interval_hours`, and sooner when the data dir's filesystem runs below `[gc] min_free`.
+//! `[gc] interval_hours`, and sooner when a filesystem of the image caches runs below
+//! `[gc] min_free`.
 //! Only a command starts one, so a host nobody uses is never swept, and a pass never stands in
 //! for the room a job is admitted against (that is `image::evict_for_room`'s).
 //!
 //! The command pays for the check: three `stat`s and one `statvfs`. Everything else happens in
 //! the child, `vk gc --auto`, in a session of its own, its output appended to
-//! `<data dir>/gc.log`. It keeps the command's priority wherever it holds a lock a build or a
+//! `gc.log` in the image-cache root. It keeps the command's priority while holding a lock a build or a
 //! boot may be waiting on — the build cache's store, an environment's, a run dir's, an image's
 //! — which is nearly everywhere; only its reading of the build cache under the shared lock,
 //! the slow part, runs at the lowest CPU and I/O priority, on a thread of its own
@@ -105,18 +106,29 @@ pub(crate) fn maybe_start(cfg: &Config, state_dir: &Path) {
             .and_then(|m| m.modified())
             .ok()
     };
-    // No data dir yet: nothing to collect.
-    let Ok(space) = crate::usage::fs_space(state_dir) else {
+    // Linked tiers can occupy different filesystems. Pick the largest shortfall, keeping
+    // the first readable filesystem on a tie. Skip GC if none can be measured.
+    let mut space = None;
+    for fs in crate::gc::tier_filesystems(state_dir) {
+        let Ok(sp) = crate::usage::fs_space(&fs) else {
+            continue;
+        };
+        let floor = cfg.gc.min_free(sp.total);
+        let need = floor.map_or(0, |f| f.saturating_sub(sp.avail));
+        if space.as_ref().is_none_or(|(_, _, _, n)| need > *n) {
+            space = Some((fs, sp.avail, floor, need));
+        }
+    }
+    let Some((short_on, avail, floor, _)) = space else {
         return;
     };
     let now = SystemTime::now();
-    let floor = cfg.gc.min_free(space.total);
     let stamps = Stamps {
         done: mtime(DONE),
         started: mtime(STARTED),
         short: mtime(SHORT),
     };
-    let Some(why) = due(now, stamps, cfg.gc.interval(), Some(space.avail), floor) else {
+    let Some(why) = due(now, stamps, cfg.gc.interval(), Some(avail), floor) else {
         return;
     };
     if let Err(e) = start(cfg, state_dir, now) {
@@ -130,7 +142,7 @@ pub(crate) fn maybe_start(cfg: &Config, state_dir: &Path) {
             "virtkit: {} free under {}, below the {} vk keeps free: reclaiming unused caches \
              in the background (`vk gc`, log {})",
             crate::usage::fmt_bytes(avail),
-            state_dir.display(),
+            short_on.display(),
             crate::usage::fmt_bytes(floor),
             state_dir.join(LOG).display()
         );

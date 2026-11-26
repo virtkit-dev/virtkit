@@ -48,9 +48,10 @@ const POLL: Duration = Duration::from_secs(60);
 /// How often the store is counted again for the hub.
 const USAGE_EVERY: Duration = Duration::from_secs(600);
 
-/// `<root>/hub`.
+/// Hub enrollment lives at `<root>/hub` except where [`crate::cachehome::server_dir`]
+/// selects the default store's enrollment directory.
 pub fn dir(root: &Path) -> PathBuf {
-    root.join("hub")
+    crate::cachehome::server_dir(root, "hub")
 }
 
 /// What `join` leaves for `serve`.

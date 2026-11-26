@@ -165,7 +165,7 @@ cache layers. It takes two:
   hub-placed job on a node caching by scope, the node takes only those, from its media cache
   or the registry, and a stage naming another fails unless the file is in its build context.
   Other builds fetch as today. Media are not project content: the media cache
-  (`<data>/windows/winiso/{iso,media,verified}`) is shared by every scope, its entries keyed
+  (`<cache>/windows/winiso/{iso,media,verified}`) is shared by every scope, with ISO files keyed
   by the pinned digests.
 - **Layers**: the job's cache setting, as for Linux — scoped at `<prefix>/build-cache:win-<key>`
   or off — and on the node its local scope's Windows cache ([the local tier](#the-local-tier)).
@@ -187,7 +187,7 @@ reuse entries within their scope.
   both alike. The builder keeps no other stage output on the node: what it caches goes to
   the job's cache destination.
 - Windows: settled bases, installs and instruction layers (`layers/<key>`), with the backing
-  chains they reference, in `<data>/windows/scopes/<local scope>` (its hex digest), laid out
+  chains they reference, in `<cache>/windows/scopes/<local scope>` (its hex digest), laid out
   as the unscoped cache. The sweep after each Windows build walks the unscoped cache and every
   local scope's, and keeps what a kept layer stands on. Media stay in the shared media cache.
 - A hub-placed job building *off* builds in a scope of its own, whose entries its cleanup
@@ -360,7 +360,7 @@ from the operator, so:
 
 - An install whose ISO and drivers were both taken from the media cache under
   `[executor] windows_media`, not from a build context, goes in a node-wide tier,
-  `<data>/windows/installs/<install_key>`, shared by every scope and the unscoped cache.
+  `<cache>/windows/installs/<install_key>`, shared by every scope and the unscoped cache.
   Approving a medium is the operator's statement that whatever it installs may be shared by
   every scope of the node; equal digests alone would not be.
 - Shared installs are immutable generations: a failed settle never deletes or replaces an
