@@ -22,6 +22,8 @@
 //! CSRF check or the write check is refused after a few hundred bytes rather than after
 //! the whole upload; a body that puts `file` first is refused for that reason.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -54,7 +56,7 @@ const MAX_FILE_NAME_BYTES: usize = 255;
 /// session cookie was written under, so it has to be the same answer the rest of the
 /// server uses (see [`accounts::session_cookie`]).
 pub(crate) async fn route(
-    store: &Store,
+    store: &Arc<Store>,
     db: &Db,
     principal: &Principal,
     secure: bool,
@@ -87,7 +89,7 @@ pub(crate) async fn route(
 }
 
 async fn submit(
-    store: &Store,
+    store: &Arc<Store>,
     db: &Db,
     principal: &Principal,
     user: &accounts::User,
@@ -284,7 +286,14 @@ async fn submit(
         );
     };
 
-    let digest = match store_upload(store, &name, &tag, &file_bytes, file_name.as_deref()) {
+    let stored = {
+        let (name, tag) = (name.clone(), tag.clone());
+        crate::store_blocking_locked(store, "an upload", move |store| {
+            store_upload(store, &name, &tag, &file_bytes, file_name.as_deref())
+        })
+        .await
+    };
+    let digest = match stored {
         Ok(digest) => digest,
         Err(e) => {
             // The chain names store paths; it goes to the log, not to the browser.

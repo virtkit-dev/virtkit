@@ -127,6 +127,9 @@ pub async fn get_blob(
         std::process::id(),
         RELAY_TMP.fetch_add(1, Ordering::Relaxed)
     ));
+    // If the request is dropped while it owns the staging file, including while waiting
+    // for a slot during gc, the guard unlinks it. Promotion takes ownership on the pool.
+    let mut staging = crate::staging::Staging::new(tmp.clone());
     let mut file = tokio::fs::File::create(&tmp)
         .await
         .with_context(|| format!("creating {}", tmp.display()))?;
@@ -163,8 +166,11 @@ pub async fn get_blob(
     // block a tokio worker for seconds. The store lock is taken inside, after that pass.
     let store = state.store.clone();
     let (hex, name_owned) = (hex.to_string(), name.to_string());
+    let waiter = store.lock_waiter().await?;
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let staged = store.stage_promotion(&hex, &tmp)?;
+        let _waiter = waiter;
+        let staged = store.stage_promotion(&hex, staging.path())?;
+        staging.disarm();
         // shared store lock (vs. an exclusive gc) across the promote; see Store::lock_shared.
         let _lock = match store.lock_shared() {
             Ok(lock) => lock,
@@ -279,16 +285,18 @@ pub async fn get_manifest(
         // Under the shared store lock, as the blob path is: the write puts the bytes and
         // the sidecar that makes them readable here, and an exclusive `gc` in between
         // would leave the one without the other.
-        let _lock = state.store.lock_shared()?;
-        // Kept as the upstream wrote it, other digest algorithms included: see
-        // `Store::put_relayed_manifest` for why that is safe and why refusing is not.
-        let got = state
-            .store
-            .put_relayed_manifest(name, reference, &ctype, &body)?;
-        if got != reference {
-            bail!("upstream manifest digest mismatch for {name}: got {got}, want {reference}");
-        }
-        return serve_manifest_local(&state.store, name, reference, head);
+        let (name, reference) = (name.to_string(), reference.to_string());
+        return crate::store_blocking_locked(&state.store, "a relayed manifest", move |store| {
+            let _lock = store.lock_shared()?;
+            // Kept as the upstream wrote it, other digest algorithms included: see
+            // `Store::put_relayed_manifest` for why that is safe and why refusing is not.
+            let got = store.put_relayed_manifest(&name, &reference, &ctype, &body)?;
+            if got != reference {
+                bail!("upstream manifest digest mismatch for {name}: got {got}, want {reference}");
+            }
+            serve_manifest_local(store, &name, &reference, head)
+        })
+        .await;
     }
 
     // a tag is mutable: relay live, never persist.

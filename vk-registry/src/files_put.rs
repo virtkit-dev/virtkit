@@ -396,7 +396,9 @@ pub(crate) async fn route(
 
     let store = state.store.clone();
     let name = name.to_string();
+    let waiter = store.lock_waiter().await?;
     let put = tokio::task::spawn_blocking(move || {
+        let _waiter = waiter;
         // Consumed from here, installed or not.
         staging.disarm();
         let tags = [

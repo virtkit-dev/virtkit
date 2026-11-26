@@ -2,6 +2,8 @@
 //! Only the tag pointer is dropped; the content-addressed manifest and blobs are the gc's
 //! to reclaim once nothing roots them (see [`crate::Store::delete_tag`]).
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
@@ -15,7 +17,7 @@ use crate::html;
 use crate::{Store, query_param, valid_name, valid_tag};
 
 pub(crate) async fn route(
-    store: &Store,
+    store: &Arc<Store>,
     db: &Db,
     principal: &Principal,
     secure: bool,
@@ -43,7 +45,7 @@ pub(crate) async fn route(
 }
 
 async fn delete(
-    store: &Store,
+    store: &Arc<Store>,
     db: &Db,
     principal: &Principal,
     user: &User,
@@ -94,7 +96,14 @@ async fn delete(
             "The form named no valid tag to delete.",
         );
     };
-    match store.delete_tag(&repo, &tag) {
+    let deleted = {
+        let (repo, tag) = (repo.clone(), tag.clone());
+        crate::store_blocking_locked(store, "a tag delete", move |store| {
+            store.delete_tag(&repo, &tag)
+        })
+        .await
+    };
+    match deleted {
         // Land back on the repository page whether or not the tag was still there: one
         // someone else deleted first is simply already gone, which is the same outcome.
         Ok(true) => {

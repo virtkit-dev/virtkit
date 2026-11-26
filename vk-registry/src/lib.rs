@@ -399,6 +399,9 @@ pub struct Store {
     prefix_windows: std::sync::Mutex<Vec<PrefixWindow>>,
     /// Slots for file puts streaming now ([`Store::file_put_slot`]).
     file_puts: tokio::sync::Semaphore,
+    /// Slots for requests on the blocking pool that may wait on the store lock
+    /// ([`Store::lock_waiter`]).
+    lock_waiters: Arc<tokio::sync::Semaphore>,
     /// The bytes of the file puts streaming now that the filesystem could not set aside for
     /// them, which the free space must still cover.
     pub(crate) unclaimed_puts: std::sync::Mutex<u64>,
@@ -410,6 +413,11 @@ pub struct Store {
 /// File puts a server streams into one store at once: each holds a file's worth of its
 /// space, and a connection for as long as the file takes.
 pub(crate) const FILE_PUTS: usize = 2;
+
+/// Maximum blocking tasks per store that may wait on its lock. Pushes and probes waiting
+/// for an exclusive gc phase could exhaust Tokio's blocking pool (512 threads by default),
+/// stalling upload chunks and WebDAV reads. Excess requests await a slot without a thread.
+pub(crate) const LOCK_WAITERS: usize = 64;
 
 /// A retention window for the tags under a prefix: those of the repositories `prefix` and
 /// `prefix/…`, and of the plain files stored as `files/prefix/…`. Under it, a tag is dropped
@@ -552,6 +560,7 @@ impl Store {
             connections: std::sync::atomic::AtomicUsize::new(0),
             prefix_windows: std::sync::Mutex::new(Vec::new()),
             file_puts: tokio::sync::Semaphore::new(FILE_PUTS),
+            lock_waiters: Arc::new(tokio::sync::Semaphore::new(LOCK_WAITERS)),
             unclaimed_puts: std::sync::Mutex::new(0),
             repo_dir_reads: AtomicU64::new(0),
         }
@@ -1759,6 +1768,15 @@ impl Store {
     /// unsupported.
     pub fn lock_shared(&self) -> Result<LockGuard> {
         self.flock(libc::LOCK_SH)
+    }
+
+    /// The blocking task owns its [`LOCK_WAITERS`] slot until it finishes, even if the
+    /// request is dropped.
+    pub(crate) async fn lock_waiter(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.lock_waiters)
+            .acquire_owned()
+            .await
+            .context("the store's lock waiter slots are closed")
     }
 
     /// Take the store lock exclusive (blocks until all shared holders drop) — the
@@ -4549,7 +4567,7 @@ pub const EXISTS_PATH: &str = "/vk/manifests/exists";
 const MAX_EXISTS_BODY: usize = 1 << 20;
 
 async fn manifests_exist(
-    store: &Store,
+    store: &Arc<Store>,
     authz: &Authz<'_>,
     req: Request<Incoming>,
 ) -> Result<Response<Body>> {
@@ -4603,8 +4621,11 @@ async fn manifests_exist(
             &format!("more than {MAX_EXISTS_TAGS} tags"),
         ));
     }
-    let tags: Vec<&str> = ask.tags.iter().map(String::as_str).collect();
-    let present = store.has_manifests(&name, &tags)?;
+    let present = store_blocking_locked(store, "a manifest probe", move |store| {
+        let tags: Vec<&str> = ask.tags.iter().map(String::as_str).collect();
+        store.has_manifests(&name, &tags)
+    })
+    .await?;
     let body = serde_json::json!({ "present": present }).to_string();
     Response::builder()
         .status(StatusCode::OK)
@@ -4901,7 +4922,16 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
             .strip_prefix("/browse")
             .unwrap_or_default()
             .trim_start_matches('/');
-        return browse::route(&state.store, db, rest, &authz, principal, csrf.as_deref());
+        let (db, principal, rest) = (Arc::clone(db), principal.clone(), rest.to_string());
+        return blocking(
+            &state.store,
+            &authz,
+            "a /browse page",
+            move |store, authz| {
+                browse::route(store, &db, &rest, authz, &principal, csrf.as_deref())
+            },
+        )
+        .await;
     }
     if is_settings_path(&path) {
         let (Authenticator::Accounts { db, .. }, Some(p)) = (&state.auth, &principal) else {
@@ -5021,7 +5051,10 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
                 let whole = std::fs::metadata(store.upload_path(after)).is_ok_and(|m| m.len() == 0);
                 let body = stage_body(&store, req.into_body(), whole && !put_is_zstd).await?;
                 let (name, id) = (name.to_string(), after.to_string());
+                // Publishing takes the store lock: see `LOCK_WAITERS`.
+                let waiter = store.lock_waiter().await?;
                 tokio::task::spawn_blocking(move || {
+                    let _waiter = waiter;
                     finish_upload(&store, &name, &id, &query, body, put_is_zstd)
                 })
                 .await
@@ -5055,12 +5088,20 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
                 // Repo-scoped: the digest has to be one this repository holds, or one the
                 // caller could fetch from a repository it may read anyway. A digest it
                 // merely *knows* is not a key to the whole store.
-                let hex = digest.trim_start_matches("sha256:");
-                let local = if readable_through(&authz, &store, name, hex) {
-                    get_blob(&store, digest, head, accept_zstd)?
-                } else {
-                    error_response(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", digest)
-                };
+                let (repo, wanted) = (name.to_string(), digest.to_string());
+                let local = blocking(&store, &authz, "a blob read", move |store, authz| {
+                    let hex = wanted.trim_start_matches("sha256:");
+                    if readable_through(authz, store, &repo, hex) {
+                        get_blob(store, &wanted, head, accept_zstd)
+                    } else {
+                        Ok(error_response(
+                            StatusCode::NOT_FOUND,
+                            "BLOB_UNKNOWN",
+                            &wanted,
+                        ))
+                    }
+                })
+                .await?;
                 // A blob this repository does not hold falls through to the relay
                 // exactly as an absent one does — which is the point: "not a member" and
                 // "not here" must be indistinguishable to the caller. The upstream fetch
@@ -5108,7 +5149,13 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
             return Ok(resp);
         }
         return match method {
-            Method::DELETE => delete_manifest(&store, name, reference),
+            Method::DELETE => {
+                let (repo, reference) = (name.to_string(), reference.to_string());
+                store_blocking_locked(&store, "a manifest delete", move |store| {
+                    delete_manifest(store, &repo, &reference)
+                })
+                .await
+            }
             Method::PUT => {
                 let ctype = req
                     .headers()
@@ -5124,7 +5171,13 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
                     // already read; otherwise write access to one repository would be a
                     // way to pull anything whose digest you can guess or overhear.
                     // Checked under the store lock, inside `put_manifest`.
-                    Ok(body) => put_manifest(&authz, &store, name, reference, &ctype, &body),
+                    Ok(body) => {
+                        let (repo, reference) = (name.to_string(), reference.to_string());
+                        blocking_locked(&store, &authz, "a manifest push", move |store, authz| {
+                            put_manifest(authz, store, &repo, &reference, &ctype, &body)
+                        })
+                        .await
+                    }
                     // A body that failed mid-read lands here too; it gets the same answer
                     // because there is no longer a connection to give it a better one.
                     Err(_) => Ok(error_response(
@@ -5140,15 +5193,23 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
                 // reference is not, and gets the same treatment as a blob — a manifest
                 // read by digest is how one would otherwise enumerate another repo's
                 // layers.
-                let scoped = match reference.strip_prefix("sha256:") {
-                    Some(hex) => readable_through(&authz, &store, name, hex),
-                    None => true,
-                };
-                let local = if scoped {
-                    get_manifest(&store, name, reference, head)?
-                } else {
-                    error_response(StatusCode::NOT_FOUND, "MANIFEST_UNKNOWN", reference)
-                };
+                let (repo, wanted) = (name.to_string(), reference.to_string());
+                let local = blocking(&store, &authz, "a manifest read", move |store, authz| {
+                    let scoped = match wanted.strip_prefix("sha256:") {
+                        Some(hex) => readable_through(authz, store, &repo, hex),
+                        None => true,
+                    };
+                    if scoped {
+                        get_manifest(store, &repo, &wanted, head)
+                    } else {
+                        Ok(error_response(
+                            StatusCode::NOT_FOUND,
+                            "MANIFEST_UNKNOWN",
+                            &wanted,
+                        ))
+                    }
+                })
+                .await?;
                 if local.status() == StatusCode::NOT_FOUND && !state.upstreams.is_empty() {
                     relay::get_manifest(&state, name, reference, head).await
                 } else {
@@ -6017,6 +6078,21 @@ where
     store_blocking(store, what, move |store| f(store, &owned.authz())).await
 }
 
+/// [`blocking`] with a [`LOCK_WAITERS`] slot held for the duration of the work.
+pub(crate) async fn blocking_locked<T, F>(
+    store: &Arc<Store>,
+    authz: &Authz<'_>,
+    what: &'static str,
+    f: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Store, &Authz<'_>) -> Result<T> + Send + 'static,
+{
+    let owned = OwnedAuthz::of(authz);
+    store_blocking_locked(store, what, move |store| f(store, &owned.authz())).await
+}
+
 /// [`blocking`] for work that needs no authorization.
 pub(crate) async fn store_blocking<T, F>(store: &Arc<Store>, what: &'static str, f: F) -> Result<T>
 where
@@ -6027,6 +6103,24 @@ where
     tokio::task::spawn_blocking(move || f(&store))
         .await
         .with_context(|| format!("{what} did not complete"))?
+}
+
+/// [`blocking_locked`] for work that needs no authorization.
+pub(crate) async fn store_blocking_locked<T, F>(
+    store: &Arc<Store>,
+    what: &'static str,
+    f: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Store) -> Result<T> + Send + 'static,
+{
+    let waiter = store.lock_waiter().await?;
+    store_blocking(store, what, move |store| {
+        let _waiter = waiter;
+        f(store)
+    })
+    .await
 }
 
 /// Whether `hex` may be read through repository `name` by this caller.
@@ -11928,6 +12022,46 @@ mod tests {
             "a hub token walks its grants"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dropping the request leaves its slot occupied until the blocking task finishes.
+    #[tokio::test]
+    async fn a_lock_waiter_slot_outlives_its_dropped_request() {
+        let dir = testtmp::root().join("regserve-lock-waiters");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::new(dir.clone()).unwrap());
+        let gc = store.lock_exclusive().unwrap();
+        let free = || store.lock_waiters.available_permits();
+
+        let push = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move {
+                store_blocking_locked(&store, "a test push", |store| store.lock_shared().map(drop))
+                    .await
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while free() == LOCK_WAITERS {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the push never took a slot"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        push.abort();
+        assert!(push.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(free(), LOCK_WAITERS - 1, "the blocked work keeps its slot");
+
+        drop(gc);
+        while free() < LOCK_WAITERS {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the slot was never released"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

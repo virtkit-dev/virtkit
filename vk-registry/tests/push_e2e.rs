@@ -1,6 +1,7 @@
 //! Chunked, whole and zstd pushes round-trip the canonical bytes over HTTP.
 //! After an interrupted PATCH, retrying extends the upload by exactly one chunk.
 //! A push to an unknown upload is refused before its body is read.
+//! A manifest push waiting on the store lock leaves the server answering other requests.
 
 use std::sync::Arc;
 
@@ -235,4 +236,82 @@ async fn a_push_to_an_unknown_upload_is_refused_before_its_body() {
     assert!(upload_files(&dir).is_empty(), "{:?}", upload_files(&dir));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The single-threaded server answers other requests while a manifest push waits on the
+/// store lock held exclusively as in a gc batch. Releasing the lock lets the push finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_push_waiting_on_the_store_lock_stalls_no_other_request() {
+    let (dir, url) = serve("lock-wait");
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    assert_eq!(
+        http.get(format!("{url}/v2/"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let store = vk_registry::Store::new(dir.join("store")).unwrap();
+    let gc = store.lock_exclusive().unwrap();
+
+    let push = tokio::spawn({
+        let (http, url) = (http.clone(), url.clone());
+        async move {
+            http.put(format!("{url}/v2/app/manifests/v1"))
+                .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+                .body(r#"{"schemaVersion":2,"layers":[]}"#)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    // Wait for the push to block in `flock` so the probes cannot finish before it stalls.
+    let lock = std::os::unix::fs::MetadataExt::ino(
+        &std::fs::metadata(dir.join("store").join(".lock")).unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !blocked_on(lock) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the push never waited for the lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!push.is_finished(), "the push waits for the lock");
+    let probe = format!("{url}/v2/app/blobs/{}", digest_of(b"absent"));
+    assert_eq!(http.head(&probe).send().await.unwrap().status(), 404);
+    assert_eq!(
+        http.get(format!("{url}/v2/"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    drop(gc);
+    assert_eq!(push.await.unwrap(), 201);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A blocked `flock` appears in `/proc/locks` as
+/// `N: -> FLOCK ADVISORY MODE PID MAJOR:MINOR:INODE START END`. Matching this process and
+/// `ino` requires `stat` and `/proc/locks` to report the same inode, which overlayfs may hide.
+fn blocked_on(ino: u64) -> bool {
+    let locks = std::fs::read_to_string("/proc/locks").expect("reading /proc/locks");
+    let pid = std::process::id().to_string();
+    locks.lines().any(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        f.get(1) == Some(&"->")
+            && f.get(2) == Some(&"FLOCK")
+            && f.get(5) == Some(&pid.as_str())
+            && f.get(6)
+                .and_then(|id| id.rsplit(':').next())
+                .is_some_and(|i| i.parse() == Ok(ino))
+    })
 }

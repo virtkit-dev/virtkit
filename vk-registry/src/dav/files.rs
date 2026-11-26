@@ -16,7 +16,7 @@ use hyper::{Request, Response, StatusCode};
 use tokio::io::AsyncWriteExt;
 
 use super::{
-    ALLOWED_FILES, ALLOWED_READ, Depth, Entry, blocking, created, href, http_date,
+    ALLOWED_FILES, ALLOWED_READ, Depth, Entry, blocking, blocking_locked, created, href, http_date,
     method_not_allowed, multistatus, no_content, not_found, options, propfind_depth, refuse,
 };
 use crate::staging::{DrainError, Staging, drain_into};
@@ -217,7 +217,7 @@ pub(super) async fn route(
                 return refuse(req, resp, &this).await;
             }
             let this = href(&parts, true);
-            blocking(state, authz, move |store, _| mkcol(store, &segs, &this)).await
+            blocking_locked(state, authz, move |store, _| mkcol(store, &segs, &this)).await
         }
         "PROPFIND" => {
             let depth = match propfind_depth(req).await {
@@ -233,20 +233,19 @@ pub(super) async fn route(
             if let Some(resp) = drain(req, &this).await? {
                 return Ok(resp);
             }
-            blocking(state, authz, move |store, authz| {
+            blocking_locked(state, authz, move |store, authz| {
                 delete(store, authz, &segs, collection, &this)
             })
             .await
         }
-        // GET and HEAD, on the runtime like `/v2/`'s blob reads.
-        _ => get(
-            authz,
-            &state.store,
-            &segs,
-            collection,
-            &this,
-            method == "HEAD",
-        ),
+        // GET and HEAD.
+        _ => {
+            let head = method == "HEAD";
+            blocking(state, authz, move |store, authz| {
+                get(authz, store, &segs, collection, &this, head)
+            })
+            .await
+        }
     }
 }
 
@@ -500,7 +499,9 @@ async fn put(
     // the relay takes it.
     let store = Arc::clone(&state.store);
     let href = href.to_string();
+    let waiter = store.lock_waiter().await?;
     tokio::task::spawn_blocking(move || -> Result<Response<Body>> {
+        let _waiter = waiter;
         let mut staging = staging;
         let staged = store.stage_promotion(&hex, staging.path())?;
         let _namespace = namespace(&store)?;

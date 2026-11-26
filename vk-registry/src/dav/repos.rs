@@ -68,14 +68,30 @@ pub(super) async fn route(
         })
         .await;
     }
-    let store = &state.store;
+    let head = method == "HEAD";
+    let accept_zstd = crate::header_has(&req, hyper::header::ACCEPT_ENCODING, "zstd");
+    let segs = segs.to_vec();
+    blocking(state, authz, move |store, authz| {
+        download(store, authz, &segs, collection, &this, head, accept_zstd)
+    })
+    .await
+}
+
+/// Serve tags, manifests and blobs for `GET` and `HEAD`. Digest reads use `/v2/`'s membership check.
+fn download(
+    store: &Store,
+    authz: &Authz<'_>,
+    segs: &[String],
+    collection: bool,
+    this: &str,
+    head: bool,
+    accept_zstd: bool,
+) -> Result<Response<Body>> {
     // No prefix walk for a download: a prefix has no body, and is a 404 either way.
     let node = match resolve(store, authz, segs, collection, false) {
         Ok(node) => node,
         Err(resp) => return Ok(*resp),
     };
-    let head = method == "HEAD";
-    let accept_zstd = crate::header_has(&req, hyper::header::ACCEPT_ENCODING, "zstd");
     match &node {
         Node::Tag(name, tag) => crate::get_manifest(store, name, tag, head),
         Node::Manifest(name, hex) if crate::readable_through(authz, store, name, hex) => {
@@ -94,7 +110,7 @@ pub(super) async fn route(
         }
         // A collection has no body to serve; a digest this repository does not hold is
         // indistinguishable from an absent one, as on `/v2/`.
-        _ => Ok(not_found(&this)),
+        _ => Ok(not_found(this)),
     }
 }
 

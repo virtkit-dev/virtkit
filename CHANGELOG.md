@@ -16,6 +16,8 @@ All notable changes to virtkit will be documented in this file.
 - CI jobs checking for blobs in `vk-registry` now search only their own namespaces.
   Scanning thousands of unrelated WebDAV cache directories could saturate the registry
   and cause uploads to time out.
+- `vk-registry` can keep reading other connections, including active uploads, during slow
+  image lookups or while a push waits on garbage collection.
 
 ## [0.116.1] - 2026-11-24
 

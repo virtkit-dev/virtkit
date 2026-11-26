@@ -125,6 +125,18 @@ where
     crate::blocking(&state.store, authz, "a WebDAV request", f).await
 }
 
+/// [`crate::blocking_locked`], labelled as a WebDAV request.
+pub(crate) async fn blocking_locked<F>(
+    state: &ServerState,
+    authz: &Authz<'_>,
+    f: F,
+) -> Result<Response<Body>>
+where
+    F: FnOnce(&Store, &Authz<'_>) -> Result<Response<Body>> + Send + 'static,
+{
+    crate::blocking_locked(&state.store, authz, "a WebDAV request", f).await
+}
+
 /// Decode the path after `/dav` into its components and whether it ended in a slash,
 /// splitting before percent-decoding. Reject decoded separators, control bytes, `.`, `..`,
 /// empty or oversized components, malformed escapes, invalid UTF-8, and excessive depth.

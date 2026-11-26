@@ -107,6 +107,20 @@ binding, installs the blob if absent, records membership and cleans up the sessi
 Hashing, compression and store-lock errors roll back the final chunk for retry. A failed
 rollback invalidates the session. A failed installation attempts to remove the staged files.
 
+The blocking pool handles blob and manifest reads with their membership checks, manifest
+pushes and deletes, batched manifest probes, storage of relayed manifests, `/browse` pages,
+manual upload storage, admin tag deletion and WebDAV downloads. A slow repository lookup
+or a store lock wait leaves the runtime worker free to read other connections.
+
+Each store limits work that may wait on its lock to 64 blocking tasks. The limit covers
+manifest pushes, deletes and probes, relayed manifest storage, manual upload storage,
+admin tag deletion, upload finalization, relayed blob promotion, WebDAV file promotion,
+`MKCOL`, `DELETE` and file puts. Other lock waiters await a slot without occupying a thread,
+leaving blocking threads available for upload chunks and WebDAV reads during `gc`. Each
+task keeps its slot until it finishes, even if the request is dropped. Upload-session
+bookkeeping and OCI tag listings run on the runtime and take no store lock. A tag listing
+reads and sorts the entries in one repository's tags directory.
+
 A request for a session the repository does not have is refused before its body is read.
 
 Manifest uploads are limited to 16 MiB and 65,536 distinct digest references. At task-rs's
@@ -588,9 +602,9 @@ shared holders or a running gc, the answer is 503.
 
 `PUT`, `MKCOL` and `DELETE` under `files/` hold one process-local lock across their checks
 and namespace changes. `PUT` rechecks its path after staging, so `MKCOL` and `PUT` of one
-path cannot both succeed. `/v2/` pushes into `files/` do not take this lock. Listings,
-`MKCOL` and `DELETE` run on the blocking pool. A `Depth: 1` listing uses memory proportional
-to the collection's members.
+path cannot both succeed. `/v2/` pushes into `files/` do not take this lock. Reads,
+listings, `PUT`'s promotion, `MKCOL` and `DELETE` run on the blocking pool. A `Depth: 1`
+listing uses memory proportional to the collection's members.
 
 Paths are split on raw `/` before each component is percent-decoded on its own — `%XX`
 escapes only, `+` being itself, and the result UTF-8 — so `%2F` cannot smuggle a separator;
