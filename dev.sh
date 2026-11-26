@@ -21,6 +21,10 @@
 #   ./dev.sh shell
 #   ./dev.sh stop
 #
+# When the vk on PATH can lend shared caches (`vk check --feature shared-cache`), Cargo
+# compiles through sccache, cached in vk's `sccache` shared cache. VK_DEV_SCCACHE=0 turns
+# that off.
+#
 # VK_DEV_CPUS / VK_DEV_MEM size the VM (default: host cpus, 8G). VK_DEV_IDLE_SECS sets how
 # long it survives with no cargo command or open shell (default: 1800, 0 = until
 # ./dev.sh stop). VK_DEV_CMD_TIMEOUT caps each cargo command (default: 3600 s, 0 = no cap).
@@ -278,12 +282,26 @@ cmd_secs=${VK_DEV_CMD_TIMEOUT:-3600}
 case "$cmd_secs" in
   *[!0-9]*) reject "VK_DEV_CMD_TIMEOUT must be a whole number of seconds (0 = no limit)" ;;
 esac
+case "${VK_DEV_SCCACHE:-1}" in
+  0 | 1) ;;
+  *) reject "VK_DEV_SCCACHE must be 0 (compile without sccache) or 1" ;;
+esac
+
+# An older vk on PATH must still be able to build the version that introduces a flag, so
+# what it can do is probed rather than assumed.
+run_help=$("$VK" run --help 2>&1 || true)
+# The shared cache store this vk would serve, if it can lend shared caches: the probe passes
+# only for a vk that has them and a store it would serve, and names that store.
+store=""
+if [ "${VK_DEV_SCCACHE:-1}" = 1 ] && probe=$("$VK" check --feature shared-cache 2>/dev/null); then
+  store=$(printf '%s\n' "$probe" | sed -n 's/^ok *shared-cache *store \(.*\)$/\1/p')
+  store=${store%, made on first use}
+fi
 
 commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 [ -n "$(git status --porcelain 2>/dev/null)" ] && commit="$commit (dirty)"
-# What the cargo modes pass is byte-identical to build.sh's BUILD_ENV, mold-linking
-# RUSTFLAGS included: any divergence changes the unit fingerprints and silently stops the
-# two workflows from sharing target/. Change both together.
+# Keep the Cargo build flags in sync with build.sh's BUILD_ENV, the mold-linking RUSTFLAGS
+# included, so both workflows can reuse artifacts in target/.
 DEV_ENV=(
   HOME=/tmp
   CARGO_HOME=/work/target/.cargo-home
@@ -293,6 +311,8 @@ DEV_ENV=(
   "CFLAGS_x86_64_unknown_linux_musl=-ffile-prefix-map=/work=/src -ffile-prefix-map=/work/target/.cargo-home=/cargo"
   "VK_GIT_COMMIT=$commit"
 )
+shared_cache_args=()
+[ -z "$store" ] || shared_cache_args=(--shared-cache sccache)
 if [ "$MODE" = shell ]; then
   # Not a login shell: a login shell would run the image's profile scripts, which can reset
   # the PATH that puts the toolchain (/opt/toolchain/bin) in front.
@@ -339,30 +359,32 @@ host_nests() {
 }
 # vk inside vk: with --nested the VM gets VMX/SVM and so its own /dev/kvm, which is what
 # lets `./dev.sh shell` build and boot microVMs (./dist/vk run …, ./build.sh) rather than
-# only compile them. Probed rather than assumed: the vk on PATH may predate the flag, and
-# it must still be able to compile the vk that introduces it.
-run_help=$("$VK" run --help 2>&1 || true)
+# only compile them.
 nested_args=()
 if [[ $run_help == *"--nested"* ]] && host_nests; then
   nested_args=(--nested)
 fi
 
-# Reboot only when the build image's inputs, the toolchain its base tag tracks, or whether
-# the VM nests, change — a resize (VK_DEV_CPUS/VK_DEV_MEM) deliberately waits for the next
-# boot instead. rust-toolchain.toml is never COPYed into the image, but update.sh keeps
-# the flake's inline channel in sync with it, and the guest toolchain follows it.
-# Source and Cargo manifest edits are shared live at /work and never require a reboot.
-# The boot shape is in the stamp so installing a vk that can nest restarts the VM instead
-# of leaving the next shell without a /dev/kvm. It restarts on losing nesting too — the
-# rule is "the shape changed", which is simpler than ranking the two directions.
+# The stamp holds what the running VM was booted from: the build image's inputs, then its
+# shape — whether it nests, and the shared cache store it lends sccache, if any.
+# VK_DEV_CPUS and VK_DEV_MEM take effect at the next boot. The image gets its Rust channel
+# from the flake; update.sh keeps it in sync with rust-toolchain.toml, which the Dockerfile
+# does not copy. Source and Cargo manifest edits are shared live at /work and never require
+# a reboot.
+# A changed image restarts the VM. So does a changed shape — a vk that can now nest or lend
+# a shared cache, or VK_DEV_SCCACHE or the store changing — but only while no other dev.sh
+# uses the VM: each holds use.lock shared from before it lets go of dev.lock until its
+# command ends. One in use keeps its shape until its next boot, and this command uses it as
+# it is: cargo is pointed at sccache only when the VM lends the cache.
 image_inputs=$(sha256sum \
   .devcontainer/Dockerfile \
   .devcontainer/nix/flake.nix \
   .devcontainer/nix/flake.lock \
   rust-toolchain.toml | sha256sum | cut -d ' ' -f 1)
-vm_stamp=$(printf '%s %s\n' "$image_inputs" "${nested_args[*]}" | sha256sum | cut -d ' ' -f 1)
+shape="${nested_args[*]} ${shared_cache_args[*]} $store"
 stamp_file="$STATE_DIR/vm.stamp"
 lock_state_dir
+exec 8>"$STATE_DIR/use.lock"
 # Retire the pre-rename stamp: a state dir is reused and never removed, so image.stamp
 # would otherwise sit beside vm.stamp forever. Delete this line once no dev VM predating
 # the rename can still be around.
@@ -372,10 +394,24 @@ checkout_record=$(printf '%s\n%s' "$ROOT" "$GIT_COMMON")
   printf '%s\n' "$checkout_record" >"$STATE_DIR/$CHECKOUT_FILE"
 agent_up=""
 "$VK" status "$STATE_DIR" >/dev/null 2>&1 && agent_up=1
-if [ -n "$agent_up" ] && [ "$(cat "$stamp_file" 2>/dev/null)" != "$vm_stamp" ]; then
-  echo "dev.sh: development VM inputs changed; restarting it" >&2
-  "$VK" stop "$STATE_DIR" || true
-  agent_up=""
+if [ -n "$agent_up" ]; then
+  booted_image="" booted_shape=""
+  { IFS= read -r booted_image && IFS= read -r booted_shape; } <"$stamp_file" 2>/dev/null || true
+  if [ "$booted_image" != "$image_inputs" ]; then
+    echo "dev.sh: development VM inputs changed; restarting it" >&2
+    "$VK" stop "$STATE_DIR" || true
+    agent_up=""
+  elif [ "$booted_shape" != "$shape" ]; then
+    if flock -x -n 8; then
+      echo "dev.sh: development VM nesting or sccache changed; restarting it" >&2
+      "$VK" stop "$STATE_DIR" || true
+      agent_up=""
+    else
+      echo "dev.sh: development VM nesting or sccache changed, but the VM is in use;" >&2
+      echo "        the change takes effect at its next boot" >&2
+      shape=$booted_shape
+    fi
+  fi
 fi
 
 if [ -z "$agent_up" ]; then
@@ -407,15 +443,34 @@ if [ -z "$agent_up" ]; then
     --workdir "$ROOT" \
     --state-dir "$STATE_DIR" \
     --net --cpus "${VK_DEV_CPUS:-host}" --mem "${VK_DEV_MEM:-8G}" --detach \
-    "${nested_args[@]}" "${lifetime_args[@]}" 9>&- || {
+    "${nested_args[@]}" "${shared_cache_args[@]}" "${lifetime_args[@]}" 8>&- 9>&- || {
     echo "dev.sh: the development VM did not start; if a previous one is stuck holding" >&2
     echo "        $STATE_DIR — or one just expired and has not let go yet — clear it" >&2
     echo "        with ./dev.sh stop and retry" >&2
     exit 1
   }
-  printf '%s\n' "$vm_stamp" >"$stamp_file"
+  printf '%s\n%s\n' "$image_inputs" "$shape" >"$stamp_file"
 fi
+flock -s 8
 exec 9>&-
+
+# Checkouts using the same shared cache store can reuse matching dependency builds. sccache
+# skips incremental builds, so workspace crates keep their incremental rebuilds. Cargo omits
+# RUSTC_WRAPPER from unit fingerprints, and no build script in this tree tracks it, so
+# build.sh, which never uses sccache, still reuses target/ with these commands.
+case " $shape " in
+  *" --shared-cache sccache "*)
+    DEV_ENV+=(
+      RUSTC_WRAPPER=sccache
+      SCCACHE_ENDPOINT=http://registry.vk/s3
+      SCCACHE_BUCKET=job
+      SCCACHE_S3_KEY_PREFIX=sccache
+      SCCACHE_REGION=auto
+      SCCACHE_S3_NO_CREDENTIALS=true
+      SCCACHE_S3_USE_SSL=false
+    )
+    ;;
+esac
 
 # Run guest commands as the host uid/gid: rootless virtio-fs creates files in /work only as
 # the host owner (or root). Explicit gid too, so an entry-less uid does not fall to gid 0

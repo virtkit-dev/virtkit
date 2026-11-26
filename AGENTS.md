@@ -214,10 +214,16 @@ also deletes the stopped VMs of this repository's checkouts that no longer exist
 `vk` and a `flock` on `PATH` are required and there is deliberately no Docker fallback.
 `VK_DEV_CPUS` and `VK_DEV_MEM` size the VM, `VK_DEV_IDLE_SECS` sets that idle window
 (`0` keeps the VM until it is stopped), and `VK_DEV_CMD_TIMEOUT` caps each cargo command
-(default one hour, `0` for no limit). Use `./build.sh --fast` only when an executable
-is actually needed for runtime testing. `./dev.sh shell` opens an interactive shell in
-that VM (same user, directory and cargo environment) and holds the VM for as long as
-the shell runs, for the odd cargo or toolchain command the modes above refuse.
+(default one hour, `0` for no limit). When the `vk` on `PATH` can lend shared caches
+(`vk check --feature shared-cache`), cargo compiles through sccache, cached in that `vk`'s
+`sccache` shared cache: checkouts using the same store can reuse matching dependency
+builds, while the workspace's own crates still compile incrementally, uncached.
+`VK_DEV_SCCACHE=0` turns it off; `./build.sh` never uses it, for fast and release builds
+alike. Turning it on or off restarts the VM only once no other `dev.sh` command uses it.
+Use `./build.sh --fast` only when an executable is actually needed for runtime testing.
+`./dev.sh shell` opens an interactive shell in that VM (same user, directory and build
+settings) and holds the VM for as long as the shell runs, for the odd cargo or toolchain
+command the modes above refuse.
 That VM boots with nested virtualization where the host allows it and the `vk` on
 `PATH` can ask for it, so the shell can also *run* what it builds: `./dist/vk run …`
 works inside it, as does `./build.sh --fast --use-virtkit=./dist`, their images and
