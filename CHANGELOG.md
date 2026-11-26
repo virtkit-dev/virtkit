@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `vk-registry` stores ZIP uploads as received, saving compression and decompression work
+  on sccache writes and reads.
+
 ## [0.117.0] - 2026-11-26
 
 ### Added

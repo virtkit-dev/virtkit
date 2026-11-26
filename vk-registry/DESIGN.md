@@ -145,7 +145,8 @@ canonical content length without decompressing the blob. The server stores the f
 verbatim and either serves it to an aware client or decompresses it for an ordinary OCI
 client. Compression is adaptive: content that does not shrink is stored and uploaded in
 canonical form. The server skips compression for raw uploads with gzip, zstd, xz or bzip2
-headers. Clients that do not see the capability header use standard identity uploads.
+headers or a ZIP local file header. Clients that do not see the capability header use
+standard identity uploads.
 
 Serving is symmetric. A blob `GET` reads the stored file a chunk at a time at the client's
 pace, decoding a stored frame on the way out for a client that cannot take zstd, so no

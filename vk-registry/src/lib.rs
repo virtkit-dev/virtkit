@@ -281,7 +281,9 @@ fn stream_body_with_pool(
 /// Absent on any dumb OCI registry.
 pub const TRANSPARENT_ZSTD_HEADER: &str = "x-virtkit-transparent-zstd";
 
-/// Detect gzip, zstd, xz, and bzip2 containers by magic number to avoid recompressing them.
+/// Detect gzip, zstd, xz, bzip2 and ZIP by magic number to skip recompression.
+/// ZIP members are usually compressed. Recompressing sccache's zstd-compressed
+/// members saved under 0.1%. ZIPs with uncompressed members may use more disk space.
 ///
 /// Files shorter than the longest magic are treated as uncompressed; I/O errors propagate.
 fn already_compressed(path: &Path) -> Result<bool> {
@@ -294,11 +296,12 @@ fn already_compressed(path: &Path) -> Result<bool> {
         .read_to_end(&mut head)
         .with_context(|| format!("reading the header of {}", path.display()))?;
     Ok(
-        head.starts_with(&[0x1f, 0x8b])                       // gzip
-        || head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])       // zstd
+        head.starts_with(&[0x1f, 0x8b])                            // gzip
+        || head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])             // zstd
         || head.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) // xz
-        || head.starts_with(b"BZh"),
-    ) // bzip2
+        || head.starts_with(b"BZh")                                // bzip2
+        || head.starts_with(b"PK\x03\x04"), // ZIP local file header
+    )
 }
 
 /// zstd `tmp` into a sibling temp file, returning its path — or `None`, having removed it,
@@ -12568,6 +12571,7 @@ mod tests {
             ("zst", &[0x28, 0xb5, 0x2f, 0xfd][..]),
             ("xz", &[0xfd, b'7', b'z', b'X', b'Z', 0x00][..]),
             ("bz2", b"BZh9"),
+            ("zip", b"PK\x03\x04"),
         ] {
             let mut bytes = magic.to_vec();
             bytes.extend(std::iter::repeat_n(0u8, 64));
@@ -12575,6 +12579,8 @@ mod tests {
         }
         // The xz magic is six bytes, so a five-byte prefix of it is not one.
         assert!(!probe("short-xz", &[0xfd, b'7', b'z', b'X', b'Z']));
+        // An empty ZIP starts with the end-of-central-directory record.
+        assert!(!probe("zip-eocd", b"PK\x05\x06\0\0\0\0\0\0\0\0"));
         assert!(!probe("empty", b""));
         assert!(!probe("tar", b"./PaxHeaders"));
         std::fs::remove_dir_all(&dir).unwrap();
