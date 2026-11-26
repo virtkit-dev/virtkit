@@ -26,6 +26,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -401,6 +402,9 @@ pub struct Store {
     /// The bytes of the file puts streaming now that the filesystem could not set aside for
     /// them, which the free space must still cover.
     pub(crate) unclaimed_puts: std::sync::Mutex<u64>,
+    /// Directory listing attempts across all repository walks, including gc, `stats`,
+    /// repository listings and lookups ([`Store::repo_dir_reads`]).
+    repo_dir_reads: AtomicU64,
 }
 
 /// File puts a server streams into one store at once: each holds a file's worth of its
@@ -549,6 +553,7 @@ impl Store {
             prefix_windows: std::sync::Mutex::new(Vec::new()),
             file_puts: tokio::sync::Semaphore::new(FILE_PUTS),
             unclaimed_puts: std::sync::Mutex::new(0),
+            repo_dir_reads: AtomicU64::new(0),
         }
     }
 
@@ -1528,15 +1533,36 @@ impl Store {
         let repos = self.root.join("repos");
         self.repo_dirs_any(REPO_SUBDIRS)
             .0
-            .into_iter()
-            .filter_map(|d| {
-                let name = d.parent()?.strip_prefix(&repos).ok()?.to_str()?;
-                // Only a name this store could have written itself, as `repo_names` does:
-                // this feeds `accounts::authorize`, and a directory left there by anything
-                // else is not a repository to ask about.
-                valid_name(name).then(|| name.to_string())
-            })
+            .iter()
+            .filter_map(|d| repo_of(&repos, d))
             .collect()
+    }
+
+    /// Whether a repository in `tree` that `readable` accepts holds `hex`, stopping at the
+    /// first. Only readable repositories get membership checks, each for the record type
+    /// whose directory the walk found.
+    fn tree_holds(&self, tree: RepoTree, hex: &str, readable: &dyn Fn(&str) -> bool) -> bool {
+        if !is_blob_hex(hex) {
+            return false;
+        }
+        let repos = self.root.join("repos");
+        let mut held = false;
+        self.walk_repo_dirs(tree, MEMBER_SUBDIRS, &mut |d| {
+            let Some(name) = repo_of(&repos, d).filter(|n| readable(n)) else {
+                return ControlFlow::Continue(());
+            };
+            held = match d.file_name().and_then(|n| n.to_str()) {
+                Some("blobs") => self.repo_has_blob(&name, hex),
+                Some("manifests") => self.repo_has_manifest(&name, hex),
+                _ => false,
+            };
+            if held {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        held
     }
 
     /// Every tag under `repos/<name>/tags`, sorted — shared by the OCI `tags/list`
@@ -2954,13 +2980,53 @@ impl Store {
     /// listing. Stopping there makes this O(repositories).
     fn repo_dirs_any(&self, kinds: &[&str]) -> (Vec<PathBuf>, Option<PathBuf>) {
         let mut out = Vec::new();
+        let unseen = self.walk_repo_dirs(RepoTree::All, kinds, &mut |p| {
+            out.push(p.to_path_buf());
+            ControlFlow::Continue(())
+        });
+        (out, unseen)
+    }
+
+    /// Visit matching layout directories in `tree` until `visit` breaks. Return the first
+    /// path the walk could not inspect before it stopped (see [`Store::repo_dirs_any`]).
+    fn walk_repo_dirs(
+        &self,
+        tree: RepoTree,
+        kinds: &[&str],
+        visit: &mut dyn FnMut(&Path) -> ControlFlow<()>,
+    ) -> Option<PathBuf> {
+        let repos = self.root.join("repos");
+        let (start, start_depth) = match tree {
+            RepoTree::All | RepoTree::OutsideFiles => (repos.clone(), 0usize),
+            RepoTree::Files => (repos.join(vk_hub_proto::token::FILES_REPO), 1),
+        };
+        // A walk starting below `repos/` skips the normal descent. Check each component
+        // for symlinks to report. Missing or non-directory components mean an empty tree.
+        let mut on_the_way = repos.clone();
+        for c in start
+            .strip_prefix(&repos)
+            .into_iter()
+            .flat_map(Path::components)
+        {
+            on_the_way.push(c);
+            match std::fs::symlink_metadata(&on_the_way) {
+                Ok(m) if m.file_type().is_symlink() => return Some(on_the_way),
+                Ok(m) if m.is_dir() => {}
+                Ok(_) => return None,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(_) => return Some(on_the_way),
+            }
+        }
         let mut unseen: Option<PathBuf> = None;
-        let mut stack = vec![(self.root.join("repos"), 0usize)];
+        let mut stack = vec![(start, start_depth)];
         while let Some((d, depth)) = stack.pop() {
+            self.repo_dir_reads.fetch_add(1, Ordering::Relaxed);
             let entries = match std::fs::read_dir(&d) {
                 Ok(e) => e,
-                // `repos/` itself absent is an empty store, not an incomplete walk
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && depth == 0 => continue,
+                // A missing walk root is an empty tree.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && depth == start_depth => {
+                    continue;
+                }
                 Err(_) => {
                     unseen = unseen.or(Some(d));
                     continue;
@@ -2988,9 +3054,15 @@ impl Store {
                 // store's own tree as unseen. It is what keeps this O(repositories) rather
                 // than one `stat` per membership marker under `blobs/`.
                 let base = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                if depth == 0
+                    && tree == RepoTree::OutsideFiles
+                    && base == vk_hub_proto::token::FILES_REPO
+                {
+                    continue;
+                }
                 if REPO_SUBDIRS.contains(&base) {
-                    if kinds.contains(&base) {
-                        out.push(p);
+                    if kinds.contains(&base) && visit(&p).is_break() {
+                        return unseen;
                     }
                 } else if depth < MAX_NAME_SEGMENTS {
                     stack.push((p, depth + 1));
@@ -2999,8 +3071,31 @@ impl Store {
                 }
             }
         }
-        (out, unseen)
+        unseen
     }
+
+    /// Tests count directory listing attempts to check how lookup cost scales with store size.
+    #[doc(hidden)]
+    pub fn repo_dir_reads(&self) -> u64 {
+        self.repo_dir_reads.load(Ordering::Relaxed)
+    }
+}
+
+/// Extract the repository name from a layout directory such as `<repos>/<name>/tags`.
+/// As in `repo_names`, validate the name before passing it to `accounts::authorize`.
+fn repo_of(repos: &Path, dir: &Path) -> Option<String> {
+    let name = dir.parent()?.strip_prefix(repos).ok()?.to_str()?;
+    valid_name(name).then(|| name.to_string())
+}
+
+/// The part of `repos/` a walk covers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RepoTree {
+    All,
+    /// Everything but the top-level `files/` tree, the WebDAV plain-file directories.
+    OutsideFiles,
+    /// Only the top-level `files/` tree, the repository named `files` included.
+    Files,
 }
 
 /// The directories a repository keeps its own state in. The walk in
@@ -3008,6 +3103,9 @@ impl Store {
 /// component may not have — a pre-existing limitation of this layout, now shared by
 /// `blobs` as it always was by `tags` and `manifests`.
 const REPO_SUBDIRS: &[&str] = &["tags", "manifests", "blobs"];
+
+/// The [`REPO_SUBDIRS`] that hold digest membership records.
+const MEMBER_SUBDIRS: &[&str] = &["manifests", "blobs"];
 
 /// Maximum manifest `PUT` body size. Bounds memory and per-digest authorization work
 /// under the store lock. Fits [`MAX_MANIFEST_REFERENCES`] layer descriptors of about
@@ -5862,10 +5960,8 @@ impl Authz<'_> {
 /// and cross-repo dedup keeps working. In shared-secret mode every repo is readable, so
 /// no read is ever refused that was served before.
 ///
-/// The `any_holds` walk is O(readable repositories) and runs only on a miss in `name`,
-/// so a pull — every digest a member of the repository it is pulled from — pays one
-/// `stat`. A caller naming digests it does not hold pays the walk per request; see
-/// DESIGN.md.
+/// Scoped reads check the local blob record first, then the manifest record on a miss.
+/// A miss on both triggers a cross-repository walk for that request (see DESIGN.md).
 pub(crate) fn readable_through(authz: &Authz<'_>, store: &Store, name: &str, hex: &str) -> bool {
     // Shared-secret (or open) mode has no per-repo scopes to enforce: every repository is
     // readable, so this is unconditionally true and no read is refused that was not
@@ -5876,8 +5972,16 @@ pub(crate) fn readable_through(authz: &Authz<'_>, store: &Store, name: &str, hex
     if store.repo_has_blob(name, hex) || store.repo_has_manifest(name, hex) {
         return true;
     }
-    store.any_holds(&readable_repos(authz, store, name), hex)
+    let readable = |r: &str| r != name && authz.may_read(r);
+    // A WebDAV compiler cache can have thousands of shard directories under `files/`.
+    // Search them only if no readable repository outside `files/` holds the digest.
+    TREES_IN_LOOKUP_ORDER
+        .iter()
+        .any(|&tree| store.tree_holds(tree, hex, &readable))
 }
+
+/// `repos/` in the order a cross-repository lookup searches it: see [`readable_through`].
+const TREES_IN_LOOKUP_ORDER: [RepoTree; 2] = [RepoTree::OutsideFiles, RepoTree::Files];
 
 /// The other repositories this caller may read — computed before any per-digest work, so
 /// a manifest with hundreds of layers walks `repos/` once rather than once per layer, and
@@ -11377,6 +11481,140 @@ mod tests {
                 .unwrap();
         assert!(matches!(outcome, Mount::Done));
         assert!(store.repo_has_blob("p/gl/42/app", &hex));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store shaped like a compiler cache over WebDAV: `shards` `files/` directories under
+    /// `prefix`, each holding one entry, as `sccache`'s `a/b/c/<key>` layout leaves them.
+    fn with_cache_shards(store: &Store, prefix: &str, shards: usize) {
+        let entry = store.put_blob(b"a cached object").unwrap();
+        for i in 0..shards {
+            let shard = format!(
+                "files/{prefix}/{:x}/{:x}/{:x}",
+                i / 256,
+                i / 16 % 16,
+                i % 16
+            );
+            store.record_blob(&shard, &hex(&entry)).unwrap();
+        }
+    }
+
+    /// An image layer is found without listing cache shards. A digest held only under
+    /// `files/` remains readable through another repository the caller can read.
+    #[test]
+    fn a_cross_repo_lookup_searches_the_files_tree_last() {
+        let dir = testtmp::root().join("regserve-files-last");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        const SHARDS: usize = 512;
+        with_cache_shards(&store, "team/sccache", SHARDS);
+        let c = claims(&[("team", "rw")]);
+        let authz = Authz::Token(&c);
+
+        let image = hex(&store.put_blob(b"an image layer").unwrap());
+        store.record_blob("team/base", &image).unwrap();
+        let before = store.repo_dir_reads();
+        assert!(readable_through(&authz, &store, "team/app", &image));
+        let reads = store.repo_dir_reads() - before;
+        // `repos/`, `repos/team`, `repos/team/base`: none of the shards.
+        assert!(reads <= 3, "{reads} directory reads to find an image layer");
+
+        let file = hex(&store.put_blob(b"a file put over WebDAV").unwrap());
+        store.record_blob("files/team/iso", &file).unwrap();
+        assert!(readable_through(&authz, &store, "team/app", &file));
+        assert!(readable_through(&authz, &store, "files/team/other", &file));
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"config":{{"digest":"sha256:{file}","size":22}},"layers":[]}}"#
+        );
+        let outcome =
+            authorize_and_mount_manifest_blobs(&authz, &store, "team/app", manifest.as_bytes())
+                .unwrap();
+        assert!(matches!(outcome, Mount::Done));
+        assert!(store.repo_has_blob("team/app", &file));
+
+        // Held only where the caller may not read: refused, from either tree.
+        let other = hex(&store.put_blob(b"another team's file").unwrap());
+        store.record_blob("files/other/iso", &other).unwrap();
+        store.record_blob("other/app", &other).unwrap();
+        assert!(!readable_through(&authz, &store, "team/app", &other));
+        assert!(!readable_through(&authz, &store, "files/team/iso", &other));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cross-repository lookup's edges: a store with no `files/` tree, a manifest held
+    /// elsewhere, the repository named `files` itself, a symlinked `files/`, which is not
+    /// followed any more than the full walk follows it, and a `files` that is no directory.
+    #[test]
+    fn a_cross_repo_lookup_handles_tree_edges() {
+        let dir = testtmp::root().join("regserve-lookup-edges");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let team = claims(&[("team", "rw")]);
+        let team = Authz::Token(&team);
+
+        // No `files/` tree at all: a miss is a plain refusal.
+        let absent = "ab".repeat(32);
+        assert!(!readable_through(&team, &store, "team/app", &absent));
+
+        // A manifest by digest, held only in another repository's `manifests/`.
+        let manifest = store
+            .put_manifest("team/base", "v1", DEFAULT_MANIFEST_TYPE, b"{}")
+            .unwrap();
+        let manifest = manifest.strip_prefix("sha256:").unwrap();
+        assert!(readable_through(&team, &store, "team/app", manifest));
+        let other = store
+            .put_manifest("other/base", "v1", DEFAULT_MANIFEST_TYPE, b"{\"a\":1}")
+            .unwrap();
+        let other = other.strip_prefix("sha256:").unwrap();
+        assert!(!readable_through(&team, &store, "team/app", other));
+
+        // Sessions can read the top-level `files` repository. Hub token grants exclude it.
+        let medium = hex(&store.put_blob(b"held by files itself").unwrap());
+        store.record_blob("files", &medium).unwrap();
+        assert!(!readable_through(&team, &store, "team/app", &medium));
+        let session = accounts::Principal::Session(accounts::User {
+            id: "https://issuer\u{1f}sub-1".to_string(),
+            oidc_issuer: "https://issuer".to_string(),
+            oidc_subject: "sub-1".to_string(),
+            email: None,
+            display_name: None,
+            is_admin: false,
+            created_at: SystemTime::UNIX_EPOCH,
+            last_login_at: SystemTime::UNIX_EPOCH,
+        });
+        assert!(readable_through(
+            &Authz::Accounts(&session),
+            &store,
+            "team/app",
+            &medium
+        ));
+
+        // A symlinked `files/` is reported, not followed.
+        let held = hex(&store.put_blob(b"behind a symlink").unwrap());
+        store.record_blob("elsewhere/team/iso", &held).unwrap();
+        let files = dir.join("repos").join("files");
+        std::fs::remove_dir_all(&files).unwrap();
+        std::os::unix::fs::symlink(dir.join("repos").join("elsewhere"), &files).unwrap();
+        assert_eq!(
+            store.walk_repo_dirs(RepoTree::Files, MEMBER_SUBDIRS, &mut |_| {
+                ControlFlow::Continue(())
+            }),
+            Some(files.clone())
+        );
+        assert!(!readable_through(&team, &store, "team/app", &held));
+
+        // A `files` that is a plain file is an empty tree, not an unseen one.
+        std::fs::remove_file(&files).unwrap();
+        std::fs::write(&files, b"").unwrap();
+        assert_eq!(
+            store.walk_repo_dirs(RepoTree::Files, MEMBER_SUBDIRS, &mut |_| {
+                ControlFlow::Continue(())
+            }),
+            None
+        );
+        assert!(!readable_through(&team, &store, "team/app", &held));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

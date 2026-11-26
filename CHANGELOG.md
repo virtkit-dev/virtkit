@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `vk-registry` finds blobs held by other image repositories faster when the registry
+  also hosts a WebDAV compiler cache.
+
 ## [0.116.1] - 2026-11-24
 
 ### Fixed
