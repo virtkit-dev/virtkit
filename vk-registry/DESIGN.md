@@ -213,6 +213,9 @@ miss searches the repositories the principal may read, the `files/` tree last, s
 an image repository holds is found without listing the WebDAV directories. A manifest
 `PUT` lists readable repositories only if a reference needs a cross-repository check. For a
 hub token, the search is limited to `<prefix>` and `files/<prefix>` for each read grant.
+For users and API keys, one blob-pool lookup skips the search if the digest is absent.
+A read-scoped API key can use `HEAD` timing to distinguish this miss from a digest held
+only in unreadable repositories. Hub tokens search their granted trees in either case.
 
 A manifest `PUT` naming a digest that is not `sha256:<64 lowercase hex>` — config, layer,
 index child or subject — is refused with `DIGEST_INVALID`, in every mode, rather than having
@@ -875,9 +878,9 @@ when that is still below `max_connections` plus 256. The unit `install-service` 
   each entry costs about five files — the tag, the manifest sidecar, the layer's membership
   marker and the pool's manifest and layer blobs, the last two shared with identical
   entries. An account's `/v2/` membership lookup (`readable_through`) can reach those
-  directories on a miss. Store-wide walks for `/dav/repos/` prefix lookups and listings,
-  `/browse`, `status` and `gc` also visit them. A hub token searches only its granted trees,
-  including `files/<prefix>`.
+  directories on a miss for a digest the store holds. Store-wide walks for `/dav/repos/`
+  prefix lookups and listings, `/browse`, `status` and `gc` also visit them. A hub token
+  searches only its granted trees, including `files/<prefix>`.
 - The `files/` area trusts its writers: a stored compiler-cache entry is linked into every
   project computing the same key, so write access belongs to trusted pipelines only (see
   "WebDAV view").

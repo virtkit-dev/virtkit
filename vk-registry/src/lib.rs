@@ -5984,7 +5984,8 @@ impl Authz<'_> {
 /// no read is ever refused that was served before.
 ///
 /// Scoped reads check the local blob record first, then the manifest record on a miss.
-/// A miss on both triggers a cross-repository walk for that request (see DESIGN.md).
+/// On a miss in both, hub tokens search their granted trees. Accounts search readable
+/// repositories only if the blob pool holds the digest (see DESIGN.md).
 pub(crate) fn readable_through(authz: &Authz<'_>, store: &Store, name: &str, hex: &str) -> bool {
     // Shared-secret (or open) mode has no per-repo scopes to enforce: every repository is
     // readable, so this is unconditionally true and no read is refused that was not
@@ -5994,6 +5995,13 @@ pub(crate) fn readable_through(authz: &Authz<'_>, store: &Store, name: &str, hex
     }
     if store.repo_has_blob(name, hex) || store.repo_has_manifest(name, hex) {
         return true;
+    }
+    // A push probes for new blobs before uploading them. Checking the compressed and
+    // identity paths rules out an absent digest without searching any repositories.
+    // As in `authorize_and_mount_manifest_blobs`, users and API keys can infer pool
+    // membership from `HEAD` timing. Hub tokens always search within their grants.
+    if !matches!(authz, Authz::Token(_)) && store.find_blob(hex).is_none() {
+        return false;
     }
     let readable = |r: &str| r != name && authz.may_read(r);
     lookup_trees(authz)
@@ -11785,6 +11793,85 @@ mod tests {
             "p/gl/42/app",
             &unreadable
         ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On a local miss, accounts search readable repositories only for stored digests.
+    /// Hub tokens search their grants even for absent digests.
+    #[test]
+    fn an_accounts_miss_on_an_absent_digest_walks_nothing() {
+        let dir = testtmp::root().join("regserve-absent-digest");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        with_cache_shards(&store, "ci/sccache", 256);
+        let principal = accounts::Principal::Session(accounts::User {
+            id: "https://issuer\u{1f}sub-1".to_string(),
+            oidc_issuer: "https://issuer".to_string(),
+            oidc_subject: "sub-1".to_string(),
+            email: None,
+            display_name: None,
+            is_admin: false,
+            created_at: SystemTime::UNIX_EPOCH,
+            last_login_at: SystemTime::UNIX_EPOCH,
+        });
+        let authz = Authz::Accounts(&principal);
+
+        let key = accounts::Principal::ApiKey(accounts::ApiKey {
+            id: "hash".to_string(),
+            owner_user_id: None,
+            name: "ci".to_string(),
+            token_prefix: "0123abcd".to_string(),
+            scopes: vec![accounts::Scope {
+                action: accounts::Action::Read,
+                repo_pattern: "team/*".to_string(),
+            }],
+            created_at: SystemTime::UNIX_EPOCH,
+            last_used_at: None,
+            expires_at: None,
+            revoked_at: None,
+        });
+        let key = Authz::Accounts(&key);
+        let absent = "ab".repeat(32);
+
+        let before = store.repo_dir_reads();
+        assert!(!readable_through(&authz, &store, "team/app", &absent));
+        assert!(!readable_through(&key, &store, "team/app", &absent));
+        assert_eq!(store.repo_dir_reads(), before);
+
+        let cached = hex(&store.put_blob(b"a cached object").unwrap());
+        assert!(readable_through(&authz, &store, "team/app", &cached));
+        let before = store.repo_dir_reads();
+        assert!(!readable_through(&key, &store, "team/app", &cached));
+        assert!(store.repo_dir_reads() > before, "refused after a walk");
+        let layer = hex(&store.put_blob(b"held, by no repository").unwrap());
+        let before = store.repo_dir_reads();
+        assert!(!readable_through(&authz, &store, "team/app", &layer));
+        assert!(
+            store.repo_dir_reads() > before,
+            "a held digest is looked for"
+        );
+        store.record_blob("team/base", &layer).unwrap();
+        assert!(readable_through(&key, &store, "team/app", &layer));
+        let manifest = store
+            .put_manifest("other/base", "v1", DEFAULT_MANIFEST_TYPE, b"{}")
+            .unwrap();
+        let manifest = manifest.strip_prefix("sha256:").unwrap();
+        assert!(readable_through(&authz, &store, "team/app", manifest));
+        assert!(!readable_through(&key, &store, "team/app", manifest));
+
+        let c = claims(&[("ci", "r")]);
+        let before = store.repo_dir_reads();
+        assert!(!readable_through(
+            &Authz::Token(&c),
+            &store,
+            "ci/app",
+            &absent
+        ));
+        assert!(
+            store.repo_dir_reads() > before,
+            "a hub token walks its grants"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

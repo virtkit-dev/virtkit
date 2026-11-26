@@ -8,6 +8,8 @@ All notable changes to virtkit will be documented in this file.
 
 - `vk-registry` finds blobs held by other image repositories faster when the registry
   also hosts a WebDAV compiler cache.
+- `vk-registry` answers requests from users and API keys faster when a blob or
+  digest-addressed manifest is absent from the registry.
 
 ### Fixed
 
