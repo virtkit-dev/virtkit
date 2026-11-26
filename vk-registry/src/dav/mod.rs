@@ -9,10 +9,9 @@ mod files;
 mod repos;
 
 use std::fmt::Write as _;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bytes::Bytes;
 use hyper::body::Incoming;
 use hyper::header::{ALLOW, CONTENT_LENGTH, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS};
@@ -114,8 +113,7 @@ pub(crate) async fn refuse(
     files::drain_then(req, resp, href).await
 }
 
-/// Run `f` on the blocking pool with the store and the caller's authorization: filesystem
-/// walks, reads per listed member and the store lock stay off the tokio workers.
+/// [`crate::blocking`], labelled as a WebDAV request.
 pub(crate) async fn blocking<F>(
     state: &ServerState,
     authz: &Authz<'_>,
@@ -124,27 +122,7 @@ pub(crate) async fn blocking<F>(
 where
     F: FnOnce(&Store, &Authz<'_>) -> Result<Response<Body>> + Send + 'static,
 {
-    let store = Arc::clone(&state.store);
-    enum Owned {
-        NoScopes,
-        Accounts(crate::accounts::Principal),
-        Token(vk_hub_proto::token::Claims),
-    }
-    let owned = match authz {
-        Authz::NoScopes => Owned::NoScopes,
-        Authz::Accounts(p) => Owned::Accounts((*p).clone()),
-        Authz::Token(c) => Owned::Token((*c).clone()),
-    };
-    tokio::task::spawn_blocking(move || {
-        let authz = match &owned {
-            Owned::NoScopes => Authz::NoScopes,
-            Owned::Accounts(p) => Authz::Accounts(p),
-            Owned::Token(c) => Authz::Token(c),
-        };
-        f(&store, &authz)
-    })
-    .await
-    .context("a WebDAV request panicked")?
+    crate::blocking(&state.store, authz, "a WebDAV request", f).await
 }
 
 /// Decode the path after `/dav` into its components and whether it ended in a slash,

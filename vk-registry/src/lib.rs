@@ -5974,6 +5974,61 @@ impl Authz<'_> {
     }
 }
 
+/// An [`Authz`] held by value, for work handed to the blocking pool.
+enum OwnedAuthz {
+    NoScopes,
+    Accounts(accounts::Principal),
+    Token(vk_hub_proto::token::Claims),
+}
+
+impl OwnedAuthz {
+    fn of(authz: &Authz<'_>) -> Self {
+        match authz {
+            Authz::NoScopes => OwnedAuthz::NoScopes,
+            Authz::Accounts(p) => OwnedAuthz::Accounts((*p).clone()),
+            Authz::Token(c) => OwnedAuthz::Token((*c).clone()),
+        }
+    }
+
+    fn authz(&self) -> Authz<'_> {
+        match self {
+            OwnedAuthz::NoScopes => Authz::NoScopes,
+            OwnedAuthz::Accounts(p) => Authz::Accounts(p),
+            OwnedAuthz::Token(c) => Authz::Token(c),
+        }
+    }
+}
+
+/// Run `f` on the blocking pool with the store and the caller's authorization.
+/// Membership lookups, repository walks and store lock waits would otherwise
+/// stall other connections on the same Tokio worker. `what` identifies the work
+/// if the task panics or runtime shutdown cancels it.
+pub(crate) async fn blocking<T, F>(
+    store: &Arc<Store>,
+    authz: &Authz<'_>,
+    what: &'static str,
+    f: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Store, &Authz<'_>) -> Result<T> + Send + 'static,
+{
+    let owned = OwnedAuthz::of(authz);
+    store_blocking(store, what, move |store| f(store, &owned.authz())).await
+}
+
+/// [`blocking`] for work that needs no authorization.
+pub(crate) async fn store_blocking<T, F>(store: &Arc<Store>, what: &'static str, f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Store) -> Result<T> + Send + 'static,
+{
+    let store = Arc::clone(store);
+    tokio::task::spawn_blocking(move || f(&store))
+        .await
+        .with_context(|| format!("{what} did not complete"))?
+}
+
 /// Whether `hex` may be read through repository `name` by this caller.
 ///
 /// The store is one content-addressed pool, so holding a digest is not an entitlement to
