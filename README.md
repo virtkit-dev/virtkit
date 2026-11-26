@@ -422,7 +422,7 @@ uses (`net.mode = "tap"` or a `pool` tap) and a static `ip` overlapping the swit
 `vk run --tap NAME` (with `--tap-mac`, `--tap-ip`, `--tap-gw`, `--tap-dns`) does the same
 for the primary, overriding its service's `tap`, and combines with `--net`. A tap guest
 rules out `--audit-egress` and a restricted egress policy, which live on the switch, and a
-tap primary `--registry-proxy`.
+tap primary rules out both `--registry-proxy` and `--shared-cache`.
 `vk check --feature tap` reports whether a `vk` supports it.
 A [Windows guest](#windows-guests) takes a tap too, `vk run --tap` on a bundle or `tap` on a
 Windows service: Windows reads no kernel command line, so vk sets a static `ip` through

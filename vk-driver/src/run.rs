@@ -417,9 +417,13 @@ pub enum RegistryProxy {
     /// `--registry-proxy`: the upstream registry base URL (`scheme://host`), forwarded to
     /// with the `--username`/`--password` credential and the `--ca` trust.
     Upstream(String),
-    /// `vk dev`'s `[dev.cache] shared`: the shared cache store ([`crate::sharedcache`]), its
-    /// proxy confined to the shared caches these aliases name.
-    Areas(Vec<String>),
+    /// The shared cache store ([`crate::sharedcache`]), its proxy confined to the shared
+    /// caches these aliases name. `asked_as` names the flag or config key that asked for
+    /// them, for diagnostics ([`crate::sharedcache::lend`]).
+    Areas {
+        aliases: Vec<String>,
+        asked_as: &'static str,
+    },
 }
 
 impl RegistryProxy {
@@ -427,7 +431,7 @@ impl RegistryProxy {
     pub fn asked_as(&self) -> &'static str {
         match self {
             RegistryProxy::Upstream(_) => "--registry-proxy",
-            RegistryProxy::Areas(_) => "`[dev.cache] shared`",
+            RegistryProxy::Areas { asked_as, .. } => asked_as,
         }
     }
 }
@@ -2557,10 +2561,10 @@ async fn build_and_boot(
                     }
                     // Served by this run for as long as it lasts: runs share the store,
                     // each with a server and a credential of its own.
-                    RegistryProxy::Areas(aliases) => {
+                    RegistryProxy::Areas { aliases, asked_as } => {
                         crate::sharedcache::serve(&crate::sharedcache::store_root()?, aliases)
                             .await
-                            .context("serving the shared cache (`[dev.cache] shared`)")?
+                            .with_context(|| format!("serving the shared cache ({asked_as})"))?
                     }
                 };
                 let socket = crate::regproxy::spawn(cfg).await?;

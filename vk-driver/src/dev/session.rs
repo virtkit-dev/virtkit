@@ -609,6 +609,7 @@ async fn exec_with(
         &plan.cache.shared,
         plan.exec_env.iter().map(|e| e.name.as_str()),
         "`exec-env`",
+        crate::sharedcache::DEV_SHARED,
     )?;
     let entry = crate::vms::resolve_one(Some(&plan.state_dir))?;
     let addr: vk_core::addr::SocketAddr = entry.exec_addr.parse()?;

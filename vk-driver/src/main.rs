@@ -2221,6 +2221,23 @@ enum Cmd {
         /// `--username`/`--password`/`--ca`. Needs `--net`. The job never sees the credentials.
         #[arg(long = "registry-proxy", value_name = "URL", help_heading = "Network")]
         registry_proxy: Option<String>,
+        /// share this cache with the guest (repeatable)
+        ///
+        /// The same shared caches `vk dev`'s `[dev.cache] shared` names. The guest needs no
+        /// credential: the cache is at `http://registry.vk/job/<NAME>`, and sccache's S3
+        /// endpoint at `http://registry.vk/s3`. The run sets `VK_REGISTRY`,
+        /// `VK_REGISTRY_CACHES` and `VK_REGISTRY_AREAS` (its older name), which --env and
+        /// --env-file may then not set.
+        ///
+        /// A plain run needs --net; a --compose run needs a primary VM. Conflicts with
+        /// --registry-proxy and a tap primary.
+        #[arg(
+            long = "shared-cache",
+            value_name = "NAME",
+            conflicts_with = "registry_proxy",
+            help_heading = "Network"
+        )]
+        shared_cache: Vec<String>,
         /// boot this compose file's services as sibling microVMs (implies --net)
         ///
         /// They share the run's LAN, the command reaches them by alias, and everything is torn
@@ -3771,11 +3788,11 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
     )?;
     writeln!(
         out,
-        "                the caches `vk dev` environments share (`[dev.cache] shared`), made on"
+        "                the caches `vk dev` (`[dev.cache] shared`) and `vk run --shared-cache`"
     )?;
     writeln!(
         out,
-        "                first use; `vk gc` collects them like the build cache"
+        "                share, made on first use; `vk gc` collects them like the build cache"
     )?;
     writeln!(out)?;
     let vms = vms::registry_dir()?;
@@ -4372,6 +4389,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         egress_restrict,
         build_audit_egress,
         registry_proxy,
+        shared_cache,
         compose,
         profile,
         primary,
@@ -4446,6 +4464,10 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 ),
                 2,
             );
+        }
+        // Before any image work.
+        if let Err(e) = shared_cache_needs(shared_cache, services_only, *net || compose.is_some()) {
+            return fail(&e, 2);
         }
         if *audit_egress && !*net && compose.is_none() {
             return fail(
@@ -4573,7 +4595,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Ok(tap) => tap,
             Err(e) => return fail(&e, 2),
         };
-        let args = run::RunArgs {
+        let mut args = run::RunArgs {
             image: image.clone().unwrap_or_default(),
             dockerfiles: file.clone(),
             target: target.clone(),
@@ -4657,6 +4679,14 @@ async fn cli_main(cli: Cli) -> ExitCode {
             detach_log: detach_log.clone(),
             command: command.clone(),
         };
+        if let Err(e) = sharedcache::lend(
+            &mut args,
+            shared_cache,
+            sharedcache::RUN_SHARED,
+            "--env/--env-file",
+        ) {
+            return fail(&e, 2);
+        }
         // `main` gave a named or detached run its state dir; any other needs `--state-dir`.
         if args.ssh_client && args.state_dir.is_none() {
             return fail(
@@ -7281,6 +7311,32 @@ fn resolve_service_addr(entry: &vms::VmEntry, service: &str) -> anyhow::Result<S
 }
 
 /// Parse a switch `--registry-proxy` value `<sentinel-ip>=@<socket-name>`.
+/// Refuse `vk run --shared-cache` where nothing would reach the caches: a services-only
+/// run serves no registry proxy and has no primary to name them to, and a run without the
+/// switch has no `registry.vk`.
+fn shared_cache_needs(
+    shared_cache: &[String],
+    services_only: bool,
+    switch: bool,
+) -> anyhow::Result<()> {
+    if shared_cache.is_empty() {
+        return Ok(());
+    }
+    if services_only {
+        anyhow::bail!(
+            "--shared-cache needs a primary VM: --compose without an image/-f/--primary is \
+             services-only"
+        );
+    }
+    if !switch {
+        anyhow::bail!(
+            "--shared-cache requires --net (or --compose): the guest reaches the caches through \
+             the switch"
+        );
+    }
+    Ok(())
+}
+
 fn parse_registry_proxy(s: &str) -> anyhow::Result<(std::net::Ipv4Addr, regproxy::ProxySocket)> {
     let (ip, socket) = s
         .split_once('=')
@@ -8318,6 +8374,52 @@ mod tests {
         assert!(Cli::try_parse_from(["vk", "run", "--atop", "30", "debian:12"]).is_err());
         // A zero interval would have the guest sampling without pause.
         assert!(Cli::try_parse_from(["vk", "run", "--atop=0", "debian:12"]).is_err());
+    }
+
+    #[test]
+    fn a_shared_cache_needs_a_primary_on_the_switch() {
+        let one = ["sccache".to_string()];
+        assert!(shared_cache_needs(&[], true, false).is_ok());
+        assert!(shared_cache_needs(&one, false, true).is_ok());
+        let err = shared_cache_needs(&one, true, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs a primary VM"), "{err}");
+        let err = shared_cache_needs(&one, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires --net"), "{err}");
+    }
+
+    #[test]
+    fn run_shared_cache_flag_repeats_and_excludes_a_registry_proxy() {
+        let cli = Cli::try_parse_from([
+            "vk",
+            "run",
+            "--net",
+            "--shared-cache",
+            "a",
+            "--shared-cache",
+            "b",
+            "debian:12",
+        ])
+        .unwrap();
+        let Cmd::Run { shared_cache, .. } = cli.cmd else {
+            panic!("expected Cmd::Run")
+        };
+        assert_eq!(shared_cache, ["a", "b"]);
+        let Err(err) = Cli::try_parse_from([
+            "vk",
+            "run",
+            "--shared-cache",
+            "a",
+            "--registry-proxy",
+            "https://r.example",
+            "debian:12",
+        ]) else {
+            panic!("--shared-cache with --registry-proxy parsed");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     /// `vk run --allow-name/--allow-ip` repeat into the run's allowlist, `--compose` gives

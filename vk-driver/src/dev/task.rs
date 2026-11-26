@@ -131,6 +131,7 @@ async fn attach(plan: &Plan, task: &TaskPlan, extra: &[String]) -> Result<ExitCo
         &plan.cache.shared,
         task.env.iter().map(|e| e.name.as_str()),
         &format!("task {}'s `env`", task.name),
+        crate::sharedcache::DEV_SHARED,
     )?;
     let mut argv = task.argv.clone();
     argv.extend_from_slice(extra);

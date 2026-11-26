@@ -1451,6 +1451,12 @@ impl Plan {
         if self.cached_only {
             out.push_str("  --require-cached \\\n");
         }
+        if !self.cache.shared.is_empty() && !matches!(self.source, Source::Compose { .. }) {
+            out.push_str("  --net \\\n");
+        }
+        for name in &self.cache.shared {
+            arg(&mut out, "--shared-cache", name);
+        }
         out.push_str("  --ssh-client\n");
         if let Some(ssh) = &self.ssh {
             comment(
@@ -1460,18 +1466,6 @@ impl Plan {
                      ~/.ssh/config — resolved at boot",
                     ssh.host.len(),
                     ssh.keys.len(),
-                ),
-            );
-        }
-        if !self.cache.shared.is_empty() {
-            comment(
-                &mut out,
-                &format!(
-                    "[dev.cache] shared: the guest reaches {} at http://{}/job/<name>, \
-                     named by VK_REGISTRY and VK_REGISTRY_CACHES — no `vk run` flag spells \
-                     this",
-                    self.cache.shared.join(" "),
-                    crate::regproxy::GUEST_HOST,
                 ),
             );
         }
@@ -2441,13 +2435,15 @@ extensions = ["ms-python.python"]
         );
         assert!(p.vscode.is_none() && p.managed_dirs.is_empty());
 
-        // Shared caches have no `vk run` flag: the printed plan says what the boot does.
-        assert!(!p.to_shell(false).unwrap().contains("shared cache"));
+        // Shared caches are `vk run --shared-cache`, which a plain run reaches through --net.
+        assert!(!p.to_shell(false).unwrap().contains("--shared-cache"));
         let mut cached = p.clone();
-        cached.cache.shared = vec!["task-cache".into()];
+        cached.cache.shared = vec!["other".into(), "task-cache".into()];
         let shell = cached.to_shell(false).unwrap();
         assert!(
-            shell.contains("# [dev.cache] shared: the guest reaches task-cache at"),
+            shell.contains(
+                "  --net \\\n  --shared-cache other \\\n  --shared-cache task-cache \\\n"
+            ),
             "{shell}"
         );
 

@@ -30,6 +30,9 @@ All notable changes to virtkit will be documented in this file.
 - `vk dev` environments can share sccache objects through a shared cache, with the
   settings a CI job uses: endpoint `http://registry.vk/s3`, bucket `job`, the cache's name
   as key prefix and no AWS credentials. `vk gc` collects unused objects with the rest.
+- `vk run --shared-cache <name>` lets a script share caches with your `vk dev`
+  environments that list the same `[dev.cache] shared` names. `vk check --feature
+  shared-cache` reports whether a `vk` supports it.
 
 ### Changed
 

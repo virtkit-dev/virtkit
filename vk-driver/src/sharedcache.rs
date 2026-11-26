@@ -1,6 +1,6 @@
 //! Shared caches: named caches in a content-addressed store of their own, which the guests
-//! of `vk dev` environments reach through their registry proxy. `[dev.cache] shared`
-//! selects the names it serves.
+//! of `vk dev` environments and of `vk run --shared-cache` reach through their registry
+//! proxy. `[dev.cache] shared` and `--shared-cache` select the names it serves ([`lend`]).
 //!
 //! To the proxy, each shared cache is an area, as a CI job's namespace alias is: its name is
 //! the alias, its repositories those under `dev/<alias>`. Each run that asks for shared
@@ -108,23 +108,59 @@ pub fn guest_env(aliases: &[String]) -> Vec<(String, String)> {
     ]
 }
 
+/// The config key that asks for shared caches, as diagnostics name it.
+pub const DEV_SHARED: &str = "`[dev.cache] shared`";
+
+/// The flag that asks for shared caches, as diagnostics name it.
+pub const RUN_SHARED: &str = "--shared-cache";
+
 /// With shared caches on, reserve the [`guest_env`] variables, so an override cannot point
 /// guest tools at another registry or at caches the proxy does not serve. Errors name the
-/// variable's source (`what`).
+/// variable's source (`what`) and the flag or config key that asked for the caches
+/// (`asked_as`).
 pub fn refuse_guest_env<'a>(
     aliases: &[String],
     names: impl IntoIterator<Item = &'a str>,
     what: &str,
+    asked_as: &str,
 ) -> Result<()> {
     if aliases.is_empty() {
         return Ok(());
     }
     if let Some(name) = names.into_iter().find(|n| GUEST_ENV.contains(n)) {
         bail!(
-            "{what} sets {name}, which `[dev.cache] shared` sets for the guest: remove it \
-             there, or drop the shared caches"
+            "{what} sets {name}, which {asked_as} sets for the guest: remove it there, or \
+             drop the shared caches"
         );
     }
+    Ok(())
+}
+
+/// Have `args`'s run serve the shared caches `aliases` names at `registry.vk` and advertise
+/// them in the guest's environment, which [`refuse_guest_env`] checks first.
+pub fn lend(
+    args: &mut crate::run::RunArgs,
+    aliases: &[String],
+    asked_as: &'static str,
+    what: &str,
+) -> Result<()> {
+    if aliases.is_empty() {
+        return Ok(());
+    }
+    for alias in aliases {
+        if let Err(why) = check_alias(alias) {
+            bail!("{asked_as} {alias:?} {why}");
+        }
+    }
+    refuse_guest_env(
+        aliases,
+        args.env.iter().map(|(name, _)| name.as_str()),
+        what,
+        asked_as,
+    )?;
+    let aliases = canonical(aliases);
+    args.env.extend(guest_env(&aliases));
+    args.registry_proxy = Some(crate::run::RegistryProxy::Areas { aliases, asked_as });
     Ok(())
 }
 
@@ -323,6 +359,62 @@ pub(crate) mod tests {
             store_root().unwrap(),
             homes.dir().join("XDG_CACHE_HOME/virtkit/shared-cache")
         );
+    }
+
+    #[test]
+    fn a_run_lent_areas_serves_them_and_names_them_to_its_guest() {
+        let lent = |aliases: &[&str], env: &[&str]| {
+            let mut args = crate::run::RunArgs {
+                env: env.iter().map(|n| (n.to_string(), "x".into())).collect(),
+                ..Default::default()
+            };
+            let aliases: Vec<String> = aliases.iter().map(|a| a.to_string()).collect();
+            lend(&mut args, &aliases, RUN_SHARED, "--env").map(|()| args)
+        };
+        // Without shared caches the caller owns the registry variables.
+        let args = lent(&[], &["VK_REGISTRY"]).unwrap();
+        assert_eq!(args.registry_proxy, None);
+        assert_eq!(args.env.len(), 1);
+
+        let args = lent(&["task-cache", "other", "task-cache"], &["X"]).unwrap();
+        assert_eq!(
+            args.registry_proxy,
+            Some(crate::run::RegistryProxy::Areas {
+                aliases: vec!["other".into(), "task-cache".into()],
+                asked_as: RUN_SHARED,
+            })
+        );
+        let names: Vec<&str> = args.env.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "X",
+                "VK_REGISTRY",
+                "VK_REGISTRY_CACHES",
+                "VK_REGISTRY_AREAS"
+            ]
+        );
+
+        let err = format!(
+            "{:#}",
+            lent(&["task-cache"], &["VK_REGISTRY_AREAS"]).err().unwrap()
+        );
+        assert!(
+            err.contains("--env sets VK_REGISTRY_AREAS, which --shared-cache sets"),
+            "{err}"
+        );
+        let err = format!(
+            "{:#}",
+            lent(&["task-cache"], &["VK_REGISTRY_CACHES"])
+                .err()
+                .unwrap()
+        );
+        assert!(
+            err.contains("--env sets VK_REGISTRY_CACHES, which --shared-cache sets"),
+            "{err}"
+        );
+        let err = format!("{:#}", lent(&["Bad"], &[]).err().unwrap());
+        assert!(err.starts_with("--shared-cache \"Bad\" is not"), "{err}");
     }
 
     #[test]

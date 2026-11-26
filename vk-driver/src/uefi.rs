@@ -325,6 +325,15 @@ pub(crate) fn overlays(disks: &[PathBuf], work: &Path) -> Result<Vec<Disk>> {
 /// takes a command, a share, an environment or an SSH server into it, and the bundle path
 /// wires no egress audit, registry proxy or inactivity watch.
 fn refuse_unsupported(args: &RunArgs) -> Result<()> {
+    // Attribute the variables shared caches set to the shared cache request.
+    let areas = matches!(
+        args.registry_proxy,
+        Some(crate::run::RegistryProxy::Areas { .. })
+    );
+    let env = args
+        .env
+        .iter()
+        .any(|(name, _)| !(areas && crate::sharedcache::GUEST_ENV.contains(&name.as_str())));
     let unsupported = [
         (!args.command.is_empty(), "a command"),
         (!args.dockerfiles.is_empty(), "--file"),
@@ -336,7 +345,7 @@ fn refuse_unsupported(args: &RunArgs) -> Result<()> {
         (!args.init_argv.is_empty(), "--init-argv"),
         (!args.prepare.is_empty(), "--prepare"),
         (args.root.is_some(), "--root"),
-        (!args.env.is_empty(), "--env/--env-file"),
+        (env, "--env/--env-file"),
         (args.shell, "--shell"),
         (args.tty, "--tty"),
         (args.ssh, "--ssh"),
@@ -1567,6 +1576,21 @@ mod tests {
             ),
             "{err}"
         );
+        // Shared caches are refused as asked for, not as the variables they set.
+        let mut args = RunArgs::default();
+        crate::sharedcache::lend(
+            &mut args,
+            &["task-cache".into()],
+            crate::sharedcache::RUN_SHARED,
+            "--env",
+        )
+        .unwrap();
+        let err = refuse_unsupported(&args).unwrap_err().to_string();
+        assert!(err.contains("honour --shared-cache"), "{err}");
+        assert!(!err.contains("--env"), "{err}");
+        args.env.push(("X".into(), "1".into()));
+        let err = refuse_unsupported(&args).unwrap_err().to_string();
+        assert!(err.contains("--env/--env-file, --shared-cache"), "{err}");
     }
 
     #[test]

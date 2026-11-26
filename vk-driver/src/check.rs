@@ -49,6 +49,8 @@ pub enum Feature {
     Nics,
     /// this build can put a guest's eth0 on a host tap (`vk run --tap`, `x-virtkit.tap`)
     Tap,
+    /// this build can lend a guest shared caches (`vk run --shared-cache`)
+    SharedCache,
 }
 
 impl Feature {
@@ -67,6 +69,7 @@ impl Feature {
                 | Feature::Publish
                 | Feature::Nics
                 | Feature::Tap
+                | Feature::SharedCache
         )
     }
 
@@ -97,6 +100,7 @@ impl Feature {
             Feature::Publish => "publish",
             Feature::Nics => "nics",
             Feature::Tap => "tap",
+            Feature::SharedCache => "shared-cache",
         }
     }
 }
@@ -502,6 +506,7 @@ fn evaluate(cfg: &Config, feature: Feature) -> Outcome {
         Feature::Publish => publish(),
         Feature::Nics => nics(),
         Feature::Tap => tap(),
+        Feature::SharedCache => shared_cache(),
     }
 }
 
@@ -575,6 +580,22 @@ fn tap() -> Outcome {
     match asset_source(Asset::Agent) {
         Ok(src) => ok(format!("eth0 on a host tap; agent {src} addresses it")),
         Err(why) => fail(format!("no agent to bring the tap NIC up: {why}")),
+    }
+}
+
+/// Whether this `vk` can lend a guest shared caches, and where their store is. A store
+/// `vk` would refuse to serve — another user's, open to others, not one it made — fails,
+/// as a run asking for one would.
+fn shared_cache() -> Outcome {
+    use crate::sharedcache::{Missing, open_store, store_root};
+    let root = match store_root() {
+        Ok(root) => root,
+        Err(e) => return fail(format!("{e:#}")),
+    };
+    match open_store(&root, Missing::Leave) {
+        Ok(Some(_)) => ok(format!("store {}", root.display())),
+        Ok(None) => ok(format!("store {}, made on first use", root.display())),
+        Err(e) => fail(format!("{e:#}")),
     }
 }
 
@@ -1584,6 +1605,20 @@ mod tests {
     // Named-only features run just when asked for: the CI-executor ones probe root-owned
     // default state dirs, and `entrypoint`/`publish` answer for the build, not the host.
     // The default sweep covers everything else.
+    /// `shared-cache` answers with the store's place, made or not, and fails on a store a
+    /// run would refuse.
+    #[test]
+    fn the_shared_cache_feature_names_its_store() {
+        let _homes = crate::dev::testutil::Homes::new("check-shared-cache");
+        let root = crate::sharedcache::store_root().unwrap();
+        let o = shared_cache();
+        assert_eq!(o.status, Status::Ok, "{}", o.detail);
+        assert!(o.detail.ends_with("made on first use"), "{}", o.detail);
+        std::fs::create_dir_all(root.join("not-a-store")).unwrap();
+        let o = shared_cache();
+        assert_eq!(o.status, Status::Fail, "{}", o.detail);
+    }
+
     #[test]
     fn default_sweep_omits_the_named_only_features() {
         let sweep = default_sweep();
@@ -1592,6 +1627,7 @@ mod tests {
         assert!(!sweep.contains(&Feature::Entrypoint));
         assert!(!sweep.contains(&Feature::Publish));
         assert!(!sweep.contains(&Feature::Tap));
+        assert!(!sweep.contains(&Feature::SharedCache));
         for f in <Feature as clap::ValueEnum>::value_variants() {
             assert_eq!(sweep.contains(f), !f.on_request_only());
         }

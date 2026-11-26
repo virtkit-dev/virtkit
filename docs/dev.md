@@ -320,6 +320,11 @@ cache's name is one repository name component — lowercase letters and digits, 
 `.`, `_`, `__` or hyphens — of at most 251 bytes, and not `blobs`, `manifests` or
 `tags`.
 
+A script that boots its own VM reaches the same caches with `vk run --shared-cache
+<name>`, repeated for each. A plain run needs `--net`; a `--compose` run needs a
+primary, whose network the compose file provides. The flag excludes
+`--registry-proxy`. `vk check --feature shared-cache` reports whether a `vk` has it.
+
 Shared caches live in a store of their own, `$XDG_CACHE_HOME/virtkit/shared-cache`
 (else `~/.cache/virtkit/shared-cache`; shown by `vk paths`), apart from the build
 cache that `registry` above selects, which may never be the same directory. `vk`

@@ -368,25 +368,20 @@ fn run_args(
     // The config's shared caches: the run serves them at `registry.vk`, and the guest's own
     // environment says so to the tools that look for it. What it says is what the proxy
     // serves, so nothing else may set those variables. The proxy lives on the run's switch:
-    // compose siblings on it reach the same caches, as their primary does.
-    if !plan.cache.shared.is_empty() {
-        let names = |env: &[crate::dev::plan::EnvVar]| -> Vec<String> {
-            env.iter().map(|e| e.name.clone()).collect()
-        };
-        for (env, what) in [
-            (&plan.container_env, "`container-env`"),
-            (&plan.exec_env, "`exec-env`"),
-        ] {
-            crate::sharedcache::refuse_guest_env(
-                &plan.cache.shared,
-                names(env).iter().map(String::as_str),
-                what,
-            )?;
-        }
-        args.registry_proxy = Some(crate::run::RegistryProxy::Areas(plan.cache.shared.clone()));
-        args.env
-            .extend(crate::sharedcache::guest_env(&plan.cache.shared));
-    }
+    // compose siblings on it reach the same caches, as their primary does. `args.env`
+    // already contains `container-env`.
+    crate::sharedcache::refuse_guest_env(
+        &plan.cache.shared,
+        plan.exec_env.iter().map(|e| e.name.as_str()),
+        "`exec-env`",
+        crate::sharedcache::DEV_SHARED,
+    )?;
+    crate::sharedcache::lend(
+        &mut args,
+        &plan.cache.shared,
+        crate::sharedcache::DEV_SHARED,
+        "`container-env`",
+    )?;
     // A compose primary lives as long as its service's command; an image or build alone has
     // no command to live by, so the run keeps the VM until `vk dev stop`.
     if !matches!(plan.source, Source::Compose { .. }) {
@@ -491,6 +486,7 @@ pub fn task_args(
         &plan.cache.shared,
         task.env.iter().map(|e| e.name.as_str()),
         &format!("task {}'s `env`", task.name),
+        crate::sharedcache::DEV_SHARED,
     )?;
     args.env.extend(
         plan.exec_env
@@ -4010,7 +4006,10 @@ mod tests {
 
         // Asked for: the run serves the caches and the guest's environment names them.
         plan.cache.shared = vec!["other".into(), "task-cache".into()];
-        let areas = crate::run::RegistryProxy::Areas(plan.cache.shared.clone());
+        let areas = crate::run::RegistryProxy::Areas {
+            aliases: plan.cache.shared.clone(),
+            asked_as: crate::sharedcache::DEV_SHARED,
+        };
         let args = run_args(&plan, None, &over, &cfg, CheckoutMode::Shared).unwrap();
         assert_eq!(args.registry_proxy.as_ref(), Some(&areas));
         assert!(args.net, "the proxy is reached through the switch");
