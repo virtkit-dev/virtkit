@@ -387,8 +387,9 @@ pub fn guest_registry<'a>(
 
 /// The variables that tell a job's steps where its registry is, and what they may do there:
 /// `VK_REGISTRY`, the guest's proxy; `VK_REGISTRY_NAMESPACES`, its grants as
-/// `<prefix>=<rights>`; and `VK_REGISTRY_AREAS`, its aliases as `<alias>=<rights>`, the
-/// rights of the grant on the alias's prefix (`job/<alias>` on the proxy). Space-separated,
+/// `<prefix>=<rights>`; and `VK_REGISTRY_CACHES`, its aliases as `<alias>=<rights>`, the
+/// rights of the grant on the alias's prefix (`job/<alias>` on the proxy), which
+/// `VK_REGISTRY_AREAS` repeats under its older name. Space-separated,
 /// raw: an entry that is not a repository name is left out, so the hub cannot put a
 /// separator or a `$` reference in it, and so is an area the proxy does not map
 /// ([`crate::regproxy::usable_areas`], which logs it) or whose prefix has no grant. Never the
@@ -418,6 +419,10 @@ fn registry_vars(registry: &JobRegistry) -> Vec<Variable> {
         Variable {
             raw: true,
             ..runner_var("VK_REGISTRY_NAMESPACES", namespaces)
+        },
+        Variable {
+            raw: true,
+            ..runner_var("VK_REGISTRY_CACHES", areas.clone())
         },
         Variable {
             raw: true,
@@ -609,13 +614,10 @@ mod tests {
             area("imgs", "images"),
         ];
         let vars = Vars::of_placed(&cfg(JOB), &CiJob::default(), Some(&r), &place());
-        assert_eq!(vars.get("VK_REGISTRY_AREAS"), "task-cache=rwl imgs=r");
-        let areas = vars
-            .0
-            .iter()
-            .find(|v| v.key == "VK_REGISTRY_AREAS")
-            .unwrap();
-        assert!(areas.raw);
+        for name in ["VK_REGISTRY_CACHES", "VK_REGISTRY_AREAS"] {
+            assert_eq!(vars.get(name), "task-cache=rwl imgs=r", "{name}");
+            assert!(vars.0.iter().find(|v| v.key == name).unwrap().raw, "{name}");
+        }
     }
 
     /// Go's `os.Expand` cases (`os/env_test.go` `expandTests`).

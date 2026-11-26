@@ -723,12 +723,13 @@ though within them it can claim protection.
   - The hub sends a job's areas (`JobRegistry.areas`) only to a node announcing
     `registry_areas`; on an older node `job/…` reaches the registry unmapped, which refuses it
     unless a grant covers that path.
-- **Discovery.** The node gives every job using `"job"` three variables:
+- **Discovery.** The node gives every job using `"job"` these variables:
   - `VK_REGISTRY=http://registry.vk`;
   - `VK_REGISTRY_NAMESPACES`, the job's prefixes with their rights, e.g.
     `p/gl/42=rwl images=r ci-pipeline/gl/42/1234=rwl`;
-  - `VK_REGISTRY_AREAS`, the job's aliases with the rights on their prefix, e.g.
-    `task-cache=rwl`.
+  - `VK_REGISTRY_CACHES`, the job's aliases with the rights on their prefix, e.g.
+    `task-cache=rwl`;
+  - `VK_REGISTRY_AREAS`, the same under its older name.
 - **In-job tools.** task-rs takes `vk: http://registry.vk/job/task-cache` as its cache:
   entries under the alias and lock names `job/task-cache/<namespace>:<key>`. sccache uses
   `$VK_REGISTRY/dav/files/job/<alias>` as its WebDAV endpoint (the alias in the endpoint, not
