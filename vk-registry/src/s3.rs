@@ -1,14 +1,15 @@
-//! sccache reads, stats and writes objects at `/s3/<bucket>/<key>`. The bucket is a
-//! top-level directory of `/dav/files/` and the key is the path below it. Listings, bucket
-//! operations, nonempty queries, multipart uploads, streaming payloads, content codings,
-//! conditional requests, partial writes and unsupported checksum or encryption headers
-//! return `NotImplemented`. For signed requests, [`admit`] checks the signature first.
+//! sccache reads, stats and writes the [`crate::objects`] file `<bucket>/<key>` at
+//! `/s3/<bucket>/<key>`. Listings, bucket operations, nonempty queries, multipart uploads,
+//! SigV4 streaming payloads, nonidentity content codings, partial writes and unsupported
+//! checksum or encryption headers return `NotImplemented`. So do `If-Match`, `If-None-Match`,
+//! `If-Modified-Since` and `If-Unmodified-Since`. Reads ignore `Range` and `If-Range`.
 //!
 //! SigV4 uses the registry credential (API key, hub token or shared bearer) as both AWS
-//! keys. [`admit`] forwards it as `Authorization: Bearer <access key>`. WebDAV applies
-//! its grants, naming rules and write path. Unsigned requests retain their Bearer or Basic
-//! credentials or use anonymous access. [`respond`] preserves successful reads, returns
-//! 200 for a successful `PUT` and maps errors to S3 XML.
+//! keys. [`admit`] checks the signature first and sets `Authorization: Bearer <access key>`
+//! for registry authentication. Unsigned requests keep their Bearer or Basic credentials.
+//! Access without credentials requires an open registry. [`route`] applies the shared object
+//! grants, naming rules and write path. [`respond`] preserves successful reads, returns 200
+//! for a successful `PUT` and maps errors to S3 XML.
 
 use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
@@ -40,9 +41,9 @@ pub(crate) fn is_s3_path(path: &str) -> bool {
 #[derive(Clone)]
 pub(crate) struct PayloadSha256(pub(crate) String);
 
-/// Marks a request [`admit`] rewrote onto `/dav/files/`, which reaches it with WebDAV off.
+/// The original encoded object path below [`PREFIX`] for a request accepted by [`admit`].
 #[derive(Clone)]
-pub(crate) struct Admitted;
+pub(crate) struct Admitted(pub(crate) String);
 
 /// A request refused before it reaches the store: its status, S3 error code and message.
 #[derive(Debug, PartialEq)]
@@ -61,8 +62,8 @@ pub(crate) struct Refused {
     pub(crate) signed: bool,
 }
 
-/// Check an S3 request and rewrite it onto `/dav/files/`, or refuse it. `now` is the clock
-/// the signature's date is held to, in Unix seconds.
+/// Check the request and mark it [`Admitted`] for [`route`]. For signed requests,
+/// check the signature date against `now` in Unix seconds.
 pub(crate) fn admit(
     mut req: Request<hyper::body::Incoming>,
     now: u64,
@@ -98,12 +99,7 @@ pub(crate) fn admit(
         };
         req.headers_mut().insert(AUTHORIZATION, bearer);
     }
-    let Ok(uri) = format!("/dav/files/{rest}").parse() else {
-        let r = Refusal(StatusCode::BAD_REQUEST, "InvalidURI", "bad path");
-        return Err(refuse(req, r, signed));
-    };
-    *req.uri_mut() = uri;
-    req.extensions_mut().insert(Admitted);
+    req.extensions_mut().insert(Admitted(rest));
     Ok(req)
 }
 
@@ -112,8 +108,43 @@ fn refuse(req: Request<hyper::body::Incoming>, r: Refusal, signed: bool) -> Box<
     Box::new(Refused { req, resp, signed })
 }
 
-/// Return the access key from a verified SigV4 signature, or `None` for a request without
-/// one: anonymous, or carrying a WebDAV credential the WebDAV handlers check.
+/// Serve `GET`, `HEAD` or `PUT` for an [`Admitted`] request after registry authentication.
+pub(crate) async fn route(
+    state: &crate::ServerState,
+    authz: &crate::Authz<'_>,
+    rest: &str,
+    req: Request<hyper::body::Incoming>,
+) -> anyhow::Result<Response<Body>> {
+    use crate::objects;
+    let href = req.uri().path().to_string();
+    let Some((segs, collection)) =
+        objects::split(rest).filter(|(segs, _)| objects::valid_plain_file(&segs.join("/")))
+    else {
+        let resp = crate::error_response(StatusCode::BAD_REQUEST, "NAME_INVALID", &href);
+        return objects::drain_then(req, resp, &href).await;
+    };
+    let put = *req.method() == Method::PUT;
+    let action = if put {
+        crate::accounts::Action::Write
+    } else {
+        crate::accounts::Action::Read
+    };
+    if !objects::admits(authz, action, &segs, put) {
+        return objects::drain_then(req, crate::accounts::forbidden(), &href).await;
+    }
+    if put {
+        let expected = req.extensions().get::<PayloadSha256>().map(|p| p.0.clone());
+        return objects::put(state, segs, collection, &href, expected, req).await;
+    }
+    let head = *req.method() == Method::HEAD;
+    objects::blocking(state, authz, move |store, authz| {
+        objects::get(authz, store, &segs, collection, &href, head)
+    })
+    .await
+}
+
+/// Return the verified SigV4 access key, or `None` for unsigned requests.
+/// The server handles unsigned credentials and anonymous access.
 fn authenticate<B>(req: &Request<B>, now: u64) -> Result<Option<String>, Refusal> {
     let sigv4 = req
         .headers()
@@ -922,7 +953,6 @@ mod tests {
     #[test]
     fn a_sigv4_signature_is_verified_and_other_credentials_go_on() {
         let path = "/s3/b/k";
-        // None at all, or a WebDAV credential sent as is: left to the WebDAV handlers.
         let req = request(path, HeaderMap::new());
         assert_eq!(authenticate(&req, NOW).unwrap(), None);
         for auth in ["Bearer vkr_x", "Basic dTpw"] {

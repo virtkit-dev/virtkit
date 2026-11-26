@@ -63,6 +63,7 @@ pub mod hub;
 pub mod hubtoken;
 pub(crate) mod keys;
 pub mod lock;
+pub(crate) mod objects;
 pub mod oidc;
 pub mod relay;
 pub(crate) mod s3;
@@ -75,7 +76,7 @@ mod zctx;
 
 pub use client::{ClientAuth, FailInfo, Held, LockClient};
 pub use config::{DEFAULT_ADDR, ServerConfig};
-pub use dav::valid_plain_file;
+pub use objects::valid_plain_file;
 pub use s3::admissible_headers as s3_admissible_headers;
 
 /// The client-auth model in force, resolved once at startup from [`config::AuthMode`].
@@ -4701,8 +4702,8 @@ async fn handle(
     let routed = if s3 {
         match s3::admit(req, vk_peer::now_secs()) {
             Ok(req) => route(req, state).await,
-            // Drain a refused body only after signature verification, subject to WebDAV's size cap.
-            Err(r) if r.signed && has_body => dav::refuse(r.req, r.resp, &path).await,
+            // Drain a refused body only after signature verification, up to the object cap.
+            Err(r) if r.signed && has_body => objects::drain_then(r.req, r.resp, &path).await,
             Err(r) => Ok(r.resp),
         }
     } else {
@@ -5043,11 +5044,14 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
         return manifests_exist(&state.store, &authz, req).await;
     }
 
-    // DAV authorizes each resource: `files/<dir>` or the OCI repository name. Keep it outside
-    // `is_human_path` so clients receive a 401 challenge, not a login redirect.
+    // S3 and DAV check grants on `files/<dir>` or the OCI repository. Keep both outside
+    // `is_human_path` so authentication failures get a DAV 401 challenge or S3 403
+    // `AccessDenied`.
     // Disabled WebDAV routes fall through to 404.
-    let admitted = req.extensions().get::<s3::Admitted>().is_some();
-    if (state.webdav || admitted) && (path == "/dav" || path.starts_with("/dav/")) {
+    if let Some(s3::Admitted(rest)) = req.extensions().get::<s3::Admitted>().cloned() {
+        return s3::route(&state, &authz, &rest, req).await;
+    }
+    if state.webdav && (path == "/dav" || path.starts_with("/dav/")) {
         return dav::route(&state, &authz, req).await;
     }
     if files_put::is_files_path(&path) {

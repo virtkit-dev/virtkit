@@ -732,10 +732,10 @@ sequence of ASCII letters, digits and hyphens. The date must be within 15 minute
 server clock. A `PUT` that supplies a SHA-256 in place of `UNSIGNED-PAYLOAD` must match it
 before publication. A mismatch returns 400 `XAmzContentSHA256Mismatch`.
 
-The registry strips cookies and forwards signed requests to `/dav/files/…` with
-`Authorization: Bearer <access key>`. WebDAV checks the credential and its grants, including
-`write:files/<bucket>/*` and hub grants. Requests without `Authorization` use WebDAV's
-anonymous permissions. WebDAV also accepts Bearer or Basic credentials on unsigned requests.
+The registry strips cookies from S3 requests. It authenticates signed requests with
+`Authorization: Bearer <access key>` and checks Bearer or Basic credentials on unsigned
+requests. Access without credentials requires an open registry. The same grants apply as
+on `/dav/files/<bucket>/<key>`, including `write:files/<bucket>/*` and hub grants.
 For example, sccache can use `SCCACHE_S3_NO_CREDENTIALS=true` with a proxy that injects the
 job's bearer token. Shared Basic credentials cannot serve as access keys. A shared bearer
 containing a comma cannot sign because commas separate the SigV4 authorization fields.

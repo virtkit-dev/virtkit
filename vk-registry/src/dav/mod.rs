@@ -9,7 +9,7 @@ mod files;
 mod repos;
 
 use std::fmt::Write as _;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -19,15 +19,10 @@ use hyper::{Request, Response, StatusCode};
 
 use crate::{Authenticator, Authz, Body, ServerState, Store, body_of, error_response};
 
-pub use files::valid_plain_file;
-
 /// Maximum path depth below `/dav/<area>/`: the deepest `repos/` path, a full-length
 /// repository name and then `blobs/<hex>`. Under `files/` the repository name bound refuses
 /// a path first, past 15 components.
 pub(crate) const MAX_DEPTH: usize = crate::MAX_NAME_SEGMENTS + 2;
-
-/// Maximum decoded component length in bytes.
-const MAX_SEGMENT: usize = 255;
 
 /// Maximum PROPFIND body size; the body is drained and ignored.
 const MAX_PROPFIND_BODY: usize = 64 * 1024;
@@ -91,7 +86,7 @@ async fn root(
                     entries.push(Entry::collection(href(&["repos"], true), repos));
                     entries.push(Entry::collection(
                         href(&["files"], true),
-                        store.repos_path_modified(files::FILES_REPO),
+                        store.repos_path_modified(crate::objects::FILES_REPO),
                     ));
                 }
                 Ok(multistatus(&entries))
@@ -112,7 +107,7 @@ pub(crate) async fn refuse(
     resp: Response<Body>,
     href: &str,
 ) -> Result<Response<Body>> {
-    files::drain_then(req, resp, href).await
+    crate::objects::drain_then(req, resp, href).await
 }
 
 /// [`crate::blocking`], labelled as a WebDAV request.
@@ -139,69 +134,11 @@ where
     crate::blocking_locked(&state.store, authz, "a WebDAV request", f).await
 }
 
-/// Decode the path after `/dav` into its components and whether it ended in a slash,
-/// splitting before percent-decoding. Reject decoded separators, control bytes, `.`, `..`,
-/// empty or oversized components, malformed escapes, invalid UTF-8, and excessive depth.
+/// Decode the path below `/dav` with [`crate::objects::split`] and enforce the DAV depth limit.
 pub(crate) fn parse(rest: &str) -> Option<(Vec<String>, bool)> {
-    // `/dav` and `/dav/` are both the root; `/dav//` is an empty component, refused with
-    // the rest of them below rather than read as a second spelling of the root.
-    let rest = rest.strip_prefix('/').unwrap_or(rest);
-    if rest.is_empty() {
-        return Some((Vec::new(), true));
-    }
-    let (rest, collection) = match rest.strip_suffix('/') {
-        Some(r) => (r, true),
-        None => (rest, false),
-    };
-    if rest.is_empty() {
-        return None;
-    }
-    let mut segments = Vec::new();
-    for raw in rest.split('/') {
-        let seg = decode_segment(raw).filter(|s| valid_segment(s))?;
-        segments.push(seg);
-    }
+    let (segments, collection) = crate::objects::split(rest)?;
     // The area (`files`, `repos`) sits above the depth bound.
     (segments.len() <= MAX_DEPTH + 1).then_some((segments, collection))
-}
-
-/// Percent-decode one path component: `%XX` escapes only, `+` being itself in a path, and
-/// the decoded bytes must be UTF-8. `None` for a malformed escape or invalid UTF-8.
-fn decode_segment(raw: &str) -> Option<String> {
-    fn hex(c: u8) -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
-        }
-    }
-    let b = raw.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while let Some(&c) = b.get(i) {
-        if c == b'%' {
-            let hi = hex(*b.get(i + 1)?)?;
-            let lo = hex(*b.get(i + 2)?)?;
-            out.push((hi << 4) | lo);
-            i += 3;
-        } else {
-            out.push(c);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-/// One decoded path component: non-empty, not a directory traversal, short enough to be a
-/// filename, and free of anything that could make it more than one component.
-fn valid_segment(seg: &str) -> bool {
-    !seg.is_empty()
-        && seg != "."
-        && seg != ".."
-        && seg.len() <= MAX_SEGMENT
-        && !seg.contains(['/', '\\'])
-        && !seg.chars().any(char::is_control)
 }
 
 /// Build an href from decoded components, percent-encoding each and appending a slash for
@@ -354,15 +291,7 @@ pub(crate) fn multistatus(entries: &[Entry]) -> Response<Body> {
         .expect("building a 207")
 }
 
-/// Format an RFC 1123 HTTP date. `httpdate` panics outside 1970 to 9999, so a time outside
-/// that range is clamped into it.
-pub(crate) fn http_date(t: SystemTime) -> String {
-    const LAST: Duration = Duration::from_secs(253_402_300_799);
-    let since = t
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
-    httpdate::fmt_http_date(SystemTime::UNIX_EPOCH + since.min(LAST))
-}
+pub(crate) use crate::objects::http_date;
 
 /// `OPTIONS`: the DAV compliance class opendal looks for, and the verbs served.
 fn options(allow: &'static str) -> Response<Body> {
@@ -375,20 +304,7 @@ fn options(allow: &'static str) -> Response<Body> {
         .expect("building an OPTIONS response")
 }
 
-fn created() -> Response<Body> {
-    Response::builder()
-        .status(StatusCode::CREATED)
-        .header(CONTENT_LENGTH, "0")
-        .body(body_of(Bytes::new()))
-        .expect("building a 201")
-}
-
-fn no_content() -> Response<Body> {
-    Response::builder()
-        .status(StatusCode::NO_CONTENT)
-        .body(body_of(Bytes::new()))
-        .expect("building a 204")
-}
+use crate::objects::{created, no_content};
 
 fn not_found(href: &str) -> Response<Body> {
     error_response(StatusCode::NOT_FOUND, "NOT_FOUND", href)
@@ -407,70 +323,15 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// Test valid paths and rejection of unsafe components.
+    /// The area sits above the depth bound, and the rest is split as objects are.
     #[test]
-    fn the_path_parser_refuses_everything_but_a_plain_relative_path() {
-        let segs = |p: &str| parse(p).map(|(s, _)| s);
-        let v = |s: &[&str]| Some(s.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        // the root, both spellings
+    fn the_path_parser_bounds_depth() {
         assert_eq!(parse(""), Some((vec![], true)));
-        assert_eq!(parse("/"), Some((vec![], true)));
-        // `sccache`'s own two shapes: the startup probe, and a sharded key
-        assert_eq!(
-            segs("/files/sccache/.sccache_check"),
-            v(&["files", "sccache", ".sccache_check"])
-        );
-        assert_eq!(
-            segs("/files/sccache/a/b/c/abcdef"),
-            v(&["files", "sccache", "a", "b", "c", "abcdef"])
-        );
-        // a collection, with and without the trailing slash a DAV client may send, which
-        // is reported
-        assert_eq!(
-            parse("/files/sccache"),
-            Some((v(&["files", "sccache"]).unwrap(), false))
-        );
         assert_eq!(
             parse("/files/sccache/"),
-            Some((v(&["files", "sccache"]).unwrap(), true))
+            Some((vec!["files".to_string(), "sccache".to_string()], true))
         );
-        // percent-decoding is per component and a path's own: `%2D` is `-`, `+` is itself
-        assert_eq!(segs("/files/x/a%2Db"), v(&["files", "x", "a-b"]));
-        assert_eq!(segs("/files/x/a+b"), v(&["files", "x", "a+b"]));
-        assert_eq!(segs("/files/x/%C3%A9"), v(&["files", "x", "\u{e9}"]));
-
-        for bad in [
-            // traversal, encoded and not
-            "/files/sccache/..",
-            "/files/sccache/../../etc/passwd",
-            "/files/sccache/a/../../b",
-            "/files/sccache/%2E%2E/x",
-            "/..",
-            // a decoded separator is a name that would become a path
-            "/files/sccache/a%2Fb",
-            "/files/sccache/a%2f%2e%2e%2fb",
-            "/files/sccache/a%5Cb",
-            // control bytes, NUL included
-            "/files/sccache/a%00b",
-            "/files/sccache/a%0Ab",
-            // empty components
-            "/files/sccache//x",
-            "/files/sccache/x//y",
-            "/files/sccache//",
-            "//",
-            // malformed escapes and bytes that are not UTF-8
-            "/files/sccache/a%2",
-            "/files/sccache/a%G0",
-            "/files/sccache/%FF",
-            "/files/sccache/%C3",
-        ] {
-            assert!(parse(bad).is_none(), "accepted {bad:?}");
-        }
-
-        // over-long and over-deep
-        let long = "x".repeat(MAX_SEGMENT + 1);
-        assert!(parse(&format!("/files/{long}")).is_none());
-        assert!(parse(&format!("/files/{}", "x".repeat(MAX_SEGMENT))).is_some());
+        assert!(parse("/files/sccache/../x").is_none());
         let deep = vec!["x"; MAX_DEPTH + 1].join("/");
         assert!(parse(&format!("/files/{deep}")).is_none());
         let deepest = vec!["x"; MAX_DEPTH].join("/");
@@ -589,19 +450,5 @@ mod tests {
         assert!(escaped.contains("&lt;&amp;&quot;&#39;&gt;"), "{escaped}");
         assert!(escaped.contains("a/&lt;b&gt;"), "{escaped}");
         assert!(!escaped.contains("<&"), "{escaped}");
-    }
-
-    /// HTTP dates are IMF-fixdate, and a time `httpdate` cannot format is clamped rather
-    /// than failing a response.
-    #[test]
-    fn http_dates_are_rfc_1123_and_clamped() {
-        let at = |secs| http_date(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
-        assert_eq!(at(784_887_151), "Tue, 15 Nov 1994 08:12:31 GMT");
-        let before = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
-        assert_eq!(http_date(before), "Thu, 01 Jan 1970 00:00:00 GMT");
-        assert_eq!(
-            at(u64::from(u32::MAX) * 1000),
-            "Fri, 31 Dec 9999 23:59:59 GMT"
-        );
     }
 }
