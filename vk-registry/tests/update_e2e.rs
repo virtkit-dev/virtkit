@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc};
+
 use tokio_tungstenite::tungstenite::Message;
 use vk_hub_proto::registry::{
     Command, HubRegistryMsg, Operation, PROTOCOL, RELEASE_PATH, RegistryMsg,
@@ -45,6 +46,33 @@ fn sha256(bytes: &[u8]) -> String {
     vk_hub_proto::to_hex(&Sha256::digest(bytes))
 }
 
+/// The test's go-ahead for the update, which a session opened after it was given still sees:
+/// under load the registry may reconnect at any time.
+#[derive(Default)]
+struct Go {
+    given: AtomicBool,
+    notify: Notify,
+}
+
+impl Go {
+    fn notify_waiters(&self) {
+        self.given.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    async fn given(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.given.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// What the fake hub saw.
 #[derive(Debug)]
 enum Seen {
@@ -59,7 +87,7 @@ async fn hub(
     listener: TcpListener,
     release: Arc<Vec<u8>>,
     command: Command,
-    go: Arc<Notify>,
+    go: Arc<Go>,
     seen: mpsc::UnboundedSender<Seen>,
 ) {
     let sent = Arc::new(Mutex::new(false));
@@ -106,7 +134,7 @@ async fn serve_release(mut stream: TcpStream, release: &[u8]) {
 async fn session(
     stream: TcpStream,
     command: Command,
-    go: Arc<Notify>,
+    go: Arc<Go>,
     seen: mpsc::UnboundedSender<Seen>,
     sent: Arc<Mutex<bool>>,
 ) {
@@ -137,8 +165,8 @@ async fn session(
     ws.send(send(serde_json::to_string(&welcome).unwrap()))
         .await
         .unwrap();
-    // Waiting on `go` before the test hears of the session, which then notifies it.
-    let told = go.notified();
+    // The go-ahead, given before or after the test hears of the session.
+    let told = go.given();
     tokio::pin!(told);
     let _ = seen.send(Seen::Session(incarnation));
     let first = !*sent.lock().unwrap();
@@ -198,6 +226,17 @@ async fn ack(seen: &mut mpsc::UnboundedReceiver<Seen>) -> CommandAck {
 async fn next_session(seen: &mut mpsc::UnboundedReceiver<Seen>) -> String {
     loop {
         if let Seen::Session(i) = seen.recv().await.unwrap() {
+            return i;
+        }
+    }
+}
+
+/// The next session of an incarnation other than `first`'s: a loaded registry may reconnect
+/// the session it had.
+async fn session_after(seen: &mut mpsc::UnboundedReceiver<Seen>, first: &str) -> String {
+    loop {
+        let i = next_session(seen).await;
+        if i != first {
             return i;
         }
     }
@@ -323,7 +362,7 @@ struct Setup {
     /// The release's sha256.
     sha: String,
     addr: String,
-    go: Arc<Notify>,
+    go: Arc<Go>,
     seen: mpsc::UnboundedReceiver<Seen>,
     served: tokio::task::JoinHandle<()>,
     log: PathBuf,
@@ -379,7 +418,7 @@ async fn setup(tag: &str, notify: Option<&std::path::Path>) -> Setup {
             signature: None,
         },
     };
-    let go = Arc::new(Notify::new());
+    let go = Arc::new(Go::default());
     let (tx, seen) = mpsc::unbounded_channel();
     let served = tokio::spawn(hub(
         hub_listener,
@@ -532,8 +571,11 @@ async fn an_update_under_a_service_manager_cuts_no_transfer_and_refuses_no_conne
     let accepted = wait!(60, "the update not acked", ack(&mut seen));
     assert_eq!(accepted.outcome, Outcome::Accepted, "{}", shown("refused"));
     // The release serves: a session of another incarnation.
-    let second = wait!(120, "no session from the release", next_session(&mut seen));
-    assert_ne!(first, second);
+    wait!(
+        120,
+        "no session from the release",
+        session_after(&mut seen, &first)
+    );
     assert!(
         registry.try_wait().unwrap().is_none(),
         "{}",
@@ -642,8 +684,11 @@ async fn an_update_elsewhere_executes_the_release_refusing_no_connection() {
     go.notify_waiters();
     let accepted = wait!(60, "the update not acked", ack(&mut seen));
     assert_eq!(accepted.outcome, Outcome::Accepted, "{}", shown("refused"));
-    let second = wait!(120, "no session from the release", next_session(&mut seen));
-    assert_ne!(first, second);
+    wait!(
+        120,
+        "no session from the release",
+        session_after(&mut seen, &first)
+    );
     let done = wait!(60, "no ack of the update done", async {
         loop {
             let a = ack(&mut seen).await;
