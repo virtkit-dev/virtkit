@@ -285,7 +285,7 @@ pub const TRANSPARENT_ZSTD_HEADER: &str = "x-virtkit-transparent-zstd";
 /// ZIP members are usually compressed. Recompressing sccache's zstd-compressed
 /// members saved under 0.1%. ZIPs with uncompressed members may use more disk space.
 ///
-/// Files shorter than the longest magic are treated as uncompressed; I/O errors propagate.
+/// Files too short to hold a full magic are treated as uncompressed; I/O errors propagate.
 fn already_compressed(path: &Path) -> Result<bool> {
     use std::io::Read;
     let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
