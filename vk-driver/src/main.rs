@@ -3203,8 +3203,10 @@ fn main() -> ExitCode {
     // SAFETY: no other thread exists yet to read the environment meanwhile.
     unsafe { std::env::remove_var(FROM_RECIPE_ENV) };
     // Before the fork, so the detaching parent is quiet too.
-    if let Cmd::Run { quiet: true, .. } = &cli.cmd {
-        quiet::set();
+    match &cli.cmd {
+        Cmd::Run { quiet: true, .. } => quiet::set(),
+        Cmd::Dev(dev) if dev.quiet() => quiet::set(),
+        _ => {}
     }
 
     // A named or detached run gets its name and state dir now, before the fork, so the

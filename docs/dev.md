@@ -833,8 +833,12 @@ The Dockerfile must supply both stages and the script must exist in the project.
 A host hook or wrapper can invoke it with:
 
 ```sh
-vk dev task pre-commit -- "$@"
+vk dev task -q pre-commit -- "$@"
 ```
+
+`-q` suppresses task placement and reuse notes, plus pull, build and boot progress for an
+ephemeral VM. Check output, warnings and errors still print. A failed build prints the end
+of its log.
 
 If the same script is the guest task, make its guest path run the checks directly
 rather than dispatching itself into `vk dev` again. An environment flag such as

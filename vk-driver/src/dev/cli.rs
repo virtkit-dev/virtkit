@@ -52,6 +52,11 @@ impl Dev {
     pub fn boots(&self) -> bool {
         self.action.boots()
     }
+
+    /// Whether `task --quiet` was requested.
+    pub fn quiet(&self) -> bool {
+        matches!(self.action, DevAction::Task { quiet: true, .. })
+    }
 }
 
 /// `vk dev`: the entry point `main` dispatches to. `host_config` is the global `--config`
@@ -267,8 +272,16 @@ enum DevAction {
     /// one that is running (`reuse`), boot one first (`require`), run in a throwaway VM
     /// (`ephemeral`), or take the running one when there is one (`reuse-or-ephemeral`).
     /// Arguments after `--` are appended to the command, whose exit status is reproduced:
-    /// `vk dev task pre-commit -- "$@"`.
+    /// `vk dev task -q pre-commit -- "$@"`.
     Task {
+        /// Leave out vk's own progress notes
+        ///
+        /// For a commit hook or a script, where only the task's output matters: leaves out
+        /// the task's placement note and, as `vk run --quiet` does, the pull, build and
+        /// boot notes of an ephemeral VM. A failed build still prints the end of its log;
+        /// the task's own output, warnings and errors still print.
+        #[arg(short = 'q', long)]
+        quiet: bool,
         /// the task, as `[dev.tasks.<name>]` names it
         name: String,
         /// arguments appended to the task's command
@@ -1151,7 +1164,7 @@ async fn dev_action(
         // Only a `require` task boots the environment; the rest attach to what runs or boot
         // a throwaway VM, so there is nothing for a forked child to do and this parent — the
         // one holding the terminal — runs the task (see `dev`'s module docs and `detach`).
-        DevAction::Task { name, args } => {
+        DevAction::Task { name, args, .. } => {
             let placement = match crate::dev::task::placement(&loaded, &plan, &name) {
                 Ok(p) => p,
                 Err(e) => return fail(&e, 2),
@@ -1972,6 +1985,21 @@ mod tests {
     fn parse(args: &[&str]) -> Dev {
         let Which::Dev(dev) = Harness::parse_from(args).cmd;
         dev
+    }
+
+    #[test]
+    fn task_quiet_is_vks_before_the_separator() {
+        let dev = parse(&["vk", "dev", "task", "-q", "pre-commit", "--", "-q", "a"]);
+        assert!(dev.quiet());
+        let DevAction::Task { name, args, .. } = dev.action else {
+            panic!("not a task");
+        };
+        assert_eq!(name, "pre-commit");
+        assert_eq!(args, ["-q", "a"]);
+        let dev = parse(&["vk", "dev", "task", "pre-commit", "-q"]);
+        assert!(dev.quiet());
+        let dev = parse(&["vk", "dev", "task", "pre-commit", "--", "-q"]);
+        assert!(!dev.quiet());
     }
 
     #[test]

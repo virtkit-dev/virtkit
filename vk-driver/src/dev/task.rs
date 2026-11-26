@@ -122,9 +122,10 @@ pub async fn run(
 /// The task in the running environment, as a session: its user, its `exec-env` plus the
 /// task's own, in the workspace folder.
 async fn attach(plan: &Plan, task: &TaskPlan, extra: &[String]) -> Result<ExitCode> {
-    eprintln!(
+    crate::quiet::enote!(
         "task {}: running in the {} environment",
-        task.name, plan.environment
+        task.name,
+        plan.environment
     );
     let mut argv = task.argv.clone();
     argv.extend_from_slice(extra);
@@ -158,7 +159,7 @@ async fn ephemeral(
         env_plan.cache = plan.cache.clone();
     }
     env_plan.require_resolved()?;
-    eprintln!(
+    crate::quiet::enote!(
         "task {}: ephemeral {} VM ({})",
         task.name,
         task.environment,
@@ -214,7 +215,7 @@ async fn run_ephemeral(
         Err(e) => match (crate::run::guest_exit(&e), &env_plan.fallback_target) {
             (Some(result), _) => Ok(Outcome::Exit(result)),
             (None, Some(target)) if crate::build::not_cached(&e) => {
-                eprintln!(
+                crate::quiet::enote!(
                     "task {}: cache miss, building the fallback target {target}",
                     task.name
                 );

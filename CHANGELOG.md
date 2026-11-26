@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Commit hooks can use `vk dev task -q` to suppress progress notes while keeping check output
+  and diagnostics visible.
+
 ### Changed
 
 - `vk-registry` finds blobs held by other image repositories faster when the registry

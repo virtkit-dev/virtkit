@@ -1089,12 +1089,12 @@ fn attach_or_restart(
     match decision {
         Live::Current { session_only } => {
             if announce_reuse {
-                eprintln!(
+                crate::quiet::enote!(
                     "virtkit: dev environment already running ({})",
                     plan.state_dir.display()
                 );
                 if session_only {
-                    eprintln!("virtkit: {SESSION_ONLY_NOTE}");
+                    crate::quiet::enote!("virtkit: {SESSION_ONLY_NOTE}");
                 }
                 // Its configuration still matches; the images it was built from may not.
                 // Say so rather than leave a caller to find out, and leave the decision to
