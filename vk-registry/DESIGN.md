@@ -211,7 +211,8 @@ The second rule preserves cross-repository deduplication without disclosing byte
 principal could not already fetch. The common pull path is one membership lookup; only a
 miss searches the repositories the principal may read, the `files/` tree last, so a digest
 an image repository holds is found without listing the WebDAV directories. A manifest
-`PUT` lists readable repositories only if a reference needs a cross-repository check.
+`PUT` lists readable repositories only if a reference needs a cross-repository check. For a
+hub token, the search is limited to `<prefix>` and `files/<prefix>` for each read grant.
 
 A manifest `PUT` naming a digest that is not `sha256:<64 lowercase hex>` — config, layer,
 index child or subject — is refused with `DIGEST_INVALID`, in every mode, rather than having
@@ -873,9 +874,10 @@ when that is still below `max_connections` plus 256. The unit `install-service` 
   cache directory grows to up to 4096 repositories and the path components above them, and
   each entry costs about five files — the tag, the manifest sidecar, the layer's membership
   marker and the pool's manifest and layer blobs, the last two shared with identical
-  entries. Everything that walks every repository name pays for those directories: a
-  membership miss on `/v2/` (`readable_through`), a `/dav/repos/` prefix lookup or listing,
-  `/browse`, `status` and `gc`.
+  entries. An account's `/v2/` membership lookup (`readable_through`) can reach those
+  directories on a miss. Store-wide walks for `/dav/repos/` prefix lookups and listings,
+  `/browse`, `status` and `gc` also visit them. A hub token searches only its granted trees,
+  including `files/<prefix>`.
 - The `files/` area trusts its writers: a stored compiler-cache entry is linked into every
   project computing the same key, so write access belongs to trusted pipelines only (see
   "WebDAV view").

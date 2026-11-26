@@ -9,6 +9,12 @@ All notable changes to virtkit will be documented in this file.
 - `vk-registry` finds blobs held by other image repositories faster when the registry
   also hosts a WebDAV compiler cache.
 
+### Fixed
+
+- CI jobs checking for blobs in `vk-registry` now search only their own namespaces.
+  Scanning thousands of unrelated WebDAV cache directories could saturate the registry
+  and cause uploads to time out.
+
 ## [0.116.1] - 2026-11-24
 
 ### Fixed

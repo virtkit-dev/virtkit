@@ -562,3 +562,59 @@ async fn a_revoked_subject_s_token_is_refused() {
     assert_eq!(status(token("job:j1")).await, 404);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Blob HEAD requests skip 1,024 WebDAV shards outside the token's grants and still
+/// find a layer held by another readable repository.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tokens_blob_probe_does_not_walk_the_rest_of_the_store() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("walk");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (state, signer) = shared(&dir);
+    let store = state.store.clone();
+    const SHARDS: usize = 1024;
+    let entry = store.put_blob(b"a cached object").unwrap();
+    for i in 0..SHARDS {
+        let shard = format!(
+            "files/ci/sccache/{:x}/{:x}/{:x}",
+            i / 256,
+            i / 16 % 16,
+            i % 16
+        );
+        store
+            .record_blob(&shard, entry.trim_start_matches("sha256:"))
+            .unwrap();
+    }
+    let layer = store.put_blob(b"a base image layer").unwrap();
+    store
+        .record_blob("images/base", layer.trim_start_matches("sha256:"))
+        .unwrap();
+    let url = spawn(state);
+    let http = reqwest::Client::new();
+    let token = signer.sign(claims(AUD, 600, None)).unwrap();
+    let head = |digest: String| {
+        let req = http
+            .head(format!("{url}/v2/p/gl/42/build-cache/blobs/{digest}"))
+            .bearer_auth(token.clone());
+        async move { req.send().await.unwrap().status() }
+    };
+
+    let before = store.repo_dir_reads();
+    for i in 0..100u32 {
+        let absent = format!("sha256:{:064x}", i);
+        assert_eq!(head(absent).await, 404);
+    }
+    assert_eq!(head(entry.clone()).await, 404, "outside the token's grants");
+    assert_eq!(
+        head(layer.clone()).await,
+        200,
+        "readable through its grants"
+    );
+    let reads = store.repo_dir_reads() - before;
+    // `images` and `images/base` per probe; the token's other roots do not exist.
+    assert!(
+        reads <= 2 * 102,
+        "{reads} directory reads for 102 probes on a store of {SHARDS} directories"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

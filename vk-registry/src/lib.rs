@@ -1540,7 +1540,7 @@ impl Store {
 
     /// Every repository in `tree` with a membership directory (`manifests/` or `blobs/`), in
     /// walk order, each once.
-    fn member_repo_names(&self, tree: RepoTree) -> Vec<String> {
+    fn member_repo_names(&self, tree: &RepoTree) -> Vec<String> {
         let repos = self.root.join("repos");
         let mut seen = HashSet::new();
         let mut names = Vec::new();
@@ -1558,7 +1558,7 @@ impl Store {
     /// Whether a repository in `tree` that `readable` accepts holds `hex`, stopping at the
     /// first. Only readable repositories get membership checks, each for the record type
     /// whose directory the walk found.
-    fn tree_holds(&self, tree: RepoTree, hex: &str, readable: &dyn Fn(&str) -> bool) -> bool {
+    fn tree_holds(&self, tree: &RepoTree, hex: &str, readable: &dyn Fn(&str) -> bool) -> bool {
         if !is_blob_hex(hex) {
             return false;
         }
@@ -2997,7 +2997,7 @@ impl Store {
     /// listing. Stopping there makes this O(repositories).
     fn repo_dirs_any(&self, kinds: &[&str]) -> (Vec<PathBuf>, Option<PathBuf>) {
         let mut out = Vec::new();
-        let unseen = self.walk_repo_dirs(RepoTree::All, kinds, &mut |p| {
+        let unseen = self.walk_repo_dirs(&RepoTree::All, kinds, &mut |p| {
             out.push(p.to_path_buf());
             ControlFlow::Continue(())
         });
@@ -3008,7 +3008,7 @@ impl Store {
     /// path the walk could not inspect before it stopped (see [`Store::repo_dirs_any`]).
     fn walk_repo_dirs(
         &self,
-        tree: RepoTree,
+        tree: &RepoTree,
         kinds: &[&str],
         visit: &mut dyn FnMut(&Path) -> ControlFlow<()>,
     ) -> Option<PathBuf> {
@@ -3016,6 +3016,10 @@ impl Store {
         let (start, start_depth) = match tree {
             RepoTree::All | RepoTree::OutsideFiles => (repos.clone(), 0usize),
             RepoTree::Files => (repos.join(vk_hub_proto::token::FILES_REPO), 1),
+            RepoTree::Under(prefix) => {
+                debug_assert!(valid_name(prefix), "{prefix} is no repository path");
+                (repos.join(prefix), prefix.split('/').count())
+            }
         };
         // A walk starting below `repos/` skips the normal descent. Check each component
         // for symlinks to report. Missing or non-directory components mean an empty tree.
@@ -3072,7 +3076,7 @@ impl Store {
                 // than one `stat` per membership marker under `blobs/`.
                 let base = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
                 if depth == 0
-                    && tree == RepoTree::OutsideFiles
+                    && matches!(tree, RepoTree::OutsideFiles)
                     && base == vk_hub_proto::token::FILES_REPO
                 {
                     continue;
@@ -3106,13 +3110,15 @@ fn repo_of(repos: &Path, dir: &Path) -> Option<String> {
 }
 
 /// The part of `repos/` a walk covers.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum RepoTree {
     All,
     /// Everything but the top-level `files/` tree, the WebDAV plain-file directories.
     OutsideFiles,
     /// Only the top-level `files/` tree, the repository named `files` included.
     Files,
+    /// A valid repository path and all its descendants.
+    Under(String),
 }
 
 /// The directories a repository keeps its own state in. The walk in
@@ -5990,23 +5996,60 @@ pub(crate) fn readable_through(authz: &Authz<'_>, store: &Store, name: &str, hex
         return true;
     }
     let readable = |r: &str| r != name && authz.may_read(r);
-    // A WebDAV compiler cache can have thousands of shard directories under `files/`.
-    // Search them only if no readable repository outside `files/` holds the digest.
-    TREES_IN_LOOKUP_ORDER
+    lookup_trees(authz)
         .iter()
-        .any(|&tree| store.tree_holds(tree, hex, &readable))
+        .any(|tree| store.tree_holds(tree, hex, &readable))
 }
 
-/// `repos/` in the order a cross-repository lookup searches it: see [`readable_through`].
-const TREES_IN_LOOKUP_ORDER: [RepoTree; 2] = [RepoTree::OutsideFiles, RepoTree::Files];
+/// Repository trees in cross-repository lookup order.
+///
+/// A hub token can read each read grant's `<prefix>` and `files/<prefix>` and their
+/// descendants ([`vk_hub_proto::token::Grant::allows_repo`]). Searching those trees
+/// skips unrelated repositories.
+///
+/// Account lookups search `files/` last. An image hit skips thousands of WebDAV
+/// compiler-cache directories. A miss still checks readable repositories there.
+fn lookup_trees(authz: &Authz<'_>) -> Vec<RepoTree> {
+    let Authz::Token(claims) = authz else {
+        return vec![RepoTree::OutsideFiles, RepoTree::Files];
+    };
+    let read: Vec<&str> = claims
+        .grants
+        .iter()
+        .filter(|g| g.read)
+        .map(|g| g.prefix.as_str())
+        .collect();
+    let roots: Vec<String> = read
+        .iter()
+        .map(|p| p.to_string())
+        .chain(
+            read.iter()
+                .map(|p| format!("{}/{p}", vk_hub_proto::token::FILES_REPO)),
+        )
+        // Descendants inherit an invalid root's reserved components or excess depth.
+        .filter(|r| valid_name(r))
+        .collect();
+    // An ancestor covers nested roots. Keep only the first copy of an identical root.
+    let mut trees: Vec<RepoTree> = Vec::new();
+    for (i, root) in roots.iter().enumerate() {
+        let covered = roots
+            .iter()
+            .enumerate()
+            .any(|(j, other)| vk_hub_proto::token::under(other, root) && (other != root || j < i));
+        if !covered {
+            trees.push(RepoTree::Under(root.clone()));
+        }
+    }
+    trees
+}
 
-/// Other readable repositories with membership directories, `files/` last. A manifest
-/// push reuses this list across layers so each digest check probes only readable
+/// Other readable repositories with membership directories, in [`lookup_trees`] order. A
+/// manifest push reuses this list across layers so each digest check probes only readable
 /// repositories without walking `repos/` again.
 fn readable_repos(authz: &Authz<'_>, store: &Store, name: &str) -> Vec<String> {
-    TREES_IN_LOOKUP_ORDER
+    lookup_trees(authz)
         .iter()
-        .flat_map(|&tree| store.member_repo_names(tree))
+        .flat_map(|tree| store.member_repo_names(tree))
         .filter(|r| r != name && authz.may_read(r))
         .collect()
 }
@@ -6086,7 +6129,7 @@ fn authorize_and_mount_manifest_blobs(
         // repository per guess. Not for a hub token: it confines a job to its namespaces,
         // and the store's holdings outside them are none of its business, by timing or
         // otherwise. It pays the walk over the repositories its grants make readable for
-        // every reference, and `readable_repos` lists every repository once per manifest.
+        // every reference, and `readable_repos` lists those once per manifest.
         if shortcut && store.find_blob(&hex).is_none() {
             return Ok(Mount::Unreadable(hex));
         }
@@ -11539,7 +11582,27 @@ mod tests {
         let before = store.repo_dir_reads();
         assert!(readable_through(&authz, &store, "team/app", &image));
         let reads = store.repo_dir_reads() - before;
-        // `repos/`, `repos/team`, `repos/team/base`: none of the shards.
+        // A token walks its own grants: `repos/team`, `repos/team/base`.
+        assert!(reads <= 2, "{reads} directory reads to find an image layer");
+        // An account reads `repos/`, `repos/team` and `repos/team/base` before any shard.
+        let session = accounts::Principal::Session(accounts::User {
+            id: "https://issuer\u{1f}sub-1".to_string(),
+            oidc_issuer: "https://issuer".to_string(),
+            oidc_subject: "sub-1".to_string(),
+            email: None,
+            display_name: None,
+            is_admin: false,
+            created_at: SystemTime::UNIX_EPOCH,
+            last_login_at: SystemTime::UNIX_EPOCH,
+        });
+        let before = store.repo_dir_reads();
+        assert!(readable_through(
+            &Authz::Accounts(&session),
+            &store,
+            "team/app",
+            &image
+        ));
+        let reads = store.repo_dir_reads() - before;
         assert!(reads <= 3, "{reads} directory reads to find an image layer");
 
         let file = hex(&store.put_blob(b"a file put over WebDAV").unwrap());
@@ -11647,7 +11710,7 @@ mod tests {
         std::fs::remove_dir_all(&files).unwrap();
         std::os::unix::fs::symlink(dir.join("repos").join("elsewhere"), &files).unwrap();
         assert_eq!(
-            store.walk_repo_dirs(RepoTree::Files, MEMBER_SUBDIRS, &mut |_| {
+            store.walk_repo_dirs(&RepoTree::Files, MEMBER_SUBDIRS, &mut |_| {
                 ControlFlow::Continue(())
             }),
             Some(files.clone())
@@ -11658,12 +11721,70 @@ mod tests {
         std::fs::remove_file(&files).unwrap();
         std::fs::write(&files, b"").unwrap();
         assert_eq!(
-            store.walk_repo_dirs(RepoTree::Files, MEMBER_SUBDIRS, &mut |_| {
+            store.walk_repo_dirs(&RepoTree::Files, MEMBER_SUBDIRS, &mut |_| {
                 ControlFlow::Continue(())
             }),
             None
         );
         assert!(!readable_through(&team, &store, "team/app", &held));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A miss skips unrelated cache shards. A hit can come from a read grant's root
+    /// or any descendant, including repositories under `files/<prefix>`.
+    #[test]
+    fn a_tokens_lookup_walks_only_its_grants() {
+        let dir = testtmp::root().join("regserve-token-trees");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        const SHARDS: usize = 2048;
+        with_cache_shards(&store, "ci/sccache", SHARDS);
+        let c = claims(&[
+            ("p/gl/42", "rw"),
+            ("p/gl/42/sub", "r"),
+            ("images", "r"),
+            ("other", "w"),
+            ("images", "r"),
+            ("x/blobs", "r"),
+        ]);
+        let authz = Authz::Token(&c);
+        assert_eq!(
+            lookup_trees(&authz),
+            ["p/gl/42", "images", "files/p/gl/42", "files/images"]
+                .map(|r| RepoTree::Under(r.to_string()))
+        );
+        store
+            .record_blob("p/gl/42/app", &hex(&store.put_blob(b"own").unwrap()))
+            .unwrap();
+
+        let absent = "ab".repeat(32);
+        let cached = hex(&store.put_blob(b"a cached object").unwrap());
+        let before = store.repo_dir_reads();
+        assert!(!readable_through(&authz, &store, "p/gl/42/app", &absent));
+        assert!(!readable_through(&authz, &store, "p/gl/42/app", &cached));
+        let reads = store.repo_dir_reads() - before;
+        // `p/gl/42` and `p/gl/42/app` per miss; the other roots do not exist.
+        assert!(reads <= 4, "{reads} directory reads for two misses");
+
+        let own = hex(&store.put_blob(b"held by the prefix itself").unwrap());
+        store.record_blob("images", &own).unwrap();
+        assert!(readable_through(&authz, &store, "p/gl/42/app", &own));
+        let deep = hex(&store.put_blob(b"held deep below a prefix").unwrap());
+        store.record_blob("p/gl/42/sub/deep", &deep).unwrap();
+        assert!(readable_through(&authz, &store, "p/gl/42/app", &deep));
+
+        let medium = hex(&store.put_blob(b"an install medium").unwrap());
+        store.record_blob("files/images/iso", &medium).unwrap();
+        assert!(readable_through(&authz, &store, "p/gl/42/app", &medium));
+        let unreadable = hex(&store.put_blob(b"written, not read").unwrap());
+        store.record_blob("other/app", &unreadable).unwrap();
+        assert!(!readable_through(
+            &authz,
+            &store,
+            "p/gl/42/app",
+            &unreadable
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
