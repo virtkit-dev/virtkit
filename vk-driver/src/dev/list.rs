@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::usage::fmt_bytes;
+use crate::usage::fmt_compact;
 
 /// Timeout for stopping each publisher before removing its environment.
 const PUBLISH_STOP: std::time::Duration = std::time::Duration::from_secs(5);
@@ -778,7 +778,7 @@ fn short_paths<'a>(paths: &[&'a Path]) -> std::collections::HashMap<&'a Path, St
 /// A size the caller asked for, or `-` where there is none to show — either because the
 /// caller did not ask to measure, or because there is nothing there yet.
 pub(super) fn fmt_size(size: Option<u64>) -> String {
-    size.map(fmt_bytes).unwrap_or_else(|| "-".into())
+    size.map(fmt_compact).unwrap_or_else(|| "-".into())
 }
 
 /// The creator, shortened to the release: what was recorded is `vk --version` in full, whose
@@ -877,7 +877,7 @@ pub fn preview(selected: &[Row]) -> String {
             out.push_str(&format!(
                 "    {}  {}\n",
                 entry.name,
-                fmt_bytes(entry.size_bytes)
+                fmt_compact(entry.size_bytes)
             ));
         }
     }
@@ -942,7 +942,7 @@ pub fn remove(selected: &[Row], index: &crate::names::Index) -> Result<String> {
         out.push_str(&format!(
             "removed {} ({} freed)\n",
             row.name,
-            fmt_bytes(freed)
+            fmt_compact(freed)
         ));
     }
     Ok(out)
@@ -1839,8 +1839,8 @@ mod tests {
             text.starts_with("would remove 1 environment(s):\n"),
             "{text}"
         );
-        assert!(text.contains("\n    vscode-server  2 KiB\n"), "{text}");
-        assert!(text.contains("\n    endpoints.json  2 B\n"), "{text}");
+        assert!(text.contains("\n    vscode-server  2K\n"), "{text}");
+        assert!(text.contains("\n    endpoints.json  2B\n"), "{text}");
         assert!(text.contains("\n    dev.json  "), "{text}");
         // Logs belong to the run, not the user: they are not offered as storage.
         assert!(!text.contains("console.log"), "{text}");

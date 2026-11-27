@@ -696,6 +696,25 @@ pub(crate) fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
+/// A size in the narrowest form that still reads — `10.5G`, `780M`, `64K`, `512B` — as `vk
+/// list`, `vk dev list` and `vk delete` show memory and disk alike: the unit letter of a
+/// `--mem` token, no space and no `iB`, so a table column holds `1.2G/8G`. Each arm
+/// branches on the rounded figure it prints, as [`fmt_bytes`] does, so 1023.7 MiB reads
+/// `1.0G`, not `1024M`.
+pub(crate) fn fmt_compact(bytes: u64) -> String {
+    let (gib, mib, kib) = (
+        bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        bytes as f64 / (1024.0 * 1024.0),
+        bytes as f64 / 1024.0,
+    );
+    match bytes {
+        _ if mib.round() >= 1024.0 => format!("{gib:.1}G"),
+        _ if kib.round() >= 1024.0 => format!("{mib:.0}M"),
+        1024.. => format!("{kib:.0}K"),
+        _ => format!("{bytes}B"),
+    }
+}
+
 /// What everything under `dir` takes on disk, in bytes: allocated blocks rather than lengths,
 /// so a sparse qcow2 overlay counts for what its guest wrote and not for the disk it describes.
 /// Symlinks are not followed, nor mount points crossed: what is mounted inside the dir is

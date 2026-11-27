@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::usage::fmt_bytes;
+use crate::usage::fmt_compact;
 use crate::vmlist::Kind;
 use crate::vms::{self, Ref, Selector, VmEntry};
 use vk_fs::LockFile;
@@ -1034,7 +1034,7 @@ impl Removal {
 /// `, 1.2 GiB`: what `path` takes on disk, which deleting it frees; empty when it is gone.
 fn size_of(path: &Path) -> String {
     match path.exists() {
-        true => format!(", {}", fmt_bytes(crate::dev::storage::disk_usage(path))),
+        true => format!(", {}", fmt_compact(crate::dev::storage::disk_usage(path))),
         false => String::new(),
     }
 }
@@ -1048,10 +1048,10 @@ fn dev_contents(dir: &Path) -> String {
     }
     let b = crate::dev::prune::breakdown(dir);
     let total = b.storage + b.images + b.unfinished + b.other;
-    let mut out = format!(", {}", fmt_bytes(total));
+    let mut out = format!(", {}", fmt_compact(total));
     let mut line = |what: &str, bytes: u64, note: &str| {
         if bytes > 0 {
-            out.push_str(&format!("\n    {what:<20}{:>9}{note}", fmt_bytes(bytes)));
+            out.push_str(&format!("\n    {what:<20}{:>9}{note}", fmt_compact(bytes)));
         }
     };
     let names = format!("  {}", b.storage_names.join(", "));
@@ -1288,7 +1288,7 @@ fn remove(p: &Planned, lock: Option<&LockFile>) -> Result<String> {
             Ok(format!(
                 "removed {} ({} freed)\n",
                 t.name,
-                crate::usage::fmt_bytes(freed)
+                fmt_compact(freed)
             ))
         }
         Removal::Forget => {
@@ -1321,7 +1321,7 @@ fn remove(p: &Planned, lock: Option<&LockFile>) -> Result<String> {
             Ok(format!(
                 "removed {} ({} freed)\n",
                 t.shown(),
-                crate::usage::fmt_bytes(freed)
+                fmt_compact(freed)
             ))
         }
     }

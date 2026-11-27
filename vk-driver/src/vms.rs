@@ -946,30 +946,9 @@ pub(crate) fn mem_cell(used: Option<u64>, configured: Option<&str>) -> String {
     }
     format!(
         "{}/{}",
-        used.map_or_else(|| "-".to_string(), compact_bytes),
+        used.map_or_else(|| "-".to_string(), crate::usage::fmt_compact),
         configured.unwrap_or("-")
     )
-}
-
-/// A memory figure in the narrowest form that still reads — `1.2G`, `780M`, `64K`. The
-/// spacious `usage::fmt_bytes` (`1.6 GiB`) is what the detail view uses; the table holds two
-/// figures and a slash in one column, so this drops the space and the `iB` and keeps the
-/// unit letter of the `--mem` token it sits beside.
-fn compact_bytes(bytes: u64) -> String {
-    let (gib, mib, kib) = (
-        bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        bytes as f64 / (1024.0 * 1024.0),
-        bytes as f64 / 1024.0,
-    );
-    // Each arm branches on the rounded figure it is about to print rather than a coarser
-    // one, for the reason `usage::fmt_bytes` spells out: branching on the untruncated MiB
-    // while printing the rounded one renders 1023.7 MiB as "1024M".
-    match bytes {
-        _ if mib.round() >= 1024.0 => format!("{gib:.1}G"),
-        _ if kib.round() >= 1024.0 => format!("{mib:.0}M"),
-        1024.. => format!("{kib:.0}K"),
-        _ => format!("{bytes}B"),
-    }
 }
 
 /// The PROJECT column: the directory as recorded, or with `$HOME` folded to `~` unless
@@ -1617,7 +1596,7 @@ fn detail(
         ("VMM", vmm),
         ("CPUS", opt(e.cpus.map(|n| n.to_string()))),
         ("MEM", opt(e.mem.clone())),
-        ("MEM USED", opt(mem_used.map(crate::usage::fmt_bytes))),
+        ("MEM USED", opt(mem_used.map(crate::usage::fmt_compact))),
         ("NESTED", yes_no(e.nested)),
         ("ATOP LOG", path(e.atop_log.as_deref())),
     ]);
@@ -3490,7 +3469,7 @@ GUEST IP      10.0.0.2
 VMM           libkrun (pid 4242)
 CPUS          4
 MEM           8G
-MEM USED      1.6 GiB
+MEM USED      1.6G
 NESTED        yes
 ATOP LOG      /state/app/atop.log
 IMAGE STALE   yes
@@ -4043,17 +4022,17 @@ PUBLISHED     -
     }
 
     #[test]
-    fn compact_bytes_keeps_a_table_cell_narrow_without_lying_at_a_boundary() {
-        assert_eq!(compact_bytes(0), "0B");
-        assert_eq!(compact_bytes(1023), "1023B");
-        assert_eq!(compact_bytes(1024), "1K");
-        assert_eq!(compact_bytes(1024 * 1024), "1M");
-        assert_eq!(compact_bytes(1024 * 1024 * 1024), "1.0G");
-        assert_eq!(compact_bytes(1_717_986_918), "1.6G");
+    fn a_compact_size_keeps_a_table_cell_narrow_without_lying_at_a_boundary() {
+        assert_eq!(crate::usage::fmt_compact(0), "0B");
+        assert_eq!(crate::usage::fmt_compact(1023), "1023B");
+        assert_eq!(crate::usage::fmt_compact(1024), "1K");
+        assert_eq!(crate::usage::fmt_compact(1024 * 1024), "1M");
+        assert_eq!(crate::usage::fmt_compact(1024 * 1024 * 1024), "1.0G");
+        assert_eq!(crate::usage::fmt_compact(1_717_986_918), "1.6G");
         // Round into the larger unit instead of printing "1024M" or "1024K" by branching
         // on the rounded figure, as `usage::fmt_bytes` does.
-        assert_eq!(compact_bytes(1024 * 1024 * 1024 - 1), "1.0G");
-        assert_eq!(compact_bytes(1024 * 1024 - 1), "1M");
+        assert_eq!(crate::usage::fmt_compact(1024 * 1024 * 1024 - 1), "1.0G");
+        assert_eq!(crate::usage::fmt_compact(1024 * 1024 - 1), "1M");
     }
 
     #[test]

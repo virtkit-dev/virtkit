@@ -29,6 +29,8 @@ All notable changes to virtkit will be documented in this file.
 - **A running compose service's `vk list` row shows its PID, uptime, memory and image**,
   as the primary's does; it used to show `-` for all four. A VM started by an earlier `vk`
   shows them once it restarts.
+- **Sizes read as memory does in `vk list`, `vk dev list`, `vk dev storage list`, `vk delete`
+  and `vk dev gc`**: `10.5G`, `780M`, `64K`, where disk sizes read `10.5 GiB`.
 
 ### Fixed
 

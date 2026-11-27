@@ -770,15 +770,15 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            "NAME             CATEGORY          KIND          BACKING                           SIZE   STATE"
+            "NAME             CATEGORY          KIND          BACKING                           SIZE  STATE"
         );
         assert_eq!(
             lines[1],
-            "runner:/var/wab  durable           disk          /w/.virtkit/runner-var-wab.qcow2  3 MiB  created (service runner running)"
+            "runner:/var/wab  durable           disk          /w/.virtkit/runner-var-wab.qcow2  3M    created (service runner running)"
         );
         assert_eq!(
             lines[2],
-            "runner:/         generation-bound  persist-root  /w/.virtkit/roots/runner.qcow2    -      not created"
+            "runner:/         generation-bound  persist-root  /w/.virtkit/roots/runner.qcow2    -     not created"
         );
         assert_eq!(render(&[], &running), "no storage declared\n");
     }
