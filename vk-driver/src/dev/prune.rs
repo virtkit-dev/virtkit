@@ -72,6 +72,90 @@ const MEDIA: &[&str] = &[
 ];
 const STORAGE_DIRS: &[&str] = &["roots", "overlays", "editor"];
 
+/// What a dev environment's state dir holds, grouped as `vk delete` lists it before removing
+/// it whole, each group as what it takes on disk.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Breakdown {
+    /// persistent storage: what `prune --storage` selects
+    pub storage: u64,
+    /// the storage's paths, relative to the state dir
+    pub storage_names: Vec<String>,
+    /// boot images and media: what `prune --images` selects
+    pub images: u64,
+    /// what an unfinished build left: a scratch dir or a staged export
+    pub unfinished: u64,
+    /// everything else: keys, logs, config, sockets
+    pub other: u64,
+    /// whether a boot of it ever finished, recording its identity
+    pub booted: bool,
+}
+
+/// Group what the state dir `dir` holds (see [`Breakdown`]). Storage is read from the
+/// identity its last boot recorded, as `prune NAME` reads it; best-effort throughout.
+pub(crate) fn breakdown(dir: &Path) -> Breakdown {
+    use crate::dev::storage::disk_usage;
+    let env = env_of_state(dir);
+    let mut storage: Vec<PathBuf> = STORAGE_DIRS.iter().map(PathBuf::from).collect();
+    for backing in env.backings.iter().flatten() {
+        if let Ok(relative) = backing.strip_prefix(dir) {
+            storage.push(relative.to_path_buf());
+        }
+    }
+    storage.sort();
+    storage.dedup();
+    // A path inside another is counted with it.
+    let outer: Vec<&PathBuf> = storage
+        .iter()
+        .filter(|s| !storage.iter().any(|o| o != *s && s.starts_with(o)))
+        .filter(|s| dir.join(s).exists())
+        .collect();
+    let mut b = Breakdown {
+        booted: dir.join("dev.json").is_file(),
+        ..Breakdown::default()
+    };
+    for s in &outer {
+        b.storage += disk_usage(&dir.join(s));
+        b.storage_names.push(s.display().to_string());
+    }
+    let mut scopes = vec![(PathBuf::new(), None)];
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        if let Some(service) = name.as_bytes().strip_prefix(b"svc-")
+            && entry.file_type().is_ok_and(|t| t.is_dir())
+            && !outer.iter().any(|s| Path::new(&name).starts_with(s))
+        {
+            scopes.push((PathBuf::from(&name), Some(service.to_vec())));
+        }
+    }
+    for (scope, service) in &scopes {
+        let mut media: Vec<std::ffi::OsString> = MEDIA.iter().map(Into::into).collect();
+        if let Some(service) = service {
+            let mut overlay = service.clone();
+            overlay.extend_from_slice(b"-overlay.qcow2");
+            media.push(OsStr::from_bytes(&overlay).to_os_string());
+        }
+        for name in &media {
+            let path = scope.join(name);
+            if !outer.iter().any(|s| path.starts_with(s)) {
+                b.images += disk_usage(&dir.join(path));
+            }
+        }
+        for entry in std::fs::read_dir(dir.join(scope))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(crate::build::SCRATCH_PREFIX) || name.ends_with(".tmp") {
+                b.unfinished += disk_usage(&entry.path());
+            }
+        }
+    }
+    b.other = disk_usage(dir).saturating_sub(b.storage + b.images + b.unfinished);
+    b
+}
+
 /// A selected name relative to a held parent descriptor. Never follow a symlink in
 /// a selected path; links *inside* a removed directory are unlinked, not traversed.
 struct Target {

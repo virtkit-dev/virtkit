@@ -16,6 +16,8 @@ All notable changes to virtkit will be documented in this file.
 
 - **`vk delete` and `vk dev gc` say how much disk space they freed**: what the deleted
   files actually took on disk, so a sparse image counts what it held, not its length.
+- **`vk delete` lists what each dev environment holds on disk** — persistent storage, boot
+  image, what an unfinished build left — so storage about to go is plain to see.
 
 ### Fixed
 

@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use crate::usage::fmt_bytes;
 use crate::vmlist::Kind;
 use crate::vms::{self, Ref, Selector, VmEntry};
 use vk_fs::LockFile;
@@ -1003,12 +1004,14 @@ impl Removal {
         let dir = t.dir.display();
         match self {
             Removal::DevDir => format!(
-                "delete dev environment {name}{}: its state dir {dir}, storage and all",
-                with_services(&t.dir)
+                "delete dev environment {name}{}: its state dir {dir}{}",
+                with_services(&t.dir),
+                dev_contents(&t.dir)
             ),
             Removal::RunDir => format!(
-                "delete {name}{}: its state dir {dir}",
-                with_services(&t.dir)
+                "delete {name}{}: its state dir {dir}{}",
+                with_services(&t.dir),
+                size_of(&t.dir)
             ),
             Removal::Forget => format!(
                 "forget {name}: its name, {} and {} go; its state dir {dir}, not known to be \
@@ -1016,12 +1019,54 @@ impl Removal {
                 crate::names::RECIPE,
                 vms::LAST
             ),
-            Removal::Service => format!(
-                "delete {name}: what it keeps in {}",
-                t.dir.join(service_dir(t)).display()
-            ),
+            Removal::Service => {
+                let svc = t.dir.join(service_dir(t));
+                format!(
+                    "delete {name}: what it keeps in {}{}",
+                    svc.display(),
+                    size_of(&svc)
+                )
+            }
         }
     }
+}
+
+/// `, 1.2 GiB`: what `path` takes on disk, which deleting it frees; empty when it is gone.
+fn size_of(path: &Path) -> String {
+    match path.exists() {
+        true => format!(", {}", fmt_bytes(crate::dev::storage::disk_usage(path))),
+        false => String::new(),
+    }
+}
+
+/// What a dev environment's state dir `dir` holds, for the line saying it goes: its size on
+/// disk, then one line per kind of content it holds, so a listing shows whether persistent
+/// storage is about to go or only what an unfinished build left. Empty when it is gone.
+fn dev_contents(dir: &Path) -> String {
+    if !dir.exists() {
+        return String::new();
+    }
+    let b = crate::dev::prune::breakdown(dir);
+    let total = b.storage + b.images + b.unfinished + b.other;
+    let mut out = format!(", {}", fmt_bytes(total));
+    let mut line = |what: &str, bytes: u64, note: &str| {
+        if bytes > 0 {
+            out.push_str(&format!("\n    {what:<20}{:>9}{note}", fmt_bytes(bytes)));
+        }
+    };
+    let names = format!("  {}", b.storage_names.join(", "));
+    line("persistent storage", b.storage, &names);
+    line("boot image", b.images, "");
+    line(
+        "unfinished build",
+        b.unfinished,
+        "  (the steps it finished stay in the build cache)",
+    );
+    line("keys, logs, config", b.other, "");
+    if !b.booted {
+        out.push_str("\n    never booted");
+    }
+    out
 }
 
 /// List service directories with a console log for the deletion preview. Omit the suffix
@@ -1606,6 +1651,43 @@ mod tests {
     }
 
     /// The list shown before a delete names what goes, and what stays.
+    #[test]
+    fn a_dev_environment_listed_for_deletion_says_what_it_holds() {
+        let dir =
+            std::env::temp_dir().join(format!("vk-lifecycle-contents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A task killed mid-build: an abandoned scratch, nothing else of note.
+        std::fs::create_dir_all(dir.join(".build-1-0-x")).unwrap();
+        std::fs::write(dir.join(".build-1-0-x/stage.qcow2"), vec![1u8; 64 * 1024]).unwrap();
+        let botched = dev_contents(&dir);
+        assert!(botched.contains("unfinished build"), "{botched}");
+        assert!(botched.contains("the steps it finished stay in the build cache"));
+        assert!(!botched.contains("persistent storage"), "{botched}");
+        assert!(!botched.contains("boot image"), "{botched}");
+        assert!(botched.ends_with("never booted"), "{botched}");
+
+        // A booted one with storage: the storage first, named, then its image.
+        std::fs::remove_dir_all(dir.join(".build-1-0-x")).unwrap();
+        std::fs::create_dir_all(dir.join("roots/home")).unwrap();
+        std::fs::write(dir.join("roots/home/data"), vec![1u8; 64 * 1024]).unwrap();
+        std::fs::write(dir.join("root.qcow2"), vec![1u8; 64 * 1024]).unwrap();
+        std::fs::write(dir.join("dev.json"), b"{}").unwrap();
+        let booted = dev_contents(&dir);
+        let storage = booted.find("persistent storage").expect(&booted);
+        let image = booted.find("boot image").expect(&booted);
+        assert!(storage < image, "{booted}");
+        assert!(booted.contains("  roots"), "{booted}");
+        assert!(!booted.contains("never booted"), "{booted}");
+        assert!(!booted.contains("unfinished build"), "{booted}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            dev_contents(&dir),
+            "",
+            "a dir that is gone holds nothing to list"
+        );
+    }
+
     #[test]
     fn delete_steps_say_what_goes() {
         let run = target(Kind::Run, None);
