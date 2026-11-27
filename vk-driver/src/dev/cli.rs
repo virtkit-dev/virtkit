@@ -482,6 +482,30 @@ enum DevAction {
         #[arg(value_name = "NAME")]
         names: Vec<String>,
     },
+    /// Delete this environment, or named ones of this workspace: its state and its name
+    ///
+    /// What `vk delete` does, scoped to this workspace: the environment's state directory
+    /// goes, storage, keys and all, and so does its name; `--service S` (or `ENV/SERVICE`)
+    /// deletes only what that compose service keeps. It lists what will go and asks first;
+    /// with no terminal to ask on it deletes nothing unless `--yes` or `--force`. A running
+    /// environment is refused unless `--force`. A VM of another workspace is `vk delete`'s.
+    #[command(visible_aliases = ["rm", "remove"])]
+    Delete {
+        #[command(flatten)]
+        targets: Targets,
+        /// stop a running environment first; implies --yes
+        #[arg(short = 'f', long)]
+        force: bool,
+        /// delete without asking
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// list what would be deleted, and delete nothing
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+        /// seconds to wait for an environment `--force` stops
+        #[arg(long, default_value_t = super::boot::STOP_TIMEOUT_SECS)]
+        timeout: u64,
+    },
     /// Remove this environment's local boot images or persistent data
     ///
     /// Defaults to local boot images. --storage selects persistent roots, overlays,
@@ -569,6 +593,7 @@ impl DevAction {
             | Self::Restart { .. }
             | Self::List { .. }
             | Self::Gc { .. }
+            | Self::Delete { .. }
             | Self::Prune { .. }
             | Self::Plan { .. }
             | Self::Schema => false,
@@ -871,6 +896,26 @@ async fn dev_action(
         host_config,
     };
     match action {
+        DevAction::Delete {
+            targets,
+            force,
+            yes,
+            dry_run,
+            timeout,
+        } => match delete_refs(&plan, &targets, &globals) {
+            Ok(refs) => crate::lifecycle::delete(
+                &refs,
+                force,
+                yes,
+                dry_run,
+                crate::lifecycle::Opts {
+                    config: globals.host_config,
+                    timeout,
+                    build: false,
+                },
+            ),
+            Err(code) => code,
+        },
         DevAction::Up { no_wait, targets } if !targets.is_empty() => {
             act_on(Verb::Up { no_wait }, &targets, 0, &plan, &globals).await
         }
@@ -1644,6 +1689,35 @@ impl Verb {
             Verb::Start | Verb::Stop | Verb::Restart => &["start"],
         }
     }
+}
+
+/// What `vk dev delete` hands `vk delete`: each target as the VM name `vk list` gives it
+/// (`ENV/SERVICE` for a compose service), or this environment's own when none is named.
+fn delete_refs(
+    plan: &plan::Plan,
+    targets: &Targets,
+    g: &Globals<'_>,
+) -> Result<Vec<std::ffi::OsString>, ExitCode> {
+    use super::targets::Pick;
+    if targets.is_empty() {
+        // `plan` joins an ASCII name onto the state base: the name `vk list` reads.
+        let name = plan.state_dir.file_name().unwrap_or_default();
+        return Ok(vec![name.to_os_string()]);
+    }
+    // Resolved as a stop resolves them: services that exist, never one only `up` makes.
+    let (_, picks) = picks(Verb::Stop, targets, plan, g).map_err(|e| {
+        match e.downcast_ref::<super::targets::Outside>() {
+            Some(o) => refuse_outside(&o.0, "vk delete"),
+            None => fail(&e, 2),
+        }
+    })?;
+    Ok(picks
+        .into_iter()
+        .map(|pick| match pick {
+            Pick::Env(env) => env.name.into(),
+            Pick::Service(env, service) => format!("{}/{service}", env.name).into(),
+        })
+        .collect())
 }
 
 /// `vk dev up | start | stop | restart NAME…`: act on each named service or environment in
@@ -2743,6 +2817,7 @@ mod tests {
         (&["stop"], false),
         (&["down", "db"], false),
         (&["list"], false),
+        (&["delete", "db", "-y"], false),
         (&["gc", "--all-stale", "--yes"], false),
         (&["prune"], false),
         (&["plan", "--diff"], false),

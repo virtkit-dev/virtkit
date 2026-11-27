@@ -7,6 +7,10 @@ All notable changes to virtkit will be documented in this file.
 ### Added
 
 - **`vk dev ls`** lists dev environments, as `vk dev list` does.
+- **`vk dev delete` (aliases `rm`, `remove`).** It is `vk delete` scoped to this
+  workspace: bare, it deletes this environment; with names, environments or compose
+  services of this workspace. Like `vk delete`, it lists what goes and asks first, and
+  `-y`/`--yes` or `-f`/`--force` answer for you.
 
 ## [0.118.0] - 2026-11-27
 

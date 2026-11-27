@@ -732,7 +732,14 @@ vk dev list --json
 vk dev gc --all-stale
 vk dev gc ENVIRONMENT_NAME --yes
 vk dev gc
+vk dev delete                       # this environment: lists what goes, asks first
+vk dev rm ENVIRONMENT_NAME -y       # another of this workspace, without asking
 ```
+
+`vk dev delete` (aliases `rm`, `remove`) is `vk delete` scoped to this workspace: the
+same listing, question, `-y`/`--yes`, `-f`/`--force` (stop it first, and do not ask)
+and `-n`/`--dry-run`, applied to this environment or to the named environments and
+services of this workspace.
 
 `list` shows declared environments and secondary compose services, followed by recorded
 environments this workspace no longer declares. A running manager supplies service
@@ -1131,5 +1138,6 @@ Use `vk dev COMMAND --help` for individual options.
 | `storage list`, `storage reset NAME` | Inspect storage or destroy a durable item's data. |
 | `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. `NAME` selects a stopped environment in this workspace. Use `vk reset NAME` for a stopped dev environment with a valid identity and no run recipe in any workspace. |
 | `list`, `ls` | List this workspace's environments and secondary compose services. Use `--all` for host-wide state, `--wide` for full paths, `--no-sizes` to skip disk usage, or `--json`. |
+| `delete [NAME…]`, `rm`, `remove` | Delete the environment, or named environments or services of this workspace, as `vk delete` does: lists what goes and asks; `-y`, `-f` (stop first), `-n`. |
 | `gc [NAME…]` | Remove stopped state of this workspace's environments. With no names, remove this workspace's environment. `--all-stale` (host-wide, no names) and `--yes`. For a stopped environment with a valid recorded identity and no run recipe, [`vk delete NAME`](../README.md#manage-vms) also removes its state, from any workspace. |
 | `schema` | Print the configuration JSON Schema. |
