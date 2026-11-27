@@ -67,6 +67,7 @@ mod lifecycle;
 mod local;
 mod manager;
 mod mkoci;
+mod namematch;
 mod names;
 mod net;
 mod node;
@@ -2656,13 +2657,20 @@ enum Cmd {
     /// `vk list --running --kind service --field name` prints names for `vk exec`.
     #[command(display_order = 6, visible_alias = "ls")]
     List {
-        /// which VMs: a name, a pid, or those of a project directory (default: all)
+        /// which VMs: names, globs, pids or directories, any of them (default: all)
         ///
-        /// A name as the NAME column prints it (`NAME/SERVICE` for one service row); an
-        /// all-digit argument is a pid; a path (`/…`, `./…`, `../…`, `~…`) a project or
-        /// state directory, matched exactly unless `--recursive`.
+        /// A name as the NAME column prints it, a VM's taking its services' rows too; a word
+        /// holding `*`, `?` or `[` is a glob over names (`'wab*'`); an all-digit argument is a
+        /// pid; a path (`/…`, `./…`, `../…`, `~…`) a project or state directory, matched
+        /// exactly unless `--recursive`. The other filters narrow what these pick.
         #[arg(value_name = "REF")]
-        target: Option<std::ffi::OsString>,
+        refs: Vec<std::ffi::OsString>,
+        /// only the VMs with this name (repeatable; any of them, with the REFs)
+        #[arg(long, value_name = "NAME")]
+        name: Vec<String>,
+        /// only the VMs whose name matches this glob (repeatable; any of them, with the REFs)
+        #[arg(long, value_name = "GLOB")]
+        glob: Vec<String>,
         /// with a directory (default: the current one) or --workspace, also every VM below it
         #[arg(short = 'r', long)]
         recursive: bool,
@@ -2672,17 +2680,23 @@ enum Cmd {
         /// that recorded no boot; `starting` and `stopping` are VMs on their way.
         #[arg(
             long,
+            visible_alias = "status",
             value_name = "STATE",
             value_delimiter = ',',
-            conflicts_with_all = ["running", "stopped"]
+            conflicts_with_all = ["running", "stopped", "active"]
         )]
         state: Vec<crate::vmlist::State>,
-        /// only the VMs that are running: `--state=running`
-        #[arg(long, conflicts_with = "stopped")]
+        /// only the VMs that are up: `--state=running`
+        #[arg(long, conflicts_with_all = ["stopped", "active"])]
         running: bool,
         /// only the VMs at rest: `--state=stopped,never-booted`
-        #[arg(long)]
+        #[arg(long, conflicts_with = "active")]
         stopped: bool,
+        /// only the VMs with a live process: `--state=running,starting,stopping`
+        ///
+        /// What holds memory and the like: the opposite of `--stopped`.
+        #[arg(long)]
+        active: bool,
         /// only these compose services' rows (comma-separated, any of them)
         #[arg(long, value_name = "SERVICE", value_delimiter = ',')]
         service: Vec<String>,
@@ -4135,11 +4149,14 @@ async fn cli_main(cli: Cli) -> ExitCode {
         };
     }
     if let Cmd::List {
-        target,
+        refs,
+        name,
+        glob,
         recursive,
         state,
         running,
         stopped,
+        active,
         service,
         workspace,
         kind,
@@ -4151,8 +4168,9 @@ async fn cli_main(cli: Cli) -> ExitCode {
         stale,
     } = &cli.cmd
     {
+        use crate::namematch::Pattern;
         let opts = vms::ListOpts {
-            target: target.clone(),
+            words: refs.clone(),
             recursive: *recursive,
             json: *json,
             stale: *stale,
@@ -4160,9 +4178,16 @@ async fn cli_main(cli: Cli) -> ExitCode {
             wide: *wide,
             detail: *detail,
             filter: crate::vmlist::Filter {
-                states: match (*running, *stopped) {
-                    (true, _) => crate::vmlist::State::RUNNING.to_vec(),
-                    (_, true) => crate::vmlist::State::STOPPED.to_vec(),
+                words: name
+                    .iter()
+                    .map(|n| Pattern::Name(n.clone()))
+                    .chain(glob.iter().map(|g| Pattern::Glob(g.clone())))
+                    .map(crate::vmlist::Word::Pattern)
+                    .collect(),
+                states: match (*running, *stopped, *active) {
+                    (true, _, _) => crate::vmlist::State::RUNNING.to_vec(),
+                    (_, true, _) => crate::vmlist::State::STOPPED.to_vec(),
+                    (_, _, true) => crate::vmlist::State::ACTIVE.to_vec(),
                     _ => state.clone(),
                 },
                 kind: *kind,

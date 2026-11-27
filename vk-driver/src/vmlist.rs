@@ -370,12 +370,50 @@ impl State {
     pub const RUNNING: &[State] = &[State::Running];
     /// What `--stopped` stands for: every state with no VM up or on its way.
     pub const STOPPED: &[State] = &[State::Stopped, State::NeverBooted];
+    /// What `--active` stands for: every state with a live process holding what it uses.
+    pub const ACTIVE: &[State] = &[State::Running, State::Starting, State::Stopping];
 }
 
-/// Which rows to keep. Each criterion given narrows the list; a list of values keeps a row
-/// that matches any of them.
+/// One word naming VMs to list: a name or a glob, a directory, or a pid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Word {
+    /// a VM's name or a row's (`NAME/SERVICE`), or a glob over them
+    Pattern(crate::namematch::Pattern),
+    /// a VM's state dir or project directory (canonical), or with `below` any project under it
+    Dir { dir: PathBuf, below: bool },
+    /// a running VM's pid; with a service, that one of its services
+    Pid(u32, Option<String>),
+}
+
+impl Word {
+    /// Whether this word names the row `r`, whose VM's own row is `vm` (`r` itself for a VM).
+    fn names(&self, r: &Row, vm: &Row) -> bool {
+        match self {
+            Word::Pattern(p) => p.matches(&r.name) || p.matches(&vm.name),
+            Word::Dir { dir, below } => {
+                crate::vms::canonical(&vm.state_dir) == *dir
+                    || vm
+                        .project
+                        .as_deref()
+                        .map(crate::vms::canonical)
+                        .is_some_and(|p| p == *dir || (*below && p.starts_with(dir)))
+            }
+            Word::Pid(pid, service) => {
+                vm.pid == Some(*pid)
+                    && service.as_ref().is_none_or(|s| {
+                        r.parent.is_some() && r.name.rsplit_once('/').is_some_and(|(_, n)| n == s)
+                    })
+            }
+        }
+    }
+}
+
+/// Which rows to keep. The words pick the VMs to look at, any of them; each other criterion
+/// given narrows that down, a list of values keeping a row that matches any of them.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Filter {
+    /// only the rows these name, any of them (none: every row)
+    pub words: Vec<Word>,
     /// only the rows in one of these states
     pub states: Vec<State>,
     pub kind: Option<Kind>,
@@ -391,8 +429,39 @@ pub struct Filter {
 }
 
 impl Filter {
-    pub fn keeps(&self, r: &Row) -> bool {
-        (self.states.is_empty() || self.states.iter().any(|s| s.status() == r.status))
+    /// Whether anything is asked for: a listing that keeps nothing says no VM matched,
+    /// rather than that there is none.
+    pub fn narrows(&self) -> bool {
+        !self.words.is_empty()
+            || !self.states.is_empty()
+            || self.kind.is_some()
+            || self.problems
+            || !self.services.is_empty()
+            || self.workspace.is_some()
+    }
+
+    /// The rows of `rows` this filter keeps, a service's judged with its VM's row.
+    pub fn apply(&self, rows: Vec<Row>) -> Vec<Row> {
+        let keep: Vec<bool> = rows
+            .iter()
+            .map(|r| {
+                let vm = r
+                    .parent
+                    .as_ref()
+                    .and_then(|p| rows.iter().find(|v| v.parent.is_none() && v.name == *p))
+                    .unwrap_or(r);
+                self.keeps(r, vm)
+            })
+            .collect();
+        rows.into_iter()
+            .zip(keep)
+            .filter_map(|(r, k)| k.then_some(r))
+            .collect()
+    }
+
+    fn keeps(&self, r: &Row, vm: &Row) -> bool {
+        (self.words.is_empty() || self.words.iter().any(|w| w.names(r, vm)))
+            && (self.states.is_empty() || self.states.iter().any(|s| s.status() == r.status))
             && self.kind.is_none_or(|k| k == r.kind)
             && self
                 .service
@@ -681,11 +750,7 @@ mod tests {
         assert_eq!(status("coming"), "starting");
         assert_eq!(status("task-1a2b"), NEVER_BOOTED);
         let keep = |f: Filter| {
-            let mut kept: Vec<&str> = rows
-                .iter()
-                .filter(|r| f.keeps(r))
-                .map(|r| r.name.as_str())
-                .collect();
+            let mut kept: Vec<String> = f.apply(rows.clone()).into_iter().map(|r| r.name).collect();
             kept.sort_unstable();
             kept
         };
@@ -764,9 +829,9 @@ mod tests {
             "-"
         );
         let keep = |f: Filter| {
-            rows.iter()
-                .filter(|r| f.keeps(r))
-                .map(|r| r.name.clone())
+            f.apply(rows.clone())
+                .into_iter()
+                .map(|r| r.name)
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -818,6 +883,44 @@ mod tests {
             }),
             ["app/db", "other/db"]
         );
+        let words = |words: &[Word]| Filter {
+            words: words.to_vec(),
+            ..Filter::default()
+        };
+        let pattern = |w: &str| Word::Pattern(crate::namematch::Pattern::from_word(w));
+        assert_eq!(keep(words(&[pattern("app/web")])), ["app/web"]);
+        // A VM's name keeps its services' rows too; a glob may name either.
+        assert_eq!(keep(words(&[pattern("app")])), ["app", "app/db", "app/web"]);
+        assert_eq!(keep(words(&[pattern("*/w*")])), ["app/web"]);
+        assert!(
+            keep(words(&[pattern("ap")])).is_empty(),
+            "a name matches whole"
+        );
+        // Words are any of them; other criteria narrow what they pick.
+        assert_eq!(
+            keep(words(&[pattern("nope"), Word::Pid(10, None)])),
+            ["app", "app/db", "app/web"]
+        );
+        assert_eq!(keep(words(&[Word::Pid(10, Some("db".into()))])), ["app/db"]);
+        assert_eq!(
+            keep(Filter {
+                states: State::ACTIVE.to_vec(),
+                ..words(&[pattern("app*")])
+            }),
+            ["app", "app/web"]
+        );
+        let dir = |d: &str, below: bool| Word::Dir {
+            dir: d.into(),
+            below,
+        };
+        assert_eq!(
+            keep(words(&[dir("/s/app", false)])).len(),
+            3,
+            "its state dir"
+        );
+        assert_eq!(keep(words(&[dir("/w/app", false)])).len(), 3, "its project");
+        assert!(keep(words(&[dir("/w", false)])).is_empty());
+        assert_eq!(keep(words(&[dir("/w", true)])).len(), 3);
     }
 
     /// Non-UTF-8 paths retain the recipe's byte representation in JSON.

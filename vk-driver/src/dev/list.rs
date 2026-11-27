@@ -44,13 +44,19 @@ pub enum Status {
     NeverBooted,
     /// declared environment with no state directory
     NotBuilt,
+    /// a boot holds the state dir and has no VM up yet
+    Starting,
+    /// asked to stop, its VM not gone yet
+    Stopping,
 }
 
 impl Status {
     /// What `--running` stands for.
     pub const RUNNING: &[Status] = &[Status::Running];
-    /// What `--stopped` stands for: every state with no VM up.
+    /// What `--stopped` stands for: every state with no VM up or on its way.
     pub const STOPPED: &[Status] = &[Status::Stopped, Status::NeverBooted];
+    /// What `--active` stands for: every state with a live process holding what it uses.
+    pub const ACTIVE: &[Status] = &[Status::Running, Status::Starting, Status::Stopping];
 
     fn label(self) -> &'static str {
         match self {
@@ -58,7 +64,14 @@ impl Status {
             Status::Stopped => "stopped",
             Status::NeverBooted => "never booted",
             Status::NotBuilt => "not built",
+            Status::Starting => crate::vmstate::State::Starting.label(),
+            Status::Stopping => crate::vmstate::State::Stopping.label(),
         }
+    }
+
+    /// Whether a live process holds the state dir: nothing may remove it from under that.
+    fn is_active(self) -> bool {
+        Self::ACTIVE.contains(&self)
     }
 }
 
@@ -161,10 +174,15 @@ pub struct Service {
     pub size_bytes: Option<u64>,
 }
 
-/// Which rows `vk dev list` keeps. Each criterion given narrows the list; a list of values
-/// keeps what matches any of them.
+/// Which rows `vk dev list` keeps. The names, globs and words pick the environments and
+/// services to look at, any of them; each other criterion given narrows that down, a list of
+/// values keeping what matches any of them.
 #[derive(Debug, Default, Clone)]
 pub struct Filter {
+    /// environments by name or by glob (`--name`, `--glob`)
+    pub names: Vec<crate::namematch::Pattern>,
+    /// words from the command line: an environment's name or glob, or a service's
+    pub words: Vec<crate::namematch::Pattern>,
     /// only what is in one of these states: an environment by its own, a service by its own
     pub states: Vec<Status>,
     /// only the compose services with one of these names, and no environment line
@@ -176,25 +194,51 @@ impl Filter {
         self.states.is_empty() || self.states.contains(&status)
     }
 
-    /// Whether only service lines are kept, the environments' own lines left out.
-    pub fn services_only(&self) -> bool {
-        !self.services.is_empty()
+    /// Whether anything is asked for: a listing that keeps nothing then prints nothing,
+    /// rather than say the workspace has no environment.
+    pub fn narrows(&self) -> bool {
+        !self.names.is_empty()
+            || !self.words.is_empty()
+            || !self.states.is_empty()
+            || !self.services.is_empty()
     }
 
-    /// Keep what this filter selects of `rows`: the environments in a selected state, each
-    /// with its services in one — or, with `services`, those services alone, each still
-    /// carried by its environment's row.
+    /// Whether the environment `r` is picked by name: always, when nothing is named. Its state
+    /// dir's own name names it too, but only exactly: being `<name>-<digest>`, it would make a
+    /// glob such as `wab-*` pick `wab` itself.
+    fn picks(&self, r: &Row) -> bool {
+        use crate::namematch::Pattern;
+        (self.names.is_empty() && self.words.is_empty())
+            || self
+                .names
+                .iter()
+                .chain(&self.words)
+                .any(|p| p.matches(&r.name) || matches!(p, Pattern::Name(n) if *n == r.dir_name))
+    }
+
+    /// Whether the environment `r`'s own line is listed, beside the services it keeps.
+    pub fn shows_line(&self, r: &Row) -> bool {
+        self.services.is_empty() && self.picks(r) && self.state_ok(r.status)
+    }
+
+    /// Keep what this filter selects of `rows`: each environment picked, in a selected state,
+    /// with its services in one; and the services a word names, each carried by its
+    /// environment's row whose own line is left out (see [`Self::shows_line`]).
     pub fn apply(&self, mut rows: Vec<Row>) -> Vec<Row> {
         for r in &mut rows {
+            let picked = self.picks(r);
+            let env = r.name.clone();
             r.services.retain(|s| {
                 (self.services.is_empty() || self.services.contains(&s.name))
                     && self.state_ok(s.state())
+                    && (picked
+                        || self
+                            .words
+                            .iter()
+                            .any(|p| p.matches(&s.name) || p.matches(&format!("{env}/{}", s.name))))
             });
         }
-        match self.services_only() {
-            true => rows.retain(|r| !r.services.is_empty()),
-            false => rows.retain(|r| self.state_ok(r.status)),
-        }
+        rows.retain(|r| self.shows_line(r) || !r.services.is_empty());
         rows
     }
 }
@@ -275,7 +319,7 @@ pub fn with_services(
             row.workspace = Some(d.workspace.clone());
             row.environment = Some(d.environment.clone());
         }
-        let running = row.status == Status::Running;
+        let running = matches!(row.status, Status::Running | Status::Stopping);
         let reported = match running {
             true => states(&row.dir),
             false => None,
@@ -329,8 +373,7 @@ impl Row {
 
     /// Eligible for `--all-stale`: not running, with a missing checkout or no identity.
     fn stale(&self) -> bool {
-        self.status != Status::Running
-            && (self.has(Flag::WorkspaceMissing) || self.has(Flag::Ephemeral))
+        !self.status.is_active() && (self.has(Flag::WorkspaceMissing) || self.has(Flag::Ephemeral))
     }
 }
 
@@ -524,6 +567,9 @@ fn row(dir: &Path, running: &[Running], with_sizes: bool, with_flags: bool) -> R
         flags.push(Flag::Ephemeral);
     }
     let booted_secs = identity.as_ref().map(|i| i.booted_secs);
+    let transient = crate::vmstate::peek(dir)
+        .filter(|(_, standing)| *standing != crate::vmstate::Standing::Gone)
+        .map(|(t, _)| t.state);
     Row {
         name: dir.file_name().unwrap_or_default().to_string_lossy().into(),
         dir_name: dir.file_name().unwrap_or_default().to_string_lossy().into(),
@@ -535,10 +581,14 @@ fn row(dir: &Path, running: &[Running], with_sizes: bool, with_flags: bool) -> R
             .and_then(|i| i.manifest.pointer("/source/Compose/service")?.as_str())
             .map(String::from),
         environment: manifest("environment"),
-        status: match (live.is_some(), identity.is_some()) {
-            (true, _) => Status::Running,
-            (false, true) => Status::Stopped,
-            (false, false) => Status::NeverBooted,
+        // On record as on its way, as `vk list` reads it; a record that no longer holds is
+        // read past.
+        status: match (transient, live.is_some(), identity.is_some()) {
+            (Some(crate::vmstate::State::Starting), _, _) => Status::Starting,
+            (Some(crate::vmstate::State::Stopping), _, _) => Status::Stopping,
+            (None, true, _) => Status::Running,
+            (None, false, true) => Status::Stopped,
+            (None, false, false) => Status::NeverBooted,
         },
         created_by: identity
             .as_ref()
@@ -614,9 +664,9 @@ pub(crate) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
 /// Render one row per environment and a `NAME/SERVICE` row per declared secondary service.
 /// A declaration without state has dashes for its VM name, creator, last boot and usage.
 /// Service rows have no creator, last boot or memory reading. `wide` shows full workspace
-/// paths instead of their shortest distinguishing suffixes. With `services_only`, the
-/// environments' own rows are left out.
-pub fn render(rows: &[Row], wide: bool, services_only: bool) -> String {
+/// paths instead of their shortest distinguishing suffixes. An environment whose `line` is
+/// false shows only its services' rows.
+pub fn render(rows: &[Row], wide: bool, line: &dyn Fn(&Row) -> bool) -> String {
     if rows.is_empty() {
         return "no dev environment state on this host\n".into();
     }
@@ -640,7 +690,7 @@ pub fn render(rows: &[Row], wide: bool, services_only: bool) -> String {
             false => r.name.clone(),
         };
         // Filtered down to some of its services, an environment's own row is left out.
-        if !services_only {
+        if line(r) {
             lines.push(vec![
                 name.clone(),
                 workspace.clone(),
@@ -782,8 +832,13 @@ pub fn select_dirs(rows: Vec<Row>, dirs: &[PathBuf]) -> Result<Vec<Row>> {
 
 /// `selected`, unless one of them is running.
 fn refuse_running(selected: Vec<Row>) -> Result<Vec<Row>> {
-    if let Some(row) = selected.iter().find(|r| r.status == Status::Running) {
-        bail!("{} is running — `vk stop {}` first", row.name, row.name);
+    if let Some(row) = selected.iter().find(|r| r.status.is_active()) {
+        bail!(
+            "{} is {} — `vk stop {}` first",
+            row.name,
+            row.status.label(),
+            row.name
+        );
     }
     Ok(selected)
 }
@@ -1033,6 +1088,7 @@ mod tests {
         };
         let env = |name: &str, status: Status, services: Vec<Service>| Row {
             name: name.into(),
+            dir_name: format!("{name}-0123456789abcdef"),
             status,
             services,
             ..base.clone()
@@ -1067,20 +1123,24 @@ mod tests {
             states: states.to_vec(),
             ..Filter::default()
         };
-        // A state keeps the environments in it, and of their services those in it too.
+        // A state keeps what is in it: an environment by its own, a service by its own — a
+        // stopped service of a running environment listed without its environment's line.
         assert_eq!(kept(states(Status::RUNNING)), ["app", "app/runner"]);
+        let stopped = states(Status::STOPPED);
         assert_eq!(
-            kept(states(Status::STOPPED)),
-            ["app-ci", "app-ci/runner", "app-task"]
+            kept(stopped.clone()),
+            ["app", "app/db", "app-ci", "app-ci/runner", "app-task"]
         );
-        assert_eq!(kept(states(&[Status::NotBuilt])), Vec::<String>::new());
+        assert!(!stopped.shows_line(&rows[0]) && stopped.shows_line(&rows[1]));
+        assert_eq!(kept(states(&[Status::NotBuilt])), ["app", "app/cache"]);
         // Services keep those services alone, any of the names, under their environment.
         let services = |names: &[&str], states: &[Status]| Filter {
             services: names.iter().map(|n| n.to_string()).collect(),
             states: states.to_vec(),
+            ..Filter::default()
         };
         let f = services(&["runner", "cache"], &[]);
-        assert!(f.services_only());
+        assert!(f.narrows());
         assert_eq!(
             kept(f),
             ["app", "app/runner", "app/cache", "app-ci", "app-ci/runner"]
@@ -1094,12 +1154,54 @@ mod tests {
             ["app", "app/cache"]
         );
         // The table leaves the environments' own lines out.
-        let shown = render(&services(&["runner"], &[]).apply(rows.clone()), false, true);
+        let f = services(&["runner"], &[]);
+        let shown = render(&f.apply(rows.clone()), false, &|r| f.shows_line(r));
         assert!(
             shown.contains("app/runner") && shown.contains("app-ci/runner"),
             "{shown}"
         );
         assert!(!shown.lines().any(|l| l.starts_with("app ")), "{shown}");
+
+        use crate::namematch::Pattern;
+        let words = |words: &[&str]| Filter {
+            words: words.iter().map(|w| Pattern::from_word(w)).collect(),
+            ..Filter::default()
+        };
+        // A word names an environment, with all its services, or a service, alone.
+        assert_eq!(kept(words(&["app-ci"])), ["app-ci", "app-ci/runner"]);
+        assert_eq!(kept(words(&["db"])), ["app", "app/db"]);
+        assert!(
+            !words(&["db"]).shows_line(&rows[0]),
+            "the environment's line is left out"
+        );
+        assert_eq!(
+            kept(words(&["app-t*", "cache"])),
+            ["app", "app/cache", "app-task"]
+        );
+        assert_eq!(kept(words(&["app/r*"])), ["app", "app/runner"]);
+        assert_eq!(
+            kept(words(&["app-task-0123456789abcdef"])),
+            ["app-task"],
+            "a state dir's own name names it exactly"
+        );
+        // `--name` and `--glob` name environments alone, never a service.
+        let names = |names: Vec<Pattern>| Filter {
+            names,
+            ..Filter::default()
+        };
+        assert!(kept(names(vec![Pattern::Name("db".into())])).is_empty());
+        assert_eq!(
+            kept(names(vec![Pattern::Glob("app-*".into())])),
+            ["app-ci", "app-ci/runner", "app-task"]
+        );
+        // The rest narrows what they pick: `--active` keeps what has a live process.
+        assert_eq!(
+            kept(Filter {
+                states: Status::ACTIVE.to_vec(),
+                ..words(&["app*"])
+            }),
+            ["app", "app/runner"]
+        );
     }
 
     /// A state dir with a `dev.json` recording `workspace`, as `after_boot` writes one.
@@ -1671,7 +1773,7 @@ mod tests {
             row.age_secs = row.age_secs.map(|_| 7200);
         }
 
-        let out = render(&rows, true, false);
+        let out = render(&rows, true, &|_| true);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("NAME"), "{out}");
         assert!(
@@ -1705,7 +1807,7 @@ mod tests {
             "{out}"
         );
         assert_eq!(
-            render(&[], false, false),
+            render(&[], false, &|_| true),
             "no dev environment state on this host\n"
         );
     }

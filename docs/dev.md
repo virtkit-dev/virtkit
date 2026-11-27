@@ -735,8 +735,9 @@ not changed for 10 minutes.
 vk dev list                         # this workspace's environments
 vk dev list --all                   # host-wide state, from anywhere
 vk dev list --json
-vk dev list runner db               # only those services' lines (= --service runner,db)
-vk dev list --running               # = --state=running; also --stopped, --state=never-booted,...
+vk dev list runner 'ad-*'           # words: environments' or services' names, or globs
+vk dev list --all 'wab-wt*'         # --name / --glob name environments alone
+vk dev list --active                # with a live process; also --running, --stopped, --state=...
 vk dev gc --all-stale
 vk dev gc ENVIRONMENT_NAME --yes
 vk dev gc

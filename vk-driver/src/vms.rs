@@ -1096,7 +1096,8 @@ fn fields_report(views: &[serde_json::Value], fields: &[String], json: bool) -> 
 
 #[derive(Debug, Default)]
 pub struct ListOpts {
-    pub target: Option<std::ffi::OsString>,
+    /// the REFs given: names or globs, pids, directories; any of them
+    pub words: Vec<std::ffi::OsString>,
     pub recursive: bool,
     pub json: bool,
     pub stale: bool,
@@ -1107,6 +1108,26 @@ pub struct ListOpts {
     pub filter: crate::vmlist::Filter,
 }
 
+/// A REF given to `vk list`, as the VMs it names: a name — `NAME/SERVICE` for one row — or a
+/// glob over names, as [`crate::namematch::Pattern::from_word`] reads it; a pid
+/// (`PID/SERVICE`); a project or state directory, or with `below` any project under it.
+fn list_word(arg: &std::ffi::OsStr, below: bool) -> Result<crate::vmlist::Word> {
+    use crate::vmlist::Word;
+    Ok(match Ref::parse(arg)? {
+        Ref::Pid(pid, service) => Word::Pid(pid, service),
+        Ref::Path(dir) => Word::Dir {
+            dir: canonical(&dir),
+            below,
+        },
+        Ref::Name { .. } => {
+            let text = arg.to_string_lossy();
+            Word::Pattern(crate::namematch::Pattern::from_word(
+                text.trim_end_matches('/'),
+            ))
+        }
+    })
+}
+
 /// Render the selected rows in the requested format. A single match still defaults to
 /// the table.
 pub fn list_report(opts: ListOpts) -> Result<String> {
@@ -1114,14 +1135,16 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
     use crate::vmstate::Standing;
     check_fields(&opts.fields)?;
     let mut filter = opts.filter;
-    let target = match &opts.target {
-        Some(t) => {
-            // Resolve the primary first. The service suffix filters its rows.
-            let (sel, service) = Selector::from_ref(Ref::parse(t)?, opts.recursive)?;
-            filter.service = service;
-            Some(sel.resolved())
+    // REFs pick rows, any of them (see [`list_word`]); with none, a bare `-r` is the current
+    // directory and every project below it.
+    let target = match opts.words.is_empty() {
+        true => selector_of(None, opts.recursive)?.map(Selector::resolved),
+        false => {
+            for word in &opts.words {
+                filter.words.push(list_word(word, opts.recursive)?);
+            }
+            None
         }
-        None => selector_of(None, opts.recursive)?.map(Selector::resolved),
     };
     let stale = opts.stale;
     let idx = crate::names::Index::open()?;
@@ -1249,8 +1272,7 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
         .collect();
     // `--detail` lists a stopped primary's services even when the filter drops their rows.
     let all = crate::vmlist::rows(&live, &known, now);
-    let mut rows: Vec<crate::vmlist::Row> =
-        all.iter().filter(|r| filter.keeps(r)).cloned().collect();
+    let mut rows: Vec<crate::vmlist::Row> = filter.apply(all.clone());
     if stale {
         // Keep the requested key on every row, including unknown results.
         for r in &mut rows {
@@ -1300,11 +1322,9 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
         return Ok(details(&rows, &all, &live, stale));
     }
     if rows.is_empty() {
-        return Ok(match (&opts.target, &target) {
-            (Some(r), _) => format!("no matching vk VM for {}\n", r.to_string_lossy()),
-            (None, Some(_)) => "no matching vk VM\n".to_string(),
-            (None, None) if !unfiltered => "no matching vk VM\n".to_string(),
-            (None, None) => "no vk VMs\n".to_string(),
+        return Ok(match target.is_none() && unfiltered {
+            true => "no vk VMs\n".to_string(),
+            false => "no matching vk VM\n".to_string(),
         });
     }
     // `tilde` matches against a canonical `project_dir`, so canonicalize `$HOME` as well;

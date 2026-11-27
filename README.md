@@ -611,12 +611,16 @@ Use the primary's NAME to select the VM. A dev environment without a stable name
 state directory's name. An unnamed running `vk run` uses its pid. `vk list`, `start`, `stop`,
 `restart`, `delete`, `exec`, `cp`, `logs`, `ping` and `publish` also accept `NAME/SERVICE`.
 
-`--state` selects rows in any of `running`, `stopped`, `never-booted` (a dev state
-directory with no recorded boot), `starting` and `stopping`. `--running` is
-`--state=running`, `--stopped` is `--state=stopped,never-booted`. A service counts by its
-own state; one with no reported state shows `-` and matches no state. `--kind
-dev|run|service` selects one kind, `--service runner,db` those compose services' rows
-alone, and `--workspace DIR` (with `-r`, below it too) the VMs of one project.
+Names pick the VMs to list, any of them: `vk list wab virtkit`, a glob `vk list 'wab*'`
+(a word holding `*`, `?` or `[`), `--name` or `--glob`, as well as pids and directories. A
+VM's name takes its services' rows too. The other filters narrow that down. `--state`
+selects rows in any of `running`, `stopped`, `never-booted` (a dev state directory with no
+recorded boot), `starting` and `stopping`. `--running` is `--state=running`, `--stopped`
+is `--state=stopped,never-booted`, and `--active` — whatever has a live process holding
+memory — is `--state=running,starting,stopping`. A service counts by its own state; one
+with no reported state shows `-` and matches no state. `--kind dev|run|service` selects one
+kind, `--service runner,db` those compose services' rows alone, and `--workspace DIR` (with
+`-r`, below it too) the VMs of one project.
 
 For a primary with a persistent state directory, STATUS shows `starting` during pull,
 build or boot before registration. A recorded whole-VM stop shows `stopping`. If the

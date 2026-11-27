@@ -445,9 +445,19 @@ enum DevAction {
     /// usage. Flags identify missing workspaces and state directories without a recorded boot.
     #[command(visible_alias = "ls")]
     List {
-        /// only these compose services' lines, as `--service`
-        #[arg(value_name = "SERVICE", conflicts_with = "all")]
-        services: Vec<String>,
+        /// which environments and services: names or globs, any of them (default: all)
+        ///
+        /// A word is an environment's name, or a compose service's of this workspace — whose
+        /// lines alone it then lists; a word holding `*`, `?` or `[` is a glob over them
+        /// (`'wab*'`). The other filters narrow what these pick.
+        #[arg(value_name = "NAME")]
+        words: Vec<String>,
+        /// only the environments with this name (repeatable; any of them, with the NAMEs)
+        #[arg(long, value_name = "NAME")]
+        name: Vec<String>,
+        /// only the environments whose name matches this glob (repeatable; any of them)
+        #[arg(long, value_name = "GLOB")]
+        glob: Vec<String>,
         /// list dev state directories across all workspaces
         #[arg(long, short = 'a')]
         all: bool,
@@ -457,17 +467,23 @@ enum DevAction {
         /// is state that recorded no boot; `not-built`, one declared and never brought up.
         #[arg(
             long,
+            visible_alias = "status",
             value_name = "STATE",
             value_delimiter = ',',
-            conflicts_with_all = ["running", "stopped"]
+            conflicts_with_all = ["running", "stopped", "active"]
         )]
         state: Vec<super::list::Status>,
-        /// only what is running: `--state=running`
-        #[arg(long, conflicts_with = "stopped")]
+        /// only what is up: `--state=running`
+        #[arg(long, conflicts_with_all = ["stopped", "active"])]
         running: bool,
         /// only what is at rest: `--state=stopped,never-booted`
-        #[arg(long)]
+        #[arg(long, conflicts_with = "active")]
         stopped: bool,
+        /// only what has a live process: `--state=running,starting,stopping`
+        ///
+        /// What holds memory and the like: the opposite of `--stopped`.
+        #[arg(long)]
+        active: bool,
         /// only these compose services' lines (comma-separated, any of them)
         ///
         /// The services are those the workspace's config declares, so this needs a
@@ -833,24 +849,36 @@ async fn dev_action(
         };
     }
     if let DevAction::List {
-        services,
+        words,
+        name,
+        glob,
         all,
         state,
         running,
         stopped,
+        active,
         service,
         json,
         no_sizes,
         wide,
     } = action
     {
+        use crate::dev::list::Status;
+        use crate::namematch::Pattern;
         let filter = crate::dev::list::Filter {
-            states: match (running, stopped) {
-                (true, _) => crate::dev::list::Status::RUNNING.to_vec(),
-                (_, true) => crate::dev::list::Status::STOPPED.to_vec(),
+            names: name
+                .into_iter()
+                .map(Pattern::Name)
+                .chain(glob.into_iter().map(Pattern::Glob))
+                .collect(),
+            words: words.iter().map(|w| Pattern::from_word(w)).collect(),
+            states: match (running, stopped, active) {
+                (true, _, _) => Status::RUNNING.to_vec(),
+                (_, true, _) => Status::STOPPED.to_vec(),
+                (_, _, true) => Status::ACTIVE.to_vec(),
                 _ => state,
             },
-            services: services.into_iter().chain(service).collect(),
+            services: service,
         };
         let scope = match all {
             true => None,
@@ -1568,18 +1596,14 @@ fn dev_list(
     let rows = filter.apply(rows);
     match (json, &here) {
         (true, _) => crate::dev::list::json(&rows).map_err(|e| fail(&e, 1)),
-        (false, _) if rows.is_empty() && (!filter.states.is_empty() || filter.services_only()) => {
-            Ok(String::new())
-        }
+        (false, _) if rows.is_empty() && filter.narrows() => Ok(String::new()),
         (false, Some((here, _))) if rows.is_empty() => Ok(format!(
             "no dev environment for {} (`vk dev list --all` lists host-wide state)\n",
             here.display()
         )),
-        (false, _) => Ok(crate::dev::list::render(
-            &rows,
-            wide,
-            filter.services_only(),
-        )),
+        (false, _) => Ok(crate::dev::list::render(&rows, wide, &|r| {
+            filter.shows_line(r)
+        })),
     }
 }
 
