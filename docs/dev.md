@@ -725,6 +725,12 @@ for intentional deletion of an individual external durable backing. Arbitrary da
 from removed mount declarations is not inferred; `vk dev gc` removes the whole
 environment state when it is no longer needed.
 
+A build or task stopped by Ctrl-C, SIGTERM or SIGQUIT removes its unfinished files itself;
+the steps it finished stay in the build cache. What one killed outright leaves (SIGKILL,
+the OOM killer, a power cut) — a build's scratch, a half-written image, a task's throwaway
+environment — `vk gc` removes, as "unfinished builds", once nothing holds it and it has
+not changed for 10 minutes.
+
 ```sh
 vk dev list                         # this workspace's environments
 vk dev list --all                   # host-wide state, from anywhere

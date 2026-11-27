@@ -834,7 +834,7 @@ pub fn build(opts: &Options) -> Result<Built> {
 /// its owner holds on it (see [`claim_scratch`]), not anything in its name. The pid stays
 /// first so a sweep can recognise this process's own dirs, and for the diagnostic value of
 /// knowing which process left one behind.
-const SCRATCH_PREFIX: &str = ".build-";
+pub(crate) const SCRATCH_PREFIX: &str = ".build-";
 
 /// The scratch dir for a build writing to `out`, unique per run:
 /// `<prefix><pid>-<seq>-<nonce>`, the nonce from [`crate::scratch::random_nonce`].
@@ -3947,7 +3947,7 @@ fn sweep_stale_sessions(dir: &Path) {
 /// namespace, which is exactly what a pid cannot tell us. Anything unexpected (an unreadable
 /// dir, a filesystem without `flock`) reads as live, so a sweep never removes what it does
 /// not understand.
-fn claim_if_abandoned(path: &Path) -> Option<vk_fs::LockFile> {
+pub(crate) fn claim_if_abandoned(path: &Path) -> Option<vk_fs::LockFile> {
     use std::os::unix::io::AsRawFd;
 
     let dir = vk_fs::LockFile::new(std::fs::File::open(path).ok()?);

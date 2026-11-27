@@ -146,6 +146,16 @@ pub(crate) fn run(cfg: &Config, state_dir: &Path, req: &Request) -> Summary {
         sum.keep(format!("{}: another user's", dir.display()));
     }
     sum.kept.extend(staging.left);
+    if let Ok(base) = &dev_base {
+        let unfinished = crate::leftovers::collect(req.dry_run);
+        sum.row(
+            "unfinished builds",
+            unfinished.dirs,
+            unfinished.bytes,
+            base,
+            "left in state dirs by builds and tasks killed outright".into(),
+        );
+    }
     // Checkouts are the executor's alone, and the executor roots its state at
     // `Config::state_dir()` — never the dev default `vk run` caches under, which is what
     // `state_dir` may be here. Sweeping that instead would walk a tree nothing ever checks
@@ -878,10 +888,17 @@ impl Summary {
             "reclaimed"
         };
         let _ = writeln!(out, "virtkit: gc {verb} {}", fmt_bytes(self.total()));
+        let width = self
+            .rows
+            .iter()
+            .map(|r| r.category.len())
+            .max()
+            .unwrap_or(0)
+            .max(11);
         for r in &self.rows {
             let _ = writeln!(
                 out,
-                "  {:<11}{:>6}  {:>10}  {}",
+                "  {:<width$}{:>6}  {:>10}  {}",
                 r.category,
                 r.count,
                 fmt_bytes(r.bytes),

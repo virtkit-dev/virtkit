@@ -61,6 +61,7 @@ mod initramfs;
 mod iso9660;
 mod jobctx;
 mod jobevents;
+mod leftovers;
 mod libkrun_sys;
 mod lifecycle;
 mod local;

@@ -27,6 +27,8 @@ All notable changes to virtkit will be documented in this file.
   steps as it does when one of them fails, removes its unfinished files, and then exits
   with the signal; the steps it finished stay cached. A second signal exits at once. A
   task's throwaway VM is removed too, where an interrupted task used to leave it behind.
+- **`vk gc` removes what builds and tasks killed outright left behind**: a build's
+  scratch, a half-written image, a task's throwaway VM. They show as "unfinished builds".
 
 ## [0.118.0] - 2026-11-27
 
