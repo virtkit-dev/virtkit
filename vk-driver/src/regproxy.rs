@@ -32,14 +32,14 @@
 //! What the proxy lends decides what it forwards ([`Scope`]). The node's own credential is
 //! not scoped, so it reaches the OCI API only (`/v2/`). A job's registry token, which the hub
 //! scoped to the job's namespaces (`[registry] guest_credential = "job"`), also reaches the
-//! lock API (`/lock/`) and plain files, as WebDAV (`/dav/files/`) and as S3 (`/s3/`, for
-//! sccache with `SCCACHE_S3_NO_CREDENTIALS=true`): the registry enforces the token's grants on
-//! each. A job meant to have a token and given none gets a proxy that forwards
+//! lock API (`/lock/`) and plain files through `/files/`, WebDAV (`/dav/files/`) and S3
+//! (`/s3/`, for sccache with `SCCACHE_S3_NO_CREDENTIALS=true`). The registry enforces the
+//! token's grants on each. A job meant to have a token and given none gets a proxy that forwards
 //! nothing. A job no hub placed, under `guest_credential = "job-or-node"`, gets the token the
 //! hub gives the node for its runner's guests on the same paths, read again for each request so
 //! a renewal reaches a running job; while the node holds none, the proxy forwards nothing.
 //!
-//! A job's token may come with areas ([`Area`]): `job/<alias>` in an OCI, WebDAV or S3 path, or
+//! A job's token may come with areas ([`Area`]): `job/<alias>` in an OCI, file or S3 path, or
 //! before the `:` of a lock name, stands for the area's prefix, so a guest names a fixed path
 //! whatever its project or protection. No other query parameter is mapped, an OCI mount's
 //! `from=` among them. Only requests are rewritten: the registry answers with the real names
@@ -94,7 +94,11 @@ const DAV_FILES_METHODS: &[&str] = &[
     "GET", "HEAD", "PROPFIND", "PUT", "MKCOL", "DELETE", "OPTIONS",
 ];
 
-/// `/s3/<bucket>/<key>` serves the same file as `/dav/files/<bucket>/<key>`.
+/// Forward the methods vk-registry supports under `/files/`.
+const FILES: &str = "/files/";
+const FILES_METHODS: &[&str] = &["GET", "HEAD", "PUT", "DELETE"];
+
+/// `/s3/<bucket>/<key>` and `/files/<bucket>/<key>` address the same stored tag.
 /// Forward every method so the registry can return S3 errors for unsupported operations.
 const S3: &str = "/s3/";
 
@@ -103,7 +107,8 @@ const S3: &str = "/s3/";
 pub enum Scope {
     /// The OCI API only, `/v2/`: what an unscoped credential may be lent for.
     Oci,
-    /// A job token reaches `/v2/`, `/lock/`, `/dav/files/` and `/s3/` under its registry grants.
+    /// A job token reaches `/v2/`, `/lock/`, `/files/`, `/dav/files/` and `/s3/` under its
+    /// registry grants.
     Job,
     /// Nothing: a job that should have had a token and has none.
     Deny,
@@ -123,7 +128,7 @@ impl Scope {
     fn paths(self) -> &'static [&'static str] {
         match self {
             Scope::Oci => &["/v2/"],
-            Scope::Job => &["/v2/", "/lock/", DAV_FILES, S3],
+            Scope::Job => &["/v2/", "/lock/", FILES, DAV_FILES, S3],
             Scope::Deny => &[],
             Scope::Areas => &["/v2/", "/lock/", S3],
         }
@@ -667,7 +672,7 @@ enum Mapped<'a> {
 }
 
 /// `url` (an accepted upstream URL) under `cfg`'s areas: `job/<alias>` at the start of an
-/// OCI, WebDAV or S3 path, or of a lock name's path part, becomes the area's prefix.
+/// OCI, file, WebDAV or S3 path, or of a lock name's path part, becomes the area's prefix.
 fn map_aliases<'a>(cfg: &'a ProxyCfg, url: &reqwest::Url) -> Mapped<'a> {
     if !matches!(cfg.scope, Scope::Job | Scope::Areas) {
         return Mapped::Unchanged;
@@ -683,7 +688,7 @@ fn map_aliases<'a>(cfg: &'a ProxyCfg, url: &reqwest::Url) -> Mapped<'a> {
             Err(()) => Mapped::Unknown,
         };
     }
-    for base in ["/v2/", DAV_FILES, S3] {
+    for base in ["/v2/", FILES, DAV_FILES, S3] {
         let Some(rest) = path.strip_prefix(base) else {
             continue;
         };
@@ -759,6 +764,8 @@ const AREA_HEADERS: &[&str] = &[
     "content-range",
     "content-type",
     "docker-content-digest",
+    // with `range`, or a resumed read could splice another object's bytes onto its start
+    "if-range",
     "range",
     "user-agent",
     "x-amz-content-sha256",
@@ -1089,7 +1096,9 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     let Some(url) = upstream_url(cfg, &path_and_query) else {
         return Ok(refuse(match cfg.scope {
             Scope::Oci => b"registry proxy: only /v2/ registry paths are proxied",
-            Scope::Job => b"registry proxy: only /v2/, /lock/, /dav/files/ and /s3/ are proxied",
+            Scope::Job => {
+                b"registry proxy: only /v2/, /lock/, /files/, /dav/files/ and /s3/ are proxied"
+            }
             Scope::Deny => b"registry proxy: this job has no registry credential",
             Scope::Areas => OUTSIDE_AREAS,
         }));
@@ -1114,14 +1123,25 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     };
     // Plain files take the verbs vk-registry serves there, and no MOVE or COPY, whose
     // `Destination` names the proxy rather than the registry.
-    if path_and_query.starts_with(DAV_FILES) && !DAV_FILES_METHODS.contains(&method.as_str()) {
+    let unserved = if path_and_query.starts_with(DAV_FILES) {
+        !DAV_FILES_METHODS.contains(&method.as_str())
+    } else {
+        path_and_query.starts_with(FILES) && !FILES_METHODS.contains(&method.as_str())
+    };
+    if unserved {
         let body = Full::new(Bytes::from_static(
-            b"registry proxy: this method is not proxied under /dav/files/",
+            b"registry proxy: this method is not proxied for plain files",
         ))
         .map_err(|never| match never {})
         .boxed_unsync();
+        let allow = if path_and_query.starts_with(DAV_FILES) {
+            DAV_FILES_METHODS.join(", ")
+        } else {
+            FILES_METHODS.join(", ")
+        };
         return Ok(Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(hyper::header::ALLOW, allow)
             .body(body)?);
     }
     // The aliases, mapped on the resolved URL, which then goes through the same checks
@@ -1171,11 +1191,17 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    // File PUT requires the guest's declared length, which streaming would discard.
+    let declared = hyper::body::Body::size_hint(&incoming).exact();
     let sent = match (repeatable(&method, path), bodyful) {
         (true, false) => Outgoing::Whole(Bytes::new()),
         (true, true) => held(incoming, MAX_HELD).await?,
         (false, false) => Outgoing::Once(None),
         (false, true) => Outgoing::Once(Some(streamed(incoming))),
+    };
+    let streamed_len = match &sent {
+        Outgoing::Once(Some(_)) => declared,
+        _ => None,
     };
     let request = |body: Option<reqwest::Body>| {
         let mut rb = cfg.client.request(method.clone(), url.clone());
@@ -1186,9 +1212,10 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
             Some(token) => rb.bearer_auth(token),
             None => cfg.creds.apply(rb),
         };
-        match body {
-            Some(body) => rb.body(body),
-            None => rb,
+        match (body, streamed_len) {
+            (Some(body), Some(len)) => rb.header(hyper::header::CONTENT_LENGTH, len).body(body),
+            (Some(body), None) => rb.body(body),
+            (None, _) => rb,
         }
     };
     let what = format!("proxy {method} {}", url.path());
@@ -1266,7 +1293,10 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     let mut out = Response::builder().status(status);
     let scoped = connection_scoped(&headers_out);
     for (k, v) in headers_out.iter() {
-        if !is_skipped(k.as_str()) && !scoped.iter().any(|s| s == k.as_str()) {
+        // An empty HEAD body cannot supply the upstream Content-Length.
+        let kept = !is_skipped(k.as_str())
+            || (method == Method::HEAD && *k == hyper::header::CONTENT_LENGTH);
+        if kept && !scoped.iter().any(|s| s == k.as_str()) {
             out = out.header(k, v);
         }
     }
@@ -1302,6 +1332,7 @@ fn repeatable(method: &Method, path: &str) -> bool {
         "GET" | "HEAD" | "OPTIONS" | "PROPFIND" => true,
         "PUT" => {
             oci.is_some_and(|p| p.rsplit('/').nth(1) == Some("manifests"))
+                || path.starts_with(FILES)
                 || path.starts_with(DAV_FILES)
                 || path.starts_with(S3)
         }
@@ -1996,7 +2027,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// OCI, lock, WebDAV and S3 requests use the job token in place of guest credentials.
+    /// OCI, lock, file, WebDAV and S3 requests use the job token in place of guest credentials.
     /// The proxy never reads the registry section's credential.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_job_token_reaches_locks_and_files_too() {
@@ -2010,6 +2041,10 @@ mod tests {
             ("POST", "/lock/acquire?name=p/gl/42:k"),
             ("PROPFIND", "/dav/files/p/gl/42/x"),
             ("PUT", "/dav/files/p/gl/42/x"),
+            ("GET", "/files/p/gl/42/x"),
+            ("HEAD", "/files/p/gl/42/x"),
+            ("PUT", "/files/p/gl/42/x"),
+            ("DELETE", "/files/p/gl/42/x"),
             ("GET", "/s3/p/gl/42/x"),
             ("HEAD", "/s3/p/gl/42/x"),
             ("PUT", "/s3/p/gl/42/x"),
@@ -2025,6 +2060,8 @@ mod tests {
             "/settings/keys",
             "/dav/files/../../settings/keys",
             "/dav/files/%2e%2e/%2e%2e/browse",
+            "/files/../settings/keys",
+            "/files/%2e%2e/browse",
             "/s3",
             "/s3?list-type=2",
             "/s3/../settings/keys",
@@ -2076,6 +2113,11 @@ mod tests {
                 "/dav/files/task-cache/gl/42/protected",
             ),
             (
+                "GET",
+                "/files/job/task-cache/a/b",
+                "/files/task-cache/gl/42/protected/a/b",
+            ),
+            (
                 "PUT",
                 "/s3/job/task-cache/a/b",
                 "/s3/task-cache/gl/42/protected/a/b",
@@ -2102,6 +2144,7 @@ mod tests {
             "/v2/job/manifests/1",
             "/v2/job",
             "/dav/files/job/",
+            "/files/job/other/k",
             "/s3/job/other/k",
             "/lock/acquire?name=job/other:k",
             "/lock/acquire?name=job:k",
@@ -2411,8 +2454,7 @@ mod tests {
         assert_eq!(seen.lock().unwrap().0, "", "nothing forwarded");
     }
 
-    /// Under /dav/files/ only the verbs the registry serves there pass, and a PROPFIND's or a
-    /// MKCOL's body reaches the registry.
+    /// Forward only supported `/files/` and WebDAV methods. Preserve PROPFIND and MKCOL bodies.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plain_files_take_the_registrys_verbs_and_their_bodies() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -2431,6 +2473,18 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(r.status().as_u16(), 405, "{method}");
+        }
+        for method in ["PROPFIND", "MKCOL", "OPTIONS", "MOVE", "POST"] {
+            let r = client
+                .request(
+                    reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                    format!("http://{proxy}/files/p/x"),
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 405, "{method} under /files/");
+            assert_eq!(r.headers()["allow"], "GET, HEAD, PUT, DELETE", "{method}");
         }
         assert_eq!(*seen.lock().unwrap(), Vec::<u8>::new(), "nothing forwarded");
         let r = client
@@ -2456,6 +2510,47 @@ mod tests {
             .unwrap();
         assert_eq!(r.status().as_u16(), 200);
         assert_eq!(*seen.lock().unwrap(), b"<mkcol/>".to_vec());
+    }
+
+    /// A PUT too large to buffer for retries retains the length `/files/` requires.
+    /// HEAD retains the upstream file length.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_put_keeps_its_length_and_a_head_its_size() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, took) = scripted_upstream(vec![
+            answer(0, b""),
+            Act::Write(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\nConnection: close\r\n\r\n".to_vec(),
+            ),
+        ]);
+        let (proxy, _served) =
+            proxy_on_tcp(ProxyCfg::for_job(&registry(up_addr), Some("vkt_job")).unwrap());
+        let client = reqwest::Client::new();
+        let big = vec![7u8; MAX_HELD + 1];
+        let r = client
+            .put(format!("http://{proxy}/files/p/x"))
+            .body(big.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        {
+            let took = took.lock().unwrap();
+            let (head, body) = &took[0];
+            assert!(
+                head.contains(&format!("content-length: {}", big.len())),
+                "{head}"
+            );
+            assert!(!head.contains("transfer-encoding"), "{head}");
+            assert_eq!(body.len(), big.len());
+        }
+        let r = client
+            .head(format!("http://{proxy}/files/p/x"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(r.headers()["content-length"], "1234");
     }
 
     /// An upstream that records the body of the last request it took.
@@ -2657,6 +2752,8 @@ mod tests {
         assert!(repeatable(&put, "/v2/app/manifests/latest"));
         assert!(repeatable(&put, "/v2/team/app/manifests/sha256:ab"));
         assert!(repeatable(&put, "/dav/files/p/x"));
+        assert!(repeatable(&put, "/files/p/x"));
+        assert!(!repeatable(&Method::DELETE, "/files/p/x"));
         assert!(repeatable(&put, "/s3/p/x"));
         assert!(!repeatable(&Method::DELETE, "/s3/p/x"));
         assert!(repeatable(&post, "/v2/app/blobs/uploads/"));
@@ -3225,9 +3322,9 @@ mod tests {
                 "accept-encoding",
                 "authorization",
                 "content-encoding",
+                "content-length",
                 "content-type",
                 "host",
-                "transfer-encoding",
                 "x-vk-lock-holder",
             ],
             "{head}"

@@ -437,6 +437,33 @@ the store, during a handover, does not see it. The 1 GiB is checked, not reserve
 writes can still fill the store, causing a put to fail while streaming or writing its tags.
 Registries advertise the route to their hub in their inventory.
 
+### Plain-file reads and deletions
+
+`GET`, `HEAD` and `DELETE` on `/files/<dir>/<name>` address the tag `files/<dir>:<name>`,
+including files written over S3. The “WebDAV view” path rules apply, except that the leaf
+may be any valid tag up to 255 bytes, including `tags`. A directory takes precedence over
+a tag at the same path. `/files/sha256/<sha256>` serves only a layer with that digest.
+
+Before lookup, the path or its parent must grant `Read` for a read or `Write` for a
+deletion. Otherwise the registry returns 403. An unreadable resolved object returns 404.
+Deletion also requires `Write` on the resolved repository.
+
+Successful reads use WebDAV's file headers and advertise `Accept-Ranges: bytes`. `GET`
+returns 206 for a satisfiable single range (`bytes=<first>-[<last>]` or `bytes=-<n>`).
+An unsatisfiable range returns 416. Multiple ranges, a malformed range or `If-Range`
+yield the whole file. `HEAD` describes the whole file. For a ranged `GET` on a zstd
+frame, decoding starts at the beginning of the frame.
+
+Reads and deletions drain request bodies before replying, up to 4 GiB. A body declared
+larger or found to exceed that limit gets 413. `DELETE` removes only the named tag
+(204, or 404 if absent). Other tags, including a separate digest tag, remain subject
+to gc. A directory or a tag for anything other than a raw file returns 409.
+
+Reads ignore `If-None-Match` and `If-Modified-Since` and process `Range` normally.
+`If-Match` and `If-Unmodified-Since` return 501. `DELETE` returns 501 for any of the
+four. Reads and deletions return 400 for the PUT-only `under=` parameter. Other query
+parameters are ignored, including Git's dumb HTTP probe `info/refs?service=…`.
+
 ## Build-once lock service
 
 The registry process is the authority for leased locks. No Redis or shared filesystem lock
@@ -703,8 +730,12 @@ left in `uploads/` goes with the idle uploads.
 
 sccache's S3 backend (OpenDAL's path-style `s3` service) can read, stat and write cache
 objects at `/s3/<bucket>/<key>` with `GET`, `HEAD` and single-request `PUT`. Each object is
-the plain file at `/dav/files/<bucket>/<key>`, visible to WebDAV, `vk registry get`,
-`/browse` and gc. S3 defaults on even with WebDAV disabled. Set `s3 = false` to disable it.
+stored as a plain file visible to `vk registry get`, `/browse` and gc. The corresponding
+paths are `/files/<bucket>/<key>` and `/dav/files/<bucket>/<key>`. Only the `/files/`
+view requires a matching digest for reads under `sha256`. Both `GET` and `HEAD` accept
+a single byte range, including `HEAD` as in S3's `HeadObject`. An unsatisfiable range
+returns 416 (`InvalidRange`). S3 defaults on even with WebDAV disabled. Set `s3 = false`
+to disable it.
 
 The service root, bucket operations, other methods and nonempty queries (listings, presigned
 URLs, multipart and sub-resources) return 501 `NotImplemented`. So do `Content-MD5`,
@@ -952,9 +983,10 @@ networking.
 
 The runner's credential is not scoped, so the proxy lends it for `/v2/` only. Under
 `[registry] guest_credential = "job"` it lends a hub-placed job's own token instead, whose
-grants this registry enforces ([Hub tokens](#hub-tokens)), and forwards `/lock/` and
-`/dav/files/` too; under `/dav/files/` only GET, HEAD, PROPFIND, PUT, MKCOL, DELETE and
-OPTIONS pass, MOVE and COPY naming the proxy in their `Destination`. A job without a token,
+grants this registry enforces ([Hub tokens](#hub-tokens)). The proxy also forwards `/lock/`,
+`/files/`, `/dav/files/` and `/s3/`. Under `/files/` it allows GET, HEAD, PUT and DELETE.
+WebDAV also allows PROPFIND, MKCOL and OPTIONS. MOVE and COPY would name the proxy in
+`Destination`. A job without a token,
 a gitlab-runner job included, gets a proxy that refuses everything.
 
 A `vk dev` environment with `[dev.cache] shared` gets a proxy over its shared caches instead:

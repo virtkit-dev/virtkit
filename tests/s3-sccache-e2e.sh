@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run sccache against a loopback registry with the shared bearer as both AWS keys.
 # Compile two C files, one producing an object over 5 MiB. Both must miss, then hit
-# after clearing local state. Check the startup probe through WebDAV and verify that
+# after clearing local state. Check the startup probe through /files/ and verify that
 # a wrong key stops startup with AccessDenied.
 #
 # Run: SCCACHE=/path/to/sccache tests/s3-sccache-e2e.sh
@@ -97,9 +97,9 @@ compile big
 echo "ok: miss then hit for a small object and a $big_size-byte one"
 
 curl -fsS -o /dev/null -H "Authorization: Bearer $BEARER" \
-  "http://127.0.0.1:$REG_PORT/dav/files/cache/e2e/.sccache_check" ||
-  fail "sccache's check object is not under /dav/files/cache/e2e/"
-echo "ok: the objects are the WebDAV view's"
+  "http://127.0.0.1:$REG_PORT/files/cache/e2e/.sccache_check" ||
+  fail "sccache's check object is not under /files/cache/e2e/"
+echo "ok: the sccache probe is readable under /files/"
 
 # A 403 AccessDenied on the startup probe must stop sccache.
 "$SCCACHE" --stop-server >/dev/null 2>&1 || true

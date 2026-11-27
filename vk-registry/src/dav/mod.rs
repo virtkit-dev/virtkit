@@ -136,7 +136,8 @@ where
 
 /// Decode the path below `/dav` with [`crate::objects::split`] and enforce the DAV depth limit.
 pub(crate) fn parse(rest: &str) -> Option<(Vec<String>, bool)> {
-    let (segments, collection) = crate::objects::split(rest)?;
+    // `/dav` and `/dav/` are both the root; `/dav//` is an empty component.
+    let (segments, collection) = crate::objects::split(rest.strip_prefix('/').unwrap_or(rest))?;
     // The area (`files`, `repos`) sits above the depth bound.
     (segments.len() <= MAX_DEPTH + 1).then_some((segments, collection))
 }

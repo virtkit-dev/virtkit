@@ -523,8 +523,8 @@ enum RegistryCmd {
     /// Put files in the build cache registry
     ///
     /// Each file is stored once, tagged by its digest (`sha256:<hex>`) and, with --dir, as
-    /// `<dir>/<its name>`: the registry's WebDAV view serves it at `/dav/files/sha256/<hex>`
-    /// and `/dav/files/<dir>/<name>`. A `FROM winiso:<file>@sha256:<hex>` stage whose ISO is
+    /// `<dir>/<its name>`: the registry serves it at `/files/sha256/<hex>` and
+    /// `/files/<dir>/<name>`. A `FROM winiso:<file>@sha256:<hex>` stage whose ISO is
     /// not on the building host fetches it by digest, so install media need only be put once,
     /// by whoever holds them. A file is kept while it gets used, unless --ttl or
     /// --keep say otherwise; putting it again sets its retention anew, under its digest too.

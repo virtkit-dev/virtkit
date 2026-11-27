@@ -1022,7 +1022,7 @@ In a CI job, the guest registry proxy supplies the token. Use
 `SCCACHE_S3_NO_CREDENTIALS=true` instead of AWS keys.
 
 `vk registry put [--dir <dir>] [--ttl 7d | --keep] <file>...` stores files there, each once by
-digest (`/dav/files/sha256/<hex>`) and, with `--dir`, by name (`/dav/files/<dir>/<name>`), and
+digest (`/files/sha256/<hex>`) and, with `--dir`, by name (`/files/<dir>/<name>`), and
 `vk registry get <sha256:hex | dir/name>` fetches one back, checked against its digest;
 without `-o` it lands in the current directory and never over a file there. A put file is
 kept while it is used, for `--ttl` after the put whether used or not, or with `--keep` until

@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk-registry` serves uploaded files and sccache objects at `/files/<dir>/<name>`.
+  Use `GET` to download a file, `HEAD` to check it, and `DELETE` to remove its name.
+  Files stored with `vk registry put` are also available at `/files/sha256/<hex>`.
+  Downloads support a single byte range here and over S3. Git can clone an uploaded
+  repository over dumb HTTP. CI jobs can use `/files/` and `job/<alias>` through `registry.vk`.
+
 ## [0.117.1] - 2026-11-26
 
 ### Changed

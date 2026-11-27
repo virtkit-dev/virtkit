@@ -208,7 +208,7 @@ namespace task-cache  path = "task-cache/{gitlab}/{project_id}/{protection}/{sco
   read write lock  own project
 ```
 
-The guest still reaches it as `$VK_REGISTRY/dav/files/job/task-cache` or
+The guest still reaches it as `$VK_REGISTRY/files/job/task-cache` or
 `vk: http://registry.vk/job/task-cache`; the alias hides the scope, so nothing in the guest
 changes. The proxy serves it with the job's token; on a node lending its own credential the
 isolation does not hold, as for builds. sccache takes an area the same way.

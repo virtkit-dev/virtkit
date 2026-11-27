@@ -1,15 +1,24 @@
-//! `/s3/` and `/dav/files/` serve named plain files from the OCI pool. An object at
-//! `<dir…>/<leaf>` is the tag `<leaf>` in `files/<dir…>`. Its single-layer raw-file
-//! manifest points to the file bytes, the same format used by `/upload` and `PUT /files/`.
-//! Grants apply to the repository, so `files/<dir>/*` covers the tree. GC applies tag
-//! retention and blob grace windows.
+//! Named plain files: the objects `/files/`, `/s3/` and `/dav/files/` serve, stored in the
+//! OCI pool.
+//! An object's path is `<dir…>/<leaf>`; it lives in the repository `files/<dir…>` as the tag
+//! `<leaf>` on a single-layer raw-file manifest, as `/upload` and `PUT /files/` write one,
+//! whose layer holds the file's bytes. A path is authorized as the repository it names, so
+//! `files/<dir>/*` covers a whole tree. Objects expire under gc's tag retention and
+//! blob grace windows.
+//!
+//! This module holds what every view of the objects shares: the path rules, the lookup, a
+//! read (including byte ranges), single-request writes and deletions under the namespace
+//! lock, and bounded draining of refused request bodies. Each view uses the parts it needs.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use hyper::body::Incoming;
-use hyper::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, LAST_MODIFIED};
+use hyper::header::{
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, IF_RANGE, LAST_MODIFIED,
+    RANGE,
+};
 use hyper::{Request, Response, StatusCode};
 use tokio::io::AsyncWriteExt;
 
@@ -85,13 +94,11 @@ impl Node {
     }
 }
 
-/// Split the path below a view's root before percent-decoding. Return the decoded components
-/// and trailing-slash flag. Both the empty path and `/` return no components and a true flag.
-/// Reject decoded separators, control characters, `.`, `..`, empty or oversized components,
-/// malformed escapes and invalid UTF-8.
+/// Split `rest`, a path below a view's root, into its decoded components and whether it
+/// ended in a slash, splitting before percent-decoding. Reject decoded separators, control
+/// bytes, `.`, `..`, empty or oversized components, malformed escapes and invalid UTF-8. An
+/// empty path is the root: no components.
 pub(crate) fn split(rest: &str) -> Option<(Vec<String>, bool)> {
-    // `//` contains an empty component.
-    let rest = rest.strip_prefix('/').unwrap_or(rest);
     if rest.is_empty() {
         return Some((Vec::new(), true));
     }
@@ -153,6 +160,18 @@ fn valid_segment(seg: &str) -> bool {
 /// and depth limits. `tags`, `manifests` and `blobs` are reserved components.
 pub fn valid_plain_file(path: &str) -> bool {
     path.split('/').all(valid_segment) && crate::valid_name(&format!("{FILES_REPO}/{path}"))
+}
+
+/// Each component must pass [`split`]'s checks and the parent must name a repository
+/// under `files/`. The leaf follows tag rules, so `tags` is valid here even though
+/// [`valid_plain_file`] rejects it. S3 leaves may exceed the file PUT tag limit.
+pub(crate) fn valid_file(segs: &[String]) -> bool {
+    let Some((leaf, parents)) = segs.split_last() else {
+        return false;
+    };
+    segs.iter().all(|s| valid_segment(s))
+        && crate::valid_tag(leaf)
+        && crate::valid_name(&repo_name(parents))
 }
 
 /// The repository a run of path components names: `files/<segs…>`.
@@ -264,16 +283,29 @@ where
     crate::blocking(&state.store, authz, "a plain-file request", f).await
 }
 
-/// Serve `GET` and `HEAD` through the `/v2/` blob handler after checking read access.
-/// A range request receives the full 200 response.
+/// Options for an object read.
+#[derive(Default)]
+pub(crate) struct Read<'a> {
+    /// A `HEAD`: the headers only, and no use recorded.
+    pub(crate) head: bool,
+    /// The `Range` asked for ([`range_asked`]).
+    pub(crate) range: Option<&'a str>,
+    /// Required layer digest for a digest URL.
+    pub(crate) layer: Option<&'a str>,
+}
+
+/// `GET`/`HEAD` an object: the layer blob, through the `/v2/` handler, under this
+/// repository's membership for whole-object reads. Ranged reads use the same membership
+/// check. An unsatisfiable range returns 416. A mismatched required layer returns 404.
 pub(crate) fn get(
     authz: &Authz<'_>,
     store: &Store,
     segs: &[String],
     collection: bool,
     href: &str,
-    head: bool,
+    read: Read<'_>,
 ) -> Result<Response<Body>> {
+    let Read { head, range, layer } = read;
     // A directory has no body to serve.
     let Some(Node::Object(obj)) =
         resolve_for(store, authz, accounts::Action::Read, segs, collection)?
@@ -285,9 +317,17 @@ pub(crate) fn get(
     if !crate::readable_through(authz, store, &obj.repo, &obj.layer) {
         return Ok(not_found(href));
     }
-    // An existence probe (`HEAD`) refreshes neither the tag nor the layer blob.
-    let mut resp = crate::serve_blob(store, &format!("sha256:{}", obj.layer), head, None, false)?;
-    if resp.status() == StatusCode::OK {
+    // A name that is a digest serves only the bytes it names.
+    if layer.is_some_and(|hex| hex != obj.layer) {
+        return Ok(not_found(href));
+    }
+    // A HEAD is a client checking that something exists, so it refreshes nothing, the layer
+    // blob included.
+    let mut resp = match range {
+        Some(range) => serve_range(store, &obj.layer, range, head)?,
+        None => crate::serve_blob(store, &format!("sha256:{}", obj.layer), head, None, false)?,
+    };
+    if resp.status().is_success() {
         // A GET served is a use, which is what keeps the tag from the gc's retention.
         // Refreshed only once idle, so a hot entry is not a metadata write per hit.
         if !head
@@ -303,11 +343,166 @@ pub(crate) fn get(
             CONTENT_DISPOSITION,
             hyper::header::HeaderValue::from_static("attachment"),
         );
+        headers.insert(
+            ACCEPT_RANGES,
+            hyper::header::HeaderValue::from_static("bytes"),
+        );
         if let Ok(v) = hyper::header::HeaderValue::from_str(&http_date(obj.modified)) {
             headers.insert(LAST_MODIFIED, v);
         }
     }
     Ok(resp)
+}
+
+/// Return a single `Range` header for parsing. Multiple headers or an unchecked
+/// `If-Range` validator permit a whole-object response.
+pub(crate) fn range_asked(headers: &hyper::HeaderMap) -> Option<String> {
+    if headers.contains_key(IF_RANGE) {
+        return None;
+    }
+    let mut ranges = headers.get_all(RANGE).iter();
+    match (ranges.next(), ranges.next()) {
+        (Some(v), None) => v.to_str().ok().map(str::to_string),
+        _ => None,
+    }
+}
+
+/// What a `Range` value asks of `len` bytes.
+#[derive(Debug, PartialEq, Eq)]
+enum Part {
+    /// The whole: no single byte range, or one this server ignores, as RFC 9110 allows.
+    Whole,
+    /// Bytes `first..=last`.
+    Bytes(u64, u64),
+    /// A valid range that selects no bytes.
+    Unsatisfiable,
+}
+
+/// Read `range` against `len` bytes: `bytes=<first>-[<last>]` or `bytes=-<suffix length>`.
+/// Several ranges, another unit or a malformed spec are served whole.
+fn part(range: &str, len: u64) -> Part {
+    let Some((first, last)) = range
+        .trim()
+        .strip_prefix("bytes=")
+        .and_then(|spec| spec.split_once('-'))
+    else {
+        return Part::Whole;
+    };
+    let (first, last) = (first.trim(), last.trim());
+    let num = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u64>().ok())
+            .flatten()
+    };
+    let (Some(first), last) = (num(first), last) else {
+        // `-<n>`: the last n bytes.
+        return match (first.is_empty(), num(last)) {
+            (true, Some(n)) if n > 0 && len > 0 => Part::Bytes(len.saturating_sub(n), len - 1),
+            (true, Some(_)) => Part::Unsatisfiable,
+            _ => Part::Whole,
+        };
+    };
+    let last = match (last.is_empty(), num(last)) {
+        (true, _) => u64::MAX,
+        (false, Some(last)) => last,
+        (false, None) => return Part::Whole,
+    };
+    if first > last {
+        Part::Whole
+    } else if first >= len {
+        Part::Unsatisfiable
+    } else {
+        Part::Bytes(first, last.min(len - 1))
+    }
+}
+
+/// Serve a range of canonical bytes with 206 and `Content-Range`, or return 416 for an
+/// unsatisfiable range. Delegate whole-object reads to [`crate::serve_blob`].
+fn serve_range(store: &Store, hex: &str, range: &str, head: bool) -> Result<Response<Body>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let digest = format!("sha256:{hex}");
+    let Some((path, is_zstd)) = store.find_blob(hex) else {
+        return Ok(error_response(
+            StatusCode::NOT_FOUND,
+            "BLOB_UNKNOWN",
+            &digest,
+        ));
+    };
+    // As in `serve_blob`, measure and stream the same open file even if its path is replaced.
+    let mut file =
+        std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+    let len = if is_zstd {
+        crate::zstd_canonical_len(&mut file)
+            .with_context(|| format!("measuring the stored blob {digest}"))?
+    } else {
+        file.metadata()
+            .with_context(|| format!("stat {}", path.display()))?
+            .len()
+    };
+    let (first, last) = match part(range, len) {
+        Part::Whole => return crate::serve_blob(store, &digest, head, None, false),
+        Part::Unsatisfiable => {
+            let mut resp = error_response(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "RANGE_INVALID",
+                &format!("the object has {len} bytes"),
+            );
+            if let Ok(v) = hyper::header::HeaderValue::from_str(&format!("bytes */{len}")) {
+                resp.headers_mut().insert(CONTENT_RANGE, v);
+            }
+            return Ok(resp);
+        }
+        Part::Bytes(first, last) => (first, last),
+    };
+    let count = last - first + 1;
+    let builder = Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header("Docker-Content-Digest", &digest)
+        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
+        .header(CONTENT_RANGE, format!("bytes {first}-{last}/{len}"))
+        .header(CONTENT_LENGTH, count.to_string());
+    if head {
+        return builder
+            .body(crate::body_of(bytes::Bytes::new()))
+            .map_err(Into::into);
+    }
+    let body = if is_zstd {
+        // The zstd frame has no seek index. Decode from the start and discard the prefix.
+        let decoder = crate::zctx::decoder(file).context("opening a stored blob")?;
+        crate::stream_body(Skip::new(decoder, first).take(count), &digest)
+    } else {
+        file.seek(SeekFrom::Start(first))
+            .with_context(|| format!("seeking in {}", path.display()))?;
+        crate::stream_body(file.take(count), &digest)
+    };
+    builder.body(body).map_err(Into::into)
+}
+
+/// A reader that drops its first `skip` bytes, on its first read.
+struct Skip<R> {
+    inner: R,
+    skip: u64,
+}
+
+impl<R> Skip<R> {
+    fn new(inner: R, skip: u64) -> Self {
+        Skip { inner, skip }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for Skip<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.skip > 0 {
+            let skipped =
+                std::io::copy(&mut (&mut self.inner).take(self.skip), &mut std::io::sink())?;
+            if skipped < self.skip {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            self.skip = 0;
+        }
+        self.inner.read(buf)
+    }
 }
 
 /// Why `segs` cannot take an object, re-checked under [`NAMESPACE`] before the tag is
@@ -430,6 +625,34 @@ pub(crate) async fn put(
     .context("the object's promotion panicked")?
 }
 
+/// Check and remove the tag under [`NAMESPACE`]. Return 204 on deletion. Other names
+/// retain their references to the bytes, which remain subject to gc. Return 404 for a
+/// missing or unreadable node, 403 for a readable node without write access, and 409
+/// for a directory or a tag that does not name a raw file.
+pub(crate) fn delete(
+    store: &Store,
+    authz: &Authz<'_>,
+    segs: &[String],
+    collection: bool,
+    href: &str,
+) -> Result<Response<Body>> {
+    let _namespace = namespace(store)?;
+    let Some(node) = resolve_for(store, authz, accounts::Action::Read, segs, collection)? else {
+        return Ok(not_found(href));
+    };
+    if !allowed(authz, accounts::Action::Write, node.repo()) {
+        return Ok(accounts::forbidden());
+    }
+    Ok(match node {
+        Node::Object(obj) if store.delete_tag(&obj.repo, &obj.tag)? => no_content(),
+        Node::Object(_) => not_found(href),
+        Node::Foreign(_) => parent_is_object(href),
+        Node::Dir(_) => {
+            error_response(StatusCode::CONFLICT, "DENIED", "a directory is not deleted")
+        }
+    })
+}
+
 /// Read a request's body through and discard it: a status sent with request bytes unread
 /// resets the connection. `Some(413)` if the body declares a length over the object cap,
 /// unread, or crosses the cap on the way.
@@ -516,58 +739,60 @@ mod tests {
     fn the_path_splitter_refuses_everything_but_a_plain_relative_path() {
         let segs = |p: &str| split(p).map(|(s, _)| s);
         let v = |s: &[&str]| Some(s.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        // the root, both spellings
+        // the root
         assert_eq!(split(""), Some((vec![], true)));
-        assert_eq!(split("/"), Some((vec![], true)));
         // `sccache`'s own two shapes: the startup probe, and a sharded key
         assert_eq!(
-            segs("/sccache/.sccache_check"),
+            segs("sccache/.sccache_check"),
             v(&["sccache", ".sccache_check"])
         );
         assert_eq!(
-            segs("/sccache/a/b/c/abcdef"),
+            segs("sccache/a/b/c/abcdef"),
             v(&["sccache", "a", "b", "c", "abcdef"])
         );
         // a directory, with and without a trailing slash, which is reported
-        assert_eq!(split("/sccache"), Some((v(&["sccache"]).unwrap(), false)));
-        assert_eq!(split("/sccache/"), Some((v(&["sccache"]).unwrap(), true)));
+        assert_eq!(split("sccache"), Some((v(&["sccache"]).unwrap(), false)));
+        assert_eq!(split("sccache/"), Some((v(&["sccache"]).unwrap(), true)));
         // percent-decoding is per component and a path's own: `%2D` is `-`, `+` is itself
-        assert_eq!(segs("/x/a%2Db"), v(&["x", "a-b"]));
-        assert_eq!(segs("/x/a+b"), v(&["x", "a+b"]));
-        assert_eq!(segs("/x/%C3%A9"), v(&["x", "\u{e9}"]));
+        assert_eq!(segs("x/a%2Db"), v(&["x", "a-b"]));
+        assert_eq!(segs("x/a+b"), v(&["x", "a+b"]));
+        assert_eq!(segs("x/%C3%A9"), v(&["x", "\u{e9}"]));
 
         for bad in [
             // traversal, encoded and not
-            "/sccache/..",
-            "/sccache/../../etc/passwd",
-            "/sccache/a/../../b",
-            "/sccache/%2E%2E/x",
-            "/..",
+            "sccache/..",
+            "sccache/../../etc/passwd",
+            "sccache/a/../../b",
+            "sccache/%2E%2E/x",
+            "..",
+            // a leading slash is an empty first component
+            "/sccache/x",
             // a decoded separator is a name that would become a path
-            "/sccache/a%2Fb",
-            "/sccache/a%2f%2e%2e%2fb",
-            "/sccache/a%5Cb",
+            "sccache/a%2Fb",
+            "sccache/a%2f%2e%2e%2fb",
+            "sccache/a%5Cb",
             // control bytes, NUL included
-            "/sccache/a%00b",
-            "/sccache/a%0Ab",
+            "sccache/a%00b",
+            "sccache/a%0Ab",
             // empty components
-            "/sccache//x",
-            "/sccache/x//y",
-            "/sccache//",
+            "sccache//x",
+            "sccache/x//y",
+            "sccache//",
+            "/",
             "//",
             // malformed escapes and bytes that are not UTF-8
-            "/sccache/a%2",
-            "/sccache/a%G0",
-            "/sccache/%FF",
-            "/sccache/%C3",
+            "sccache/a%2",
+            "sccache/a%G0",
+            "sccache/%FF",
+            "sccache/%C3",
         ] {
             assert!(split(bad).is_none(), "accepted {bad:?}");
         }
 
         // over-long
         let long = "x".repeat(MAX_SEGMENT + 1);
-        assert!(split(&format!("/{long}")).is_none());
-        assert!(split(&format!("/{}", "x".repeat(MAX_SEGMENT))).is_some());
+        assert!(split(&long).is_none());
+        assert!(split(&"x".repeat(MAX_SEGMENT)).is_some());
     }
 
     /// A served name is a repository name below `files/`, leaf included, so the store's
@@ -582,6 +807,79 @@ mod tests {
         let deepest = vec!["x"; crate::MAX_NAME_SEGMENTS - 1].join("/");
         assert!(valid_plain_file(&deepest));
         assert!(!valid_plain_file(&format!("{deepest}/x")));
+    }
+
+    /// Clamp a single range to the last byte. An unsatisfiable range selects no bytes.
+    /// An ignored range gets the whole object.
+    #[test]
+    fn a_range_asks_for_one_part_or_the_whole() {
+        assert_eq!(part("bytes=0-0", 10), Part::Bytes(0, 0));
+        assert_eq!(part("bytes=2-5", 10), Part::Bytes(2, 5));
+        assert_eq!(part("bytes=2-", 10), Part::Bytes(2, 9));
+        assert_eq!(part("bytes=8-100", 10), Part::Bytes(8, 9));
+        assert_eq!(part("bytes=-3", 10), Part::Bytes(7, 9));
+        assert_eq!(part("bytes=-30", 10), Part::Bytes(0, 9));
+        assert_eq!(part(" bytes= 1 - 2 ", 10), Part::Bytes(1, 2));
+        for unsatisfiable in ["bytes=10-", "bytes=10-20", "bytes=-0"] {
+            assert_eq!(
+                part(unsatisfiable, 10),
+                Part::Unsatisfiable,
+                "{unsatisfiable}"
+            );
+        }
+        assert_eq!(part("bytes=0-", 0), Part::Unsatisfiable);
+        assert_eq!(part("bytes=-1", 0), Part::Unsatisfiable);
+        for whole in [
+            "bytes=5-2",
+            "bytes=0-1,3-4",
+            "bytes=-",
+            "bytes=a-b",
+            "bytes=+1-2",
+            "items=0-1",
+            "bytes 0-1",
+            "bytes=99999999999999999999-",
+        ] {
+            assert_eq!(part(whole, 10), Part::Whole, "{whole}");
+        }
+    }
+
+    /// The part starts after the skipped prefix. EOF inside the prefix is an error.
+    #[test]
+    fn skipping_drops_the_bytes_before_a_part() {
+        use std::io::Read;
+        let mut out = String::new();
+        Skip::new(&b"0123456789"[..], 4)
+            .take(3)
+            .read_to_string(&mut out)
+            .unwrap();
+        assert_eq!(out, "456");
+        let mut short = Skip::new(&b"01"[..], 4);
+        assert!(short.read(&mut [0; 4]).is_err());
+    }
+
+    /// The leaf follows tag rules. The parent follows repository name and depth limits.
+    #[test]
+    fn file_names_are_a_repository_and_a_tag() {
+        let v = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(valid_file(&v(&["media", "tags"])));
+        assert!(valid_file(&v(&["repo.git", "HEAD"])));
+        assert!(valid_file(&v(&["media"])));
+        let deepest = vec!["x"; crate::MAX_NAME_SEGMENTS];
+        assert!(valid_file(&v(&deepest)));
+        let deeper = vec!["x"; crate::MAX_NAME_SEGMENTS + 1];
+        assert!(!valid_file(&v(&deeper)));
+        for bad in [
+            &["a b", "x"][..],
+            &["tags", "x"],
+            &["a", "x y"],
+            &["a", ".."],
+            &[],
+        ] {
+            assert!(!valid_file(&v(bad)), "{bad:?}");
+        }
+        // An S3 leaf may use the full component length.
+        assert!(valid_file(&v(&["a", &"t".repeat(MAX_SEGMENT)])));
+        assert!(!valid_file(&v(&["a", &"t".repeat(MAX_SEGMENT + 1)])));
     }
 
     /// HTTP dates are IMF-fixdate, and a time `httpdate` cannot format is clamped rather

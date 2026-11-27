@@ -1,7 +1,8 @@
 //! A file streamed to `PUT /files/<dir>/<name>` over real HTTP: stored as `vk registry put
 //! --dir` stores it, with the annotations asked for, only once all of it arrived and hashes
 //! to what was asked; a put cut short or refused leaves no staging file behind, and one
-//! refused on its headers is refused before its body is read.
+//! refused on its headers is refused before its body is read. The same path supports
+//! whole and ranged reads and deletion by name.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -49,7 +50,7 @@ fn serve(dir: &std::path::Path) -> (String, Arc<Store>, Signer) {
         }),
         tls: None,
         webdav: false,
-        s3: false,
+        s3: true,
         tokens: Default::default(),
         handover: Default::default(),
     });
@@ -88,6 +89,33 @@ fn token(signer: &Signer, prefixes: &[&str]) -> String {
                     write: true,
                     ..Grant::default()
                 })
+                .collect(),
+        })
+        .unwrap()
+}
+
+/// Grant read access under both prefix lists and write access only under `write`.
+fn grants(signer: &Signer, read: &[&str], write: &[&str]) -> String {
+    let now = vk_peer::now_secs();
+    let grant = |prefix: &&str, write| Grant {
+        prefix: prefix.to_string(),
+        read: true,
+        write,
+        ..Grant::default()
+    };
+    signer
+        .sign(Claims {
+            kid: String::new(),
+            aud: AUD.into(),
+            sub: "hub:media".into(),
+            jti: vk_peer::token::new_jti().unwrap(),
+            pipeline: None,
+            iat: now - 1,
+            exp: now + 600,
+            grants: read
+                .iter()
+                .map(|p| grant(p, false))
+                .chain(write.iter().map(|p| grant(p, true)))
                 .collect(),
         })
         .unwrap()
@@ -366,5 +394,283 @@ async fn puts_beyond_the_slots_wait_their_turn() {
             .size,
         0
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Read named raw and compressed files by range, and the raw file by digest.
+/// Reads require `Read` on the resolved repository. Deletion also requires `Write`.
+/// Deleting the raw file's name preserves its digest tag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_put_file_is_read_ranged_and_deleted_by_name() {
+    let dir = tmp("read");
+    let (url, _store, signer) = serve(&dir);
+    let http = reqwest::Client::new();
+    let writer = grants(&signer, &[], &["sha256", "media"]);
+    let reader = grants(&signer, &["media"], &[]);
+    let body: Vec<u8> = (0..1000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let sha = hex(&body);
+    let r = http
+        .put(format!("{url}/files/media/disk.img"))
+        .bearer_auth(&writer)
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    // Compressible, written over S3, so stored as a zstd frame.
+    let text = "a line of text, said again and again\n"
+        .repeat(200)
+        .into_bytes();
+    let r = http
+        .put(format!("{url}/s3/media/text"))
+        .bearer_auth(&writer)
+        .body(text.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let get = |path: &str, key: &str| {
+        http.get(format!("{url}{path}"))
+            .bearer_auth(key.to_string())
+    };
+    let r = get("/files/media/disk.img", &reader).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["accept-ranges"], "bytes");
+    assert_eq!(r.headers()["content-disposition"], "attachment");
+    assert!(r.headers().contains_key("last-modified"));
+    assert_eq!(r.bytes().await.unwrap(), body);
+    let r = http
+        .head(format!("{url}/files/media/disk.img"))
+        .bearer_auth(&reader)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-length"], "1000");
+
+    for (path, want) in [
+        ("/files/media/disk.img", &body),
+        ("/files/media/text", &text),
+    ] {
+        for (range, first, last) in [
+            ("bytes=10-19", 10, 19),
+            ("bytes=990-", 990, want.len() - 1),
+            ("bytes=-5", want.len() - 5, want.len() - 1),
+            ("bytes=0-99999", 0, want.len() - 1),
+        ] {
+            let r = get(path, &reader)
+                .header("range", range)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 206, "{path} {range}");
+            assert_eq!(
+                r.headers()["content-range"],
+                format!("bytes {first}-{last}/{}", want.len()).as_str(),
+                "{path} {range}"
+            );
+            assert_eq!(
+                r.bytes().await.unwrap(),
+                want[first..=last],
+                "{path} {range}"
+            );
+        }
+        let r = get(path, &reader)
+            .header("range", "bytes=99999-")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 416, "{path}");
+        assert_eq!(
+            r.headers()["content-range"],
+            format!("bytes */{}", want.len()).as_str()
+        );
+        // An unchecked If-Range validator yields the whole object.
+        let r = get(path, &reader)
+            .header("range", "bytes=0-1")
+            .header("if-range", "\"x\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{path}");
+        assert_eq!(r.bytes().await.unwrap(), *want, "{path}");
+    }
+    // A HEAD describes the whole file, whatever range it names.
+    let r = http
+        .head(format!("{url}/files/media/disk.img"))
+        .bearer_auth(&reader)
+        .header("range", "bytes=0-9")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-length"], "1000");
+    // Reads ignore If-Modified-Since and reject If-Match and If-Unmodified-Since.
+    let r = get("/files/media/disk.img", &reader)
+        .header("if-modified-since", "Thu, 01 Jan 2026 00:00:00 GMT")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    for (h, v) in [
+        ("if-match", "\"x\""),
+        ("if-unmodified-since", "Thu, 01 Jan 2026 00:00:00 GMT"),
+    ] {
+        let r = get("/files/media/disk.img", &reader)
+            .header(h, v)
+            .header("range", "bytes=0-1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 501, "{h}");
+    }
+    // An unread request body could reset the connection before the 404 arrives.
+    let r = get("/files/media/missing", &reader)
+        .body(vec![0u8; 8 << 20])
+        .send()
+        .await
+        .expect("a GET with a body is answered, not reset");
+    assert_eq!(r.status(), 404);
+    let r = get("/s3/media/disk.img", &reader)
+        .header("range", "bytes=1-2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 206);
+    assert_eq!(r.bytes().await.unwrap(), body[1..=2]);
+
+    // Digest reads require a grant on the digest repository.
+    let r = get(&format!("/files/sha256/{sha}"), &writer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.bytes().await.unwrap(), body);
+
+    // A digest name serves only the bytes it names, whatever another writer tagged there.
+    let forged = hex(b"not the file");
+    let r = http
+        .put(format!("{url}/s3/sha256/{forged}"))
+        .bearer_auth(&writer)
+        .body("something else")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = get(&format!("/files/sha256/{forged}"), &writer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    // Over S3, `sha256` is a bucket like any other.
+    let r = get(&format!("/s3/sha256/{forged}"), &writer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // `tags` is a valid leaf tag but a reserved repository component.
+    let r = http
+        .put(format!("{url}/files/media/tags"))
+        .bearer_auth(&writer)
+        .body("t")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let r = get("/files/media/tags", &reader).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.bytes().await.unwrap().as_ref(), b"t");
+
+    let r = http
+        .get(format!("{url}/files/media/disk.img"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    let other = grants(&signer, &["other"], &[]);
+    let r = get("/files/media/disk.img", &other).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+    let r = get(&format!("/files/sha256/{sha}"), &reader)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        403,
+        "the digest's repository is not the reader's"
+    );
+    let r = http
+        .delete(format!("{url}/files/media/disk.img"))
+        .bearer_auth(&reader)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "a read grant does not delete");
+
+    let r = get("/files/media/disk.img?under=x", &reader)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let r = get("/files/media/disk.img?service=git-upload-pack", &reader)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "another query is ignored");
+    for bad in [
+        "/files/media/a%2Fb",
+        "/files//media/disk.img",
+        "/files/a%20b/x",
+    ] {
+        let r = get(bad, &reader).send().await.unwrap();
+        assert_eq!(r.status(), 400, "{bad}");
+    }
+    let r = get("/files/media", &reader).send().await.unwrap();
+    assert_eq!(r.status(), 404, "a directory has no bytes");
+    let r = get("/files/media/disk.img/", &reader).send().await.unwrap();
+    assert_eq!(r.status(), 404);
+    let r = get("/files/media/missing", &reader).send().await.unwrap();
+    assert_eq!(r.status(), 404);
+    let r = http
+        .post(format!("{url}/files/media/disk.img"))
+        .bearer_auth(&writer)
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 405);
+    assert_eq!(r.headers()["allow"], "GET, HEAD, PUT, DELETE");
+    let r = http
+        .delete(format!("{url}/files/media"))
+        .bearer_auth(&writer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 409, "a directory is not deleted");
+    let r = http
+        .delete(format!("{url}/files/media/disk.img"))
+        .bearer_auth(&writer)
+        .header("if-unmodified-since", "Thu, 01 Jan 1970 00:00:00 GMT")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 501, "a precondition is not ignored");
+
+    // Deleting the name preserves the separate digest tag.
+    let delete = || {
+        http.delete(format!("{url}/files/media/disk.img"))
+            .bearer_auth(&writer)
+            .send()
+    };
+    assert_eq!(delete().await.unwrap().status(), 204);
+    assert_eq!(delete().await.unwrap().status(), 404);
+    let r = get("/files/media/disk.img", &reader).send().await.unwrap();
+    assert_eq!(r.status(), 404);
+    let r = get(&format!("/files/sha256/{sha}"), &writer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
     std::fs::remove_dir_all(&dir).unwrap();
 }

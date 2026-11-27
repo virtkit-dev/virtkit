@@ -12,6 +12,9 @@
 //! every byte the `Content-Length` declared has arrived and hashes to the sha256 asked for, if
 //! one was; a body cut short or gone idle leaves no staging file. The answer, a [`FilePut`],
 //! comes once both tags are written.
+//!
+//! `GET`, `HEAD` and `DELETE` address the named objects [`crate::objects`] also serves
+//! over S3. Reads at `/files/sha256/<sha256>` require a matching layer digest.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -21,6 +24,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use hyper::body::Incoming;
+use hyper::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use hyper::{Method, Request, Response, StatusCode};
 use tokio::io::AsyncWriteExt;
 use vk_hub_proto::registry::{
@@ -31,7 +35,7 @@ use vk_hub_proto::registry::{
 use crate::staging::{DrainError, Idle, Staging, drain_into, went_idle};
 use crate::{
     Authz, Body, EXPIRES_ANNOTATION, FILE_PUTS, RETENTION_ANNOTATION, ServerState, accounts,
-    body_of, error_response, valid_name, valid_tag,
+    body_of, error_response, objects, valid_name, valid_tag,
 };
 
 /// Where every file is also tagged, by its sha256, under [`FILES`].
@@ -250,7 +254,7 @@ fn hold<'a>(
     }
 }
 
-/// Answer a file put at `path`.
+/// Route a file upload, read or deletion ([`serve`]).
 pub(crate) async fn route(
     state: &Arc<ServerState>,
     authz: &Authz<'_>,
@@ -258,11 +262,7 @@ pub(crate) async fn route(
     req: Request<Incoming>,
 ) -> Result<Response<Body>> {
     if req.method() != Method::PUT {
-        return Ok(error_response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "UNSUPPORTED",
-            path,
-        ));
+        return serve(state, authz, path, req).await;
     }
     let query = req.uri().query().unwrap_or_default();
     let under = crate::query_param(query, "under");
@@ -421,6 +421,107 @@ pub(crate) async fn route(
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .body(body_of(Bytes::from(serde_json::to_vec(&put)?)))
         .map_err(Into::into)
+}
+
+/// The verbs `/files/` answers, for the `Allow` on a 405.
+const ALLOWED: &str = "GET, HEAD, PUT, DELETE";
+
+/// Serve `files/<dir>:<name>` through [`objects`]. The leaf may be any tag a file PUT
+/// accepts. Reads require `Read` on the resolved repository. `GET` supports a single
+/// byte range. Deletion also requires `Write` and removes only that tag. Other tags,
+/// including a separate digest tag, remain subject to gc.
+async fn serve(
+    state: &Arc<ServerState>,
+    authz: &Authz<'_>,
+    path: &str,
+    req: Request<Incoming>,
+) -> Result<Response<Body>> {
+    let method = req.method().clone();
+    if !matches!(method, Method::GET | Method::HEAD | Method::DELETE) {
+        let mut resp = error_response(StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED", path);
+        resp.headers_mut().insert(
+            hyper::header::ALLOW,
+            hyper::header::HeaderValue::from_static(ALLOWED),
+        );
+        return objects::drain_then(req, resp, path).await;
+    }
+    let rest = path.strip_prefix(FILES_PATH).unwrap_or_default();
+    // Reject PUT's `under=` so a request cannot silently address files outside that prefix.
+    // Ignore other queries for Git's dumb HTTP probe, `info/refs?service=…`.
+    let under = crate::query_param(req.uri().query().unwrap_or_default(), "under");
+    let Some((segs, collection)) = objects::split(rest)
+        .filter(|(segs, _)| objects::valid_file(segs))
+        .filter(|_| under.is_none())
+    else {
+        let resp = error_response(StatusCode::BAD_REQUEST, "NAME_INVALID", path);
+        return objects::drain_then(req, resp, path).await;
+    };
+    let action = if method == Method::DELETE {
+        accounts::Action::Write
+    } else {
+        accounts::Action::Read
+    };
+    if !objects::admits(authz, action, &segs, false) {
+        return objects::drain_then(req, accounts::forbidden(), path).await;
+    }
+    // Reads ignore If-None-Match and If-Modified-Since. Reject the conditions below
+    // rather than carry out an operation whose precondition has not been checked.
+    let refused: &[_] = match method {
+        Method::DELETE => &[
+            IF_MATCH,
+            IF_NONE_MATCH,
+            IF_MODIFIED_SINCE,
+            IF_UNMODIFIED_SINCE,
+        ],
+        _ => &[IF_MATCH, IF_UNMODIFIED_SINCE],
+    };
+    if refused.iter().any(|h| req.headers().contains_key(h)) {
+        let resp = error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "UNSUPPORTED",
+            "this conditional request is not served",
+        );
+        return objects::drain_then(req, resp, path).await;
+    }
+    let href = path.to_string();
+    // HEAD describes the whole file even when the request includes Range.
+    let range = (method == Method::GET)
+        .then(|| objects::range_asked(req.headers()))
+        .flatten();
+    // Drain even a read's body, up to the cap, so the client receives the response.
+    if let Some(resp) = objects::drain(req, path).await? {
+        return Ok(resp);
+    }
+    if method == Method::DELETE {
+        return crate::blocking_locked(
+            &state.store,
+            authz,
+            "a plain-file deletion",
+            move |store, authz| objects::delete(store, authz, &segs, collection, &href),
+        )
+        .await;
+    }
+    let head = method == Method::HEAD;
+    // `/files/sha256/<sha256>` names a file by its digest, and serves no other bytes.
+    let layer = match segs.as_slice() {
+        [dir, hex] if dir == BY_DIGEST => Some(hex.clone()),
+        _ => None,
+    };
+    objects::blocking(state, authz, move |store, authz| {
+        objects::get(
+            authz,
+            store,
+            &segs,
+            collection,
+            &href,
+            objects::Read {
+                head,
+                range: range.as_deref(),
+                layer: layer.as_deref(),
+            },
+        )
+    })
+    .await
 }
 
 #[cfg(test)]

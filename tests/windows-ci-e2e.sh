@@ -18,7 +18,7 @@
 # nothing of the host but bash and a POSIX userland (the test repository is made by
 # vk-testkit, VK_TESTKIT, by default built with `./dev.sh build -p vk-testkit`, under vk), a
 # vk-registry (VK_REGISTRY, by default the one beside $VK), which this script runs to serve
-# the repository from its WebDAV area, and the Windows Server 2025 evaluation ISO and
+# the repository from its plain files, and the Windows Server 2025 evaluation ISO and
 # virtio-win.iso: either in ISO_DIR, put by this script into that vk-registry (and pinned by
 # the digests of those files), or already in the vk-registry at $REGISTRY under the digests
 # ISO_SHA256 and DRIVERS_SHA256 name (plain HTTP; `vk registry put --cache-registry $REGISTRY
@@ -69,7 +69,7 @@ if [ -z "$VK_TESTKIT" ]; then
 fi
 [ -x "$VK_TESTKIT" ] || fail "no vk-testkit at $VK_TESTKIT"
 
-# A vk-registry of this test's own: its WebDAV area serves the repository, and without a
+# A vk-registry of this test's own: its plain files serve the repository, and without a
 # REGISTRY it also holds the ISOs from ISO_DIR. On a port the kernel picks, which it reports.
 VK_REGISTRY=${VK_REGISTRY:-$(dirname "$VK")/vk-registry}
 [ -x "$VK_REGISTRY" ] || fail "no vk-registry at $VK_REGISTRY (set VK_REGISTRY)"
@@ -118,7 +118,7 @@ EOF
 # One commit of the files, as a bare repository git's dumb HTTP transport can clone.
 bare=$root/repo.git
 "$VK_TESTKIT" git-repo "$src" "$bare" main >"$root/commit" || fail "making the repository"
-# Served from the registry's WebDAV area, one file per `files/<dir>:<name>`.
+# Publish each repository file as `files/<dir>:<name>`.
 while IFS= read -r path; do
   path=${path#"$bare/"}
   dir=repo.git
@@ -126,7 +126,7 @@ while IFS= read -r path; do
   "$VK" registry put --cache-registry "$local_registry" --cache-insecure --dir "$dir" \
     "$bare/$path" >/dev/null 2>>"$root/serve.log" || fail "serving $path (see $root/serve.log)"
 done < <(find "$bare" -type f)
-repo_url=http://$local_registry/dav/files/repo.git
+repo_url=http://$local_registry/files/repo.git
 
 cat >"$root/config.toml" <<EOF
 state_dir = "$root/state"

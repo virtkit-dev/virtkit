@@ -1075,7 +1075,7 @@ pub struct Registry {
     pub proxy_guests: bool,
     /// What the guest's registry proxy injects. `"node"` (the default): this section's own
     /// credential, and only when `proxy_guests` is on. `"job"`: the registry token the hub
-    /// minted for the job, scoped to its namespaces, with the lock API and `/dav/files/`
+    /// minted for the job, scoped to its namespaces, with the lock API and plain files
     /// proxied too; the proxy then runs for every job, and one without a token gets a proxy
     /// that refuses everything, never this section's credential. That includes every job a
     /// local gitlab-runner gives this node: under `"job"`, only jobs the hub placed reach the

@@ -108,7 +108,8 @@ fn refuse(req: Request<hyper::body::Incoming>, r: Refusal, signed: bool) -> Box<
     Box::new(Refused { req, resp, signed })
 }
 
-/// Serve `GET`, `HEAD` or `PUT` for an [`Admitted`] request after registry authentication.
+/// Serve an [`Admitted`] request, authenticated by the server: `GET` or `HEAD` reads the
+/// object at `rest`, optionally by byte range. `PUT` writes it.
 pub(crate) async fn route(
     state: &crate::ServerState,
     authz: &crate::Authz<'_>,
@@ -137,8 +138,24 @@ pub(crate) async fn route(
         return objects::put(state, segs, collection, &href, expected, req).await;
     }
     let head = *req.method() == Method::HEAD;
+    let range = objects::range_asked(req.headers());
+    // Drain the read's body up to the cap so the client receives the response.
+    if let Some(resp) = objects::drain(req, &href).await? {
+        return Ok(resp);
+    }
     objects::blocking(state, authz, move |store, authz| {
-        objects::get(authz, store, &segs, collection, &href, head)
+        objects::get(
+            authz,
+            store,
+            &segs,
+            collection,
+            &href,
+            objects::Read {
+                head,
+                range: range.as_deref(),
+                layer: None,
+            },
+        )
     })
     .await
 }
@@ -540,6 +557,11 @@ pub(crate) async fn respond(resp: Response<Body>, method: &Method, path: &str) -
             "the key is a directory, or below an object",
         ),
         StatusCode::LENGTH_REQUIRED => (status, "MissingContentLength", "Content-Length needed"),
+        StatusCode::RANGE_NOT_SATISFIABLE => (
+            status,
+            "InvalidRange",
+            "the requested range is not satisfiable",
+        ),
         StatusCode::PAYLOAD_TOO_LARGE => (status, "EntityTooLarge", "the object is too large"),
         StatusCode::NOT_IMPLEMENTED => (status, "NotImplemented", "not served"),
         StatusCode::SERVICE_UNAVAILABLE => (status, "ServiceUnavailable", "try again later"),
@@ -552,7 +574,11 @@ pub(crate) async fn respond(resp: Response<Body>, method: &Method, path: &str) -
     };
     let mut out = error(status, code, message, path);
     // What the refusal said about the connection and when to retry still holds.
-    for name in [hyper::header::CONNECTION, hyper::header::RETRY_AFTER] {
+    for name in [
+        hyper::header::CONNECTION,
+        hyper::header::RETRY_AFTER,
+        hyper::header::CONTENT_RANGE,
+    ] {
         if let Some(v) = parts.headers.get(&name) {
             out.headers_mut().insert(name, v.clone());
         }

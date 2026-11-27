@@ -1,5 +1,5 @@
 //! Plain files in the build cache registry: `vk registry put|get` and the install media a
-//! `winiso:` stage pins. WebDAV serves `files/<dir>:<name>` at `/dav/files/<dir>/<name>`.
+//! `winiso:` stage pins. The registry serves `files/<dir>:<name>` at `/files/<dir>/<name>`.
 //! Every file is also tagged by digest in [`BY_DIGEST`], so a Dockerfile pinning
 //! `<file>@sha256:<hex>` can fetch it by content regardless of its names.
 

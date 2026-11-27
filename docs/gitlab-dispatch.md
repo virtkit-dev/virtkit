@@ -697,11 +697,12 @@ names to nodes taking tokens of their own, placed jobs are treated as under `"jo
 local gitlab-runner's job gets the node's guest token instead
 ([registry hub, 4d](registry-hub.md#4d-node-tokens)).
 
-With a token, the proxy forwards OCI (`/v2/`), locks (`/lock/`) and plain files over WebDAV
-(`/dav/files/`) and S3 (`/s3/`). The registry enforces the token's grants. WebDAV allows
-GET, HEAD, PROPFIND, PUT, MKCOL, DELETE and OPTIONS. MOVE and COPY would name the proxy in
-their `Destination`. The proxy forwards all S3 methods so the registry can return S3 errors
-for unsupported operations. Job steps find the proxy in `VK_REGISTRY` (`http://registry.vk`)
+With a token, the proxy forwards OCI (`/v2/`), locks (`/lock/`) and plain files through
+`/files/`, WebDAV (`/dav/files/`) and S3 (`/s3/`). The registry enforces the token's grants.
+The proxy allows GET, HEAD, PUT and DELETE under `/files/`. WebDAV also allows PROPFIND,
+MKCOL and OPTIONS. MOVE and COPY would name the proxy in `Destination`. All S3 methods
+reach the registry so it can return S3 errors for unsupported operations.
+Job steps find the proxy in `VK_REGISTRY` (`http://registry.vk`)
 and their grants in `VK_REGISTRY_NAMESPACES`, space-separated `<prefix>=<rights>` with `r`,
 `w` and `l` for read, write and lock. The proxy needs `net.mode = "switch"`, the only network
 that serves `registry.vk`; under any other, a job gets neither the proxy nor these variables.

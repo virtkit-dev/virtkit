@@ -105,7 +105,22 @@ pub(super) async fn route(
         _ => {
             let head = method == "HEAD";
             blocking(state, authz, move |store, authz| {
-                objects::get(authz, store, &segs, collection, &this, head)
+                objects::get(
+                    authz,
+                    store,
+                    &segs,
+                    collection,
+                    &this,
+                    objects::Read {
+                        head,
+                        ..Default::default()
+                    },
+                )
+                .map(|mut resp| {
+                    // WebDAV reads ignore `Range`: advertise none.
+                    resp.headers_mut().remove(hyper::header::ACCEPT_RANGES);
+                    resp
+                })
             })
             .await
         }

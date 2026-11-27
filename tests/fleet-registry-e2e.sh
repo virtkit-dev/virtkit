@@ -237,9 +237,9 @@ done
 host_vk kvm registry pull e2e-bundle:1 >"$FLEET/pull.log" 2>&1 ||
   { cat "$FLEET/pull.log"; fail "vk registry pull failed with the node's token"; }
 # A plain file the guests may read, for sccache's S3 view below.
-code=$(reg_code /dav/files/e2e-bundle/s3/probe -X PUT --data-binary s3-probe \
+code=$(reg_code /s3/e2e-bundle/s3/probe -X PUT --data-binary s3-probe \
   -H "$(bearer "$(cat "$FLEET/admin/token")")")
-[ "$code" = 201 ] || fail "the operator could not write a plain file ($code)"
+[ "$code" = 200 ] || fail "the operator could not write a plain file ($code)"
 
 echo "== jobs gitlab-runner gives the node: images with its token, guests with theirs =="
 mkdir -p "$FLEET/gl"
