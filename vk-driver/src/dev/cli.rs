@@ -501,7 +501,7 @@ enum DevAction {
         json: bool,
         /// skip the on-disk size measurement (a stat walk of every file)
         ///
-        /// The `ON DISK` column then shows `-`.
+        /// The `ON_DISK` column then shows `-`.
         #[arg(long)]
         no_sizes: bool,
         /// show each workspace's full path

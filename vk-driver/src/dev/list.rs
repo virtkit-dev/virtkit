@@ -741,7 +741,7 @@ pub fn render(rows: &[Row], wide: bool, line: &dyn Fn(&Row) -> bool) -> String {
             "CREATED BY",
             "LAST BOOT",
             "MEM",
-            "ON DISK",
+            "ON_DISK",
             "FLAGS",
         ],
         &rows,
@@ -1777,7 +1777,7 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("NAME"), "{out}");
         assert!(
-            lines[0].contains("CREATED BY  LAST BOOT  MEM      ON DISK  FLAGS"),
+            lines[0].contains("CREATED BY  LAST BOOT  MEM      ON_DISK  FLAGS"),
             "{out}"
         );
         // The running row is the only one holding memory: what its tree holds now over the
