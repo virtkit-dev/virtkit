@@ -371,12 +371,16 @@ fn access(
     let (managed, own): (Vec<_>, Vec<_>) = areas.iter().partition(|a| a.managed);
     h.raw("<section><h2>Storage areas</h2><p class=\"sub\">Each is a part of the registry. ")
         .raw("Jobs and nodes get access only where an access rule allows it.</p>");
-    let editable = operator.is_some().then_some(v.id.as_str());
+    let context = Own {
+        v,
+        namespaces,
+        operator: operator.map(|(auth, _)| auth),
+    };
     if own.is_empty() {
         h.raw("<p class=\"empty\">None besides the ones kept for CI. ")
             .raw("An operator adds one here, or with <code>vk-hub namespaces add</code>.</p>");
     } else {
-        areas_table(h, &own, editable);
+        areas_table(h, &own, Some(&context));
     }
     if !managed.is_empty() {
         h.raw("<details class=\"fold\"><summary>Managed by CI <span class=\"sub\">· CI caches, ")
@@ -416,12 +420,31 @@ fn access(
         .raw("\">Access history in the audit log</a></p>");
 }
 
-/// Link each area to its edit form when `editable` supplies a registry ID.
-fn areas_table(h: &mut Html, areas: &[&super::access::Area], editable: Option<&str>) {
+/// Registry context for rows outside the CI-managed table.
+struct Own<'a> {
+    v: &'a RegistryView,
+    /// The registry's areas as stored.
+    namespaces: &'a [NamespaceRow],
+    /// The operator who may change them.
+    operator: Option<&'a Auth>,
+}
+
+/// Non-CI rows show a flat store and give operators an edit link.
+fn areas_table(h: &mut Html, areas: &[&super::access::Area], own: Option<&Own>) {
     h.raw("<table class=\"grid\"><thead><tr>");
-    header_cells(h, &["AREA", "WHO CAN READ", "WHO CAN PUBLISH"]);
+    if own.is_some() {
+        header_cells(
+            h,
+            &["AREA", "WHO CAN READ", "WHO CAN PUBLISH", "FLAT STORE"],
+        );
+    } else {
+        header_cells(h, &["AREA", "WHO CAN READ", "WHO CAN PUBLISH"]);
+    }
     h.raw("</tr></thead><tbody>");
     for a in areas {
+        let editable = own
+            .filter(|o| o.operator.is_some())
+            .map(|o| o.v.id.as_str());
         h.raw("<tr><td><strong>")
             .text(&a.label)
             .raw("</strong><div class=\"sub\"><code>")
@@ -444,6 +467,12 @@ fn areas_table(h: &mut Html, areas: &[&super::access::Area], editable: Option<&s
         lines(h, &a.readers);
         h.raw("</td><td>");
         lines(h, &a.publishers);
+        if let Some(o) = own
+            && let Some(ns) = o.namespaces.iter().find(|n| n.name == a.name)
+        {
+            h.raw("</td><td>");
+            super::areas::flat_cell(h, o.v, ns, o.namespaces, o.operator);
+        }
         h.raw("</td></tr>");
     }
     h.raw("</tbody></table>");
@@ -751,6 +780,10 @@ fn steering(h: &mut Html, v: &RegistryView, releases: &[Release], auth: &Auth) {
             .raw("\">");
         form(h, "flat-remove", &format!("Unbind {}", s.prefix), &remove);
     }
+    h.raw("<p class=\"sub\">Bind a store for a non-CI area from its row on <a href=\"")
+        .raw(DETAIL_PREFIX)
+        .text(&v.id)
+        .raw("?tab=access\">Job access</a>.</p>");
     h.raw("</div><div class=\"group\"><h3>Update</h3>");
     updates::form(h, &KIND, &peer(v.clone(), None), releases, Some(&auth.csrf));
     h.raw(
@@ -964,6 +997,8 @@ enum Act {
         dry_run: bool,
     },
     Flat(FlatEdit),
+    /// A new cap for the flat store bound at a storage area's prefix.
+    Resize(u64),
 }
 
 fn act(form: &[(String, String)]) -> Result<Act, &'static str> {
@@ -998,6 +1033,13 @@ fn act(form: &[(String, String)]) -> Result<Act, &'static str> {
                 durable: field(form, "durable").is_some().then_some(true),
             }))
         }
+        "flat-resize" => match field(form, "cap")
+            .and_then(vk_hub_proto::registry::parse_size)
+            .filter(|n| *n > 0)
+        {
+            Some(cap) => Act::Resize(cap),
+            None => return Err("Refused. The cap must be a size such as 50G."),
+        },
         "flat-remove" => Act::Flat(FlatEdit::Remove {
             prefix: field(form, "prefix").unwrap_or("").to_string(),
         }),
@@ -1058,6 +1100,14 @@ pub(super) async fn action(
         Ok(act) => act,
         Err(why) => return Ok(message(StatusCode::BAD_REQUEST, why)),
     };
+    let area = field(&form, "area").map(|name| {
+        let revision = field(&form, "revision").unwrap_or("");
+        (name.to_string(), revision.to_string())
+    });
+    let back = match field(&form, "back") {
+        Some("access") => format!("{DETAIL_PREFIX}{id}?tab=access"),
+        _ => format!("{DETAIL_PREFIX}{id}"),
+    };
     let principal = auth.session.principal();
     let hub = ui.hub.clone();
     let registry = id.to_string();
@@ -1065,7 +1115,10 @@ pub(super) async fn action(
         Ok(match act {
             Act::ReadOnly(r) => ops::read_only(&hub, &principal, &registry, r).map(|_| ()),
             Act::Schedule(s) => ops::gc_schedule(&hub, &principal, &registry, s).map(|_| ()),
-            Act::Flat(edit) => ops::flat(&hub, &principal, &registry, edit).map(|_| ()),
+            Act::Flat(edit) => area_flat(&hub, &registry, area.as_ref(), edit)
+                .and_then(|edit| ops::flat(&hub, &principal, &registry, edit))
+                .map(|_| ()),
+            Act::Resize(cap) => resize(&hub, &principal, &registry, area.as_ref(), cap),
             Act::GcNow {
                 retention_days,
                 grace_days,
@@ -1083,10 +1136,79 @@ pub(super) async fn action(
     })
     .await?;
     match done {
-        Ok(()) => Ok(see_other(&format!("{DETAIL_PREFIX}{id}"))),
+        Ok(()) => Ok(see_other(&back)),
         Err(e) if e.is::<NotEnrolled>() => {
             Ok(message(StatusCode::NOT_FOUND, "There is no such registry."))
         }
         Err(e) => Ok(message(StatusCode::CONFLICT, &format!("Refused: {e:#}."))),
     }
+}
+
+/// Row edits use the area's [`NamespaceRow::static_prefix`] after checking its revision.
+/// Overview edits supply their own prefix.
+fn area_flat(
+    hub: &crate::server::Hub,
+    registry: &str,
+    area: Option<&(String, String)>,
+    edit: FlatEdit,
+) -> Result<FlatEdit> {
+    let Some(area) = area else {
+        return Ok(edit);
+    };
+    let prefix = area_prefix(hub, registry, area)?;
+    Ok(match edit {
+        FlatEdit::Set(s) => FlatEdit::Set(FlatSetting { prefix, ..s }),
+        FlatEdit::Remove { .. } => FlatEdit::Remove { prefix },
+    })
+}
+
+/// Change only the cap of the hub binding at the area's exact prefix, as `actor`.
+/// Check the area revision as in [`area_flat`] and refuse a resize if the binding is absent at
+/// lookup.
+fn resize(
+    hub: &crate::server::Hub,
+    actor: &str,
+    registry: &str,
+    area: Option<&(String, String)>,
+    cap: u64,
+) -> Result<()> {
+    let area = area.ok_or_else(|| anyhow::anyhow!("resizing requires a storage area"))?;
+    let prefix = area_prefix(hub, registry, area)?;
+    let row = hub
+        .db
+        .registry(registry)?
+        .ok_or_else(|| NotEnrolled(registry.to_string()))?;
+    let Some(s) = row
+        .desired
+        .and_then(|d| d.flat)
+        .and_then(|l| l.into_iter().find(|s| s.prefix == prefix))
+    else {
+        anyhow::bail!("files/{prefix} has no current hub binding. Reload the area");
+    };
+    ops::flat(
+        hub,
+        actor,
+        registry,
+        FlatEdit::Set(FlatSetting { cap, ..s }),
+    )
+    .map(drop)
+}
+
+/// Look up the named area's fixed prefix and reject a stale page revision.
+fn area_prefix(
+    hub: &crate::server::Hub,
+    registry: &str,
+    (name, revision): &(String, String),
+) -> Result<String> {
+    let ns = hub
+        .db
+        .namespaces(registry)?
+        .into_iter()
+        .find(|n| n.name == *name)
+        .ok_or_else(|| anyhow::anyhow!("there is no storage area {name}"))?;
+    if ns.revision() != *revision {
+        anyhow::bail!("storage area {name} changed meanwhile. Reload the area");
+    }
+    ns.static_prefix()
+        .ok_or_else(|| anyhow::anyhow!("storage area {name}'s path has no fixed prefix"))
 }

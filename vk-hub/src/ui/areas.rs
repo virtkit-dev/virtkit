@@ -13,9 +13,13 @@ use super::html::Html;
 use super::pages;
 use super::registries::{DETAIL_PREFIX, Tab};
 use super::{Auth, Body, Ui, actions, blocking, field, html_response, message};
+use crate::registries::RegistryView;
 use crate::store::{
-    CI_BUILD, CI_CACHE, CI_PIPELINE, Expect, NamespaceChanged, NamespaceRow, NotEnrolled, Role,
+    CI_BUILD, CI_CACHE, CI_PIPELINE, Expect, NamespaceChanged, NamespaceRow, NotEnrolled,
+    RegistryRow, Role,
 };
+use vk_hub_proto::registry::{FlatSetting, FlatUsage, flat_prefixes_overlap};
+use vk_hub_proto::token::under;
 
 /// Allow for 32 access rules (job subjects up to 512 bytes) and 32 isolated ref globs
 /// of up to 255 bytes each, even when every byte is percent-encoded.
@@ -391,9 +395,303 @@ fn layout(
     )
 }
 
+/// Requested and reported flat stores relative to an area's [`NamespaceRow::static_prefix`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Flat<'a> {
+    /// Its path starts with a placeholder: no fixed prefix to bind.
+    NoPrefix,
+    /// The hub binds its prefix.
+    Bound(&'a FlatSetting),
+    /// The hub binds a prefix above it.
+    Within(&'a FlatSetting),
+    /// The registry last reported a covering store with no current hub binding there.
+    /// It may come from local config or an earlier hub binding.
+    Reported(&'a FlatUsage),
+    /// Requested or reported stores below the prefix would overlap a binding here.
+    Below(Vec<&'a str>),
+    Unbound,
+}
+
+impl<'a> Flat<'a> {
+    pub(super) fn of(ns: &NamespaceRow, row: &'a RegistryRow) -> Self {
+        let Some(prefix) = ns.static_prefix() else {
+            return Flat::NoPrefix;
+        };
+        let bound = row
+            .desired
+            .as_ref()
+            .and_then(|d| d.flat.as_deref())
+            .unwrap_or_default();
+        if let Some(s) = bound.iter().find(|s| s.prefix == prefix) {
+            return Flat::Bound(s);
+        }
+        if let Some(s) = bound.iter().find(|s| under(&s.prefix, &prefix)) {
+            return Flat::Within(s);
+        }
+        if let Some(u) = usage(row, &prefix) {
+            return Flat::Reported(u);
+        }
+        let counted = row.usage.as_ref().map_or(&[][..], |u| &u.flat[..]);
+        let below: std::collections::BTreeSet<&str> = (bound.iter().map(|s| s.prefix.as_str()))
+            .chain(counted.iter().map(|u| u.prefix.as_str()))
+            .filter(|p| flat_prefixes_overlap(p, &prefix))
+            .collect();
+        if below.is_empty() {
+            Flat::Unbound
+        } else {
+            Flat::Below(below.into_iter().collect())
+        }
+    }
+}
+
+/// Last reported usage of a store at or above `prefix`.
+fn usage<'a>(row: &'a RegistryRow, prefix: &str) -> Option<&'a FlatUsage> {
+    row.usage
+        .as_ref()?
+        .flat
+        .iter()
+        .find(|u| under(&u.prefix, prefix))
+}
+
+/// A reported refusal applies to the latest request only once the registry acknowledges it.
+fn applied(row: &RegistryRow) -> bool {
+    row.desired.as_ref().is_none_or(|d| {
+        row.report
+            .as_ref()
+            .and_then(|r| r.applied)
+            .is_some_and(|a| a >= d.generation)
+    })
+}
+
+/// Whether the last report refused this exact prefix.
+fn refused(row: &RegistryRow, prefix: &str) -> bool {
+    row.report
+        .as_ref()
+        .is_some_and(|r| r.flat_refused.iter().any(|p| p == prefix))
+}
+
+/// An editable cap, using an exact binary unit such as `50G` or a byte count.
+fn cap_text(n: u64) -> String {
+    for (shift, unit) in [(40, 'T'), (30, 'G'), (20, 'M'), (10, 'K')] {
+        if n >= 1 << shift && n.is_multiple_of(1 << shift) {
+            return format!("{}{unit}", n >> shift);
+        }
+    }
+    n.to_string()
+}
+
+/// Show the area's flat store and any other areas sharing its binding.
+/// Operators also get the applicable bind, resize or unbind form.
+pub(super) fn flat_cell(
+    h: &mut Html,
+    v: &RegistryView,
+    ns: &NamespaceRow,
+    namespaces: &[NamespaceRow],
+    operator: Option<&Auth>,
+) {
+    let flat = Flat::of(ns, &v.row);
+    let counted = |h: &mut Html, prefix: &str| {
+        if let Some(u) = usage(&v.row, prefix).filter(|u| u.prefix == prefix) {
+            h.raw("<div class=\"sub\">")
+                .text(format!(
+                    "{} used of {}, {} object{}",
+                    pages::bytes(u.bytes),
+                    pages::bytes(u.cap),
+                    u.objects,
+                    if u.objects == 1 { "" } else { "s" }
+                ))
+                .raw("</div>");
+        }
+    };
+    match &flat {
+        Flat::NoPrefix => {
+            h.raw("<span class=\"sub\">none: its path has no fixed prefix to bind</span>");
+        }
+        Flat::Bound(s) => {
+            h.raw("<code>files/")
+                .text(&s.prefix)
+                .raw("</code><div class=\"sub\">");
+            h.text(format!(
+                "cap {}, evicting to {}%{}",
+                pages::bytes(s.cap),
+                s.evict_to_percent.unwrap_or(90),
+                if s.durable == Some(true) {
+                    ", durable"
+                } else {
+                    ""
+                }
+            ))
+            .raw("</div>");
+            counted(h, &s.prefix);
+            let shared: Vec<&str> = namespaces
+                .iter()
+                .filter(|o| {
+                    o.name != ns.name && o.static_prefix().is_some_and(|p| under(&s.prefix, &p))
+                })
+                .map(|o| o.name.as_str())
+                .collect();
+            if !shared.is_empty() {
+                h.raw("<div class=\"sub\">shared with ")
+                    .text(shared.join(", "))
+                    .raw("</div>");
+            }
+        }
+        Flat::Within(s) => {
+            h.raw("within <code>files/")
+                .text(&s.prefix)
+                .raw("</code>'s");
+            counted(h, &s.prefix);
+        }
+        Flat::Below(below) => {
+            let names: Vec<String> = below.iter().map(|p| format!("files/{p}")).collect();
+            h.raw("<span class=\"sub\">none of its own: ")
+                .node(&names.join(", "))
+                .raw(", below it, ")
+                .raw(if below.len() == 1 {
+                    "has one"
+                } else {
+                    "have some"
+                })
+                .raw("</span>");
+        }
+        Flat::Reported(u) => {
+            h.raw("<code>files/")
+                .node(&u.prefix)
+                .raw("</code><div class=\"sub\">last reported here. A store kept by the registry, ")
+                .raw("not the hub, may come from local <code>[[flat]]</code> or an earlier ")
+                .raw("binding.</div>");
+            counted(h, &u.prefix);
+        }
+        Flat::Unbound => {
+            h.raw("<span class=\"sub\">none</span>");
+        }
+    }
+    let bound = match &flat {
+        Flat::Bound(s) | Flat::Within(s) => Some(s.prefix.as_str()),
+        _ => None,
+    };
+    if bound.is_some() && !applied(&v.row) {
+        h.raw("<div><span class=\"badge busy\">Not applied yet</span></div>");
+    } else if let Some(prefix) = bound
+        && refused(&v.row, prefix)
+    {
+        h.raw("<div><span class=\"badge warn\">Refused</span></div><div class=\"sub\">")
+            .raw("Check for an overlapping local <code>[[flat]]</code> binding, missing ")
+            .raw("<code>flat</code> in <code>[hub] allow</code>, an invalid binding list, or a ")
+            .raw("store that failed to open.")
+            .raw("</div>");
+    }
+    let Some(auth) = operator else {
+        return;
+    };
+    let form = |h: &mut Html, op: &str| {
+        h.raw("<form class=\"act\" method=\"post\" action=\"")
+            .raw(DETAIL_PREFIX)
+            .text(&v.id)
+            .raw("/action\">");
+        pages::csrf_field(h, auth);
+        h.raw("<input type=\"hidden\" name=\"op\" value=\"")
+            .text(op)
+            .raw("\">");
+        hidden(h, "area", &ns.name);
+        hidden(h, "revision", &ns.revision());
+        hidden(h, "back", "access");
+    };
+    match &flat {
+        Flat::Bound(s) => {
+            // Unbinding needs neither current registry support nor allowlist permission.
+            if v.row.takes_flat() {
+                form(h, "flat-resize");
+                h.raw("<label>cap <input name=\"cap\" size=\"6\" required value=\"")
+                    .text(cap_text(s.cap))
+                    .raw("\"></label><button>Resize</button></form>");
+            }
+            form(h, "flat-remove");
+            h.raw("<button>Unbind</button></form>");
+        }
+        Flat::Unbound
+            if !ns
+                .static_prefix()
+                .is_some_and(|p| vk_hub_proto::registry::valid_flat_prefix(&p)) =>
+        {
+            h.raw("<div class=\"sub\">A flat-store prefix allows up to 14 components and 255 ")
+                .raw("bytes including files/. Its first component cannot be sha256.</div>");
+        }
+        Flat::Unbound if v.row.takes_flat() => {
+            form(h, "flat-set");
+            h.raw("<label>cap <input name=\"cap\" size=\"6\" placeholder=\"50G\" required>")
+                .raw("</label><button>Bind a flat store</button></form>");
+        }
+        Flat::Unbound => {
+            h.raw("<div class=\"sub\">To bind a store here, the registry must advertise ")
+                .raw("flat-store support and list ")
+                .raw("<code>flat</code> in its <code>[hub] allow</code>.</div>");
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A requested or reported store below the area's fixed prefix prevents a binding there.
+    #[test]
+    fn an_area_falls_in_the_store_of_its_prefix() {
+        use vk_hub_proto::registry::{DesiredState, Usage};
+        let ns = |path: &str| NamespaceRow {
+            name: "a".into(),
+            path: path.into(),
+            retention_days: None,
+            alias: None,
+            isolate: Vec::new(),
+            grants: Vec::new(),
+            node_grants: Vec::new(),
+            created_at: 0,
+            created_by: "u".into(),
+        };
+        let setting = |prefix: &str| FlatSetting {
+            prefix: prefix.into(),
+            cap: 1,
+            evict_to_percent: None,
+            durable: None,
+        };
+        let counted = |prefix: &str| FlatUsage {
+            prefix: prefix.into(),
+            ..FlatUsage::default()
+        };
+        let row = RegistryRow {
+            desired: Some(DesiredState {
+                flat: Some(vec![setting("cc"), setting("tools/x")]),
+                ..DesiredState::default()
+            }),
+            usage: Some(Usage {
+                flat: vec![counted("own"), counted("mixed/local")],
+                ..Usage::default()
+            }),
+            ..RegistryRow::default()
+        };
+        let bound = setting("cc");
+        assert_eq!(Flat::of(&ns("{gitlab}/x"), &row), Flat::NoPrefix);
+        assert_eq!(Flat::of(&ns("cc/{gitlab}"), &row), Flat::Bound(&bound));
+        assert_eq!(
+            Flat::of(&ns("cc/deep/{gitlab}"), &row),
+            Flat::Within(&bound)
+        );
+        assert_eq!(Flat::of(&ns("ccache/{gitlab}"), &row), Flat::Unbound);
+        assert_eq!(
+            Flat::of(&ns("tools/{gitlab}"), &row),
+            Flat::Below(vec!["tools/x"])
+        );
+        assert_eq!(
+            Flat::of(&ns("mixed/{gitlab}"), &row),
+            Flat::Below(vec!["mixed/local"])
+        );
+        assert_eq!(
+            Flat::of(&ns("own/{gitlab}"), &row),
+            Flat::Reported(&counted("own"))
+        );
+    }
 
     #[test]
     fn a_draft_reads_back_as_the_area_it_came_from() {

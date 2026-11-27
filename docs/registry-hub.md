@@ -384,7 +384,8 @@ the newest one, and again after a restart:
 - `flat` binds prefixes below `files/` to flat stores. Set the cap, eviction target and
   durability with `vk-hub registries flat <id> set <prefix> --cap 200G [--evict-to-percent 90]
   [--durable]`. Remove a binding with `vk-hub registries flat <id> remove <prefix>`.
-  Both actions are available on the registry's page. See `vk-registry/DESIGN.md`, “Flat stores”.
+  Operators can bind or unbind a prefix on the registry overview. For a non-CI area's fixed
+  prefix, use its *Job access* row. See `vk-registry/DESIGN.md`, “Flat stores”.
 
   To set a binding, the registry must advertise `flat` and list it in `[hub] allow`.
   Older registries omit the capability. Removal needs neither support nor permission.
@@ -760,7 +761,8 @@ though within them it can claim protection.
   plain files under one size cap rather than tags: for a namespace whose path is
   `sccache/{gitlab}/{project_id}/{protection}`, add `[[flat]] prefix = "sccache"` with a
   `cap` to the registry's config and restart it, or, with `flat` in its `[hub] allow`,
-  `vk-hub registries flat <id> set sccache --cap 200G`. Every project's entries then share that cap,
+  run `vk-hub registries flat <id> set sccache --cap 200G` or enter `200G` and select
+  *Bind a flat store* on the area's *Job access* row. All projects then share that cap,
   each under its own path. Entries cached before are not carried over.
 - **Build caches.** A job's builds cache per project, protection and scope in `ci-build`, and
   a namespace may give chosen refs a scope of their own: see the
@@ -1117,7 +1119,20 @@ change or remove it. CI areas can only be managed from the CLI.
 
 The forms post to `/registry/<id>/areas`. Removal requires confirmation. A change or removal
 must match the revision shown on the page. The registry's audit log records each successful
-operation under the session's principal. *Settings* (`?tab=settings`) shows the bound
+operation under the session's principal.
+
+For areas outside *Managed by CI*, the *Flat store* column uses the path up to its first
+placeholder, such as `sccache` for `sccache/{gitlab}/{project_id}/{protection}`. It shows
+the hub's requested binding and cap at that prefix, or the parent binding that covers it.
+The row includes the registry's last reported usage when available and flags pending or
+refused bindings. A store reported at or above the prefix without a current hub binding
+may come from the registry's `[[flat]]` or an earlier binding. Otherwise the row shows
+*none*, with an explanation if the path lacks a fixed prefix or stores below it prevent
+a binding there.
+
+Operators can bind a free prefix or resize or unbind an exact hub binding from the row.
+The row uses the same registry action as *Flat stores* on the overview, where operators
+can enter a prefix directly. *Settings* (`?tab=settings`) shows the bound
 address and, per signing key the registry was sent, whether it signs the registry's tokens,
 awaits being applied, or was replaced and is kept while its tokens may be live.
 

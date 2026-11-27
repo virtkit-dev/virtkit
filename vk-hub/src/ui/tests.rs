@@ -9781,6 +9781,189 @@ async fn an_operator_adds_changes_and_removes_storage_areas() {
     audited(&hub, "removed namespace cache").await;
 }
 
+/// Non-CI rows show exact and parent bindings, reported usage and refusals.
+/// Operators manage exact bindings from the row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_storage_areas_row_shows_and_steers_its_flat_store() {
+    use crate::store::{NamespaceRow, RegistryWrite};
+    use crate::tests::tokens::token_registry;
+    use vk_hub_proto::registry::{
+        ALLOW_FLAT, ALLOW_GC, FlatSetting, FlatUsage, Inventory, Report, Usage,
+    };
+    let (addr, hub, _keys) = start_fleet_keys("flat-areas").await;
+    let origin = format!("http://{addr}");
+    let id = token_registry(&hub, "https://ok.example.com", "d1");
+    let tab = format!("/registry/{id}?tab=access");
+    let action = format!("/registry/{id}/action");
+    let now = crate::now_secs();
+    for (name, path) in [
+        ("sccache", "sccache/{gitlab}/{project_id}/{protection}"),
+        ("deep", "sccache/deep/{gitlab}/{project_id}"),
+    ] {
+        let ns = NamespaceRow {
+            name: name.into(),
+            path: path.into(),
+            retention_days: None,
+            alias: None,
+            isolate: Vec::new(),
+            grants: crate::store::parse_grants(&["rw:own project"]).unwrap().0,
+            node_grants: Vec::new(),
+            created_at: 0,
+            created_by: "uid 0".into(),
+        };
+        hub.db.put_namespace(&id, &ns, "uid 0", now).unwrap();
+    }
+    let revision = |name: &str| {
+        hub.db
+            .namespaces(&id)
+            .unwrap()
+            .into_iter()
+            .find(|n| n.name == name)
+            .unwrap()
+            .revision()
+    };
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+
+    // Show the registry requirements until an operator can bind a store.
+    let body = get(addr, &tab, Some(&operator)).await.body;
+    assert!(body.contains("<th>FLAT STORE</th>"), "{body}");
+    assert!(
+        body.contains("<code>flat</code> in its <code>[hub] allow</code>"),
+        "{body}"
+    );
+    assert!(!body.contains("Bind a flat store"), "{body}");
+    let inventory = Inventory {
+        hostname: "reg-1".into(),
+        tokens: true,
+        flat: true,
+        allow: vec![ALLOW_GC.into(), ALLOW_FLAT.into()],
+        ..Inventory::default()
+    };
+    hub.db
+        .record_registry(&id, RegistryWrite::Inventory(inventory), now)
+        .unwrap();
+    let body = get(addr, &tab, Some(&operator)).await.body;
+    assert!(body.contains("Bind a flat store"), "{body}");
+    assert!(
+        !get(addr, &tab, Some(&viewer))
+            .await
+            .body
+            .contains("Bind a flat store")
+    );
+
+    // Binding from the row uses the area's prefix and returns to Job access.
+    let bind = format!(
+        "_csrf={csrf}&op=flat-set&area=sccache&revision={}&back=access&cap=50G",
+        revision("sccache")
+    );
+    let reply = post_action(addr, &origin, &operator, &action, &bind, false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some(tab.as_str()));
+    let flat = || {
+        hub.db
+            .registry(&id)
+            .unwrap()
+            .unwrap()
+            .desired
+            .unwrap()
+            .flat
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        flat(),
+        [FlatSetting {
+            prefix: "sccache".into(),
+            cap: 50 << 30,
+            evict_to_percent: None,
+            durable: None,
+        }]
+    );
+    // A stale area revision rejects the bind.
+    let stale = bind.replace(&revision("sccache"), "0");
+    let reply = post_action(addr, &origin, &operator, &action, &stale, false).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(reply.body.contains("changed meanwhile"), "{}", reply.body);
+
+    let usage = Usage {
+        at: now,
+        flat: vec![FlatUsage {
+            prefix: "sccache".into(),
+            objects: 3,
+            bytes: 2048,
+            cap: 50 << 30,
+        }],
+        ..Usage::default()
+    };
+    hub.db
+        .record_registry(&id, RegistryWrite::Usage(usage), now)
+        .unwrap();
+    let applied = hub
+        .db
+        .registry(&id)
+        .unwrap()
+        .unwrap()
+        .desired
+        .unwrap()
+        .generation;
+    let report = Report {
+        applied: Some(applied),
+        flat_refused: vec!["sccache".into()],
+        ..Report::default()
+    };
+    hub.db
+        .record_registry(&id, RegistryWrite::Report(report), now)
+        .unwrap();
+    let body = get(addr, &tab, Some(&operator)).await.body;
+    for want in [
+        "<code>files/sccache</code><div class=\"sub\">cap 50.0 GiB, evicting to 90%</div>",
+        "2.0 KiB used of 50.0 GiB, 3 objects",
+        "within <code>files/sccache</code>'s",
+        "shared with deep",
+        "<span class=\"badge warn\">Refused</span>",
+        "name=\"cap\" size=\"6\" required value=\"50G\"",
+        "<button>Unbind</button>",
+    ] {
+        assert!(body.contains(want), "{want}: {body}");
+    }
+
+    // A resize preserves the eviction target and durability.
+    let setting = FlatSetting {
+        evict_to_percent: Some(80),
+        durable: Some(true),
+        ..flat()[0].clone()
+    };
+    crate::registries::flat(&hub, "uid 0", &id, crate::store::FlatEdit::Set(setting)).unwrap();
+    let body = get(addr, &tab, Some(&operator)).await.body;
+    // The refusal belongs to the previous request.
+    assert!(body.contains("Not applied yet"), "{body}");
+    assert!(!body.contains("badge warn\">Refused"), "{body}");
+    let resize = format!(
+        "_csrf={csrf}&op=flat-resize&area=sccache&revision={}&back=access&cap=100G",
+        revision("sccache")
+    );
+    let reply = post_action(addr, &origin, &operator, &action, &resize, false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(
+        (flat()[0].cap, flat()[0].evict_to_percent, flat()[0].durable),
+        (100 << 30, Some(80), Some(true))
+    );
+    let unbind = format!(
+        "_csrf={csrf}&op=flat-remove&area=sccache&revision={}&back=access",
+        revision("sccache")
+    );
+    let reply = post_action(addr, &origin, &operator, &action, &unbind, false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert!(flat().is_empty());
+    // A resize from a page that still showed it does not bind it again.
+    let reply = post_action(addr, &origin, &operator, &action, &resize, false).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(flat().is_empty());
+    // Unbinding leaves the last usage report visible.
+    let body = get(addr, &tab, Some(&viewer)).await.body;
+    assert!(body.contains("kept by the registry, not the hub"), "{body}");
+}
+
 /// `/gitlab` lists the GitLab servers, `/keys` the API keys; Connections' old addresses lead
 /// to them, and those of the capacity policy's and a project's pages to theirs.
 #[tokio::test(flavor = "multi_thread")]

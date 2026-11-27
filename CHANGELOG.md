@@ -8,6 +8,8 @@ All notable changes to virtkit will be documented in this file.
 
 - Add, change and remove a registry's storage areas from its *Job access* tab on the hub, with
   the same paths, aliases and access rules as `vk-hub namespaces add`.
+- On *Job access*, storage areas outside *Managed by CI* show flat-store caps, reported usage
+  and refusals. Operators can bind, resize and unbind a store from the area's row.
 
 ### Fixed
 
