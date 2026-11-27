@@ -1051,6 +1051,7 @@ pub(crate) async fn run(
         services: Vec::new(),
         guest_agent: Some(work.join(GUEST_AGENT_SOCKET)),
         control: Some(work.join(CONTROL_SOCKET)),
+        created_by: Some(crate::dev::own_version()),
     });
 
     let result = hold(&mut ch, &console, args).await;

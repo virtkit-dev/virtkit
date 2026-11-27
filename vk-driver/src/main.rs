@@ -31,6 +31,7 @@ mod build;
 mod cachelock;
 mod check;
 mod checkout;
+mod columns;
 mod compose;
 mod config;
 mod console;
@@ -2714,9 +2715,25 @@ enum Cmd {
         /// records untouched.
         #[arg(long)]
         problems: bool,
-        /// the full table: the project path in full, and EXEC_ADDRESS
+        /// the full table: the workspace path in full, and EXEC_ADDRESS
         #[arg(short = 'w', long, conflicts_with_all = ["json", "field"])]
         wide: bool,
+        /// which columns, in which order (comma-separated; `+COL` adds one, `all` every one)
+        ///
+        /// The default is name, status, pid, mem, on_disk, created_by and workspace, as
+        /// `vk dev list` shows them but workspace. `--columns +last_boot,+kind` adds to them;
+        /// `--columns name,mem` shows only those. The others: last_boot, kind, env, image, ip,
+        /// published, exec_address, and stale with `--stale`.
+        #[arg(long, value_name = "COLS", conflicts_with_all = ["json", "field", "detail"])]
+        columns: Option<String>,
+        /// add the PUBLISHED column: the host ports `vk publish ensure` holds open
+        #[arg(long, conflicts_with_all = ["json", "field", "detail"])]
+        published: bool,
+        /// skip measuring what each VM takes on disk (a stat walk of every file)
+        ///
+        /// The `ON_DISK` column then shows `-`.
+        #[arg(long)]
+        no_sizes: bool,
         /// show detailed VM records
         ///
         /// Each record starts with NAME, KIND, STATUS, ATTENTION and STALE RECORD. A running
@@ -4149,6 +4166,9 @@ async fn cli_main(cli: Cli) -> ExitCode {
         };
     }
     if let Cmd::List {
+        columns,
+        published,
+        no_sizes,
         refs,
         name,
         glob,
@@ -4197,6 +4217,9 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 workspace: workspace.as_deref().map(vms::canonical),
                 below: *recursive,
             },
+            columns: columns.clone(),
+            published: *published,
+            sizes: !*no_sizes,
         };
         return match vms::list_report(opts) {
             Ok(report) => write_report(&report),
@@ -8932,6 +8955,7 @@ mod tests {
             }],
             guest_agent: None,
             control: None,
+            created_by: None,
         };
         assert_eq!(
             resolve_service_addr(&entry, "db").unwrap(),

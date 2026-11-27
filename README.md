@@ -592,15 +592,15 @@ vk list
 ```
 
 ```
-NAME        KIND     STATUS   PID    UPTIME  MEM       IMAGE               PROJECT  PUBLISHED
-app         run      running  41230  2h14m   1.2G/8G   app/Dockerfile:dev  ~/app    -
-shop        dev      running  41877  35m     5.9G/16G  devcontainer        ~/shop   -
-shop/db     service  running  -      -       -         -                   ~/shop   127.0.0.1:5432->127.0.0.1:5432@db
-shop/redis  service  stopped  -      -       -         -                   ~/shop   -
-scratch     run      stopped  -      -       -         alpine              ~/tmp    -
+NAME        STATUS   PID    MEM       ON_DISK  CREATED_BY  WORKSPACE
+app         running  41230  1.2G/8G   1.3G     vk-0.118.0  ~/app
+shop        running  41877  5.9G/16G  10.5G    vk-0.118.0  ~/shop
+shop/db     running  -      -         4.5G     vk-0.118.0  ~/shop
+shop/redis  stopped  -      -         80M      vk-0.118.0  ~/shop
+scratch     stopped  -      -         2.0G     -           ~/tmp
 ```
 
-`vk list` groups rows by PROJECT. Each primary is followed by its compose services in name
+`vk list` groups rows by WORKSPACE. Each primary is followed by its compose services in name
 order. A service gets a row when its manager reports it active or its console log records
 an earlier start. A dev environment's project is its workspace. A run uses `--workspace`,
 then `--workdir`, then its launch directory. A declared service that never started has no
@@ -642,11 +642,22 @@ when both halves are unknown and on stopped rows. A running service's row shows 
 VM's memory over the size it boots with; that memory is part of its primary's figure too,
 so the rows do not add up to a total.
 
-IMAGE identifies the Dockerfile and target stage, compose primary or image ref. PUBLISHED
-shows each host port held by `vk publish ensure` on the row of the VM that dials the target.
-It shows `listen->to`, with `@NAME` for a service and `(unconfirmed)` if the publisher's
-liveness could not be checked. The table abbreviates `$HOME` to `~`. `--wide` (`-w`) shows
-the full project path and adds EXEC_ADDRESS. It conflicts with `--detail`, `--json` and `--field`.
+ON_DISK is what the VM's state directory takes on disk, in blocks used — what `vk delete`
+frees; a primary's includes its services' directories, which their own rows show. Measuring
+walks every file; `--no-sizes` skips it. CREATED_BY is the `vk` that created the VM (a run
+started by an older `vk` shows `-`), a service's being its primary's.
+
+The table shows NAME, STATUS, PID, MEM, ON_DISK, CREATED_BY and WORKSPACE, the columns `vk
+dev list` shows too, but WORKSPACE. `--columns` picks others, in any order:
+`--columns name,mem,on_disk` shows those alone, `--columns +last_boot,+image` adds to the
+default, and `--columns all` shows every one. The others are LAST_BOOT (how long ago it
+booted: its uptime while it runs), KIND, ENV, IMAGE (the Dockerfile and target stage,
+compose primary or image ref), IP, PUBLISHED, EXEC_ADDRESS and, with `--stale`, STALE.
+`--published` adds PUBLISHED: each host port held by `vk publish ensure`, on the row of the
+VM that dials the target, as `listen->to`, with `@NAME` for a service and `(unconfirmed)` if
+the publisher's liveness could not be checked. The table abbreviates `$HOME` to `~`.
+`--wide` (`-w`) shows the full workspace path and adds EXEC_ADDRESS. These conflict with
+`--detail`, `--json` and `--field`.
 
 **Naming a VM.** `vk list` accepts references to VMs in any listed state. `vk atop` also accepts recorded jobs.
 

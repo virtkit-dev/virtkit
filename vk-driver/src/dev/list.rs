@@ -108,6 +108,8 @@ pub struct Running {
     pub mem_used: Option<u64>,
     /// the memory size it booted with, the `--mem` token verbatim
     pub mem: Option<String>,
+    /// its managing `vk run`'s pid, as `vk list` shows it
+    pub pid: Option<u32>,
 }
 /// One environment in the inventory.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -150,6 +152,13 @@ pub struct Row {
     /// directory size in bytes when measured, omitted for missing state and with `--no-sizes`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
+    /// what the directory takes on disk, blocks used — what deleting it frees; measured with
+    /// `size_bytes`, which adds up file lengths
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
+    /// its running VM's managing `vk run`, as `vk list` shows it
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
     pub flags: Vec<Flag>,
     /// whether the directory passes the ownership check for deletion ([`owned`])
     pub deletable: bool,
@@ -172,6 +181,9 @@ pub struct Service {
     /// service that has no VM
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
+    /// what its directory takes on disk, blocks used; measured with `size_bytes`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
 }
 
 /// Which rows `vk dev list` keeps. The names, globs and words pick the environments and
@@ -312,6 +324,8 @@ pub fn with_services(
                 mem_used_bytes: None,
                 mem: None,
                 size_bytes: None,
+                disk_bytes: None,
+                pid: None,
                 flags: Vec::new(),
                 deletable: false,
                 services: Vec::new(),
@@ -361,9 +375,11 @@ fn service(
         _ => None,
     }
     .or_else(|| booted.then(|| crate::vmlist::STOPPED.to_string()));
+    let measured = sizes && status.is_some();
     Service {
         name: name.to_string(),
-        size_bytes: (sizes && status.is_some()).then(|| crate::dev::storage::dir_size(&dir)),
+        size_bytes: measured.then(|| crate::dev::storage::dir_size(&dir)),
+        disk_bytes: measured.then(|| crate::dev::storage::disk_usage(&dir)),
         status,
         dir,
     }
@@ -602,6 +618,8 @@ fn row(dir: &Path, running: &[Running], with_sizes: bool, with_flags: bool) -> R
         mem_used_bytes: live.and_then(|r| r.mem_used),
         mem: live.and_then(|r| r.mem.clone()),
         size_bytes: with_sizes.then(|| crate::dev::storage::dir_size(dir)),
+        disk_bytes: with_sizes.then(|| crate::dev::storage::disk_usage(dir)),
+        pid: live.and_then(|r| r.pid),
         flags,
         deletable: owned(dir).is_ok(),
         services: Vec::new(),
@@ -669,13 +687,20 @@ pub(crate) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
 /// Service rows have no creator, last boot or memory reading. `wide` shows full workspace
 /// paths instead of their shortest distinguishing suffixes. An environment whose `line` is
 /// false shows only its services' rows.
-pub fn render(rows: &[Row], wide: bool, line: &dyn Fn(&Row) -> bool) -> String {
+pub fn render(
+    rows: &[Row],
+    wide: bool,
+    line: &dyn Fn(&Row) -> bool,
+    cols: &[crate::columns::Col],
+) -> String {
+    use crate::columns::Col;
     if rows.is_empty() {
         return "no dev environment state on this host\n".into();
     }
     let dash = || "-".to_string();
     let listed: Vec<&Path> = rows.iter().filter_map(|r| r.workspace.as_deref()).collect();
     let short = short_paths(&listed);
+    let size = |disk: Option<u64>, len: Option<u64>| fmt_size(disk.or(len));
     let mut lines: Vec<Vec<String>> = Vec::new();
     for r in rows {
         let not_built = r.status == Status::NotBuilt;
@@ -694,61 +719,78 @@ pub fn render(rows: &[Row], wide: bool, line: &dyn Fn(&Row) -> bool) -> String {
         };
         // Filtered down to some of its services, an environment's own row is left out.
         if line(r) {
-            lines.push(vec![
-                name.clone(),
-                workspace.clone(),
-                environment.clone(),
-                r.status.label().into(),
-                match not_built {
-                    true => dash(),
-                    false => r
-                        .created_by
-                        .as_deref()
-                        .map(short_creator)
-                        .unwrap_or_default(),
-                },
-                match not_built {
-                    true => dash(),
-                    false => r.age_secs.map(crate::vms::fmt_uptime).unwrap_or_default(),
-                },
-                crate::vms::mem_cell(r.mem_used_bytes, r.mem.as_deref()),
-                fmt_size(r.size_bytes),
-                r.flags
-                    .iter()
-                    .map(|f| f.label())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ]);
+            lines.push(
+                cols.iter()
+                    .map(|col| match col {
+                        Col::Name => name.clone(),
+                        Col::Workspace => workspace.clone(),
+                        Col::Env => environment.clone(),
+                        Col::Status => r.status.label().into(),
+                        Col::Pid => r.pid.map_or_else(dash, |p| p.to_string()),
+                        Col::CreatedBy => match not_built {
+                            true => dash(),
+                            false => r.created_by.as_deref().map_or_else(dash, short_creator),
+                        },
+                        Col::LastBoot => match not_built {
+                            true => dash(),
+                            false => r.age_secs.map_or_else(dash, crate::vms::fmt_uptime),
+                        },
+                        Col::Mem => crate::vms::mem_cell(r.mem_used_bytes, r.mem.as_deref()),
+                        Col::OnDisk => size(r.disk_bytes, r.size_bytes),
+                        Col::Flags => r
+                            .flags
+                            .iter()
+                            .map(|f| f.label())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        _ => dash(),
+                    })
+                    .collect(),
+            );
         }
         for s in &r.services {
-            lines.push(vec![
-                format!("{name}/{}", s.name),
-                workspace.clone(),
-                environment.clone(),
-                s.status.clone().unwrap_or_else(dash),
-                dash(),
-                dash(),
-                dash(),
-                fmt_size(s.size_bytes),
-                String::new(),
-            ]);
+            lines.push(
+                cols.iter()
+                    .map(|col| match col {
+                        Col::Name => format!("{name}/{}", s.name),
+                        Col::Workspace => workspace.clone(),
+                        Col::Env => environment.clone(),
+                        Col::Status => s.status.clone().unwrap_or_else(dash),
+                        // A service is created by the `vk` that boots its environment.
+                        Col::CreatedBy => match s.status.is_some() {
+                            true => r.created_by.as_deref().map_or_else(dash, short_creator),
+                            false => dash(),
+                        },
+                        Col::OnDisk => size(s.disk_bytes, s.size_bytes),
+                        Col::Flags => String::new(),
+                        _ => dash(),
+                    })
+                    .collect(),
+            );
         }
     }
-    let rows = lines;
-    table(
-        &[
-            "NAME",
-            "WORKSPACE",
-            "ENV",
-            "STATUS",
-            "CREATED_BY",
-            "LAST_BOOT",
-            "MEM",
-            "ON_DISK",
-            "FLAGS",
-        ],
-        &rows,
-    )
+    let headers: Vec<&str> = cols.iter().map(|c| c.title()).collect();
+    table(&headers, &lines)
+}
+
+/// What `vk dev list` can show, in the order `--columns all` lists them.
+pub fn offer() -> Vec<crate::columns::Col> {
+    use crate::columns::Col::*;
+    vec![
+        Name, Status, Pid, Mem, OnDisk, CreatedBy, Workspace, LastBoot, Env, Flags,
+    ]
+}
+
+/// The columns to print for `rows`, from a `--columns` spec: the defaults both listings
+/// share, and FLAGS when some row is flagged and the spec does not name the columns outright.
+pub fn columns(rows: &[Row], spec: Option<&str>) -> Result<Vec<crate::columns::Col>> {
+    use crate::columns::Col;
+    let flagged = rows.iter().any(|r| !r.flags.is_empty());
+    let added: &[Col] = match flagged && !crate::columns::explicit(spec) {
+        true => &[Col::Flags],
+        false => &[],
+    };
+    crate::columns::choose(&offer(), crate::columns::DEFAULTS, spec, added)
 }
 
 /// Use the shortest unique suffix: `shop` alone, or `a/shop` and `b/shop` for two
@@ -787,7 +829,7 @@ pub(super) fn fmt_size(size: Option<u64>) -> String {
 /// The creator, shortened to the release: what was recorded is `vk --version` in full, whose
 /// commit hash would double the column's width without telling the reader anything a
 /// `vk dev status` would not.
-fn short_creator(created_by: &str) -> String {
+pub(crate) fn short_creator(created_by: &str) -> String {
     // One word, as every cell of the table is: `vk 0.117.1` reads `vk-0.117.1`.
     created_by
         .split_whitespace()
@@ -970,6 +1012,7 @@ fn running_vms(live: &[crate::vms::VmEntry]) -> Vec<Running> {
                 .and_then(crate::usage::tree_resident),
             mem: e.mem.clone(),
             state_dir: e.state_dir.clone(),
+            pid: Some(e.pid),
         })
         .collect()
 }
@@ -997,6 +1040,7 @@ pub fn state_in(live: &[crate::vms::VmEntry], sizes: bool) -> Result<Vec<Row>> {
 pub fn measure(rows: &mut [Row]) {
     for row in rows {
         row.size_bytes = Some(crate::dev::storage::dir_size(&row.dir));
+        row.disk_bytes = Some(crate::dev::storage::disk_usage(&row.dir));
     }
 }
 
@@ -1088,6 +1132,7 @@ mod tests {
             status: status.map(Into::into),
             dir: t.0.join(format!("app-1/svc-{name}")),
             size_bytes: None,
+            disk_bytes: None,
         };
         let env = |name: &str, status: Status, services: Vec<Service>| Row {
             name: name.into(),
@@ -1167,7 +1212,12 @@ mod tests {
         );
         // The table leaves the environments' own lines out.
         let f = services(&["runner"], &[]);
-        let shown = render(&f.apply(rows.clone()), false, &|r| f.shows_line(r));
+        let shown = render(
+            &f.apply(rows.clone()),
+            false,
+            &|r| f.shows_line(r),
+            &offer(),
+        );
         assert!(
             shown.contains("app/runner") && shown.contains("app-ci/runner"),
             "{shown}"
@@ -1222,6 +1272,28 @@ mod tests {
         );
         // A service whose state is unknown matches no state.
         assert!(!kept(states(Status::STOPPED)).contains(&"app-down/web".to_string()));
+    }
+
+    #[test]
+    fn flags_show_by_themselves_only_when_a_row_has_one() {
+        use crate::columns::{Col, DEFAULTS};
+        let t = scratch("columns");
+        let mut row = row(&t.0.join("app-1"), &[], false, false);
+        assert_eq!(columns(&[row.clone()], None).unwrap(), DEFAULTS);
+        row.flags = vec![Flag::Ephemeral];
+        let rows = [row];
+        assert_eq!(columns(&rows, None).unwrap().last(), Some(&Col::Flags));
+        assert_eq!(
+            columns(&rows, Some("+workspace")).unwrap().last(),
+            Some(&Col::Flags)
+        );
+        assert_eq!(
+            columns(&rows, Some("name,on_disk")).unwrap(),
+            [Col::Name, Col::OnDisk],
+            "columns named outright are those alone"
+        );
+        let err = columns(&rows, Some("image")).unwrap_err().to_string();
+        assert!(err.contains("no IMAGE column"), "{err}");
     }
 
     /// A state dir with a `dev.json` recording `workspace`, as `after_boot` writes one.
@@ -1290,7 +1362,7 @@ mod tests {
         assert!(!rows[1].deletable);
         assert!(rows[1].services.iter().all(|s| s.status.is_none()));
         assert!(rows[2].services.is_empty());
-        let out = render(&rows, false, &|_| true);
+        let out = render(&rows, false, &|_| true, &offer());
         assert!(out.lines().any(|l| l.starts_with("shop-aaaa/db ")), "{out}");
         assert_eq!(serde_json::to_value(Status::NotBuilt).unwrap(), "not-built");
     }
@@ -1324,7 +1396,7 @@ mod tests {
         }];
         let rows = with_services(Vec::new(), &declared, false, &|_| None);
         assert_eq!(rows[0].name, "shop-bbbb");
-        let out = render(&rows, false, &|_| true);
+        let out = render(&rows, false, &|_| true, &offer());
         let lines: Vec<&str> = out.lines().skip(1).collect();
         assert!(
             lines[0].starts_with("-  ") && lines[0].contains("not built"),
@@ -1382,6 +1454,7 @@ mod tests {
             state_dir: dir.clone(),
             mem_used: None,
             mem: None,
+            pid: None,
         };
         let statuses = |running: &[Running], states: &UnitStates| -> Vec<Option<String>> {
             let rows = with_services(
@@ -1399,7 +1472,7 @@ mod tests {
         assert_eq!(statuses(up, &reported), [s("running"), s("stopped"), None]);
         assert_eq!(statuses(&[], &reported), [s("stopped"), s("stopped"), None]);
         let rows = with_services(scan(&base, up, false).unwrap(), &declared, false, &reported);
-        let out = render(&rows, false, &|_| true);
+        let out = render(&rows, false, &|_| true, &offer());
         let db = out
             .lines()
             .find(|l| l.starts_with("shop-aaaa/db "))
@@ -1511,6 +1584,7 @@ mod tests {
             state_dir: std::fs::canonicalize(dir).unwrap(),
             mem_used: None,
             mem: Some("2G".into()),
+            pid: None,
         };
         let rows = running_rows(&base, &[running(&up), running(&elsewhere)]);
         assert_eq!(rows.len(), 1, "{rows:?}");
@@ -1649,6 +1723,7 @@ mod tests {
             state_dir: dir,
             mem_used: Some(1_288_490_189),
             mem: Some("8G".into()),
+            pid: None,
         };
         let rows = scan(&base, std::slice::from_ref(&live), true).unwrap();
         assert_eq!(rows[0].status, Status::Running);
@@ -1786,6 +1861,7 @@ mod tests {
             state_dir: up,
             mem_used: Some(1_288_490_189),
             mem: Some("8G".into()),
+            pid: None,
         };
         let mut rows = scan(&base, std::slice::from_ref(&live), true).unwrap();
         // Fixed, so the columns read the same on every run.
@@ -1793,11 +1869,11 @@ mod tests {
             row.age_secs = row.age_secs.map(|_| 7200);
         }
 
-        let out = render(&rows, true, &|_| true);
+        let out = render(&rows, true, &|_| true, &offer());
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("NAME"), "{out}");
         assert!(
-            lines[0].contains("CREATED_BY  LAST_BOOT  MEM      ON_DISK  FLAGS"),
+            lines[0].contains("STATUS        PID  MEM      ON_DISK  CREATED_BY  WORKSPACE"),
             "{out}"
         );
         // The running row is the only one holding memory: what its tree holds now over the
@@ -1821,13 +1897,16 @@ mod tests {
             "a stopped row dashes MEM: {out}"
         );
         // Nothing was recorded, so the workspace and environment columns say so.
-        assert!(lines[3].starts_with("repo-hook-cccc  ?"), "{out}");
+        assert!(
+            lines[3].starts_with("repo-hook-cccc  never booted"),
+            "{out}"
+        );
         assert!(
             lines[3].contains("never booted") && lines[3].ends_with("ephemeral"),
             "{out}"
         );
         assert_eq!(
-            render(&[], false, &|_| true),
+            render(&[], false, &|_| true, &offer()),
             "no dev environment state on this host\n"
         );
     }

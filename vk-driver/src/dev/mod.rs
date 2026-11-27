@@ -23,6 +23,7 @@ pub mod editor;
 pub mod endpoints;
 mod hooks;
 mod identity;
+pub(crate) use identity::own_version;
 pub mod init;
 pub mod list;
 pub mod plan;

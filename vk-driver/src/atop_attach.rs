@@ -357,6 +357,7 @@ mod tests {
             services: Vec::new(),
             guest_agent: None,
             control: None,
+            created_by: None,
         }
     }
 

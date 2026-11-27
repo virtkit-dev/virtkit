@@ -34,6 +34,12 @@ All notable changes to virtkit will be documented in this file.
 - **`vk list --running` keeps only the VMs that are up.** In 0.118.0 it also kept VMs
   starting or stopping; `--active` keeps all three now, `--running` matching the STATUS
   column's `running`.
+- **`vk list` and `vk dev list` show the same columns**: NAME, STATUS, PID, MEM, ON_DISK
+  and CREATED_BY, and in `vk list` WORKSPACE (formerly PROJECT); FLAGS shows in `vk dev
+  list` when something is flagged. ON_DISK is the space used on disk, so a sparse image no
+  longer counts its full length. `--columns` picks any set in any order (`+COL` adds, `all`
+  shows every column), and `vk list --published` adds the host ports. UPTIME is now
+  LAST_BOOT, which stopped VMs show too. A run records the `vk` that started it.
 
 ### Fixed
 

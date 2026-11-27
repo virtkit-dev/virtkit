@@ -67,6 +67,16 @@ pub struct Row {
     pub mem_used_bytes: Option<u64>,
     /// the memory size it booted with
     pub mem: Option<String>,
+    /// what its state dir takes on disk, blocks used — a primary's with its services' —
+    /// and for a service its own directory; absent with `--no-sizes`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
+    /// the `vk` that created it, as `vk --version` prints it; a service's is its primary's
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    /// how long ago it last booted: its uptime while it runs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_boot_secs: Option<u64>,
     /// what it boots: the image, the compose primary or the Dockerfile
     pub image: Option<String>,
     /// The dev workspace or run project directory.
@@ -183,6 +193,9 @@ pub fn rows_with(
             primary_dir: e.state_dir.clone(),
             pid: Some(e.pid),
             uptime_secs: Some(now.saturating_sub(e.created_secs)),
+            disk_bytes: None,
+            created_by: e.created_by.clone(),
+            last_boot_secs: Some(now.saturating_sub(e.created_secs)),
             mem_used_bytes: l.mem_used,
             mem: e.mem.clone(),
             image: Some(e.label.clone()),
@@ -220,6 +233,11 @@ pub fn rows_with(
                 uptime_secs: ours
                     .and_then(crate::usage::proc_age)
                     .map(|age| age.as_secs()),
+                disk_bytes: None,
+                created_by: e.created_by.clone(),
+                last_boot_secs: ours
+                    .and_then(crate::usage::proc_age)
+                    .map(|age| age.as_secs()),
                 mem_used_bytes: ours.and_then(crate::usage::tree_resident),
                 mem: unit.and_then(|u| u.mem.clone()),
                 image: unit.and_then(|u| u.image.clone()),
@@ -250,6 +268,9 @@ pub fn rows_with(
             primary_dir: k.dir.clone(),
             pid: None,
             uptime_secs: None,
+            disk_bytes: None,
+            created_by: last.and_then(|e| e.created_by.clone()),
+            last_boot_secs: last.map(|e| now.saturating_sub(e.created_secs)),
             mem_used_bytes: None,
             mem: last.and_then(|e| e.mem.clone()),
             image: last.map(|e| e.label.clone()),
@@ -277,6 +298,9 @@ pub fn rows_with(
                 primary_dir: k.dir.clone(),
                 pid: None,
                 uptime_secs: None,
+                disk_bytes: None,
+                created_by: last.and_then(|e| e.created_by.clone()),
+                last_boot_secs: None,
                 mem_used_bytes: None,
                 mem: None,
                 image: None,
@@ -498,51 +522,85 @@ fn service_of(r: &Row) -> Option<&str> {
     r.name.strip_prefix(r.parent.as_deref()?)?.strip_prefix('/')
 }
 
-/// Render the table. Only the narrow PROJECT column abbreviates `home` to `~`.
-pub fn render(rows: &[Row], home: Option<&Path>, wide: bool, stale: bool) -> String {
-    let dash = || "-".to_string();
-    let mut headers = vec![
-        "NAME", "KIND", "STATUS", "PID", "UPTIME", "MEM", "IMAGE", "PROJECT",
+/// What `vk list` can show, in the order `--columns all` lists them; STALE only with
+/// `--stale`, which works it out.
+pub fn offer(stale: bool) -> Vec<crate::columns::Col> {
+    use crate::columns::Col::*;
+    let mut cols = vec![
+        Name,
+        Status,
+        Pid,
+        Mem,
+        OnDisk,
+        CreatedBy,
+        Workspace,
+        LastBoot,
+        Kind,
+        Env,
+        Image,
+        Ip,
+        Published,
+        ExecAddress,
     ];
-    if wide {
-        headers.push("EXEC_ADDRESS");
-    }
-    headers.push("PUBLISHED");
     if stale {
-        headers.push("STALE");
+        cols.push(Stale);
     }
-    let cells: Vec<Vec<String>> = rows
-        .iter()
-        .map(|r| {
-            let mut row = vec![
-                r.name.clone(),
-                r.kind.label().to_string(),
-                status_cell(r),
-                r.pid.map_or_else(dash, |p| p.to_string()),
-                r.uptime_secs.map_or_else(dash, crate::vms::fmt_uptime),
-                match r.parent.is_some() || at_rest(&r.status) {
-                    true => dash(),
-                    false => crate::vms::mem_cell(r.mem_used_bytes, r.mem.as_deref()),
-                },
-                r.image.clone().unwrap_or_else(dash),
-                crate::vms::project_cell(r.project.as_deref(), home, wide),
-            ];
-            if wide {
-                row.push(r.exec_addr.clone().unwrap_or_else(dash));
-            }
-            row.push(match r.published.is_empty() {
+    cols
+}
+
+/// What `vk list` shows by default: the columns both listings share, then WORKSPACE.
+pub fn defaults() -> Vec<crate::columns::Col> {
+    let mut cols = crate::columns::DEFAULTS.to_vec();
+    cols.push(crate::columns::Col::Workspace);
+    cols
+}
+
+/// Render the table's `cols`. Only the narrow WORKSPACE column abbreviates `home` to `~`.
+pub fn render(
+    rows: &[Row],
+    home: Option<&Path>,
+    wide: bool,
+    cols: &[crate::columns::Col],
+) -> String {
+    use crate::columns::Col;
+    let dash = || "-".to_string();
+    let headers: Vec<&str> = cols.iter().map(|c| c.title()).collect();
+    let cell = |r: &Row, col: Col| -> String {
+        match col {
+            Col::Name => r.name.clone(),
+            Col::Status => status_cell(r),
+            Col::Pid => r.pid.map_or_else(dash, |p| p.to_string()),
+            Col::Mem => match at_rest(&r.status) {
+                true => dash(),
+                false => crate::vms::mem_cell(r.mem_used_bytes, r.mem.as_deref()),
+            },
+            Col::OnDisk => r.disk_bytes.map_or_else(dash, crate::usage::fmt_compact),
+            Col::CreatedBy => r
+                .created_by
+                .as_deref()
+                .map_or_else(dash, crate::dev::list::short_creator),
+            Col::Workspace => crate::vms::project_cell(r.project.as_deref(), home, wide),
+            Col::LastBoot => r.last_boot_secs.map_or_else(dash, crate::vms::fmt_uptime),
+            Col::Kind => r.kind.label().to_string(),
+            Col::Env => r.environment.clone().unwrap_or_else(dash),
+            Col::Image => r.image.clone().unwrap_or_else(dash),
+            Col::Ip => r.ip.clone().unwrap_or_else(dash),
+            Col::Published => match r.published.is_empty() {
                 true => dash(),
                 false => r.published.join(", "),
-            });
-            if stale {
-                row.push(match r.stale {
-                    Some(Some(true)) => "yes".into(),
-                    Some(Some(false)) => "no".into(),
-                    _ => dash(),
-                });
-            }
-            row
-        })
+            },
+            Col::ExecAddress => r.exec_addr.clone().unwrap_or_else(dash),
+            Col::Stale => match r.stale {
+                Some(Some(true)) => "yes".into(),
+                Some(Some(false)) => "no".into(),
+                _ => dash(),
+            },
+            Col::Flags => dash(),
+        }
+    };
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| cols.iter().map(|&c| cell(r, c)).collect())
         .collect();
     crate::dev::list::table(&headers, &cells)
 }
@@ -786,8 +844,8 @@ mod tests {
         };
         assert_eq!(keep(problems), ["hung", "task-1a2b"]);
         // Markers decorate table cells. JSON retains the status, including `never booted`.
-        let table = render(&rows, None, false, false);
-        assert!(table.contains("task-1a2b  dev   never booted*"), "{table}");
+        let table = render(&rows, None, false, &defaults());
+        assert!(table.contains("task-1a2b  never booted*"), "{table}");
         assert!(table.contains("stopping!"), "{table}");
         let json = serde_json::to_string(&rows).unwrap();
         assert!(json.contains("\"status\":\"never booted\""), "{json}");
@@ -1021,8 +1079,20 @@ mod tests {
             project: scratch.project_dir.clone(),
             environment: None,
         };
-        let rows = rows(&[shop_live, app_live], &[stopped], 100_000);
-        render(&rows, Some(Path::new("/home/me")), false, false)
+        let mut rows = rows(&[shop_live, app_live], &[stopped], 100_000);
+        // What the caller measures and reads: disk usage, and a dev environment's creator.
+        // In the table's order: app, shop and its services, scratch (from an older `vk`).
+        for (r, (disk, by)) in rows.iter_mut().zip([
+            (1_395_864_371, Some("vk 0.118.0 (abc)")),
+            (11_274_289_152, Some("vk 0.118.0 (abc)")),
+            (4_831_838_208, Some("vk 0.118.0 (abc)")),
+            (83_886_080, Some("vk 0.118.0 (abc)")),
+            (2_147_483_648, None),
+        ]) {
+            r.disk_bytes = Some(disk);
+            r.created_by = by.map(Into::into);
+        }
+        render(&rows, Some(Path::new("/home/me")), false, &defaults())
     }
 
     #[test]
@@ -1040,17 +1110,21 @@ mod tests {
             &[],
             160,
         );
-        let out = render(&rows, None, false, false);
+        let out = render(&rows, None, false, &defaults());
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[0].starts_with("NAME    KIND"), "{out}");
-        assert!(lines[1].starts_with("app     dev"), "{out}");
-        assert!(lines[2].starts_with("app/db  service  running  -"), "{out}");
+        assert!(lines[0].starts_with("NAME    STATUS   PID"), "{out}");
+        assert!(lines[1].starts_with("app     running  10"), "{out}");
+        assert!(lines[2].starts_with("app/db  running  -"), "{out}");
         assert!(
-            render(&rows, None, true, true)
-                .lines()
-                .next()
-                .unwrap()
-                .contains("EXEC_ADDRESS")
+            render(&rows, None, true, &{
+                let mut cols = defaults();
+                cols.extend([crate::columns::Col::ExecAddress, crate::columns::Col::Stale]);
+                cols
+            })
+            .lines()
+            .next()
+            .unwrap()
+            .contains("EXEC_ADDRESS")
         );
     }
 }

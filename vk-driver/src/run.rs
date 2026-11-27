@@ -3217,6 +3217,7 @@ async fn build_and_boot(
             services: service_entries,
             guest_agent: None,
             control: None,
+            created_by: Some(crate::dev::own_version()),
         })
     });
 

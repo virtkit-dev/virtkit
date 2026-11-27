@@ -157,6 +157,7 @@ fn dev_rows(vms: &[VmEntry]) -> Result<Vec<Row>> {
             // Measured by the [`Meter`], for every kind alike.
             mem_used: None,
             mem: e.mem.clone(),
+            pid: Some(e.pid),
         })
         .collect();
     Ok(crate::dev::list::running_rows(&base, &running))
@@ -600,6 +601,7 @@ mod tests {
             state_dir: env.clone(),
             mem_used: None,
             mem: e.mem.clone(),
+            pid: None,
         }];
         let dev = crate::dev::list::running_rows(&base, &running);
         let found = workloads(&Sources {

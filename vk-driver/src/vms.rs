@@ -104,6 +104,10 @@ pub struct VmEntry {
     /// `None` for a VM without one.
     #[serde(default, with = "crate::names::opt_os_string")]
     pub control: Option<PathBuf>,
+    /// The `vk` that started it, as `vk --version` prints it; `None` from a `vk` that did not
+    /// record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
 }
 
 /// A sibling compose service declared alongside the primary VM.
@@ -1085,6 +1089,12 @@ pub struct ListOpts {
     /// Render detail records for the selected VMs.
     pub detail: bool,
     pub filter: crate::vmlist::Filter,
+    /// `--columns`: which columns, in which order (see [`crate::columns::choose`])
+    pub columns: Option<String>,
+    /// `--published`: add the PUBLISHED column
+    pub published: bool,
+    /// measure what each VM's state dir takes on disk; `--no-sizes` skips it
+    pub sizes: bool,
 }
 
 /// A REF given to `vk list`, as the VMs it names: a name — `NAME/SERVICE` for one row — or a
@@ -1113,6 +1123,25 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
     use crate::vmlist::{Kind, Known, Live};
     use crate::vmstate::Standing;
     check_fields(&opts.fields)?;
+    let cols = {
+        use crate::columns::Col;
+        let mut added = Vec::new();
+        if opts.published {
+            added.push(Col::Published);
+        }
+        if opts.wide {
+            added.push(Col::ExecAddress);
+        }
+        if opts.stale {
+            added.push(Col::Stale);
+        }
+        crate::columns::choose(
+            &crate::vmlist::offer(opts.stale),
+            &crate::vmlist::defaults(),
+            opts.columns.as_deref(),
+            &added,
+        )?
+    };
     let mut filter = opts.filter;
     // REFs pick rows, any of them (see [`list_word`]); with none, a bare `-r` is the current
     // directory and every project below it.
@@ -1252,6 +1281,9 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
     // `--detail` lists a stopped primary's services even when the filter drops their rows.
     let all = crate::vmlist::rows(&live, &known, now);
     let mut rows: Vec<crate::vmlist::Row> = filter.apply(all.clone());
+    let measure = opts.sizes
+        && (opts.json || !opts.fields.is_empty() || cols.contains(&crate::columns::Col::OnDisk));
+    fill_disk_and_creator(&mut rows, measure);
     if stale {
         // Keep the requested key on every row, including unknown results.
         for r in &mut rows {
@@ -1325,8 +1357,45 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
         &rows,
         home.as_deref(),
         opts.wide,
-        stale,
+        &cols,
     ))
+}
+
+/// Fill what a row's registry record does not carry: with `measure`, what each VM's state dir
+/// takes on disk (a service's, its own directory); and a dev environment's creator and last
+/// boot, from the identity its boot recorded, for a VM whose record predates `created_by` or
+/// that left no record. A service's creator is its primary's.
+fn fill_disk_and_creator(rows: &mut [crate::vmlist::Row], measure: bool) {
+    use crate::vmlist::Kind;
+    for r in rows.iter_mut() {
+        if measure {
+            r.disk_bytes = Some(crate::dev::storage::disk_usage(&r.state_dir));
+        }
+        if r.kind == Kind::Dev && (r.created_by.is_none() || r.last_boot_secs.is_none()) {
+            let identity = std::fs::read(r.state_dir.join("dev.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<crate::dev::Identity>(&b).ok());
+            if let Some(identity) = identity {
+                if r.created_by.is_none() && !identity.created_by.is_empty() {
+                    r.created_by = Some(identity.created_by);
+                }
+                r.last_boot_secs
+                    .get_or_insert(unix_now().saturating_sub(identity.booted_secs));
+            }
+        }
+    }
+    let creators: HashMap<String, String> = rows
+        .iter()
+        .filter(|r| r.parent.is_none())
+        .filter_map(|r| Some((r.name.clone(), r.created_by.clone()?)))
+        .collect();
+    for r in rows.iter_mut() {
+        if r.created_by.is_none()
+            && let Some(parent) = &r.parent
+        {
+            r.created_by = creators.get(parent).cloned();
+        }
+    }
 }
 
 /// Classify a VM by `dev.json` or `run.json`. If both or neither exist, classify direct
@@ -2900,6 +2969,7 @@ pub(crate) mod tests {
             services: Vec::new(),
             guest_agent: None,
             control: None,
+            created_by: None,
         }
     }
 
@@ -4708,7 +4778,7 @@ PUBLISHED     -
                 .split_whitespace()
                 .take(2)
                 .collect();
-            assert_eq!(head, ["NAME", "KIND"], "{table}");
+            assert_eq!(head, ["NAME", "STATUS"], "{table}");
             let record = detail(app);
             assert!(record.starts_with("NAME          app\n"), "{record}");
             assert!(record.contains("\nSTATUS        running\n"), "{record}");

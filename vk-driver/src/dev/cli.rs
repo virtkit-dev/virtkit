@@ -510,6 +510,14 @@ enum DevAction {
         /// JSON includes the full path when known.
         #[arg(short = 'w', long, conflicts_with = "json")]
         wide: bool,
+        /// which columns, in which order (comma-separated; `+COL` adds one, `all` every one)
+        ///
+        /// The default is name, status, pid, mem, on_disk and created_by, as `vk list` shows
+        /// them, and flags when a row is flagged. `--columns +workspace,+last_boot` adds to
+        /// them; `--columns name,on_disk` shows only those. The others: workspace, last_boot,
+        /// env and flags.
+        #[arg(long, value_name = "COLS", conflicts_with = "json")]
+        columns: Option<String>,
     },
     /// Remove the state of environments that are finished with
     ///
@@ -849,6 +857,7 @@ async fn dev_action(
         };
     }
     if let DevAction::List {
+        columns,
         words,
         name,
         glob,
@@ -884,7 +893,15 @@ async fn dev_action(
             true => None,
             false => Some((workspace, config)),
         };
-        return match dev_list(&cwd, scope, json, !no_sizes, wide, &filter) {
+        return match dev_list(
+            &cwd,
+            scope,
+            json,
+            !no_sizes,
+            wide,
+            &filter,
+            columns.as_deref(),
+        ) {
             Ok(report) => write_report(&report),
             Err(code) => code,
         };
@@ -1559,6 +1576,7 @@ fn dev_list(
     sizes: bool,
     wide: bool,
     filter: &crate::dev::list::Filter,
+    columns: Option<&str>,
 ) -> Result<String, ExitCode> {
     let here = match scope {
         None => None,
@@ -1594,6 +1612,7 @@ fn dev_list(
     }
     .map_err(|e| fail(&e, 1))?;
     let rows = filter.apply(rows);
+    let cols = crate::dev::list::columns(&rows, columns).map_err(|e| fail(&e, 2))?;
     match (json, &here) {
         (true, _) => crate::dev::list::json(&rows).map_err(|e| fail(&e, 1)),
         (false, _) if rows.is_empty() && filter.narrows() => Ok(String::new()),
@@ -1601,9 +1620,12 @@ fn dev_list(
             "no dev environment for {} (`vk dev list --all` lists host-wide state)\n",
             here.display()
         )),
-        (false, _) => Ok(crate::dev::list::render(&rows, wide, &|r| {
-            filter.shows_line(r)
-        })),
+        (false, _) => Ok(crate::dev::list::render(
+            &rows,
+            wide,
+            &|r| filter.shows_line(r),
+            &cols,
+        )),
     }
 }
 
@@ -2307,6 +2329,7 @@ mod tests {
                 true,
                 false,
                 &crate::dev::list::Filter::default(),
+                None,
             ));
             assert_eq!(here.len(), 3, "{here:#?}");
             let dev = by_dir(&here, &state("dev")).unwrap();
@@ -2334,6 +2357,7 @@ mod tests {
                 false,
                 false,
                 &crate::dev::list::Filter::default(),
+                None,
             )
             .unwrap();
             assert!(
@@ -2376,7 +2400,8 @@ mod tests {
                         true,
                         false,
                         false,
-                        &crate::dev::list::Filter::default()
+                        &crate::dev::list::Filter::default(),
+                        None
                     )
                     .unwrap_err(),
                     exit_code(2),
@@ -2406,6 +2431,7 @@ mod tests {
                 false,
                 false,
                 &crate::dev::list::Filter::default(),
+                None,
             ));
             let dev = by_dir(&listed, &state("dev")).unwrap();
             assert_eq!(dev["services"][0]["name"], "db", "{dev}");
@@ -2420,7 +2446,8 @@ mod tests {
                     true,
                     false,
                     false,
-                    &crate::dev::list::Filter::default()
+                    &crate::dev::list::Filter::default(),
+                    None
                 )
                 .unwrap_err(),
                 exit_code(NO_WORKSPACE_EXIT)
@@ -2432,6 +2459,7 @@ mod tests {
                 false,
                 false,
                 &crate::dev::list::Filter::default(),
+                None,
             ));
             assert_eq!(all.len(), 4, "{all:#?}");
             assert!(by_dir(&all, &base.join("other")).is_some());

@@ -12,7 +12,7 @@ use super::session::running_vm;
 use super::{GENERATION_MARKER, Identity};
 
 /// What this `vk` records as an environment's creator: what `vk --version` prints.
-pub(super) fn own_version() -> String {
+pub(crate) fn own_version() -> String {
     format!("vk {} ({})", env!("CARGO_PKG_VERSION"), env!("VK_GIT_HASH"))
 }
 
