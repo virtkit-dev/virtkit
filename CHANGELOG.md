@@ -10,6 +10,8 @@ All notable changes to virtkit will be documented in this file.
   the same paths, aliases and access rules as `vk-hub namespaces add`.
 - On *Job access*, storage areas outside *Managed by CI* show flat-store caps, reported usage
   and refusals. Operators can bind, resize and unbind a store from the area's row.
+- A registry's *Job access* tab offers a storage area prefilled for sccache and shows
+  the environment variables jobs need to use it.
 
 ### Fixed
 

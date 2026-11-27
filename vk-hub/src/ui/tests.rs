@@ -9964,6 +9964,112 @@ async fn a_storage_areas_row_shows_and_steers_its_flat_store() {
     assert!(body.contains("kept by the registry, not the hub"), "{body}");
 }
 
+/// The operator sees the same job variables in the sccache preset and on the saved
+/// area's row after requesting a flat store.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_sets_up_an_sccache_cache() {
+    use crate::store::{FlatEdit, RegistryWrite};
+    use crate::tests::tokens::token_registry;
+    use vk_hub_proto::registry::{ALLOW_FLAT, FlatSetting, Inventory};
+    let (addr, hub, _keys) = start_fleet_keys("sccache").await;
+    let origin = format!("http://{addr}");
+    let id = token_registry(&hub, "https://ok.example.com", "e1");
+    let tab = format!("/registry/{id}?tab=access");
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let body = get(addr, &tab, Some(&operator)).await.body;
+    let link = format!("/registry/{id}?tab=access&amp;preset=sccache#area");
+    assert!(body.contains(&link), "{body}");
+    let env = "SCCACHE_ENDPOINT=$VK_REGISTRY/s3 SCCACHE_BUCKET=job SCCACHE_S3_KEY_PREFIX=sccache \
+               SCCACHE_REGION=auto SCCACHE_S3_NO_CREDENTIALS=true";
+    let body = get(addr, &format!("{tab}&preset=sccache"), Some(&operator))
+        .await
+        .body;
+    for want in [
+        "<details class=\"upload\" id=\"area\" open>",
+        "name=\"name\" required maxlength=\"64\"",
+        "value=\"sccache/{gitlab}/{project_id}/{protection}\"",
+        "autocomplete=\"off\" value=\"sccache\"></label><label>Path",
+        "name=\"alias\" spellcheck=\"false\" autocomplete=\"off\" value=\"sccache\"",
+        // This registry needs a local binding to use a flat store.
+        "[[flat]] prefix = \"sccache\"",
+        "rw:own project</textarea>",
+        env,
+        // The registry reported S3 off.
+        "The registry serves no S3 now",
+    ] {
+        assert!(body.contains(want), "{want}: {body}");
+    }
+    // Submit the preset unchanged.
+    let form = format!(
+        "_csrf={csrf}&op=put&new=1&name=sccache&path={}&alias=sccache&retention_days=&isolate=&grants={}",
+        form_value("sccache/{gitlab}/{project_id}/{protection}"),
+        form_value("rw:own project")
+    );
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        &format!("/registry/{id}/areas"),
+        &form,
+        false,
+    )
+    .await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    // A direct preset link must also respect the collision.
+    for path in [tab.clone(), format!("{tab}&preset=sccache")] {
+        let body = get(addr, &path, Some(&operator)).await.body;
+        assert!(!body.contains("preset=sccache"), "{body}");
+        assert!(!body.contains("Prefilled"), "{body}");
+        assert!(
+            body.contains("Jobs reach it as <code>job/sccache</code>"),
+            "{body}"
+        );
+        assert!(!body.contains("Use with sccache"), "{body}");
+    }
+    // A pending binding suffices for the row to show the job variables.
+    let inventory = Inventory {
+        hostname: "reg-1".into(),
+        tokens: true,
+        s3: true,
+        flat: true,
+        allow: vec![ALLOW_FLAT.into()],
+        ..Inventory::default()
+    };
+    hub.db
+        .record_registry(&id, RegistryWrite::Inventory(inventory), crate::now_secs())
+        .unwrap();
+    let setting = FlatSetting {
+        prefix: "sccache".into(),
+        cap: 1 << 30,
+        evict_to_percent: None,
+        durable: None,
+    };
+    crate::registries::flat(&hub, "uid 0", &id, FlatEdit::Set(setting)).unwrap();
+    // With read-only job access, the row shows the alias but omits sccache settings.
+    let read_only = crate::store::NamespaceRow {
+        name: "ro".into(),
+        path: "sccache/ro/{gitlab}/{project_id}".into(),
+        retention_days: None,
+        alias: Some("ro".into()),
+        isolate: Vec::new(),
+        grants: crate::store::parse_grants(&["r:own project"]).unwrap().0,
+        node_grants: Vec::new(),
+        created_at: 0,
+        created_by: "uid 0".into(),
+    };
+    hub.db
+        .put_namespace(&id, &read_only, "uid 0", crate::now_secs())
+        .unwrap();
+    let body = get(addr, &tab, Some(&operator)).await.body;
+    assert!(body.contains("Use with sccache"), "{body}");
+    assert!(
+        body.contains("Jobs reach it as <code>job/ro</code>"),
+        "{body}"
+    );
+    assert!(!body.contains("SCCACHE_S3_KEY_PREFIX=ro"), "{body}");
+    assert!(body.contains(env), "{body}");
+}
+
 /// `/gitlab` lists the GitLab servers, `/keys` the API keys; Connections' old addresses lead
 /// to them, and those of the capacity policy's and a project's pages to theirs.
 #[tokio::test(flavor = "multi_thread")]

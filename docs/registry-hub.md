@@ -1132,8 +1132,22 @@ a binding there.
 
 Operators can bind a free prefix or resize or unbind an exact hub binding from the row.
 The row uses the same registry action as *Flat stores* on the overview, where operators
-can enter a prefix directly. *Settings* (`?tab=settings`) shows the bound
-address and, per signing key the registry was sent, whether it signs the registry's tokens,
+can enter a prefix directly. If the area has an alias and a job access rule, its row shows
+`job/<alias>`. If jobs can also write there, the row shows sccache settings when a reported
+or requested flat store covers the area. It omits the settings if the registry refused the
+current request for that store. If the settings would otherwise appear but the registry
+reports S3 is off, the row shows a warning instead.
+
+When `sccache` is free as both a name and an alias, operators can open the sccache preset
+(`?tab=access&preset=sccache`). It fills in `sccache` for both, sets the path to
+`sccache/{gitlab}/{project_id}/{protection}` and the access rule to `rw:own project`, and shows
+the job environment variables. To cap the cache, bind a flat store from the saved area's row
+when the prefix is available and the registry supports and permits `flat` in `[hub] allow`.
+For a local binding, set `prefix = "sccache"` and a `cap` in a `[[flat]]` table and restart
+the registry.
+
+*Settings* (`?tab=settings`) shows the configured registry URL. For each signing key sent to
+a registry that accepts hub tokens, it shows whether the key signs its tokens, is applied,
 awaits being applied, or was replaced and is kept while its tokens may be live.
 
 ## Open questions

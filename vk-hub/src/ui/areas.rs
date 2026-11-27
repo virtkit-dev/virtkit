@@ -76,6 +76,18 @@ impl Draft {
         }
     }
 
+    /// Separate caches by project and protection. Jobs use the `sccache` alias.
+    /// The preset grants nodes no access.
+    fn sccache() -> Self {
+        Draft {
+            name: SCCACHE.into(),
+            path: SCCACHE_PATH.into(),
+            alias: SCCACHE.into(),
+            grants: "rw:own project".into(),
+            ..Draft::blank()
+        }
+    }
+
     /// Stored area `ns`, to change.
     pub(super) fn of_row(ns: &NamespaceRow) -> Self {
         let grants: Vec<String> = ns
@@ -210,6 +222,139 @@ pub(super) fn editor(h: &mut Html, id: &str, d: &Draft, auth: &Auth) {
         .raw("apart, include <code>{scope}</code> in the path so each gets its own scope. Cleanup ")
         .raw("windows set here need <code>gc</code> in the registry's <code>[hub] allow</code>. ")
         .raw("Tokens issued before a change keep their access until they expire.</p>");
+}
+
+/// The area form an operator requested on the Job access tab.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Asked {
+    /// The collapsed add form.
+    Add,
+    /// `?preset=sccache` requests the open add form with [`Draft::sccache`].
+    Sccache,
+    /// `?edit=<name>` requests the form to change or remove an area.
+    Edit(String),
+}
+
+impl Asked {
+    /// An edit request takes precedence over a preset.
+    pub(super) fn of(query: &[(String, String)]) -> Self {
+        match (field(query, "edit"), field(query, "preset")) {
+            (Some(name), _) => Asked::Edit(name.to_string()),
+            (None, Some("sccache")) => Asked::Sccache,
+            _ => Asked::Add,
+        }
+    }
+}
+
+/// The name and alias of [`Draft::sccache`].
+const SCCACHE: &str = "sccache";
+const SCCACHE_PATH: &str = "sccache/{gitlab}/{project_id}/{protection}";
+
+/// Job environment for sccache to reach `alias` over the registry's S3 endpoint.
+fn sccache_env(alias: &str) -> String {
+    format!(
+        "SCCACHE_ENDPOINT=$VK_REGISTRY/s3 SCCACHE_BUCKET=job SCCACHE_S3_KEY_PREFIX={alias} \
+         SCCACHE_REGION=auto SCCACHE_S3_NO_CREDENTIALS=true"
+    )
+}
+
+/// Show the edit and remove forms for a named, unmanaged area. Otherwise show the
+/// add form, collapsed unless the requested sccache preset is available.
+pub(super) fn forms(
+    h: &mut Html,
+    v: &RegistryView,
+    namespaces: &[NamespaceRow],
+    auth: &Auth,
+    asked: &Asked,
+) {
+    if let Asked::Edit(name) = asked
+        && let Some(ns) = namespaces
+            .iter()
+            .find(|n| n.name == *name && !managed(name))
+    {
+        h.raw("<section id=\"area\"><h2>Change ")
+            .text(&ns.name)
+            .raw("</h2>");
+        editor(h, &v.id, &Draft::of_row(ns), auth);
+        remove_form(h, &v.id, ns, auth);
+        h.raw("<p><a href=\"")
+            .text(tab_path(&v.id))
+            .raw("\">Cancel</a></p></section>");
+        return;
+    }
+    let sccache = !namespaces
+        .iter()
+        .any(|n| n.name == SCCACHE || n.alias.as_deref() == Some(SCCACHE));
+    let preset = sccache && *asked == Asked::Sccache;
+    h.raw("<details class=\"upload\" id=\"area\"")
+        .raw(if preset { " open" } else { "" })
+        .raw("><summary class=\"button\">Add a storage area</summary>");
+    if preset {
+        h.raw("<p class=\"sub\">Prefilled for sccache. Each project has separate caches for ")
+            .raw("protected and unprotected jobs. ");
+        if v.row.takes_flat() {
+            h.raw("After adding the area, use its row to bind a flat store if available. ")
+                .raw("All projects share its cap, for example 200G. ");
+        } else {
+            h.raw("A flat store gives all projects one shared cap. If the registry supports ")
+                .raw("hub bindings, allow <code>flat</code> in <code>[hub] allow</code> to bind ")
+                .raw("an available store from the area's row. For a local binding, configure ")
+                .raw("<code>[[flat]] prefix = \"sccache\"</code> with a <code>cap</code> and ")
+                .raw("restart the registry. ");
+        }
+        h.raw("Set these variables in jobs that use sccache.</p><pre>")
+            .text(sccache_env(SCCACHE))
+            .raw("</pre>");
+        if v.row.inventory.as_ref().is_some_and(|i| !i.s3) {
+            h.raw("<p class=\"callout warn\">The registry serves no S3 now: sccache needs its ")
+                .raw("<code>/s3/</code>.</p>");
+        }
+    }
+    let d = if preset {
+        Draft::sccache()
+    } else {
+        Draft::blank()
+    };
+    editor(h, &v.id, &d, auth);
+    h.raw("</details>");
+    if sccache && !preset {
+        h.raw("<p class=\"sub\"><a href=\"")
+            .text(tab_path(&v.id))
+            .raw("&amp;preset=sccache#area\">Add a storage area prefilled for sccache</a>.</p>");
+    }
+}
+
+/// Show the alias for an area with job grants. Show sccache settings when jobs can write
+/// there and a reported or requested flat store covers the area. Skip the settings if the
+/// registry refused the current binding. Otherwise, warn instead if the registry reports S3 is
+/// off.
+pub(super) fn reached(h: &mut Html, v: &RegistryView, ns: &NamespaceRow) {
+    let Some(alias) = ns.alias.as_ref().filter(|_| !ns.grants.is_empty()) else {
+        return;
+    };
+    h.raw("<div class=\"sub\">Jobs reach it as <code>job/")
+        .text(alias)
+        .raw("</code></div>");
+    // sccache needs write access to store entries.
+    if !ns.grants.iter().any(|g| g.write) {
+        return;
+    }
+    let serving = match Flat::of(ns, &v.row) {
+        Flat::Bound(s) | Flat::Within(s) => !(applied(&v.row) && refused(&v.row, &s.prefix)),
+        Flat::Reported(_) => true,
+        _ => false,
+    };
+    if !serving {
+        return;
+    }
+    if v.row.inventory.as_ref().is_some_and(|i| !i.s3) {
+        h.raw("<div class=\"sub\">This registry reports S3 is off. The sccache backend needs ")
+            .raw("S3.</div>");
+        return;
+    }
+    h.raw("<details class=\"fold\"><summary class=\"sub\">Use with sccache</summary><pre>")
+        .text(sccache_env(alias))
+        .raw("</pre></details>");
 }
 
 /// Start a confirmed removal of area `ns` from registry `id`.

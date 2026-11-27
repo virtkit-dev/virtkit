@@ -310,7 +310,7 @@ pub(super) async fn detail(
                 &namespaces,
                 instances.as_deref(),
                 &nodes,
-                operator.map(|auth| (auth, field(&query, "edit"))),
+                operator.map(|auth| (auth, super::areas::Asked::of(&query))),
             );
         }
         Tab::Settings => settings(&mut main, &view, &namespaces, &keys, now),
@@ -334,7 +334,7 @@ fn access(
     namespaces: &[NamespaceRow],
     instances: Instances<&str>,
     nodes: &[(String, String)],
-    operator: Option<(&Auth, Option<&str>)>,
+    operator: Option<(&Auth, super::areas::Asked)>,
 ) {
     if !v.row.takes_tokens() {
         h.raw("<p class=\"callout\">Jobs get no access here, because the registry does not take ")
@@ -374,7 +374,7 @@ fn access(
     let context = Own {
         v,
         namespaces,
-        operator: operator.map(|(auth, _)| auth),
+        operator: operator.as_ref().map(|(auth, _)| *auth),
     };
     if own.is_empty() {
         h.raw("<p class=\"empty\">None besides the ones kept for CI. ")
@@ -390,30 +390,8 @@ fn access(
             .raw("<code>vk-hub namespaces remove</code> to remove it.</p>")
             .raw("</details>");
     }
-    if let Some((auth, edit)) = operator {
-        match edit.and_then(|name| {
-            namespaces
-                .iter()
-                .find(|n| n.name == name && !super::areas::managed(name))
-        }) {
-            Some(ns) => {
-                h.raw("<section id=\"area\"><h2>Change ")
-                    .text(&ns.name)
-                    .raw("</h2>");
-                super::areas::editor(h, &v.id, &super::areas::Draft::of_row(ns), auth);
-                super::areas::remove_form(h, &v.id, ns, auth);
-                h.raw("<p><a href=\"")
-                    .raw(DETAIL_PREFIX)
-                    .text(&v.id)
-                    .raw("?tab=access\">Cancel</a></p></section>");
-            }
-            None => {
-                h.raw("<details class=\"upload\" id=\"area\"><summary class=\"button\">")
-                    .raw("Add a storage area</summary>");
-                super::areas::editor(h, &v.id, &super::areas::Draft::blank(), auth);
-                h.raw("</details>");
-            }
-        }
+    if let Some((auth, asked)) = operator {
+        super::areas::forms(h, v, namespaces, auth, &asked);
     }
     h.raw("</section><p><a href=\"/audit?category=all&amp;node=")
         .text(&v.id)
@@ -462,6 +440,11 @@ fn areas_table(h: &mut Html, areas: &[&super::access::Area], own: Option<&Own>) 
             h.raw("<div class=\"sub\">Kept apart for refs matching ")
                 .text(a.isolated.join(" "))
                 .raw("</div>");
+        }
+        if let Some(o) = own
+            && let Some(ns) = o.namespaces.iter().find(|n| n.name == a.name)
+        {
+            super::areas::reached(h, o.v, ns);
         }
         h.raw("</td><td>");
         lines(h, &a.readers);
