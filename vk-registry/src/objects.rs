@@ -28,7 +28,7 @@ use crate::{Authz, Body, ServerState, Store, accounts, error_response};
 const FILES_REPO: &str = "files";
 
 /// Maximum object size, checked both against Content-Length and while streaming.
-const MAX_OBJECT: u64 = 4 << 30;
+pub(crate) const MAX_OBJECT: u64 = 4 << 30;
 
 /// Maximum decoded component length in bytes.
 const MAX_SEGMENT: usize = 255;
@@ -366,7 +366,7 @@ pub(crate) fn range_asked(headers: &hyper::HeaderMap) -> Option<String> {
 
 /// What a `Range` value asks of `len` bytes.
 #[derive(Debug, PartialEq, Eq)]
-enum Part {
+pub(crate) enum Part {
     /// The whole: no single byte range, or one this server ignores, as RFC 9110 allows.
     Whole,
     /// Bytes `first..=last`.
@@ -377,7 +377,7 @@ enum Part {
 
 /// Read `range` against `len` bytes: `bytes=<first>-[<last>]` or `bytes=-<suffix length>`.
 /// Several ranges, another unit or a malformed spec are served whole.
-fn part(range: &str, len: u64) -> Part {
+pub(crate) fn part(range: &str, len: u64) -> Part {
     let Some((first, last)) = range
         .trim()
         .strip_prefix("bytes=")
@@ -438,17 +438,7 @@ fn serve_range(store: &Store, hex: &str, range: &str, head: bool) -> Result<Resp
     };
     let (first, last) = match part(range, len) {
         Part::Whole => return crate::serve_blob(store, &digest, head, None, false),
-        Part::Unsatisfiable => {
-            let mut resp = error_response(
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                "RANGE_INVALID",
-                &format!("the object has {len} bytes"),
-            );
-            if let Ok(v) = hyper::header::HeaderValue::from_str(&format!("bytes */{len}")) {
-                resp.headers_mut().insert(CONTENT_RANGE, v);
-            }
-            return Ok(resp);
-        }
+        Part::Unsatisfiable => return Ok(unsatisfiable(len)),
         Part::Bytes(first, last) => (first, last),
     };
     let count = last - first + 1;
@@ -474,6 +464,19 @@ fn serve_range(store: &Store, hex: &str, range: &str, head: bool) -> Result<Resp
         crate::stream_body(file.take(count), &digest)
     };
     builder.body(body).map_err(Into::into)
+}
+
+/// 416 for a range that selects none of an object's `len` bytes.
+pub(crate) fn unsatisfiable(len: u64) -> Response<Body> {
+    let mut resp = error_response(
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        "RANGE_INVALID",
+        &format!("the object has {len} bytes"),
+    );
+    if let Ok(v) = hyper::header::HeaderValue::from_str(&format!("bytes */{len}")) {
+        resp.headers_mut().insert(CONTENT_RANGE, v);
+    }
+    resp
 }
 
 /// A reader that drops its first `skip` bytes, on its first read.
@@ -662,7 +665,7 @@ pub(crate) async fn drain(req: Request<Incoming>, href: &str) -> Result<Option<R
 }
 
 /// Whether `Content-Length` declares a body over the object cap.
-fn declared_over_cap(req: &Request<Incoming>) -> bool {
+pub(crate) fn declared_over_cap(req: &Request<Incoming>) -> bool {
     req.headers()
         .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -670,7 +673,7 @@ fn declared_over_cap(req: &Request<Incoming>) -> bool {
         .is_some_and(|n| n > MAX_OBJECT)
 }
 
-fn too_big(href: &str) -> Response<Body> {
+pub(crate) fn too_big(href: &str) -> Response<Body> {
     error_response(StatusCode::PAYLOAD_TOO_LARGE, "TOOBIG", href)
 }
 
@@ -691,15 +694,15 @@ fn parent_is_object(href: &str) -> Response<Body> {
 }
 
 /// 405 for a write onto a directory, or onto a top-level name, which is always one.
-fn not_an_object(href: &str) -> Response<Body> {
+pub(crate) fn not_an_object(href: &str) -> Response<Body> {
     error_response(StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED", href)
 }
 
-fn not_found(href: &str) -> Response<Body> {
+pub(crate) fn not_found(href: &str) -> Response<Body> {
     error_response(StatusCode::NOT_FOUND, "NOT_FOUND", href)
 }
 
-fn created() -> Response<Body> {
+pub(crate) fn created() -> Response<Body> {
     Response::builder()
         .status(StatusCode::CREATED)
         .header(CONTENT_LENGTH, "0")
@@ -707,7 +710,7 @@ fn created() -> Response<Body> {
         .expect("building a 201")
 }
 
-fn no_content() -> Response<Body> {
+pub(crate) fn no_content() -> Response<Body> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(crate::body_of(bytes::Bytes::new()))

@@ -732,6 +732,11 @@ though within them it can claim protection.
   set `SCCACHE_ENDPOINT=$VK_REGISTRY/s3 SCCACHE_BUCKET=job SCCACHE_S3_KEY_PREFIX=<alias>
   SCCACHE_REGION=auto SCCACHE_S3_NO_CREDENTIALS=true`. `auto` supplies the required region.
   The proxy supplies the credential.
+  On the registry, bind the alias's namespace to a flat store, so its many small entries are
+  plain files under one size cap rather than tags: for a namespace whose path is
+  `sccache/{gitlab}/{project_id}/{protection}`, add `[[flat]] prefix = "sccache"` with a
+  `cap` to the registry's config and restart it. Every project's entries then share that cap,
+  each under its own path. Entries cached before are not carried over.
 - **Build caches.** A job's builds cache per project, protection and scope in `ci-build`, and
   a namespace may give chosen refs a scope of their own: see the
   [build caches design](build-cache-design.md).

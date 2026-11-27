@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Run sccache against a loopback registry with the shared bearer as both AWS keys.
 # Compile two C files, one producing an object over 5 MiB. Both must miss, then hit
-# after clearing local state. Check the startup probe through /files/ and verify that
-# a wrong key stops startup with AccessDenied.
+# after clearing local state, first under a tagged prefix and then under a flat prefix.
+# Check that the flat prefix holds files without tags, that /files/ serves the tagged
+# startup probe, and that a wrong key stops startup with AccessDenied.
 #
 # Run: SCCACHE=/path/to/sccache tests/s3-sccache-e2e.sh
 # VK_REGISTRY defaults to the executable beside $VK, then ./dist/vk-registry.
@@ -46,6 +47,10 @@ cat >"$WORK/registry.toml" <<EOF
 addr = "127.0.0.1:$REG_PORT"
 root = "$WORK/store"
 token_file = "$WORK/token"
+
+[[flat]]
+prefix = "cache/flat"
+cap = "1G"
 EOF
 "$VK_REGISTRY" serve --config "$WORK/registry.toml" >"$WORK/registry.log" 2>&1 &
 reg_pid=$!
@@ -82,19 +87,32 @@ sys.stdout.write("};\n")' >"$WORK/src/big.c"
 
 compile() { "$SCCACHE" cc -c "$WORK/src/$1.c" -o "$WORK/src/$1.o"; }
 
-restart
-compile small
-compile big
-[ "$(stats | field cache_misses)" = 2 ] || fail "expected two misses: $(stats)"
-[ "$(stats | field cache_errors)" = 0 ] || fail "cache errors: $(stats)"
-big_size=$(stat -c %s "$WORK/src/big.o")
-[ "$big_size" -gt $((5 * 1024 * 1024)) ] || fail "big.o is only $big_size bytes"
+cycle() {
+  export SCCACHE_S3_KEY_PREFIX=$1
+  restart
+  compile small
+  compile big
+  [ "$(stats | field cache_misses)" = 2 ] || fail "$1: expected two misses: $(stats)"
+  [ "$(stats | field cache_errors)" = 0 ] || fail "$1: cache errors: $(stats)"
+  big_size=$(stat -c %s "$WORK/src/big.o")
+  [ "$big_size" -gt $((5 * 1024 * 1024)) ] || fail "big.o is only $big_size bytes"
 
-restart
-compile small
-compile big
-[ "$(stats | field cache_hits)" = 2 ] || fail "expected two hits from the registry: $(stats)"
-echo "ok: miss then hit for a small object and a $big_size-byte one"
+  restart
+  compile small
+  compile big
+  [ "$(stats | field cache_hits)" = 2 ] || fail "$1: expected two hits from the registry: $(stats)"
+  echo "ok: $1: miss then hit for a small object and a $big_size-byte one"
+}
+
+cycle e2e
+[ -d "$WORK/store/repos/files/cache/e2e" ] || fail "missing tag repository files/cache/e2e"
+
+cycle flat
+flat_objects=$(find "$WORK/store/flat/cache+flat/objects" -type f | wc -l)
+# the startup probe and two compiler outputs
+[ "$flat_objects" -ge 3 ] || fail "$flat_objects files in the flat store, expected at least 3"
+[ ! -e "$WORK/store/repos/files/cache/flat" ] || fail "a flat object was tagged"
+echo "ok: the flat-bound prefix holds $flat_objects files and no tag"
 
 curl -fsS -o /dev/null -H "Authorization: Bearer $BEARER" \
   "http://127.0.0.1:$REG_PORT/files/cache/e2e/.sccache_check" ||

@@ -1016,3 +1016,235 @@ fn server_nodelay(server: std::net::SocketAddr, client: std::net::SocketAddr) ->
     }
     None
 }
+
+/// On-disk path of `key` in the flat store bound to `prefix`.
+fn flat_object(root: &std::path::Path, prefix: &str, key: &str) -> std::path::PathBuf {
+    let hash: String = sha2::Sha256::digest(key.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    root.join("flat")
+        .join(prefix.replace('/', "+"))
+        .join("objects")
+        .join(&hash[..2])
+        .join(hash)
+}
+
+/// A server whose `sccache` directory is a flat store capped at `cap`.
+fn flat_state(dir: &std::path::Path, cap: u64) -> Arc<ServerState> {
+    let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("store"));
+    cfg.flat = vec![vk_registry::flat::FlatBinding::new("sccache", cap)];
+    Arc::new(cfg.into_state().expect("a flat config starts"))
+}
+
+/// S3 uploads flat objects. Both routes serve byte ranges. `/files/` deletes objects
+/// and refuses uploads. Keys can share a path prefix, and other prefixes still use tags.
+#[tokio::test]
+async fn a_bound_prefix_keeps_its_objects_in_a_flat_store() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("flat");
+    let root = dir.join("store");
+    // Binding the prefix hides its existing tag from S3.
+    {
+        let url = spawn(open_state(&dir));
+        assert_eq!(put(&client(), &url, "sccache/old", None, "old").await, 200);
+        assert!(tag_path(&root, "sccache/old").is_file());
+    }
+    let url = spawn(flat_state(&dir, 1 << 30));
+    let c = client();
+    assert_eq!(
+        c.get(format!("{url}/s3/sccache/old"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+
+    let key = "sccache/a/b/c/0123abcd";
+    let resp = c.get(format!("{url}/s3/{key}")).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+    assert!(resp.text().await.unwrap().contains("NoSuchKey"));
+    assert_eq!(put(&c, &url, key, None, "0123456789").await, 200);
+    assert!(flat_object(&root, "sccache", key).is_file());
+    assert!(!root.join("repos/files/sccache/a").exists(), "no tag");
+    assert_eq!(staging_left(&root), 0);
+    for read in ["files", "s3"] {
+        let resp = c.get(format!("{url}/{read}/{key}")).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{read}");
+        assert_eq!(resp.headers()["content-type"], "application/octet-stream");
+        assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(resp.headers()["content-disposition"], "attachment");
+        assert_eq!(resp.headers()["content-length"], "10");
+        assert!(!resp.headers().contains_key("last-modified"));
+        assert!(!resp.headers().contains_key("etag"));
+        assert_eq!(resp.text().await.unwrap(), "0123456789");
+        let resp = c
+            .get(format!("{url}/{read}/{key}"))
+            .header("range", "bytes=2-5")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 206, "{read}");
+        assert_eq!(resp.headers()["content-range"], "bytes 2-5/10");
+        assert_eq!(resp.text().await.unwrap(), "2345");
+        let resp = c
+            .get(format!("{url}/{read}/{key}"))
+            .header("range", "bytes=10-")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 416, "{read}");
+        assert_eq!(resp.headers()["content-range"], "bytes */10");
+        let resp = c.head(format!("{url}/{read}/{key}")).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{read}");
+        assert_eq!(resp.headers()["content-length"], "10");
+        // A trailing slash names no object.
+        let resp = c.get(format!("{url}/{read}/{key}/")).send().await.unwrap();
+        assert_eq!(resp.status(), 404, "{read}");
+    }
+    // No directories: a key and one below it are both objects.
+    assert_eq!(put(&c, &url, "sccache/a/b", None, "ab").await, 200);
+    assert_eq!(put(&c, &url, "sccache/a/b/c", None, "abc").await, 200);
+    for (k, body) in [("sccache/a/b", "ab"), ("sccache/a/b/c", "abc")] {
+        let resp = c.get(format!("{url}/s3/{k}")).send().await.unwrap();
+        assert_eq!(resp.text().await.unwrap(), body);
+    }
+    // A digest mismatch leaves the last successful replacement intact.
+    assert_eq!(put(&c, &url, key, None, "replaced").await, 200);
+    let resp = c
+        .put(format!("{url}/s3/{key}"))
+        .header("x-amz-content-sha256", "0".repeat(64))
+        .body("corrupt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(
+        resp.text()
+            .await
+            .unwrap()
+            .contains("XAmzContentSHA256Mismatch")
+    );
+    let resp = c.get(format!("{url}/files/{key}")).send().await.unwrap();
+    assert_eq!(resp.text().await.unwrap(), "replaced");
+    // Files are put over S3 only.
+    let resp = c
+        .put(format!("{url}/files/sccache/x"))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 405);
+    assert_eq!(resp.headers()["allow"], "GET, HEAD, DELETE");
+    let resp = c.delete(format!("{url}/files/{key}")).send().await.unwrap();
+    assert_eq!(resp.status(), 204);
+    assert!(!flat_object(&root, "sccache", key).exists());
+    let resp = c.delete(format!("{url}/files/{key}")).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+    assert_eq!(
+        c.get(format!("{url}/s3/{key}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    // Outside the prefix, objects are tags as before.
+    assert_eq!(put(&c, &url, "other/x", None, "x").await, 200);
+    assert!(tag_path(&root, "other/x").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A flat store over its cap loses its least recently used objects in the background.
+#[tokio::test]
+async fn a_flat_store_over_its_cap_evicts_the_oldest() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("flat-cap");
+    let root = dir.join("store");
+    let url = spawn(flat_state(&dir, 1 << 20));
+    let c = client();
+    let keys: Vec<String> = (0..4).map(|i| format!("sccache/k/{i}")).collect();
+    for k in &keys {
+        assert_eq!(put(&c, &url, k, None, vec![1u8; 400 << 10]).await, 200);
+        // Space the writes so their mtimes fall in different seconds.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    }
+    wait_until("the store fits its cap", || {
+        keys.iter()
+            .filter(|k| flat_object(&root, "sccache", k).exists())
+            .count()
+            <= 2
+    })
+    .await;
+    assert!(!flat_object(&root, "sccache", &keys[0]).exists());
+    assert!(flat_object(&root, "sccache", &keys[3]).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Below a bound prefix, grants apply to an object's parent repository as they do to a tag.
+#[tokio::test]
+async fn a_flat_object_is_gated_by_its_parent_repository() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("flat-authz");
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret = dir.join("oidc-secret");
+    std::fs::write(&secret, "s3cr3t\n").unwrap();
+    let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("store"));
+    cfg.mode = AuthMode::Accounts;
+    cfg.oidc = Some(OidcSpec {
+        issuer: "https://login.example.com".to_string(),
+        client_id: "vk-registry".to_string(),
+        client_secret_file: secret,
+        public_url: "https://registry.internal".to_string(),
+    });
+    cfg.flat = vec![vk_registry::flat::FlatBinding::new("sccache", 1 << 30)];
+    let state = Arc::new(cfg.into_state().unwrap());
+    let db = accounts_db(&state);
+    let user = db
+        .upsert_user("https://issuer", "ci", EmailUpdate::Keep, None)
+        .unwrap();
+    let key = |name: &str, action: Action, pattern: &str| {
+        db.create_api_key(
+            Some(&user.id),
+            name,
+            &[Scope {
+                action,
+                repo_pattern: pattern.to_string(),
+            }],
+            None,
+        )
+        .unwrap()
+        .1
+    };
+    let read_key = key("read", Action::Read, "files/*");
+    let write_key = key("write", Action::Write, "files/sccache");
+    let other_key = key("other", Action::Write, "files/other/*");
+    let url = spawn(state.clone());
+    let c = client();
+    assert_eq!(put(&c, &url, "sccache/k", Some(&write_key), "v").await, 200);
+    // The exact grant covers objects directly in its repository only.
+    assert_eq!(
+        put(&c, &url, "sccache/a/k", Some(&write_key), "v").await,
+        403
+    );
+    assert_eq!(put(&c, &url, "sccache/k", Some(&read_key), "v").await, 403);
+    assert_eq!(put(&c, &url, "sccache/k", Some(&other_key), "v").await, 403);
+    let get = |k: &str| {
+        c.get(format!("{url}/s3/sccache/k"))
+            .bearer_auth(k.to_string())
+            .send()
+    };
+    assert_eq!(get(&read_key).await.unwrap().text().await.unwrap(), "v");
+    assert_eq!(get(&other_key).await.unwrap().status(), 403);
+    let delete = |k: &str| {
+        c.delete(format!("{url}/files/sccache/k"))
+            .bearer_auth(k.to_string())
+            .send()
+    };
+    assert_eq!(delete(&read_key).await.unwrap().status(), 403);
+    assert_eq!(delete(&other_key).await.unwrap().status(), 403);
+    assert_eq!(delete(&write_key).await.unwrap().status(), 204);
+    assert_eq!(get(&read_key).await.unwrap().status(), 404);
+    let _ = std::fs::remove_dir_all(&dir);
+}

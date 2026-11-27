@@ -11,6 +11,11 @@ All notable changes to virtkit will be documented in this file.
   Files stored with `vk registry put` are also available at `/files/sha256/<hex>`.
   Downloads support a single byte range here and over S3. Git can clone an uploaded
   repository over dumb HTTP. CI jobs can use `/files/` and `job/<alias>` through `registry.vk`.
+- **Cache directories can have a size cap.** To cap an sccache bucket, add a `[[flat]]`
+  table with `prefix = "sccache"` and `cap = "200G"`. The registry evicts the least recently
+  used entries when the bucket exceeds its cap. Use S3 to read or write entries and
+  `/files/` to read or delete them. These routes stop serving earlier tags under the
+  prefix. Their usual retention rules still apply.
 
 ### Changed
 

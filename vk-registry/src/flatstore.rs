@@ -588,6 +588,16 @@ impl Write for Upload {
 }
 
 impl Upload {
+    /// Clone the staging descriptor for writers that cannot use [`Write`], including async
+    /// writers. Finish their writes before [`Upload::commit`].
+    pub fn writer(&self) -> Result<File> {
+        self.file
+            .as_ref()
+            .context("an upload's file is gone")?
+            .try_clone()
+            .context("duplicating an upload's descriptor")
+    }
+
     /// Publish the upload under `key`, replacing its previous object. [`Options::durable`]
     /// syncs the bytes before publication. Drain queued events before returning.
     pub fn commit(mut self, key: &[u8]) -> Result<Meta> {

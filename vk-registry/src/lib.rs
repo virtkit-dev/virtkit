@@ -54,6 +54,7 @@ pub(crate) mod chunks;
 pub mod client;
 pub mod config;
 pub(crate) mod files_put;
+pub mod flat;
 pub mod flatstore;
 pub(crate) mod forms;
 pub mod handover;
@@ -421,6 +422,8 @@ pub struct Store {
     /// Directory listing attempts across all repository walks, including gc, `stats`,
     /// repository listings and lookups ([`Store::repo_dir_reads`]).
     repo_dir_reads: AtomicU64,
+    /// The prefixes bound to flat stores ([`Store::bind_flat`]).
+    flat: std::sync::OnceLock<flat::Areas>,
 }
 
 /// File puts a server streams into one store at once: each holds a file's worth of its
@@ -561,6 +564,7 @@ impl Store {
             lock_waiters: Arc::new(tokio::sync::Semaphore::new(LOCK_WAITERS)),
             unclaimed_puts: std::sync::Mutex::new(0),
             repo_dir_reads: AtomicU64::new(0),
+            flat: std::sync::OnceLock::new(),
         }
     }
 
@@ -905,6 +909,21 @@ impl Store {
             .prefix_windows
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = windows;
+    }
+
+    /// Bind `bindings`' prefixes to flat stores under this store's root, once, for `usage`
+    /// ([`flat::Use`]).
+    pub fn bind_flat(&self, bindings: Vec<flat::FlatBinding>, usage: flat::Use) -> Result<()> {
+        let areas = flat::Areas::new(&self.root, bindings, usage)?;
+        self.flat
+            .set(areas)
+            .map_err(|_| anyhow::anyhow!("{}: flat stores already bound", self.root.display()))
+    }
+
+    /// The prefixes bound to flat stores: none until [`Store::bind_flat`].
+    pub fn flat(&self) -> &flat::Areas {
+        static NONE: flat::Areas = flat::Areas::none();
+        self.flat.get().unwrap_or(&NONE)
     }
 
     /// The retention windows under prefixes now.

@@ -46,12 +46,14 @@ Repository names and tags are metadata over that shared blob pool.
   repos/<name>/blobs/<hex>      blob membership marker
   uploads/<id>                  in-progress upload, or a request body being staged
   uploads/owners/<id>           repository that opened the upload
+  flat/<prefix, / as +>/        a flat store bound with [[flat]] (see "Flat stores")
   accounts/accounts.db          account data when accounts mode is enabled
                                 (for the default store, see "The default store")
 ```
 
 Plain files use the same pool: each object is a tag on a raw-file manifest in a `files/`
-repository, with its bytes stored as a blob. See "Plain files".
+repository, with its bytes stored as a blob. See "Plain files". The objects under a prefix
+bound with `[[flat]]` are the exception: they are files in a flat store of their own.
 
 The `sha256` and `zstd` directories are two physical encodings of the same logical
 namespace. A digest always identifies the uncompressed bytes. Deduplication is therefore
@@ -667,6 +669,59 @@ from read-only pipelines also keep an entry alive. There is no write-time quota 
 directory. Replacement and deletion reclaim blob space only when gc sweeps the bytes.
 GC removes staging files left by crashed uploads with other idle files in `uploads/`.
 
+### Flat stores (`[[flat]]`)
+
+Tags suit small collections of long-lived files. Compiler caches write many small entries
+once and often look up missing keys. As tags, each entry costs about five files. Misses
+leave negative dentries, writes take the namespace lock, and `gc` walks the entries without
+enforcing a size cap. A `[[flat]]` table gives a directory below `files/` its own flat store.
+
+```toml
+[[flat]]
+prefix = "sccache"   # files/sccache/…, the S3 bucket sccache
+cap = "200G"         # required; evict least recently used objects above this cap
+evict_to = 0.9       # evict down to this share of cap [default: 0.9]
+durable = false      # sync each object before acknowledging it [default: false]
+```
+
+A prefix has at most 14 lowercase repository components. Prefixes cannot overlap or start
+with `sha256` or `files` as a component. Each object occupies one file under
+`<root>/flat/<prefix with / as +>/`, named by the SHA-256 of its key. The store preserves
+the uploaded bytes, including sccache's compression.
+
+Each serving process has one in-memory index per store. It loads the 256 shards on demand
+and tracks changes with inotify. An indexed miss needs no lookup of the absent name.
+Reads, writes and deletes take no cross-process lock.
+
+When usage exceeds the cap, the process holding `evict.lock` evicts the least recently used
+objects in the background, aiming for `evict_to` times the cap. A hit attempts to refresh
+the object's mtime when it is at least an hour old. Without `durable`, power loss can leave
+a partial object. sccache can detect a corrupt entry and treat it as a miss. The registry
+opens every bound store at startup and fails if any cannot be opened.
+
+The key is the decoded path below `files/`. These routes use the flat store for keys
+strictly below its prefix (`<prefix>/<anything>`):
+
+- S3 supports `GET`, `HEAD` and `PUT`. `/files/` supports `GET`, `HEAD` and `DELETE`.
+  Each route keeps its path and request checks. S3 uploads have the same body limit and
+  `x-amz-content-sha256` check as tagged uploads. A `PUT` replaces the whole object.
+  The last upload published wins.
+- Reads and deletes return 403 before lookup if neither the key nor its parent grants the
+  requested action. After admission, a read or delete returns 404 without `Read` on the
+  parent. Deletion also requires `Write` there and returns 403 to a reader without it.
+  S3 `PUT` requires `Write` on the parent.
+- Reads retain the tagged routes' download headers and single-range handling. Flat
+  responses omit `Last-Modified`, `ETag` and `Docker-Content-Digest`. The file's mtime
+  records use. A `HEAD` hit can refresh it too.
+- Flat keys have no directories. `a/b` and `a/b/c` can both be objects. A trailing slash
+  returns 404 on a read, 409 `InvalidRequest` on S3 `PUT`, and 400 `NAME_INVALID` on a
+  direct `/files/` upload.
+- On a valid object path, direct `PUT /files/` returns 405 with `Allow: GET, HEAD, DELETE`.
+  Its response requires a manifest and digest tag. Uploads with `?under=` still use tags.
+- `/files/sha256/<hex>`, `/v2/`, `/browse` and tag GC do not see flat objects. Below a
+  bound prefix, S3 and `/files/` look only in the flat store. Existing tags retain their
+  GC policy. Unbinding leaves the flat store on disk for the operator to remove.
+
 ## S3 view for sccache (`/s3/`)
 
 sccache's S3 backend (OpenDAL's path-style `s3` service) can read, stat and write cache
@@ -990,10 +1045,12 @@ when that is still below `max_connections` plus 256. The unit `install-service` 
   requires a distributed lock implementation and a replicated account store.
 - Pull-through cache eviction is retention-based; there is no size-capped LRU policy.
 - `files/` entries expire through `gc`'s store-wide retention unless their manifest keeps or
-  expires them; there is no per-directory policy and no size cap (see "Lifecycle").
+  expires them, or `[[gc.prefix]]` sets a window; only a `[[flat]]` store has a size cap (see
+  "Lifecycle" and "Flat stores").
 - Retention annotations are trusted from any account with push rights: a pusher can keep its
   tags past the operator's window, and there is no quota.
-- Every `files/` directory is a repository. `sccache` shards keys as `a/b/c/<key>`, so one
+- Outside `[[flat]]` prefixes, every `files/` directory is a repository. `sccache` shards
+  keys as `a/b/c/<key>`, so one
   cache directory grows to up to 4096 repositories and the path components above them, and
   each entry costs about five files — the tag, the manifest sidecar, the layer's membership
   marker and the pool's manifest and layer blobs, the last two shared with identical

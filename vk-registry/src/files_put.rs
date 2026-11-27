@@ -279,6 +279,27 @@ pub(crate) async fn route(
             ),
         ));
     };
+    // A direct /files/ upload must return a manifest and digest tag. Flat objects have neither.
+    if under.is_none() {
+        let segs: Vec<String> = repo
+            .split('/')
+            .skip(1)
+            .chain([name])
+            .map(str::to_string)
+            .collect();
+        if state.store.flat().find(&segs).is_some() {
+            let mut resp = error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "UNSUPPORTED",
+                "use S3 to upload files to this flat store",
+            );
+            resp.headers_mut().insert(
+                hyper::header::ALLOW,
+                hyper::header::HeaderValue::from_static(FLAT_ALLOWED),
+            );
+            return Ok(resp);
+        }
+    }
     for r in [digests.as_str(), repo.as_str()] {
         if let Some(resp) = crate::authorize_or_forbidden(authz, accounts::Action::Write, r) {
             return Ok(resp);
@@ -426,6 +447,9 @@ pub(crate) async fn route(
 /// The verbs `/files/` answers, for the `Allow` on a 405.
 const ALLOWED: &str = "GET, HEAD, PUT, DELETE";
 
+/// The verbs `/files/` answers below a prefix bound to a flat store.
+const FLAT_ALLOWED: &str = "GET, HEAD, DELETE";
+
 /// Serve `files/<dir>:<name>` through [`objects`]. The leaf may be any tag a file PUT
 /// accepts. Reads require `Read` on the resolved repository. `GET` supports a single
 /// byte range. Deletion also requires `Write` and removes only that tag. Other tags,
@@ -439,9 +463,11 @@ async fn serve(
     let method = req.method().clone();
     if !matches!(method, Method::GET | Method::HEAD | Method::DELETE) {
         let mut resp = error_response(StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED", path);
+        let flat = objects::split(path.strip_prefix(FILES_PATH).unwrap_or_default())
+            .is_some_and(|(segs, _)| state.store.flat().find(&segs).is_some());
         resp.headers_mut().insert(
             hyper::header::ALLOW,
-            hyper::header::HeaderValue::from_static(ALLOWED),
+            hyper::header::HeaderValue::from_static(if flat { FLAT_ALLOWED } else { ALLOWED }),
         );
         return objects::drain_then(req, resp, path).await;
     }
@@ -491,6 +517,14 @@ async fn serve(
     // Drain even a read's body, up to the cap, so the client receives the response.
     if let Some(resp) = objects::drain(req, path).await? {
         return Ok(resp);
+    }
+    if let Some(area) = state.store.flat().find(&segs) {
+        return if method == Method::DELETE {
+            crate::flat::delete(area, authz, segs, trailing_slash, &href).await
+        } else {
+            let head = method == Method::HEAD;
+            crate::flat::get(area, authz, segs, trailing_slash, &href, head, range).await
+        };
     }
     if method == Method::DELETE {
         return crate::blocking_locked(

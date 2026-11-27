@@ -1004,6 +1004,9 @@ Use the registry's bearer token or key as both AWS keys. A shared username and p
 cannot sign S3 requests. In accounts mode, `write:files/<dir>/*` can populate the cache
 and `read:files/<dir>/*` gives read-only access. `vk-registry gc` applies the same tag
 retention and manifest keep or expiry rules as for other tags. Set `s3 = false` to disable S3.
+For a busy sccache bucket, add a `[[flat]]` table with `prefix = "<dir>"` and `cap = "200G"`
+to the registry config. The registry stores one file per entry and evicts the least recently
+used entries when the bucket exceeds its cap.
 
 ```sh
 SCCACHE_BUCKET=cache SCCACHE_ENDPOINT=https://<registry>/s3 SCCACHE_REGION=auto \

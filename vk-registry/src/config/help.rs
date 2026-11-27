@@ -24,6 +24,8 @@ enum Table {
     Hub,
     /// `[[gc.prefix]]`, repeatable
     GcPrefix,
+    /// `[[flat]]`, repeatable
+    Flat,
 }
 
 /// One config-file key: where it lives, what it is called, and what it does. The order
@@ -135,6 +137,12 @@ const KEYS: &[Key] = &[
         name: "gc",
         help: "the [[gc.prefix]] tables below; none = one store-wide\n\
                retention window",
+    },
+    Key {
+        table: Table::Top,
+        name: "flat",
+        help: "the [[flat]] tables below; none = every plain file\n\
+               is a tag",
     },
     Key {
         table: Table::Oidc,
@@ -249,6 +257,30 @@ const KEYS: &[Key] = &[
                hold only within it (a window the hub sets on\n\
                another prefix leaves them holding)",
     },
+    Key {
+        table: Table::Flat,
+        name: "prefix",
+        help: "a directory below files/ (an S3 bucket, or bucket/\n\
+               prefix): /s3/ and /files/ keep its objects in a\n\
+               flat store, <root>/flat/<prefix, / as +>, not as tags",
+    },
+    Key {
+        table: Table::Flat,
+        name: "cap",
+        help: "required size cap in bytes or with a binary suffix such as \"50G\"\n\
+               evict least recently used objects above the cap",
+    },
+    Key {
+        table: Table::Flat,
+        name: "evict_to",
+        help: "evict down to this share of cap, 0 to 1 [default: 0.9]",
+    },
+    Key {
+        table: Table::Flat,
+        name: "durable",
+        help: "sync each object before acknowledging it, so power\n\
+               loss cannot leave it partial [default: false]",
+    },
 ];
 
 /// A shared-secret deployment, TLS terminated here, relaying what it does not hold.
@@ -325,6 +357,10 @@ fn render() -> String {
             Table::GcPrefix,
             "[[gc.prefix]] — a retention window of its own under a prefix:",
         ),
+        (
+            Table::Flat,
+            "[[flat]] — a cache directory kept in a flat store, such as sccache's:",
+        ),
     ] {
         let _ = writeln!(out, "\n{heading}");
         for key in KEYS.iter().filter(|k| k.table == table) {
@@ -349,7 +385,7 @@ fn render() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{FileConfig, FileHub, FileOidc, FileUpstream, GcPrefix};
+    use super::super::{FileConfig, FileFlat, FileHub, FileOidc, FileUpstream, GcPrefix};
     use super::*;
 
     /// The field names a table will accept, taken from the parser itself: with
@@ -391,12 +427,14 @@ mod tests {
         let upstream = toml::from_str::<FileUpstream>("nope = 1\n").map(|_| ());
         let hub = toml::from_str::<FileHub>("nope = 1\n").map(|_| ());
         let gc_prefix = toml::from_str::<GcPrefix>("nope = 1\n").map(|_| ());
+        let flat = toml::from_str::<FileFlat>("nope = 1\n").map(|_| ());
         for (table, err) in [
             (Table::Top, top.unwrap_err()),
             (Table::Oidc, oidc.unwrap_err()),
             (Table::Upstream, upstream.unwrap_err()),
             (Table::Hub, hub.unwrap_err()),
             (Table::GcPrefix, gc_prefix.unwrap_err()),
+            (Table::Flat, flat.unwrap_err()),
         ] {
             let mut accepted = accepted(&err.to_string());
             let mut documented = documented(table);

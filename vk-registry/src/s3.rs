@@ -133,15 +133,22 @@ pub(crate) async fn route(
     if !objects::admits(authz, action, &segs, put) {
         return objects::drain_then(req, crate::accounts::forbidden(), &href).await;
     }
+    let area = state.store.flat().find(&segs);
     if put {
         let expected = req.extensions().get::<PayloadSha256>().map(|p| p.0.clone());
-        return objects::put(state, segs, trailing_slash, &href, expected, req).await;
+        return match area {
+            Some(area) => crate::flat::put(area, segs, trailing_slash, &href, expected, req).await,
+            None => objects::put(state, segs, trailing_slash, &href, expected, req).await,
+        };
     }
     let head = *req.method() == Method::HEAD;
     let range = objects::range_asked(req.headers());
     // Drain the read's body up to the cap so the client receives the response.
     if let Some(resp) = objects::drain(req, &href).await? {
         return Ok(resp);
+    }
+    if let Some(area) = area {
+        return crate::flat::get(area, authz, segs, trailing_slash, &href, head, range).await;
     }
     objects::blocking(state, authz, move |store, authz| {
         objects::get(

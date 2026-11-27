@@ -95,6 +95,8 @@ pub struct ServerConfig {
     pub hub: HubSettings,
     /// `[[gc.prefix]]`: retention windows of their own for the tags under a prefix.
     pub gc_prefixes: Vec<GcPrefix>,
+    /// `[[flat]]`: prefixes below `files/` whose objects live in flat stores.
+    pub flat: Vec<crate::flat::FlatBinding>,
 }
 
 /// A `[[gc.prefix]]` entry: tags under `path` (or `files/<path>`) are dropped once idle
@@ -266,6 +268,52 @@ struct FileConfig {
     upstream: Vec<FileUpstream>,
     hub: Option<FileHub>,
     gc: Option<FileGc>,
+    #[serde(default)]
+    flat: Vec<FileFlat>,
+}
+
+/// Reject unknown `[[flat]]` keys so a misspelled `cap` is reported by name.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileFlat {
+    prefix: String,
+    cap: FileSize,
+    evict_to: Option<f64>,
+    #[serde(default)]
+    durable: bool,
+}
+
+/// A size: a number of bytes, or a string with a binary suffix (`"50G"`).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FileSize {
+    Bytes(u64),
+    Text(String),
+}
+
+fn flat_bindings(entries: Vec<FileFlat>) -> Result<Vec<crate::flat::FlatBinding>> {
+    let bindings = entries
+        .into_iter()
+        .map(|f| {
+            let cap = match f.cap {
+                FileSize::Bytes(n) => n,
+                FileSize::Text(t) => crate::flat::parse_size(&t).with_context(|| {
+                    format!(
+                        "[[flat]] prefix = {:?}: cap = {t:?} is not a size such as \"50G\"",
+                        f.prefix
+                    )
+                })?,
+            };
+            Ok(crate::flat::FlatBinding {
+                prefix: f.prefix,
+                cap,
+                evict_to: f.evict_to.unwrap_or(crate::flat::DEFAULT_EVICT_TO),
+                durable: f.durable,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    crate::flat::check(&bindings)?;
+    Ok(bindings)
 }
 
 /// `[gc]`: only its `[[gc.prefix]]` entries, for now.
@@ -384,6 +432,19 @@ impl ServerConfig {
             max_connections_per_client: crate::DEFAULT_MAX_CONNECTIONS_PER_CLIENT,
             hub: HubSettings::default(),
             gc_prefixes: Vec::new(),
+            flat: Vec::new(),
+        }
+    }
+
+    /// The `[[flat]]` bindings `vk-registry status` and `gc` apply to the store they work on:
+    /// those of the config at `config`, unless an explicit `root` names another store.
+    pub fn flat_of(
+        config: Option<&Path>,
+        root: Option<&Path>,
+    ) -> Result<Vec<crate::flat::FlatBinding>> {
+        match (config, root) {
+            (Some(path), None) => flat_bindings(read_file(path)?.flat),
+            _ => Ok(Vec::new()),
         }
     }
 
@@ -466,6 +527,12 @@ impl ServerConfig {
         // Only when turned off, so a registry that leaves it on keeps the hash it had.
         if !self.s3 {
             described.push_str(" s3=false");
+        }
+        // Omit empty bindings to preserve the previous hash. Binding order is immaterial.
+        if !self.flat.is_empty() {
+            let mut flat = self.flat.clone();
+            flat.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+            described.push_str(&format!(" flat={flat:?}"));
         }
         crate::hub::Facts {
             listen: self.addr.to_string(),
@@ -696,6 +763,7 @@ impl ServerConfig {
                     .unwrap_or(DEFAULT_UPDATE_DRAIN_MINUTES),
             }),
             gc_prefixes: f.gc.map(|g| g.prefix).unwrap_or_default(),
+            flat: flat_bindings(f.flat)?,
         };
         cfg.check_connection_limits()?;
         cfg.check_hub()?;
@@ -941,6 +1009,9 @@ impl ServerConfig {
                 .map(crate::PrefixWindow::from)
                 .collect(),
         );
+        if !self.flat.is_empty() {
+            store.bind_flat(self.flat, crate::flat::Use::Serve)?;
+        }
         // `resolve_oidc` yields `Some` exactly in accounts mode, so it selects the arm as
         // well as supplying the provider.
         let auth = match oidc_cfg {
@@ -1812,6 +1883,68 @@ mod tests {
             "[[gc.prefix]]\npath = \"a\"\nretention_days = 0\n",
             "[[gc.prefix]]\npath = \"a\"\nretention_days = 1\n[[gc.prefix]]\npath = \"a\"\nretention_days = 2\n",
             "[[gc.prefix]]\npath = \"a\"\nretention_days = 1\nnope = 1\n",
+        ] {
+            assert!(load(bad).is_err(), "{bad}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Check prefix validation, both cap formats, and the explicit-root override.
+    /// Binding order does not affect the hash, and empty bindings preserve the old hash.
+    #[test]
+    fn flat_bindings_load() {
+        use crate::flat::FlatBinding;
+        let dir = std::env::temp_dir().join(format!("vk-regserve-flat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("c.toml");
+        let load = |body: &str| {
+            std::fs::write(&p, body).unwrap();
+            ServerConfig::load(&p, None, None)
+        };
+        let two = "[[flat]]\nprefix = \"sccache\"\ncap = \"50G\"\n\n\
+                   [[flat]]\nprefix = \"dev/cc\"\ncap = 1024\nevict_to = 0.5\ndurable = true\n";
+        let cfg = load(two).unwrap();
+        assert_eq!(
+            cfg.flat,
+            vec![
+                FlatBinding::new("sccache", 50 << 30),
+                FlatBinding {
+                    evict_to: 0.5,
+                    durable: true,
+                    ..FlatBinding::new("dev/cc", 1024)
+                }
+            ]
+        );
+        assert_eq!(
+            ServerConfig::flat_of(Some(&p), None).unwrap(),
+            cfg.flat,
+            "the store the config names"
+        );
+        assert!(
+            ServerConfig::flat_of(Some(&p), Some(&dir))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(ServerConfig::flat_of(None, None).unwrap().is_empty());
+        let hash = cfg.hub_facts().config_hash;
+        assert_ne!(hash, "e3609a2059e9c15e");
+        let swapped = "[[flat]]\nprefix = \"dev/cc\"\ncap = 1024\nevict_to = 0.5\n\
+                       durable = true\n\n[[flat]]\nprefix = \"sccache\"\ncap = \"50G\"\n";
+        assert_eq!(load(swapped).unwrap().hub_facts().config_hash, hash);
+        assert_eq!(
+            load("").unwrap().hub_facts().config_hash,
+            "e3609a2059e9c15e"
+        );
+        for bad in [
+            "[[flat]]\nprefix = \"sccache\"\n",
+            "[[flat]]\nprefix = \"sccache\"\ncap = \"lots\"\n",
+            "[[flat]]\nprefix = \"sccache\"\ncap = 0\n",
+            "[[flat]]\nprefix = \"sha256\"\ncap = 1\n",
+            "[[flat]]\nprefix = \"Bad\"\ncap = 1\n",
+            "[[flat]]\nprefix = \"a\"\ncap = 1\nevict_to = 2.0\n",
+            "[[flat]]\nprefix = \"a\"\ncap = 1\nnope = 1\n",
+            "[[flat]]\nprefix = \"a\"\ncap = 1\n[[flat]]\nprefix = \"a/b\"\ncap = 1\n",
         ] {
             assert!(load(bad).is_err(), "{bad}");
         }
