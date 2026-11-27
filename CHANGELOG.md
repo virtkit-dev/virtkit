@@ -23,6 +23,10 @@ All notable changes to virtkit will be documented in this file.
   writing goes with the rest of its unfinished files, where it used to stay beside the
   VM's state as a `.tmp` file until the next build of that VM; one left by an earlier
   `vk` goes with the next build.
+- **Ctrl-C, SIGTERM or SIGQUIT during a build stops it cleanly.** The build stops its
+  steps as it does when one of them fails, removes its unfinished files, and then exits
+  with the signal; the steps it finished stay cached. A second signal exits at once. A
+  task's throwaway VM is removed too, where an interrupted task used to leave it behind.
 
 ## [0.118.0] - 2026-11-27
 

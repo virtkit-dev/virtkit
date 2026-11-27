@@ -1,8 +1,14 @@
-//! Remove a build's scratch dirs when SIGTERM or SIGINT ends the process. Their default action
-//! ends it on the spot, running no destructor, so a build cancelled with its job would leave
-//! its scratch for a sweep to find. Best-effort: SIGKILL cannot be caught, and a process that
-//! handles either signal itself is left to do so — the handler goes in only over the default
-//! action, for as long as a dir is registered.
+//! Interrupt a build cleanly when SIGTERM, SIGINT or SIGQUIT ends the process, and remove its
+//! scratch dirs. Their default action ends it on the spot, running no destructor, so a build
+//! cancelled with its job would leave its scratch for a sweep to find. Best-effort: SIGKILL
+//! cannot be caught, and a process that handles one of them itself is left to do so — the
+//! handler goes in only over the default action, for as long as something is registered.
+//!
+//! A build that can stop its steps registers its cancellation token ([`cancel_on_signal`]).
+//! While one is registered, the first signal cancels it instead: the build stops its steps
+//! and unwinds through its own cleanup, as when one of its steps fails, and then ends the
+//! process with the signal ([`end_if_interrupted`]). Should it not within [`UNWIND_GRACE`],
+//! the dirs still registered are removed and the process ends regardless.
 //!
 //! The handler only writes the signal's number to a pipe. A thread of its own reads it, resets
 //! the handlers it installed to the default action, so a second signal ends the process at
@@ -23,7 +29,13 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// The signals a registration covers.
-const SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGINT];
+const SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT];
+
+/// How long a cancelled build has to unwind and end the process itself.
+const UNWIND_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The signal a cancelled build is to end the process with; 0 until one cancels it.
+static INTERRUPTED: AtomicI32 = AtomicI32::new(0);
 
 /// A registered dir: the descriptors it is removed through, and its path for messages.
 struct Target {
@@ -47,12 +59,15 @@ fn open_target(dir: &Path, opened: BorrowedFd<'_>) -> Option<Target> {
 struct State {
     /// The registered dirs, by registration.
     dirs: Vec<(u64, Target)>,
+    /// The registered cancellation tokens, by registration.
+    cancels: Vec<(u64, tokio_util::sync::CancellationToken)>,
     /// The signals whose handler this installed, to restore once no dir is registered.
     installed: Vec<libc::c_int>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
     dirs: Vec::new(),
+    cancels: Vec::new(),
     installed: Vec::new(),
 });
 
@@ -67,19 +82,20 @@ static OWNER: AtomicI32 = AtomicI32::new(0);
 /// Set once the remover has stopped reading, after which nothing is registered any more.
 static GONE: AtomicBool = AtomicBool::new(false);
 
-/// Keeps a dir registered for removal on SIGTERM or SIGINT; dropping it unregisters it.
+/// Keeps a dir registered for removal, or a build for cancellation, on one of [`SIGNALS`];
+/// dropping it unregisters it.
 pub(crate) struct Registration(u64);
 
-/// Remove `dir`, which the caller holds open as `opened`, if SIGTERM or SIGINT ends the process
-/// before the returned registration drops. Register a dir only while this process owns it
-/// outright. A dir whose parent cannot be opened now is not registered.
+/// Remove `dir`, which the caller holds open as `opened`, if one of [`SIGNALS`] ends the
+/// process before the returned registration drops. Register a dir only while this process owns
+/// it outright. A dir whose parent cannot be opened now is not registered.
 pub(crate) fn remove_on_signal(dir: &Path, opened: BorrowedFd<'_>) -> Registration {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let Some(target) = open_target(dir, opened) else {
         return Registration(id);
     };
     let mut state = lock();
-    if state.dirs.is_empty() {
+    if state.is_empty() {
         install(&mut state);
     }
     if !state.installed.is_empty() {
@@ -88,11 +104,48 @@ pub(crate) fn remove_on_signal(dir: &Path, opened: BorrowedFd<'_>) -> Registrati
     Registration(id)
 }
 
+/// Cancel `token` on the first of [`SIGNALS`] that arrives before the returned registration
+/// drops, rather than end the process there and then. The build `token` stops must call
+/// [`end_if_interrupted`] once it has cleaned up; [`UNWIND_GRACE`] after the signal, the process
+/// ends whatever it is doing.
+pub(crate) fn cancel_on_signal(token: &tokio_util::sync::CancellationToken) -> Registration {
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut state = lock();
+    if state.is_empty() {
+        install(&mut state);
+    }
+    if !state.installed.is_empty() {
+        state.cancels.push((id, token.clone()));
+    }
+    Registration(id)
+}
+
+/// End the process with the signal that cancelled a build (see [`cancel_on_signal`]), if one
+/// did, removing the dirs still registered first. Called by a build once it has cleaned up.
+pub(crate) fn end_if_interrupted() {
+    let signal = INTERRUPTED.load(Ordering::Acquire);
+    if signal == 0 {
+        return;
+    }
+    let state = lock();
+    remove_all(&state);
+    die(signal);
+}
+
+impl State {
+    fn is_empty(&self) -> bool {
+        self.dirs.is_empty() && self.cancels.is_empty()
+    }
+}
+
 impl Drop for Registration {
     fn drop(&mut self) {
         let mut state = lock();
         state.dirs.retain(|(id, _)| *id != self.0);
-        if state.dirs.is_empty() {
+        state.cancels.retain(|(id, _)| *id != self.0);
+        // Once a signal has cancelled a build the handlers are the default again: nothing to
+        // restore, and nothing to put back should a registration follow.
+        if state.is_empty() && INTERRUPTED.load(Ordering::Acquire) == 0 {
             uninstall(&mut state);
         }
     }
@@ -109,7 +162,8 @@ fn ours() -> libc::sighandler_t {
 
 /// Put the handler in for each signal still at its default action.
 fn install(state: &mut State) {
-    if !remover_started() {
+    // After a signal cancelled a build, a second one is to end the process at once.
+    if !remover_started() || INTERRUPTED.load(Ordering::Acquire) != 0 {
         return;
     }
     for signal in SIGNALS {
@@ -234,6 +288,7 @@ fn remover(read: OwnedFd) {
             GONE.store(true, Ordering::Release);
             uninstall(&mut state);
             state.dirs.clear();
+            state.cancels.clear();
             std::mem::forget(read);
             return;
         }
@@ -241,19 +296,37 @@ fn remover(read: OwnedFd) {
             continue; // passed on by a handler installed over this one: that one's to act on
         }
         let signal = libc::c_int::from(byte & !DIRECT);
+        let mut state = lock();
+        // The default action is back from here on: a second signal ends the process at once.
+        uninstall(&mut state);
+        if !state.cancels.is_empty() && INTERRUPTED.load(Ordering::Acquire) == 0 {
+            INTERRUPTED.store(signal, Ordering::Release);
+            say("interrupted: stopping the build");
+            for (_, token) in &state.cancels {
+                token.cancel();
+            }
+            // Let the build unwind, its registrations coming and going, and end the process
+            // itself through `end_if_interrupted`; take over only past the grace.
+            drop(state);
+            std::thread::sleep(UNWIND_GRACE);
+            state = lock();
+        }
         // Held to the end, so no registration comes or goes meanwhile. The signal ends the
         // process even when the last registration went since it arrived.
-        let mut state = lock();
-        uninstall(&mut state);
-        // A panic in the removal still ends the process with the signal below.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            for (_, target) in &state.dirs {
-                say(&format!("interrupted; removing {}", target.path.display()));
-                remove(target);
-            }
-        }));
+        remove_all(&state);
         die(signal);
     }
+}
+
+/// Remove every registered dir. A panic in the removal is caught, so the caller still ends the
+/// process with its signal.
+fn remove_all(state: &State) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for (_, target) in &state.dirs {
+            say(&format!("interrupted; removing {}", target.path.display()));
+            remove(target);
+        }
+    }));
 }
 
 /// End the process with `signal`, as its default action would have.
@@ -370,6 +443,18 @@ mod tests {
         };
         let signal: libc::c_int = std::env::var(SIGNAL_VAR).unwrap().parse().unwrap();
         let mode = std::env::var(MODE_VAR).unwrap_or_default();
+        // A SIGQUIT the stand-in dies of must not leave a core behind.
+        // SAFETY: setrlimit(2) with a fully initialised struct.
+        unsafe {
+            let none = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            libc::setrlimit(libc::RLIMIT_CORE, &none);
+        }
+        // An ignored signal is inherited, and another test in the harness that spawned this
+        // one may have ignored it: start from the default action a `vk` would see.
+        set_action(signal, libc::SIG_DFL);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/data"), b"x").unwrap();
         if mode == "own" {
@@ -405,6 +490,23 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(5));
                 // SAFETY: plain `_exit`: the signal was lost.
                 unsafe { libc::_exit(1) };
+            }
+            "cancel" => {
+                // A build: cancelled by the signal, it cleans up after itself, says so, and
+                // ends the process with that signal.
+                std::mem::forget(registration);
+                let token = tokio_util::sync::CancellationToken::new();
+                std::mem::forget(cancel_on_signal(&token));
+                let cleaned = dir.with_extension("cleaned");
+                std::thread::spawn(move || {
+                    while !token.is_cancelled() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    std::fs::write(&cleaned, b"").unwrap();
+                    end_if_interrupted();
+                    // SAFETY: plain `_exit`: the interruption did not end the process.
+                    unsafe { libc::_exit(1) };
+                });
             }
             "chain" => {
                 std::mem::forget(registration);
@@ -487,6 +589,40 @@ mod tests {
 
     // A process that handles the signal itself keeps it: its handler stays in place across a
     // registration, and one chained over this module's, calling it, decides alone.
+    #[test]
+    fn a_signal_cancels_a_registered_build_which_cleans_up_and_dies_of_it() {
+        let root = std::env::temp_dir().join(format!("vk-termclean-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGQUIT] {
+            let dir = root.join(format!("build-{signal}"));
+            let status = signalled(&dir, "cancel", signal);
+            assert_eq!(status.signal(), Some(signal), "{status:?}");
+            assert!(
+                dir.with_extension("cleaned").exists(),
+                "the build ran its own cleanup before the process ended"
+            );
+            assert!(
+                !dir.exists(),
+                "a dir still registered goes when the build ends"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_registered_dir_goes_with_a_sigquit_too() {
+        let root = std::env::temp_dir().join(format!("vk-termclean-quit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = root.join("held");
+        let status = signalled(&dir, "", libc::SIGQUIT);
+        assert_eq!(status.signal(), Some(libc::SIGQUIT), "{status:?}");
+        assert!(!dir.exists(), "a registered dir must be removed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_signal_the_process_handles_itself_is_left_to_it() {
         let root = std::env::temp_dir().join(format!("vk-termclean-own-{}", std::process::id()));

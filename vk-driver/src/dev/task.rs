@@ -170,9 +170,9 @@ async fn ephemeral(
     // The scratch directory is this run's alone. The guard removes it however run_ephemeral
     // returns — the command failing, the run refusing, an error on the way out; `exec::exit`
     // below would end the process before any destructor runs, so the guard is dropped first
-    // and the process exit is the last thing to happen. A signal that kills `vk` itself
-    // leaves the directory behind, with `vk dev gc` the backstop.
-    let _scratch = args.state_dir.clone().map(Scratch);
+    // and the process exit is the last thing to happen. A signal that ends `vk` removes it
+    // too (see `termclean`); one it cannot catch leaves it, marked for `vk gc` to sweep.
+    let _scratch = args.state_dir.clone().map(Scratch::new);
     let outcome = run_ephemeral(&env_plan, task, extra, cfg, over, args).await;
     drop(_scratch);
     Ok(match outcome? {
@@ -207,13 +207,41 @@ enum Outcome {
     Exit(vk_core::messages::CmdResult),
 }
 
-/// A throwaway run's state directory, removed when this goes out of scope: its sockets,
-/// logs and root image are that run's alone (the built stages stay in the shared cache).
-struct Scratch(std::path::PathBuf);
+/// The file that marks a throwaway run's state directory as one: what lets a sweep remove
+/// one that a killed `vk` left behind, whatever it is named.
+pub(crate) const THROWAWAY_MARKER: &str = ".virtkit-throwaway";
+
+/// A throwaway run's state directory, removed when this goes out of scope, or when a signal
+/// ends the process first: its sockets, logs and root image are that run's alone (the built
+/// stages stay in the shared cache).
+struct Scratch {
+    path: std::path::PathBuf,
+    _on_signal: Option<crate::termclean::Registration>,
+}
+
+impl Scratch {
+    /// Create `path`, private and marked as a throwaway, and register it for removal on a
+    /// signal. Best-effort: the run creates it anyway, and the guard still removes it.
+    fn new(path: std::path::PathBuf) -> Self {
+        use std::os::unix::fs::DirBuilderExt;
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&path);
+        let _ = std::fs::write(path.join(THROWAWAY_MARKER), b"");
+        let on_signal = vk_fs::open_dir(&path)
+            .ok()
+            .map(|dir| crate::termclean::remove_on_signal(&path, std::os::fd::AsFd::as_fd(&dir)));
+        Self {
+            path,
+            _on_signal: on_signal,
+        }
+    }
+}
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
@@ -270,7 +298,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("root.ext4"), b"x").unwrap();
         assert!(dir.is_dir());
-        drop(Some(Scratch(dir.clone())));
+        drop(Some(Scratch::new(dir.clone())));
         assert!(
             !dir.exists(),
             "the guard removes the whole state dir, contents and all"

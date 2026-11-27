@@ -1150,13 +1150,15 @@ impl Drop for ScratchGuard {
     }
 }
 
-/// After a build's scratch is gone: say what became of an unfinished one.
+/// After a build's scratch is gone: say what became of an unfinished one, and end the
+/// process if a signal interrupted it (see [`crate::termclean::cancel_on_signal`]).
 fn after_unfinished(failed: bool) {
     if failed {
         crate::quiet::enote!(
             "virtkit: removed the unfinished build's files; the steps it finished stay in the build cache"
         );
     }
+    crate::termclean::end_if_interrupted();
 }
 
 /// Publish the image exported to `tmp` as `out`: stamp its content-freshness UUID (the
@@ -1778,6 +1780,9 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
         };
 
         let cancel = CancellationToken::new();
+        // A signal stops the steps as a failing one does, so the build unwinds through
+        // its own cleanup (see `termclean::cancel_on_signal`).
+        let _cancel_on_signal = crate::termclean::cancel_on_signal(&cancel);
         // `budget` caps concurrent guest builds — `jobs` slots, plus the host-memory
         // ledger — not the DAG dispatch pool: a fully-cached stage never touches a guest,
         // so it must not queue behind either just to restore from cache. Dispatch gets one
@@ -3574,6 +3579,9 @@ fn drive_microvm(
     // stage honors it, so a failure interrupts the RUN steps in flight on sibling guests
     // instead of letting them run to completion before the build bails.
     let cancel = CancellationToken::new();
+    // A signal stops the steps as a failing one does, so the build unwinds through
+    // its own cleanup (see `termclean::cancel_on_signal`).
+    let _cancel_on_signal = crate::termclean::cancel_on_signal(&cancel);
     // `budget` caps concurrent guest builds — `jobs` slots, plus the host-memory ledger —
     // not the DAG dispatch pool: a fully-cached stage never touches a guest, so it must not
     // queue behind either just to restore from cache. Dispatch gets one thread per
