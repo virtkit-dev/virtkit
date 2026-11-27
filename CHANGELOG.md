@@ -40,6 +40,9 @@ All notable changes to virtkit will be documented in this file.
   longer counts its full length. `--columns` picks any set in any order (`+COL` adds, `all`
   shows every column), and `vk list --published` adds the host ports. UPTIME is now
   LAST_BOOT, which stopped VMs show too. A run records the `vk` that started it.
+  `--detail` records carry ON_DISK, CREATED_BY, ENV and LAST_BOOT too, each field named as
+  its column (`STATE_DIR`, `EXEC_ADDRESS`, `IP`, `MEM_USED`…), and `vk dev list --detail`
+  prints the same records for the environments it lists.
 
 ### Fixed
 

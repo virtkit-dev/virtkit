@@ -1282,7 +1282,10 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
     let all = crate::vmlist::rows(&live, &known, now);
     let mut rows: Vec<crate::vmlist::Row> = filter.apply(all.clone());
     let measure = opts.sizes
-        && (opts.json || !opts.fields.is_empty() || cols.contains(&crate::columns::Col::OnDisk));
+        && (opts.json
+            || opts.detail
+            || !opts.fields.is_empty()
+            || cols.contains(&crate::columns::Col::OnDisk));
     fill_disk_and_creator(&mut rows, measure);
     if stale {
         // Keep the requested key on every row, including unknown results.
@@ -1529,7 +1532,7 @@ fn details(
             match live.iter().find(|l| l.entry.state_dir == r.state_dir) {
                 Some(vm) => detail(
                     vm.entry,
-                    &record_head(r),
+                    &[record_head(r), record_facts(r, false)].concat(),
                     vm.units.as_deref(),
                     &vm.published,
                     vm.fresh.unwrap_or(Freshness::Unknown),
@@ -1554,15 +1557,39 @@ fn record_head(r: &crate::vmlist::Row) -> Vec<(&'static str, String)> {
             r.attention.clone().unwrap_or_else(|| "-".into()),
         ),
         (
-            "STALE RECORD",
+            "STALE_RECORD",
             if r.stale_record { "yes" } else { "no" }.into(),
         ),
     ]
 }
 
-/// With `--stale`, the IMAGE STALE line of a record whose freshness is never checked.
+/// What every record says beside its head, as the table's columns of the same names do: what
+/// it takes on disk, which `vk` created it, its environment and, for one at rest, how long ago
+/// it last booted (a running VM's record says so with the date it booted).
+fn record_facts(r: &crate::vmlist::Row, at_rest: bool) -> Vec<(&'static str, String)> {
+    let dash = || "-".to_string();
+    let mut facts = vec![
+        (
+            "ON_DISK",
+            r.disk_bytes.map_or_else(dash, crate::usage::fmt_compact),
+        ),
+        (
+            "CREATED_BY",
+            r.created_by
+                .as_deref()
+                .map_or_else(dash, crate::dev::list::short_creator),
+        ),
+        ("ENV", r.environment.clone().unwrap_or_else(dash)),
+    ];
+    if at_rest {
+        facts.push(("LAST_BOOT", r.last_boot_secs.map_or_else(dash, fmt_uptime)));
+    }
+    facts
+}
+
+/// With `--stale`, the STALE line of a record whose freshness is never checked.
 fn unknown_freshness(stale: bool) -> Option<(&'static str, String)> {
-    stale.then(|| ("IMAGE STALE", Freshness::Unknown.cell().to_string()))
+    stale.then(|| ("STALE", Freshness::Unknown.cell().to_string()))
 }
 
 /// For a primary without a registered run (stopped, never booted or starting), match
@@ -1577,15 +1604,16 @@ fn detail_unregistered(r: &crate::vmlist::Row, all: &[crate::vmlist::Row], stale
         })
         .collect();
     let mut lines = record_head(r);
+    lines.extend(record_facts(r, true));
     lines.extend([
         ("IMAGE", r.image.clone().unwrap_or_else(dash)),
         (
-            "PROJECT",
+            "WORKSPACE",
             r.project
                 .as_ref()
                 .map_or_else(dash, |p| p.display().to_string()),
         ),
-        ("STATE DIR", r.state_dir.display().to_string()),
+        ("STATE_DIR", r.state_dir.display().to_string()),
         ("MEM", r.mem.clone().unwrap_or_else(dash)),
     ]);
     lines.extend(unknown_freshness(stale));
@@ -1597,15 +1625,16 @@ fn detail_unregistered(r: &crate::vmlist::Row, all: &[crate::vmlist::Row], stale
 fn detail_service(r: &crate::vmlist::Row, stale: bool) -> String {
     let dash = || "-".to_string();
     let mut lines = record_head(r);
+    lines.extend(record_facts(r, false));
     lines.extend([
         (
-            "PROJECT",
+            "WORKSPACE",
             r.project
                 .as_ref()
                 .map_or_else(dash, |p| p.display().to_string()),
         ),
-        ("STATE DIR", r.state_dir.display().to_string()),
-        ("EXEC ADDRESS", r.exec_addr.clone().unwrap_or_else(dash)),
+        ("STATE_DIR", r.state_dir.display().to_string()),
+        ("EXEC_ADDRESS", r.exec_addr.clone().unwrap_or_else(dash)),
         ("IP", r.ip.clone().unwrap_or_else(dash)),
     ]);
     lines.extend(unknown_freshness(stale));
@@ -1664,23 +1693,23 @@ fn detail(
         ("IMAGE", e.label.clone()),
         ("PID", e.pid.to_string()),
         (
-            "UPTIME",
+            "LAST_BOOT",
             format!("{} (since {date} {time} UTC)", uptime(e.created_secs)),
         ),
-        ("PROJECT", path(e.project_dir.as_deref())),
-        ("STATE DIR", e.state_dir.display().to_string()),
-        ("EXEC ADDRESS", e.exec_addr.clone()),
+        ("WORKSPACE", path(e.project_dir.as_deref())),
+        ("STATE_DIR", e.state_dir.display().to_string()),
+        ("EXEC_ADDRESS", e.exec_addr.clone()),
         ("SSH", opt(e.ssh_addr.clone())),
-        ("GUEST IP", opt(e.guest_ip.map(|ip| ip.to_string()))),
+        ("IP", opt(e.guest_ip.map(|ip| ip.to_string()))),
         ("VMM", vmm),
         ("CPUS", opt(e.cpus.map(|n| n.to_string()))),
         ("MEM", opt(e.mem.clone())),
-        ("MEM USED", opt(mem_used.map(crate::usage::fmt_compact))),
+        ("MEM_USED", opt(mem_used.map(crate::usage::fmt_compact))),
         ("NESTED", yes_no(e.nested)),
-        ("ATOP LOG", path(e.atop_log.as_deref())),
+        ("ATOP_LOG", path(e.atop_log.as_deref())),
     ]);
     if stale {
-        rows.push(("IMAGE STALE", freshness.cell().to_string()));
+        rows.push(("STALE", freshness.cell().to_string()));
     }
     let services: Vec<[String; 4]> = e
         .services
@@ -3540,19 +3569,19 @@ pub(crate) mod tests {
 NAME          shop
 IMAGE         app
 PID           41877
-UPTIME        {up} (since 2025/09/04 08:00:00 UTC)
-PROJECT       /project
-STATE DIR     /state/app
-EXEC ADDRESS  vsock-auto:///tmp/x/vsock.sock:4444
+LAST_BOOT     {up} (since 2025/09/04 08:00:00 UTC)
+WORKSPACE     /project
+STATE_DIR     /state/app
+EXEC_ADDRESS  vsock-auto:///tmp/x/vsock.sock:4444
 SSH           127.0.0.1:2222
-GUEST IP      10.0.0.2
+IP            10.0.0.2
 VMM           libkrun (pid 4242)
 CPUS          4
 MEM           8G
-MEM USED      1.6G
+MEM_USED      1.6G
 NESTED        yes
-ATOP LOG      /state/app/atop.log
-IMAGE STALE   yes
+ATOP_LOG      /state/app/atop.log
+STALE         yes
 SERVICES      db     running  10.0.0.3  vsock-auto:///state/app/svc-db/vsock.sock:4444
               redis  stopped  10.0.0.4  vsock-auto:///state/app/svc-redis/vsock.sock:4444
 PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 4242
@@ -3583,18 +3612,18 @@ PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 4242
 NAME          7
 IMAGE         devcontainer
 PID           7
-UPTIME        {up} (since 2025/09/04 08:00:00 UTC)
-PROJECT       -
-STATE DIR     /state/x
-EXEC ADDRESS  vsock-auto:///tmp/x/vsock.sock:4444
+LAST_BOOT     {up} (since 2025/09/04 08:00:00 UTC)
+WORKSPACE     -
+STATE_DIR     /state/x
+EXEC_ADDRESS  vsock-auto:///tmp/x/vsock.sock:4444
 SSH           -
-GUEST IP      -
+IP            -
 VMM           -
 CPUS          -
 MEM           -
-MEM USED      -
+MEM_USED      -
 NESTED        -
-ATOP LOG      -
+ATOP_LOG      -
 SERVICES      -
 PUBLISHED     -
 ",
@@ -3650,14 +3679,16 @@ PUBLISHED     -
         assert!(
             text.starts_with(
                 "NAME          shop\nKIND          run\nSTATUS        stopping\n\
-                 ATTENTION     overdue\nSTALE RECORD  no\nIMAGE         app\n"
+                 ATTENTION     overdue\nSTALE_RECORD  no\nON_DISK       -\n\
+                 CREATED_BY    -\nENV           -\nIMAGE         app\n"
             ),
             "{text}"
         );
         assert!(
             text.contains(
                 "\n\nNAME          old\nKIND          run\nSTATUS        stopped\n\
-                 ATTENTION     -\nSTALE RECORD  yes\nIMAGE         -\n"
+                 ATTENTION     -\nSTALE_RECORD  yes\nON_DISK       -\nCREATED_BY    -\n\
+                 ENV           -\nLAST_BOOT     -\nIMAGE         -\n"
             ),
             "{text}"
         );
@@ -3711,12 +3742,12 @@ PUBLISHED     -
         let text = details(&all, &all, &[], false);
         let records: Vec<&str> = text.split("\n\n").collect();
         assert_eq!(records.len(), 2, "{text}");
-        assert!(records[0].contains("\nSTATE DIR     /a/shop\n"), "{text}");
+        assert!(records[0].contains("\nSTATE_DIR     /a/shop\n"), "{text}");
         assert!(
             records[0].ends_with("\nSERVICES      db  stopped"),
             "{text}"
         );
-        assert!(records[1].contains("\nSTATE DIR     /b/shop\n"), "{text}");
+        assert!(records[1].contains("\nSTATE_DIR     /b/shop\n"), "{text}");
         assert!(
             records[1].ends_with("\nSERVICES      cache  stopped\n"),
             "{text}"
@@ -3749,7 +3780,7 @@ PUBLISHED     -
         };
         for rows in [pick("shop"), pick("shop/db")] {
             let text = details(&rows, &all, &[], true);
-            assert!(text.contains("\nIMAGE STALE   -\n"), "{text}");
+            assert!(text.contains("\nSTALE         -\n"), "{text}");
             let text = details(&rows, &all, &[], false);
             assert!(!text.contains("IMAGE STALE"), "{text}");
         }
@@ -3772,7 +3803,7 @@ PUBLISHED     -
         );
         assert!(text.contains("\nVMM           libkrun\n"), "{text}");
         assert!(text.contains("\nNESTED        no\n"), "{text}");
-        assert!(text.contains("\nIMAGE STALE   no\n"), "{text}");
+        assert!(text.contains("\nSTALE         no\n"), "{text}");
     }
 
     #[test]
@@ -3795,7 +3826,7 @@ PUBLISHED     -
         );
         // Asked for but not determinable prints `-`, in the cell a fresh or stale answer
         // would fill.
-        assert!(text.contains("\nIMAGE STALE   -\n"), "{text}");
+        assert!(text.contains("\nSTALE         -\n"), "{text}");
     }
 
     #[test]

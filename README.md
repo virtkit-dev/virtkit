@@ -732,13 +732,14 @@ some targets deleted.
 `vk list` defaults to the table even for one match. With `--detail` (`-d`), each primary
 gets a record. A service gets its own record when its primary is absent, as in
 `vk list --detail shop/db`. Each record starts with NAME, KIND and STATUS. ATTENTION
-and STALE RECORD explain the table's `!` and `*` marks.
+and STALE_RECORD explain the table's `!` and `*` marks. ON_DISK, CREATED_BY, ENV and
+LAST_BOOT follow, as the table's columns of those names; a field is named as its column.
 
 A running primary's record shows boot settings, current memory usage and every declared
 compose service with its state, LAN address and exec address. Each published port shows
 its name, `listen->to` (`@NAME` for a service) and publisher pid. `(unconfirmed)` marks
 the pid in the record and the address in the table. A primary without a registered run
-shows its image, project, state directory, memory size and previously started services.
+shows its image, workspace, state directory, memory size and previously started services.
 Detail records use full paths. `--detail` conflicts with `--wide`, `--json` and `--field`.
 
 ```sh
@@ -753,21 +754,24 @@ NAME          shop
 KIND          dev
 STATUS        running
 ATTENTION     -
-STALE RECORD  no
+STALE_RECORD  no
+ON_DISK       10.5G
+CREATED_BY    vk-0.118.0
+ENV           dev
 IMAGE         devcontainer
 PID           41877
-UPTIME        35m (since 2026/09/04 08:12:03 UTC)
-PROJECT       /home/me/shop
-STATE DIR     /home/me/.local/state/virtkit/dev/shop-3f586d79eb02d9d9
-EXEC ADDRESS  vsock-auto:///home/me/.local/state/virtkit/dev/shop-3f586d79eb02d9d9/vsock.sock:4444
+LAST_BOOT     35m (since 2026/09/04 08:12:03 UTC)
+WORKSPACE     /home/me/shop
+STATE_DIR     /home/me/.local/state/virtkit/dev/shop-3f586d79eb02d9d9
+EXEC_ADDRESS  vsock-auto:///home/me/.local/state/virtkit/dev/shop-3f586d79eb02d9d9/vsock.sock:4444
 SSH           127.0.0.1:2222
-GUEST IP      10.0.0.2
+IP            10.0.0.2
 VMM           libkrun (pid 41902)
 CPUS          4
 MEM           16G
-MEM USED      5.9 GiB
+MEM_USED      5.9G
 NESTED        no
-ATOP LOG      -
+ATOP_LOG      -
 SERVICES      db     running  10.0.0.3  vsock-auto:///home/me/.local/state/virtkit/dev/shop-3f586d79eb02d9d9/svc-db/vsock.sock:4444
               redis  stopped  10.0.0.4  vsock-auto:///home/me/.local/state/virtkit/dev/shop-3f586d79eb02d9d9/svc-redis/vsock.sock:4444
 PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 42011
@@ -776,7 +780,9 @@ PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 42011
 `--json` returns an array with one object per row. Its keys are `name`, `kind`, `status`,
 `parent` (the primary's name for a service, `null` for a primary), `pid`, `uptime_secs`,
 `mem_used_bytes`, `mem`, `image`, `project`, `environment`, `state_dir`, `exec_addr`,
-`ssh_addr`, `ip` and `published` (an array of `listen->to` strings). A path that is not
+`ssh_addr`, `ip`, `published` (an array of `listen->to` strings) and, when known,
+`disk_bytes` (blocks used on disk, left out with `--no-sizes`), `created_by` and
+`last_boot_secs`. A path that is not
 UTF-8 is encoded as `{"bytes": [...]}`. An overdue whole-VM stop adds `attention` with
 recovery advice. An explicit `--field attention` returns `null` when no advice applies.
 Plain JSON omits `stale_record` when false. Selecting it with `--field` returns `false`.
@@ -796,8 +802,8 @@ vk list --json | jq '.[] | select(.image == "ci")'
 
 `--stale` checks whether a fresh run would rebuild the running primary's image or a
 `build:` service's image after a change to a Dockerfile, build context or base image. It
-can resolve base image digests over the network. The table shows STALE and detail records
-show IMAGE STALE. Both use `yes`, `no` or `-` for unknown. An image-only workload
+can resolve base image digests over the network. The table and detail records show
+STALE. Both use `yes`, `no` or `-` for unknown. An image-only workload
 without a build recipe has unknown freshness. JSON adds `stale` to every row, with `null`
 for unknown results and for all service and stopped rows.
 

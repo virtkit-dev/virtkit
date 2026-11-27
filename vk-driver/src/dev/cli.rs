@@ -518,6 +518,9 @@ enum DevAction {
         /// env and flags.
         #[arg(long, value_name = "COLS", conflicts_with = "json")]
         columns: Option<String>,
+        /// a full record per environment instead of the table, as `vk list --detail` prints it
+        #[arg(short = 'd', long, conflicts_with_all = ["json", "columns", "wide"])]
+        detail: bool,
     },
     /// Remove the state of environments that are finished with
     ///
@@ -858,6 +861,7 @@ async fn dev_action(
     }
     if let DevAction::List {
         columns,
+        detail,
         words,
         name,
         glob,
@@ -901,6 +905,7 @@ async fn dev_action(
             wide,
             &filter,
             columns.as_deref(),
+            detail,
         ) {
             Ok(report) => write_report(&report),
             Err(code) => code,
@@ -1569,6 +1574,7 @@ fn stop_dir(dir: &Path, timeout: u64) -> ExitCode {
 
 /// With a workspace, combine its recorded state and declared environments and services.
 /// Invalid config or compose input is a usage error (2). With `--all`, read only host state.
+#[allow(clippy::too_many_arguments)]
 fn dev_list(
     cwd: &Path,
     scope: Option<(Option<&Path>, Option<&Path>)>,
@@ -1577,6 +1583,7 @@ fn dev_list(
     wide: bool,
     filter: &crate::dev::list::Filter,
     columns: Option<&str>,
+    detail: bool,
 ) -> Result<String, ExitCode> {
     let here = match scope {
         None => None,
@@ -1612,6 +1619,9 @@ fn dev_list(
     }
     .map_err(|e| fail(&e, 1))?;
     let rows = filter.apply(rows);
+    if detail {
+        return dev_details(&rows, filter, sizes);
+    }
     let cols = crate::dev::list::columns(&rows, columns).map_err(|e| fail(&e, 2))?;
     match (json, &here) {
         (true, _) => crate::dev::list::json(&rows).map_err(|e| fail(&e, 1)),
@@ -1627,6 +1637,59 @@ fn dev_list(
             &cols,
         )),
     }
+}
+
+/// `vk dev list --detail`: the records `vk list --detail` prints, for the environments listed
+/// — by state dir, so a name is never in doubt — and for the services listed without their
+/// environment's line (`ENV/SERVICE`); an environment declared and never brought up has no
+/// VM to describe, and gets the few facts its declaration gives.
+fn dev_details(
+    rows: &[crate::dev::list::Row],
+    filter: &crate::dev::list::Filter,
+    sizes: bool,
+) -> Result<String, ExitCode> {
+    use crate::dev::list::Status;
+    let mut words: Vec<std::ffi::OsString> = Vec::new();
+    let mut not_built: Vec<String> = Vec::new();
+    for r in rows {
+        if !filter.shows_line(r) {
+            words.extend(
+                r.services
+                    .iter()
+                    .map(|s| format!("{}/{}", r.name, s.name).into()),
+            );
+        } else if r.status == Status::NotBuilt {
+            let lines = [
+                ("NAME", r.name.clone()),
+                ("KIND", "dev".to_string()),
+                ("STATUS", "not built".to_string()),
+                ("ENV", r.environment.clone().unwrap_or_else(|| "-".into())),
+                (
+                    "WORKSPACE",
+                    r.workspace
+                        .as_ref()
+                        .map_or_else(|| "-".into(), |w| w.display().to_string()),
+                ),
+                ("STATE_DIR", r.dir.display().to_string()),
+            ];
+            not_built.push(lines.iter().map(|(k, v)| format!("{k:<14}{v}\n")).collect());
+        } else {
+            words.push(r.dir.clone().into_os_string());
+        }
+    }
+    let mut records = Vec::new();
+    if !words.is_empty() {
+        let found = crate::vms::list_report(crate::vms::ListOpts {
+            words,
+            detail: true,
+            sizes,
+            ..Default::default()
+        })
+        .map_err(|e| fail(&e, 1))?;
+        records.push(found);
+    }
+    records.extend(not_built);
+    Ok(records.join("\n"))
 }
 
 /// Resolve the canonical workspace, state directories and secondary compose services.
@@ -2330,6 +2393,7 @@ mod tests {
                 false,
                 &crate::dev::list::Filter::default(),
                 None,
+                false,
             ));
             assert_eq!(here.len(), 3, "{here:#?}");
             let dev = by_dir(&here, &state("dev")).unwrap();
@@ -2358,6 +2422,7 @@ mod tests {
                 false,
                 &crate::dev::list::Filter::default(),
                 None,
+                false,
             )
             .unwrap();
             assert!(
@@ -2401,7 +2466,8 @@ mod tests {
                         false,
                         false,
                         &crate::dev::list::Filter::default(),
-                        None
+                        None,
+                        false
                     )
                     .unwrap_err(),
                     exit_code(2),
@@ -2432,6 +2498,7 @@ mod tests {
                 false,
                 &crate::dev::list::Filter::default(),
                 None,
+                false,
             ));
             let dev = by_dir(&listed, &state("dev")).unwrap();
             assert_eq!(dev["services"][0]["name"], "db", "{dev}");
@@ -2447,7 +2514,8 @@ mod tests {
                     false,
                     false,
                     &crate::dev::list::Filter::default(),
-                    None
+                    None,
+                    false
                 )
                 .unwrap_err(),
                 exit_code(NO_WORKSPACE_EXIT)
@@ -2460,6 +2528,7 @@ mod tests {
                 false,
                 &crate::dev::list::Filter::default(),
                 None,
+                false,
             ));
             assert_eq!(all.len(), 4, "{all:#?}");
             assert!(by_dir(&all, &base.join("other")).is_some());
