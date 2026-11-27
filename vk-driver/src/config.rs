@@ -294,6 +294,11 @@ pub struct Gc {
     /// a share of its filesystem (`"10%"`), a size (`"50G"`), or `"none"`. Default: 10% of its
     /// filesystem, at most 50G. Entries used within the last day stay regardless.
     pub build_cache_max: Option<Limit>,
+    /// Separate limit for the flat store used by `[dev.cache] shared = ["sccache"]`.
+    /// Above it, eviction removes objects by oldest recorded use. Accepts a filesystem
+    /// share (`"10%"`), a size (`"20G"`), or `"none"`. Defaults to 10% of the store's
+    /// filesystem, up to 50G.
+    pub sccache_max: Option<Limit>,
     /// Remove the boot images of a `vk dev` environment stopped this many days, as
     /// `vk dev prune --images` does; its next `up` rebuilds them. One whose config has a
     /// `hooks.create` is left unless `dev_images_with_create_hook`. `0` removes none. Default 14.
@@ -373,12 +378,23 @@ impl Gc {
 
     /// The most the build cache may take on a filesystem of `fs_total` bytes; `None`: uncapped.
     pub fn build_cache_max(&self, fs_total: u64) -> Option<u64> {
-        match self.build_cache_max {
-            Some(limit) => limit.of(fs_total),
-            None => Limit::Percent(10)
-                .of(fs_total)
-                .map(|cap| cap.min(BUILD_CACHE_MAX_DEFAULT_CEILING)),
-        }
+        cache_max(self.build_cache_max, fs_total)
+    }
+
+    /// The sccache cap in bytes for a filesystem of `fs_total` bytes, or `None` if uncapped.
+    pub fn sccache_max(&self, fs_total: u64) -> Option<u64> {
+        cache_max(self.sccache_max, fs_total)
+    }
+}
+
+/// An unset limit defaults to 10% of `fs_total`, up to [`BUILD_CACHE_MAX_DEFAULT_CEILING`].
+/// An explicit limit overrides that default. A `None` result means uncapped.
+fn cache_max(limit: Option<Limit>, fs_total: u64) -> Option<u64> {
+    match limit {
+        Some(limit) => limit.of(fs_total),
+        None => Limit::Percent(10)
+            .of(fs_total)
+            .map(|cap| cap.min(BUILD_CACHE_MAX_DEFAULT_CEILING)),
     }
 }
 
@@ -2420,6 +2436,8 @@ mod tests {
         );
         assert_eq!(cfg.gc.build_cache_max(100 * gib), Some(10 * gib));
         assert_eq!(cfg.gc.build_cache_max(2000 * gib), Some(50 * gib));
+        assert_eq!(cfg.gc.sccache_max(100 * gib), Some(10 * gib));
+        assert_eq!(cfg.gc.sccache_max(2000 * gib), Some(50 * gib));
         assert!(cfg.gc.auto());
         assert_eq!(
             cfg.gc.interval(),
@@ -2440,13 +2458,15 @@ mod tests {
             ("\"none\"", 100 * gib, None),
         ] {
             let cfg: Config = toml::from_str(&format!(
-                "[gc]\nbuild_cache_max = {text}\nbuild_cache_retention_days = 0\n\
+                "[gc]\nbuild_cache_max = {text}\nsccache_max = {text}\n\
+                 build_cache_retention_days = 0\n\
                  dev_image_idle_days = 0\nrun_image_idle_days = 0\n\
                  dev_images_with_create_hook = true\nauto = false\ninterval_hours = 0\n\
                  min_free = {text}\n"
             ))
             .unwrap();
             assert_eq!(cfg.gc.build_cache_max(fs), want, "{text}");
+            assert_eq!(cfg.gc.sccache_max(fs), want, "{text}");
             assert_eq!(cfg.gc.build_cache_retention(), None);
             assert_eq!(cfg.gc.dev_image_idle(), None);
             assert_eq!(cfg.gc.run_image_idle(), None);

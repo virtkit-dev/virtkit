@@ -2,7 +2,7 @@
 # Run sccache in a `vk dev` environment against a shared cache, with the settings
 # docs/dev.md gives and no AWS keys. A lib crate builds once (a miss), then again with
 # sccache's local state and cargo's target emptied (a hit from the shared cache). The
-# startup probe and the cached object must be plain files of the cache in its store.
+# startup probe and cached object must exist as flat files without corresponding tags.
 #
 # Run: SCCACHE=/path/to/sccache VK=./dist/vk tests/dev-sccache-e2e.sh
 # SCCACHE must be a static x86_64 Linux build: it runs in the guest (the musl release
@@ -105,9 +105,11 @@ second=$(build) || { cat "$WORK/build.log"; fail "the second build"; }
 [ "$(count cache_misses <<<"$second")" = 0 ] || fail "a miss on the second build: $second"
 echo "ok: a miss, then a hit from the shared cache after emptying local state"
 
-tags=$STORE/repos/files/dev/sccache/tags
-[ -f "$tags/.sccache_check" ] || fail "no startup probe in the shared cache: $(find "$STORE/repos/files" 2>&1 | head)"
-objects=$(find "$STORE/repos/files/dev/sccache" -path '*/tags/*' ! -name .sccache_check | wc -l)
-[ "$objects" -ge 1 ] || fail "no cached object under the shared cache"
-echo "ok: the probe and $objects object(s) are the shared cache's plain files"
+flat=$STORE/flat/dev+sccache/objects
+probe=$(printf %s dev/sccache/.sccache_check | sha256sum | cut -c1-64)
+[ -f "$flat/${probe:0:2}/$probe" ] || fail "no startup probe in the flat store: $(find "$STORE/flat" 2>&1 | head)"
+objects=$(find "$flat" -type f ! -name "$probe" | wc -l)
+[ "$objects" -ge 1 ] || fail "no cached object in the flat store"
+[ ! -e "$STORE/repos/files/dev/sccache" ] || fail "unexpected tag repository at repos/files/dev/sccache"
+echo "ok: the probe and $objects object(s) are files of the shared cache's flat store"
 echo PASS

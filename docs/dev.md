@@ -336,6 +336,21 @@ then the least recently used until it fits its cap, when they are old enough to 
 (`[gc] build_cache_retention_days` and `build_cache_max`). `vk registry status
 --root` and `vk registry gc --root` inspect and reclaim it by hand.
 
+The `sccache` shared cache keeps one file per object under `flat/dev+sccache/` in
+the shared cache store. A miss skips the tag lookup. `[gc] sccache_max` defaults
+to 10% of the cache filesystem, up to 50G, separate from the build cache limit
+for other shared caches.
+
+A `vk` serving `sccache` checks the limit in the background. `vk gc` can evict
+when the area's eviction lock is free. The process holding the lock applies its
+own limit. Above it, eviction targets 90% of the limit, oldest recorded use
+first. A hit can refresh an object's timestamp once it is at least an hour old.
+
+A lookup for an object cached only as a tag returns a miss. The old tags remain
+subject to ordinary tag collection. `vk registry status --root` and
+`vk registry gc --root` cover the registry's tags and blobs. Use `vk gc` to
+reclaim space in the flat store.
+
 A guest reaches the shared caches its environment names and nothing else: no other
 repository's name, lock name or S3 object path, and nothing of the build cache or of any
 registry credential on the host — the proxy authenticates for it. Everything inside

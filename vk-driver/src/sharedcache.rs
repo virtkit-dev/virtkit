@@ -12,7 +12,8 @@
 //! this user alone can reach ([`open_store`]). The runs using a store share its build-once
 //! locks ([`vk_registry::lock::LockManager::host_shared`]), so a task two environments want
 //! can be built by one of them and restored by the other. sccache reads and writes an area's
-//! plain files over the store's S3 view (`/s3/job/<alias>/…`).
+//! plain files over the store's S3 view (`/s3/job/<alias>/…`). The `sccache` area uses a
+//! flat store ([`flat_bindings`]) with its own `[gc] sccache_max` limit.
 
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd};
@@ -29,6 +30,31 @@ use crate::regproxy::{GUEST_HOST, ProxyCfg};
 
 /// The repository prefix every area of the store lies under, `<AREA_ROOT>/<alias>`.
 const AREA_ROOT: &str = "dev";
+
+/// The only shared cache with a flat store.
+const FLAT_ALIAS: &str = "sccache";
+
+/// This process's `[gc] sccache_max`, set by [`set_sccache_max`].
+static SCCACHE_MAX: std::sync::OnceLock<Option<crate::config::Limit>> = std::sync::OnceLock::new();
+
+/// Record `[gc] sccache_max` for stores this process serves. An unset limit uses the default.
+pub fn set_sccache_max(limit: Option<crate::config::Limit>) {
+    let _ = SCCACHE_MAX.set(limit);
+}
+
+/// Return the [`FLAT_ALIAS`] binding with `[gc] sccache_max` evaluated on `root`'s filesystem.
+pub fn flat_bindings(
+    root: &Path,
+    gc: &crate::config::Gc,
+) -> Result<Vec<vk_registry::flat::FlatBinding>> {
+    let space = crate::usage::fs_space(root)
+        .with_context(|| format!("sizing the filesystem of {}", root.display()))?;
+    let cap = gc.sccache_max(space.total).unwrap_or(u64::MAX).max(1);
+    Ok(vec![vk_registry::flat::FlatBinding::new(
+        &area(FLAT_ALIAS).prefix,
+        cap,
+    )])
+}
 
 /// The file that marks a directory as a shared cache store `vk` made: what tells it from a
 /// store of anything else before it is served or collected.
@@ -188,7 +214,7 @@ pub async fn serve(root: &Path, aliases: &[String]) -> Result<ProxyCfg> {
         },
         &areas,
     )?;
-    let state = Arc::new(state(root, token)?);
+    let state = Arc::new(state(root, token, aliases)?);
     tokio::spawn(async move {
         if let Err(e) = vk_registry::serve_unannounced_on(listener, state).await {
             eprintln!("virtkit: the shared cache stopped serving: {e:#}");
@@ -198,14 +224,21 @@ pub async fn serve(root: &Path, aliases: &[String]) -> Result<ProxyCfg> {
 }
 
 /// The server's state over the store at `root`, made if absent ([`open_store`]): the S3 view
-/// on, the store's locks shared with every process serving it, and the enabled API to
-/// whoever presents `token` — the guests' proxy forwards far less
-/// ([`crate::regproxy::Scope::Areas`]).
-fn state(root: &Path, token: String) -> Result<vk_registry::ServerState> {
+/// enabled and the flat store bound when `aliases` includes `sccache`. Serving processes
+/// share the store's locks. The bearer `token` grants access to the enabled API. The guest
+/// proxy limits that access to [`crate::regproxy::Scope::Areas`].
+fn state(root: &Path, token: String, aliases: &[String]) -> Result<vk_registry::ServerState> {
     let root = open_store(root, Missing::Create)?.context("the shared cache store was not made")?;
     let mut cfg =
         vk_registry::ServerConfig::local((std::net::Ipv4Addr::LOCALHOST, 0).into(), root.clone());
     cfg.s3 = true;
+    let gc = crate::config::Gc {
+        sccache_max: SCCACHE_MAX.get().copied().flatten(),
+        ..Default::default()
+    };
+    if aliases.iter().any(|a| a == FLAT_ALIAS) {
+        cfg.flat = flat_bindings(&root, &gc)?;
+    }
     let mut state = cfg
         .into_state()
         .with_context(|| format!("opening the shared cache store {}", root.display()))?;
@@ -736,8 +769,8 @@ pub(crate) mod tests {
     }
 
     /// sccache's S3 requests reach an area's plain files by the alias a CI job uses: its
-    /// startup probe and a sharded key are written, read and stated as tags under the area's
-    /// prefix, and a missing key is `NoSuchKey`. Unconfigured areas, listings, multipart
+    /// startup probe and a sharded key are written, read and stated as files of the area's
+    /// flat store, another area's objects stay tags, and a missing key is `NoSuchKey`. Unconfigured areas, listings, multipart
     /// uploads, deletes and direct `/files/` access are refused.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sccache_reaches_an_areas_objects_over_s3() {
@@ -767,13 +800,22 @@ pub(crate) mod tests {
         let (status, miss) = ask(&proxy, request("GET", "/s3/job/sccache/a/b/c/ff", "", "")).await;
         assert_eq!(status, 404, "{miss}");
         assert!(miss.contains("NoSuchKey"), "{miss}");
-        for (repo, tag) in [
-            ("dev/sccache", ".sccache_check"),
-            ("dev/sccache/a/b/c", "0123abcd"),
-        ] {
-            let file = root.join("repos/files").join(repo).join("tags").join(tag);
+        // The sccache area's objects are files of its flat store, not tags.
+        let objects = root.join("flat/dev+sccache/objects");
+        for key in ["dev/sccache/.sccache_check", "dev/sccache/a/b/c/0123abcd"] {
+            use sha2::Digest as _;
+            let hash: String = sha2::Sha256::digest(key.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let file = objects.join(&hash[..2]).join(&hash);
             assert!(file.is_file(), "{}", file.display());
         }
+        assert!(!root.join("repos/files/dev/sccache").exists());
+        // Another area's objects stay tags.
+        let (status, put) = ask(&proxy, request("PUT", "/s3/job/task-cache/x/y", amz, "t")).await;
+        assert_eq!(status, 200, "{put}");
+        assert!(root.join("repos/files/dev/task-cache/x/tags/y").is_file());
 
         for (method, target) in [
             ("GET", "/s3/job/other/x"),

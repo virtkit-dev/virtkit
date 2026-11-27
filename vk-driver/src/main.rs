@@ -4073,6 +4073,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
     vk_registry::cachehome::keep_in_place(run::configured_caches(&cfg));
     // Apply the host's `[build]` tuning process-wide, before any build or boot path runs.
     build::set_tuning(&cfg.build);
+    sharedcache::set_sccache_max(cfg.gc.sccache_max);
     vmm::warn_if_cloud_hypervisor_requested(cfg.vmm);
     numa::set_policy(cfg.numa.mode);
     // The commands that fill the caches start a background `vk gc` when one is due. `vk run`

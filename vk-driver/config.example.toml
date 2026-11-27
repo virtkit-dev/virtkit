@@ -143,6 +143,9 @@
 #                          # "none". Default: 10% of its filesystem, at most 50G; a share
 #                          # set here has no ceiling. Entries used within the last day
 #                          # stay regardless.
+# sccache_max = "50G"      # evict sccache flat files above this limit, oldest recorded use
+#                          # first. Accepts a size, a filesystem share ("10%"), or "none".
+#                          # Defaults to 10% of the filesystem, up to 50G
 # dev_image_idle_days = 14 # remove the boot images of a `vk dev` environment stopped this
 #                          # many days, as `vk dev prune --images` does; its next `up`
 #                          # rebuilds them. One with a hooks.create is left. 0 = never

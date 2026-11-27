@@ -18,6 +18,9 @@ All notable changes to virtkit will be documented in this file.
   prefix. Their usual retention rules still apply.
 - See each flat store's object count, size and cap in `vk-registry status --config` and on
   the hub. Both `vk-registry gc --config` and hub-run gc evict objects from stores over cap.
+- The `sccache` shared cache used by `vk dev`, `vk run --shared-cache` and `dev.sh`
+  dependency builds has its own size limit. `[gc] sccache_max` defaults to 10% of the
+  cache filesystem, up to 50G. Entries cached as tags before the upgrade produce misses.
 
 ### Changed
 
