@@ -518,7 +518,7 @@ async fn serve(
     if let Some(resp) = objects::drain(req, path).await? {
         return Ok(resp);
     }
-    if let Some(area) = state.store.flat().find(&segs) {
+    if let Some(area) = state.store.flat().as_ref().find(&segs) {
         return if method == Method::DELETE {
             crate::flat::delete(area, authz, segs, trailing_slash, &href).await
         } else {

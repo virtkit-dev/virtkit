@@ -133,7 +133,8 @@ pub(crate) async fn route(
     if !objects::admits(authz, action, &segs, put) {
         return objects::drain_then(req, crate::accounts::forbidden(), &href).await;
     }
-    let area = state.store.flat().find(&segs);
+    let areas = state.store.flat();
+    let area = areas.find(&segs);
     if put {
         let expected = req.extensions().get::<PayloadSha256>().map(|p| p.0.clone());
         return match area {

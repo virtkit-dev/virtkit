@@ -127,6 +127,24 @@ impl Options {
     }
 }
 
+/// The [`Options`] an open store can change ([`FlatStore::set_policy`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Policy {
+    pub cap: Option<u64>,
+    pub evict_to: f64,
+    pub durable: bool,
+}
+
+impl Policy {
+    fn of(opts: &Options) -> Policy {
+        Policy {
+            cap: opts.cap,
+            evict_to: opts.evict_to,
+            durable: opts.durable,
+        }
+    }
+}
+
 /// An area's size, as the index knows it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
@@ -177,7 +195,9 @@ struct Inner {
     objects: OwnedFd,
     run: Run,
     index: Index,
+    /// Options at open. Read mutable settings from `policy` (see [`FlatStore::set_policy`]).
     opts: Options,
+    policy: Mutex<Policy>,
     /// `evict.lock`, held while this instance is the evictor.
     evictor: Mutex<Option<vk_fs::LockFile>>,
     is_evictor: AtomicBool,
@@ -605,7 +625,7 @@ impl Upload {
         let file = self.file.take().context("an upload's file is gone")?;
         set_mtime(&file, inner.opts.clock.as_ref().map(|c| c())).context("stamping an upload")?;
         // Report data-sync errors before publishing the staging file.
-        if inner.opts.durable {
+        if inner.policy().durable {
             file.sync_data().context("syncing an upload")?;
         }
         let meta = Stat::of(&fstat(&file).context("an upload's size")?).meta;
@@ -640,6 +660,10 @@ impl Drop for Upload {
 }
 
 impl Inner {
+    fn policy(&self) -> Policy {
+        *self.policy.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn usage(&self) -> Usage {
         let mut u = Usage::default();
         self.index.each_loaded(|_, s| {
@@ -696,7 +720,7 @@ impl Inner {
     /// Serialize election and eviction under `evicting`. With `only_over`, check usage
     /// before starting a pass. On a pass error, release the role so another instance
     /// can try.
-    fn evict(&self, cap: u64, only_over: bool) -> Result<Option<EvictReport>> {
+    fn evict(&self, cap: u64, evict_to: f64, only_over: bool) -> Result<Option<EvictReport>> {
         let _pass = self.evicting.lock().unwrap_or_else(PoisonError::into_inner);
         if !self.elect()? {
             return Ok(None);
@@ -708,7 +732,7 @@ impl Inner {
                     return Ok(None);
                 }
             }
-            self.pass(cap).map(Some)
+            self.pass(cap, evict_to).map(Some)
         })();
         if done.is_err() {
             self.resign();
@@ -716,7 +740,7 @@ impl Inner {
         done
     }
 
-    fn pass(&self, cap: u64) -> Result<EvictReport> {
+    fn pass(&self, cap: u64, evict_to: f64) -> Result<EvictReport> {
         let start = Instant::now();
         self.index.drain()?;
         // Recount before selecting candidates. Running totals can retain a replaced
@@ -733,7 +757,7 @@ impl Inner {
             live.extend(s.stats.iter().map(|(k, st)| (*st, *k)));
         });
         if report.before > cap {
-            let target = (cap as f64 * self.opts.evict_to) as u64;
+            let target = (cap as f64 * evict_to) as u64;
             live.sort_unstable_by_key(|(st, _)| st.meta.mtime);
             report.select = start.elapsed();
             for (st, hash) in live {
@@ -831,6 +855,7 @@ impl FlatStore {
             objects,
             run,
             index,
+            policy: Mutex::new(Policy::of(&opts)),
             opts,
             evictor: Mutex::new(None),
             is_evictor: AtomicBool::new(false),
@@ -983,10 +1008,35 @@ impl FlatStore {
     /// Run an eviction pass now if this instance is, or can become, the evictor: `None` if
     /// another holds `evict.lock`, or this instance has no cap.
     pub fn evict(&self) -> Result<Option<EvictReport>> {
-        match self.inner.opts.cap {
-            Some(cap) => self.inner.evict(cap, false),
+        // Use the same cap and target throughout the pass.
+        let p = self.inner.policy();
+        match p.cap {
+            Some(cap) => self.inner.evict(cap, p.evict_to, false),
             None => Ok(None),
         }
+    }
+
+    /// The current cap, eviction target and durability.
+    pub fn policy(&self) -> Policy {
+        self.inner.policy()
+    }
+
+    /// Change the cap, eviction target and durability. The background thread reads the cap
+    /// at its next check and releases `evict.lock` if still uncapped. Checks are scheduled
+    /// every [`Options::evict_interval`] (one second by default). After an eviction error,
+    /// the delay is the longer of that interval and [`EVICT_BACKOFF`].
+    pub fn set_policy(&self, policy: Policy) -> Result<()> {
+        Options {
+            evict_to: policy.evict_to,
+            ..self.inner.opts.clone()
+        }
+        .validate()?;
+        *self
+            .inner
+            .policy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = policy;
+        Ok(())
     }
 
     /// Apply the queued inotify events now rather than when the background thread wakes.
@@ -1069,13 +1119,28 @@ fn background(inner: &Inner, stop: i32) {
         let now = Instant::now();
         if now >= next_check {
             next_check = now + tick;
-            if let Some(cap) = inner.opts.cap {
+            let p = inner.policy();
+            match p.cap {
                 // Only the elected instance loads all shards for background eviction.
-                if let Err(e) = inner.evict(cap, true) {
-                    eprintln!("flatstore {}: evicting: {e:#}", inner.root.display());
-                    // Leave the role to others a while before trying again.
-                    next_check = now + tick.max(EVICT_BACKOFF);
+                Some(cap) => {
+                    if let Err(e) = inner.evict(cap, p.evict_to, true) {
+                        eprintln!("flatstore {}: evicting: {e:#}", inner.root.display());
+                        // Leave the role to others a while before trying again.
+                        next_check = now + tick.max(EVICT_BACKOFF);
+                    }
                 }
+                None if inner.is_evictor.load(Ordering::Relaxed) => {
+                    // Let any active pass finish before releasing the role.
+                    // The cap may change while waiting.
+                    let _pass = inner
+                        .evicting
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    if inner.policy().cap.is_none() {
+                        inner.resign();
+                    }
+                }
+                None => {}
             }
         }
         if now >= next_reap {

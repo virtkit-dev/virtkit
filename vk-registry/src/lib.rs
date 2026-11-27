@@ -423,7 +423,7 @@ pub struct Store {
     /// repository listings and lookups ([`Store::repo_dir_reads`]).
     repo_dir_reads: AtomicU64,
     /// The prefixes bound to flat stores ([`Store::bind_flat`]).
-    flat: std::sync::OnceLock<flat::Areas>,
+    flat: std::sync::RwLock<Arc<flat::Areas>>,
 }
 
 /// File puts a server streams into one store at once: each holds a file's worth of its
@@ -564,7 +564,7 @@ impl Store {
             lock_waiters: Arc::new(tokio::sync::Semaphore::new(LOCK_WAITERS)),
             unclaimed_puts: std::sync::Mutex::new(0),
             repo_dir_reads: AtomicU64::new(0),
-            flat: std::sync::OnceLock::new(),
+            flat: std::sync::RwLock::new(Arc::new(flat::Areas::none())),
         }
     }
 
@@ -911,19 +911,21 @@ impl Store {
             .unwrap_or_else(|e| e.into_inner()) = windows;
     }
 
-    /// Bind `bindings`' prefixes to flat stores under this store's root, once, for `usage`
-    /// ([`flat::Use`]).
+    /// Replace the flat-store bindings under this store's root for the given [`flat::Use`].
+    /// An open failure preserves the old bindings and the policies of already open stores.
+    /// Requests holding the old bindings can finish there. Unbound stores stay on disk.
     pub fn bind_flat(&self, bindings: Vec<flat::FlatBinding>, usage: flat::Use) -> Result<()> {
-        let areas = flat::Areas::new(&self.root, bindings, usage)?;
-        self.flat
-            .set(areas)
-            .map_err(|_| anyhow::anyhow!("{}: flat stores already bound", self.root.display()))
+        // Serialize serving policy changes with publication across all stores in this process.
+        static BINDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _binding = BINDING.lock().unwrap_or_else(|e| e.into_inner());
+        let areas = Arc::new(flat::Areas::new(&self.root, bindings, usage)?);
+        *self.flat.write().unwrap_or_else(|e| e.into_inner()) = areas;
+        Ok(())
     }
 
-    /// The prefixes bound to flat stores: none until [`Store::bind_flat`].
-    pub fn flat(&self) -> &flat::Areas {
-        static NONE: flat::Areas = flat::Areas::none();
-        self.flat.get().unwrap_or(&NONE)
+    /// A snapshot of the bound prefixes, empty until [`Store::bind_flat`].
+    pub fn flat(&self) -> Arc<flat::Areas> {
+        Arc::clone(&self.flat.read().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// The retention windows under prefixes now.
@@ -7963,7 +7965,10 @@ mod tests {
         };
         assert_eq!(row("files/cc"), "3 1.8 KiB 1000 B");
         assert_eq!(row("files/unused"), "0 0 B 1000 B");
-        assert!(!dir.join("flat/unused").exists(), "status created the missing flat store");
+        assert!(
+            !dir.join("flat/unused").exists(),
+            "status created the missing flat store"
+        );
 
         let gc = |dry_run: bool| {
             let mut g = Vec::new();
@@ -7987,7 +7992,10 @@ mod tests {
         let g = gc(false);
         assert!(g.contains("flat cc: evicted 2 object(s)"), "{g}");
         assert!(g.contains("flat unused: not created yet"), "{g}");
-        assert!(!dir.join("flat/unused").exists(), "gc created the missing flat store");
+        assert!(
+            !dir.join("flat/unused").exists(),
+            "gc created the missing flat store"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

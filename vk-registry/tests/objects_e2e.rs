@@ -1248,3 +1248,52 @@ async fn a_flat_object_is_gated_by_its_parent_repository() {
     assert_eq!(get(&read_key).await.unwrap().status(), 404);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Changing the cap preserves existing objects until eviction. Removing the binding restores
+/// tag routing and leaves the flat store on disk.
+#[tokio::test]
+async fn flat_stores_rebind_at_runtime() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("flat-rebind");
+    let root = dir.join("store");
+    let state = flat_state(&dir, 1 << 30);
+    let url = spawn(state.clone());
+    let c = client();
+    assert_eq!(put(&c, &url, "sccache/k", None, "flat").await, 200);
+    let bind = |cap| {
+        state
+            .store
+            .bind_flat(
+                vec![vk_registry::flat::FlatBinding::new("sccache", cap)],
+                vk_registry::flat::Use::Serve,
+            )
+            .unwrap()
+    };
+    bind(1 << 20);
+    assert_eq!(state.store.flat().usage()[0].cap, 1 << 20);
+    let resp = c.get(format!("{url}/s3/sccache/k")).send().await.unwrap();
+    assert_eq!(resp.text().await.unwrap(), "flat");
+    // The background evictor picks up the lower cap.
+    bind(1);
+    wait_until("the store fits its new cap", || {
+        !flat_object(&root, "sccache", "sccache/k").exists()
+    })
+    .await;
+    assert_eq!(put(&c, &url, "sccache/k", None, "flat").await, 200);
+    state
+        .store
+        .bind_flat(Vec::new(), vk_registry::flat::Use::Serve)
+        .unwrap();
+    assert_eq!(
+        c.get(format!("{url}/s3/sccache/k"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert_eq!(put(&c, &url, "sccache/k", None, "tag").await, 200);
+    assert!(tag_path(&root, "sccache/k").is_file());
+    assert!(root.join("flat/sccache/objects").is_dir());
+    let _ = std::fs::remove_dir_all(&dir);
+}

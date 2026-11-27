@@ -10,7 +10,9 @@
 //! use, not change. Tags left under a newly bound prefix are no longer served there and
 //! expire under gc's retention.
 //!
-//! One [`FlatStore`] serves an area per process, however many [`crate::Store`]s bind it.
+//! All [`crate::Store`]s in a process share one [`FlatStore`] per area. Serving sets its cap,
+//! eviction target and durability at bind time. Collecting sets them on first open.
+//! Inspection preserves an open store's policy.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -26,7 +28,7 @@ use hyper::header::{
 use hyper::{Request, Response, StatusCode};
 use tokio::io::AsyncWriteExt;
 
-use crate::flatstore::{EvictReport, FlatStore, Options, Usage};
+use crate::flatstore::{EvictReport, FlatStore, Options, Policy, Usage};
 use crate::objects::{self, MAX_OBJECT, Part};
 use crate::staging::{DrainError, drain_into};
 use crate::{Authz, Body, accounts, error_response};
@@ -184,7 +186,7 @@ pub enum Eviction {
 
 impl Areas {
     /// No areas.
-    pub(crate) const fn none() -> Areas {
+    pub(crate) fn none() -> Areas {
         Areas { areas: Vec::new() }
     }
 
@@ -208,8 +210,13 @@ impl Areas {
                 .collect(),
         };
         if usage == Use::Serve {
+            // Open every area, a new one uncapped, before giving any store its policy. An open
+            // failure leaves every store under its previous cap, and a new one under none.
             for area in &areas.areas {
-                area.store()?;
+                area.open(false)?;
+            }
+            for area in &areas.areas {
+                area.apply()?;
             }
         }
         Ok(areas)
@@ -230,28 +237,37 @@ impl Areas {
     pub fn usage(&self) -> Vec<AreaUsage> {
         self.areas
             .iter()
-            .map(|a| AreaUsage {
-                prefix: a.binding.prefix.clone(),
-                cap: a.binding.cap,
-                usage: a.store().and_then(|s| s.map(|s| s.usage()).transpose()),
+            .map(|a| {
+                let store = a.store();
+                AreaUsage {
+                    prefix: a.binding.prefix.clone(),
+                    cap: a.cap(&store),
+                    usage: store.and_then(|s| s.map(|s| s.usage()).transpose()),
+                }
             })
             .collect()
     }
 
     /// Run an eviction pass on each area this process can evict, which also reaps abandoned
-    /// uploads.
+    /// uploads. Skip areas bound for [`Use::Inspect`].
     pub fn evict(&self) -> Vec<Evicted> {
         self.areas
             .iter()
-            .map(|a| Evicted {
-                prefix: a.binding.prefix.clone(),
-                cap: a.binding.cap,
-                outcome: a.store().and_then(|s| {
-                    let Some(s) = s else {
-                        return Ok(Eviction::Absent);
-                    };
-                    Ok(s.evict()?.map_or(Eviction::Elsewhere, Eviction::Done))
-                }),
+            .map(|a| {
+                let store = a.store();
+                Evicted {
+                    prefix: a.binding.prefix.clone(),
+                    cap: a.cap(&store),
+                    outcome: store.and_then(|s| {
+                        let Some(s) = s else {
+                            return Ok(Eviction::Absent);
+                        };
+                        if a.usage == Use::Inspect {
+                            return Ok(Eviction::Elsewhere);
+                        }
+                        Ok(s.evict()?.map_or(Eviction::Elsewhere, Eviction::Done))
+                    }),
+                }
             })
             .collect()
     }
@@ -261,6 +277,12 @@ impl Area {
     /// The area's store: opened by [`Use::Serve`] at binding, otherwise on first use and
     /// only if it exists.
     fn store(&self) -> Result<Option<Arc<FlatStore>>> {
+        self.open(self.usage != Use::Inspect)
+    }
+
+    /// As [`Area::store`]. On this binding's first open, `set` applies its policy to an
+    /// existing instance.
+    fn open(&self, set: bool) -> Result<Option<Arc<FlatStore>>> {
         let mut held = self.store.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(s) = &*held {
             return Ok(Some(Arc::clone(s)));
@@ -272,16 +294,41 @@ impl Area {
                 Err(e) => return Err(e).with_context(|| format!("stat {}", self.root.display())),
             }
         }
+        let store = shared(&self.root, self.policy(), set)
+            .with_context(|| format!("opening the flat store of {}", self.binding.prefix))?;
+        *held = Some(Arc::clone(&store));
+        Ok(Some(store))
+    }
+
+    /// Inspection opens new instances without a cap.
+    fn policy(&self) -> Policy {
         let b = &self.binding;
-        let settings = Settings {
+        Policy {
             cap: (self.usage != Use::Inspect).then_some(b.cap),
             evict_to: b.evict_to,
             durable: b.durable,
-        };
-        let store = shared(&self.root, settings)
-            .with_context(|| format!("opening the flat store of {}", b.prefix))?;
-        *held = Some(Arc::clone(&store));
-        Ok(Some(store))
+        }
+    }
+
+    /// Apply the binding's policy to its open store.
+    fn apply(&self) -> Result<()> {
+        let held = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(s) = &*held
+            && self.usage != Use::Inspect
+            && s.policy() != self.policy()
+        {
+            s.set_policy(self.policy())?;
+        }
+        Ok(())
+    }
+
+    /// Report the open store's cap if it has one, otherwise the binding's cap.
+    /// Another binding in this process may have changed the store's cap.
+    fn cap(&self, store: &Result<Option<Arc<FlatStore>>>) -> u64 {
+        match store {
+            Ok(Some(s)) => s.policy().cap.unwrap_or(self.binding.cap),
+            _ => self.binding.cap,
+        }
     }
 
     /// The area's store for a request: [`Use::Serve`] opened it.
@@ -291,42 +338,29 @@ impl Area {
     }
 }
 
-/// What [`shared`] opens an area with: what two binders in one process must agree on.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Settings {
-    cap: Option<u64>,
-    evict_to: f64,
-    durable: bool,
-}
-
-/// The process's instance of the area at `root`, opened with `settings` if there is none.
-fn shared(root: &Path, settings: Settings) -> Result<Arc<FlatStore>> {
-    type Open = HashMap<PathBuf, (Weak<FlatStore>, Settings)>;
-    static OPEN: Mutex<Option<Open>> = Mutex::new(None);
+/// Share one instance per `root` in this process. Existing instances take `policy` only when
+/// `set`; new ones use it, but for its cap when not `set`.
+fn shared(root: &Path, policy: Policy, set: bool) -> Result<Arc<FlatStore>> {
+    static OPEN: Mutex<Option<HashMap<PathBuf, Weak<FlatStore>>>> = Mutex::new(None);
     let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
     let open = open.get_or_insert_with(HashMap::new);
-    open.retain(|_, (w, _)| w.strong_count() > 0);
-    if let Some((w, had)) = open.get(root)
-        && let Some(store) = w.upgrade()
-    {
-        if *had != settings {
-            bail!(
-                "{} is open in this process with other settings ({had:?}, not {settings:?})",
-                root.display()
-            );
+    open.retain(|_, w| w.strong_count() > 0);
+    if let Some(store) = open.get(root).and_then(Weak::upgrade) {
+        if set && store.policy() != policy {
+            store.set_policy(policy)?;
         }
         return Ok(store);
     }
     let store = Arc::new(FlatStore::open(
         root,
         Options {
-            cap: settings.cap,
-            evict_to: settings.evict_to,
-            durable: settings.durable,
+            cap: policy.cap.filter(|_| set),
+            evict_to: policy.evict_to,
+            durable: policy.durable,
             ..Options::default()
         },
     )?);
-    open.insert(root.to_path_buf(), (Arc::downgrade(&store), settings));
+    open.insert(root.to_path_buf(), Arc::downgrade(&store));
     Ok(store)
 }
 
@@ -574,7 +608,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Two bindings of one area in a process share its instance, and must agree on it.
+    /// Serving bindings share an instance and update its policy. Inspection preserves it.
     #[test]
     fn a_process_opens_an_area_once() {
         let dir = crate::testtmp::root().join("flat-once");
@@ -582,15 +616,27 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let one = Areas::new(&dir, vec![b("a")], Use::Serve).unwrap();
         let two = Areas::new(&dir.join("."), vec![b("a")], Use::Serve).unwrap();
-        let (one, two) = (&one.areas[0], &two.areas[0]);
+        let store = one.areas[0].store().unwrap().unwrap();
+        assert!(Arc::ptr_eq(&store, &two.areas[0].store().unwrap().unwrap()));
+        let three = Areas::new(&dir, vec![FlatBinding::new("a", 2)], Use::Serve).unwrap();
         assert!(Arc::ptr_eq(
-            &one.store().unwrap().unwrap(),
-            &two.store().unwrap().unwrap()
+            &store,
+            &three.areas[0].store().unwrap().unwrap()
         ));
-        let err = Areas::new(&dir, vec![FlatBinding::new("a", 2)], Use::Serve)
-            .err()
-            .unwrap();
-        assert!(format!("{err:#}").contains("other settings"), "{err:#}");
+        assert_eq!(store.policy().cap, Some(2));
+        let four = Areas::new(&dir, vec![FlatBinding::new("a", 3)], Use::Inspect).unwrap();
+        assert!(Arc::ptr_eq(
+            &store,
+            &four.areas[0].store().unwrap().unwrap()
+        ));
+        assert_eq!(store.policy().cap, Some(2));
+        assert!(matches!(four.evict()[0].outcome, Ok(Eviction::Elsewhere)));
+        assert_eq!(four.usage()[0].cap, 2, "the cap in force");
+        // A failed open preserves the existing store's cap.
+        std::fs::write(dir.join("flat/b"), b"not a store").unwrap();
+        let bad = vec![FlatBinding::new("a", 1), FlatBinding::new("b", 1)];
+        assert!(Areas::new(&dir, bad, Use::Serve).is_err());
+        assert_eq!(store.policy().cap, Some(2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
