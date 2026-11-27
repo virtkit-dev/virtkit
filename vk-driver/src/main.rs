@@ -2663,17 +2663,32 @@ enum Cmd {
         /// state directory, matched exactly unless `--recursive`.
         #[arg(value_name = "REF")]
         target: Option<std::ffi::OsString>,
-        /// with a directory (default: the current one), also every VM whose project is below it
+        /// with a directory (default: the current one) or --workspace, also every VM below it
         #[arg(short = 'r', long)]
         recursive: bool,
-        /// only the VMs reported running, starting or stopping
+        /// only the VMs in one of these states (comma-separated)
         ///
-        /// A service counts by its own state; one whose state could not be read is left out.
+        /// A service counts by its own state. `never-booted` is a dev environment's state
+        /// that recorded no boot; `starting` and `stopping` are VMs on their way.
+        #[arg(
+            long,
+            value_name = "STATE",
+            value_delimiter = ',',
+            conflicts_with_all = ["running", "stopped"]
+        )]
+        state: Vec<crate::vmlist::State>,
+        /// only the VMs that are running: `--state=running`
         #[arg(long, conflicts_with = "stopped")]
         running: bool,
-        /// only stopped VMs and dev environments that never booted
+        /// only the VMs at rest: `--state=stopped,never-booted`
         #[arg(long)]
         stopped: bool,
+        /// only these compose services' rows (comma-separated, any of them)
+        #[arg(long, value_name = "SERVICE", value_delimiter = ',')]
+        service: Vec<String>,
+        /// only the VMs of this workspace: a dev environment's, or a run's project directory
+        #[arg(long, value_name = "DIR")]
+        workspace: Option<PathBuf>,
         /// only VMs of this kind
         #[arg(long, value_name = "KIND")]
         kind: Option<crate::vmlist::Kind>,
@@ -4122,8 +4137,11 @@ async fn cli_main(cli: Cli) -> ExitCode {
     if let Cmd::List {
         target,
         recursive,
+        state,
         running,
         stopped,
+        service,
+        workspace,
         kind,
         problems,
         wide,
@@ -4142,11 +4160,17 @@ async fn cli_main(cli: Cli) -> ExitCode {
             wide: *wide,
             detail: *detail,
             filter: crate::vmlist::Filter {
-                running: *running,
-                stopped: *stopped,
+                states: match (*running, *stopped) {
+                    (true, _) => crate::vmlist::State::RUNNING.to_vec(),
+                    (_, true) => crate::vmlist::State::STOPPED.to_vec(),
+                    _ => state.clone(),
+                },
                 kind: *kind,
                 service: None,
                 problems: *problems,
+                services: service.clone(),
+                workspace: workspace.as_deref().map(vms::canonical),
+                below: *recursive,
             },
         };
         return match vms::list_report(opts) {

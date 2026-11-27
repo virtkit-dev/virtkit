@@ -445,9 +445,41 @@ enum DevAction {
     /// usage. Flags identify missing workspaces and state directories without a recorded boot.
     #[command(visible_alias = "ls")]
     List {
+        /// only these compose services' lines, as `--service`
+        #[arg(value_name = "SERVICE", conflicts_with = "all")]
+        services: Vec<String>,
         /// list dev state directories across all workspaces
         #[arg(long, short = 'a')]
         all: bool,
+        /// only what is in one of these states (comma-separated)
+        ///
+        /// An environment counts by its own state, a service by its own. `never-booted`
+        /// is state that recorded no boot; `not-built`, one declared and never brought up.
+        #[arg(
+            long,
+            value_name = "STATE",
+            value_delimiter = ',',
+            conflicts_with_all = ["running", "stopped"]
+        )]
+        state: Vec<super::list::Status>,
+        /// only what is running: `--state=running`
+        #[arg(long, conflicts_with = "stopped")]
+        running: bool,
+        /// only what is at rest: `--state=stopped,never-booted`
+        #[arg(long)]
+        stopped: bool,
+        /// only these compose services' lines (comma-separated, any of them)
+        ///
+        /// The services are those the workspace's config declares, so this needs a
+        /// workspace. `--json` keeps each environment one of them belongs to, with only
+        /// those services.
+        #[arg(
+            long = "service",
+            value_name = "SERVICE",
+            value_delimiter = ',',
+            conflicts_with = "all"
+        )]
+        service: Vec<String>,
         /// print JSON, including whether vk delete recognizes each state directory as its own
         #[arg(long)]
         json: bool,
@@ -801,17 +833,30 @@ async fn dev_action(
         };
     }
     if let DevAction::List {
+        services,
         all,
+        state,
+        running,
+        stopped,
+        service,
         json,
         no_sizes,
         wide,
     } = action
     {
+        let filter = crate::dev::list::Filter {
+            states: match (running, stopped) {
+                (true, _) => crate::dev::list::Status::RUNNING.to_vec(),
+                (_, true) => crate::dev::list::Status::STOPPED.to_vec(),
+                _ => state,
+            },
+            services: services.into_iter().chain(service).collect(),
+        };
         let scope = match all {
             true => None,
             false => Some((workspace, config)),
         };
-        return match dev_list(&cwd, scope, json, !no_sizes, wide) {
+        return match dev_list(&cwd, scope, json, !no_sizes, wide, &filter) {
             Ok(report) => write_report(&report),
             Err(code) => code,
         };
@@ -1485,6 +1530,7 @@ fn dev_list(
     json: bool,
     sizes: bool,
     wide: bool,
+    filter: &crate::dev::list::Filter,
 ) -> Result<String, ExitCode> {
     let here = match scope {
         None => None,
@@ -1519,13 +1565,21 @@ fn dev_list(
         }),
     }
     .map_err(|e| fail(&e, 1))?;
+    let rows = filter.apply(rows);
     match (json, &here) {
         (true, _) => crate::dev::list::json(&rows).map_err(|e| fail(&e, 1)),
+        (false, _) if rows.is_empty() && (!filter.states.is_empty() || filter.services_only()) => {
+            Ok(String::new())
+        }
         (false, Some((here, _))) if rows.is_empty() => Ok(format!(
             "no dev environment for {} (`vk dev list --all` lists host-wide state)\n",
             here.display()
         )),
-        (false, _) => Ok(crate::dev::list::render(&rows, wide)),
+        (false, _) => Ok(crate::dev::list::render(
+            &rows,
+            wide,
+            filter.services_only(),
+        )),
     }
 }
 

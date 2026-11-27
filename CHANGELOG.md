@@ -7,6 +7,11 @@ All notable changes to virtkit will be documented in this file.
 ### Added
 
 - **`vk dev ls`** lists dev environments, as `vk dev list` does.
+- **`vk list` and `vk dev list` filter alike.** Both take `--state` (any of `running`,
+  `stopped`, `never-booted`; `starting` and `stopping` for `vk list`, `not-built` for
+  `vk dev list`), with `--running` and `--stopped` as its shorthands, and `--service a,b`
+  to list only those compose services; `vk dev list a b` does the same. `vk list
+  --workspace DIR` lists one project's VMs, those below it too with `-r`.
 - **`vk dev delete` (aliases `rm`, `remove`).** It is `vk delete` scoped to this
   workspace: bare, it deletes this environment; with names, environments or compose
   services of this workspace. Like `vk delete`, it lists what goes and asks first, and

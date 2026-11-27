@@ -39,8 +39,7 @@ pub const STOPPED: &str = "stopped";
 /// Dev state with no recorded boot, including an interrupted first boot or a throwaway task.
 pub const NEVER_BOOTED: &str = "never booted";
 
-/// `--stopped` includes environments that never booted. Neither status filter includes
-/// a service with unknown state (`-`); `--running` includes a VM on its way up or down.
+/// Whether a row's status is at rest: stopped, or state that never booted.
 fn at_rest(status: &str) -> bool {
     status == STOPPED || status == NEVER_BOOTED
 }
@@ -340,27 +339,77 @@ fn published_text((e, liveness): &Published) -> String {
     cell
 }
 
+/// A state `vk list --state` keeps: a row's STATUS, as `--json` words it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum State {
+    /// up
+    Running,
+    /// booted before, nothing up now
+    Stopped,
+    /// a dev environment's state that recorded no boot
+    NeverBooted,
+    /// its run holds it, no VM up yet
+    Starting,
+    /// asked to stop, not gone yet
+    Stopping,
+}
+
+impl State {
+    /// The row status this state is.
+    fn status(self) -> &'static str {
+        match self {
+            State::Running => "running",
+            State::Stopped => STOPPED,
+            State::NeverBooted => NEVER_BOOTED,
+            State::Starting => crate::vmstate::State::Starting.label(),
+            State::Stopping => crate::vmstate::State::Stopping.label(),
+        }
+    }
+
+    /// What `--running` stands for.
+    pub const RUNNING: &[State] = &[State::Running];
+    /// What `--stopped` stands for: every state with no VM up or on its way.
+    pub const STOPPED: &[State] = &[State::Stopped, State::NeverBooted];
+}
+
+/// Which rows to keep. Each criterion given narrows the list; a list of values keeps a row
+/// that matches any of them.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Filter {
-    pub running: bool,
-    pub stopped: bool,
+    /// only the rows in one of these states
+    pub states: Vec<State>,
     pub kind: Option<Kind>,
     /// only the compose service of this name, of whichever VM the REF selected
     pub service: Option<String>,
     /// only rows with an attention message or stale records
     pub problems: bool,
+    /// only the rows of compose services with one of these names
+    pub services: Vec<String>,
+    /// only the rows whose project is this directory (canonical) — or below it, with `below`
+    pub workspace: Option<PathBuf>,
+    pub below: bool,
 }
 
 impl Filter {
     pub fn keeps(&self, r: &Row) -> bool {
-        (!self.running || r.status == RUNNING || on_its_way(&r.status))
-            && (!self.stopped || at_rest(&r.status))
+        (self.states.is_empty() || self.states.iter().any(|s| s.status() == r.status))
             && self.kind.is_none_or(|k| k == r.kind)
             && self
                 .service
                 .as_ref()
                 .is_none_or(|s| service_of(r) == Some(s.as_str()))
             && (!self.problems || r.attention.is_some() || r.stale_record)
+            && (self.services.is_empty()
+                || r.kind == Kind::Service
+                    && r.name
+                        .rsplit_once('/')
+                        .is_some_and(|(_, s)| self.services.iter().any(|w| w == s)))
+            && self.workspace.as_ref().is_none_or(|w| {
+                r.project
+                    .as_deref()
+                    .map(crate::vms::canonical)
+                    .is_some_and(|p| p == *w || (self.below && p.starts_with(w)))
+            })
     }
 }
 
@@ -640,18 +689,20 @@ mod tests {
             kept.sort_unstable();
             kept
         };
-        let (running, stopped) = (
-            Filter {
-                running: true,
-                ..Filter::default()
-            },
-            Filter {
-                stopped: true,
-                ..Filter::default()
-            },
+        let states = |states: &[State]| Filter {
+            states: states.to_vec(),
+            ..Filter::default()
+        };
+        // Nothing here is up: on their way, these count as neither running nor stopped.
+        assert!(keep(states(State::RUNNING)).is_empty());
+        assert_eq!(keep(states(&[State::Stopping])), ["app", "hung"]);
+        assert_eq!(keep(states(State::STOPPED)), ["task-1a2b"]);
+        assert_eq!(keep(states(&[State::NeverBooted])), ["task-1a2b"]);
+        assert_eq!(
+            keep(states(&[State::Running, State::Starting, State::Stopping])),
+            ["app", "coming", "hung"]
         );
-        assert_eq!(keep(running), ["app", "coming", "hung"]);
-        assert_eq!(keep(stopped), ["task-1a2b"]);
+        // `--problems` keeps what needs attention and what came from stale records.
         assert_eq!(status("hung"), "stopping");
         let problems = Filter {
             problems: true,
@@ -720,18 +771,38 @@ mod tests {
         };
         assert_eq!(
             keep(Filter {
-                running: true,
+                states: State::RUNNING.to_vec(),
                 ..Filter::default()
             }),
             ["app", "app/web", "other"]
         );
         assert_eq!(
             keep(Filter {
-                stopped: true,
+                states: State::STOPPED.to_vec(),
                 ..Filter::default()
             }),
             ["app/db"]
         );
+        // `--service` keeps those services' rows alone, any of the names given.
+        assert_eq!(
+            keep(Filter {
+                services: vec!["web".into(), "cache".into()],
+                ..Filter::default()
+            }),
+            ["app/web"]
+        );
+        // `--workspace` keeps the rows of that project, below it too with `-r`.
+        let workspace = |dir: &str, below: bool| Filter {
+            workspace: Some(dir.into()),
+            below,
+            ..Filter::default()
+        };
+        assert_eq!(
+            keep(workspace("/w/app", false)),
+            ["app", "app/db", "app/web"]
+        );
+        assert!(keep(workspace("/w", false)).is_empty());
+        assert_eq!(keep(workspace("/w", true)).len(), 3);
         assert_eq!(
             keep(Filter {
                 kind: Some(Kind::Service),

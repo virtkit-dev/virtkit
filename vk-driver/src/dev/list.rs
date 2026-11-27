@@ -33,7 +33,7 @@ use crate::usage::fmt_bytes;
 const PUBLISH_STOP: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Environment status from live VMs, on-disk state and workspace declarations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Status {
     /// a VM is up on this state dir
@@ -47,6 +47,11 @@ pub enum Status {
 }
 
 impl Status {
+    /// What `--running` stands for.
+    pub const RUNNING: &[Status] = &[Status::Running];
+    /// What `--stopped` stands for: every state with no VM up.
+    pub const STOPPED: &[Status] = &[Status::Stopped, Status::NeverBooted];
+
     fn label(self) -> &'static str {
         match self {
             Status::Running => "running",
@@ -154,6 +159,55 @@ pub struct Service {
     /// service that has no VM
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
+}
+
+/// Which rows `vk dev list` keeps. Each criterion given narrows the list; a list of values
+/// keeps what matches any of them.
+#[derive(Debug, Default, Clone)]
+pub struct Filter {
+    /// only what is in one of these states: an environment by its own, a service by its own
+    pub states: Vec<Status>,
+    /// only the compose services with one of these names, and no environment line
+    pub services: Vec<String>,
+}
+
+impl Filter {
+    fn state_ok(&self, status: Status) -> bool {
+        self.states.is_empty() || self.states.contains(&status)
+    }
+
+    /// Whether only service lines are kept, the environments' own lines left out.
+    pub fn services_only(&self) -> bool {
+        !self.services.is_empty()
+    }
+
+    /// Keep what this filter selects of `rows`: the environments in a selected state, each
+    /// with its services in one — or, with `services`, those services alone, each still
+    /// carried by its environment's row.
+    pub fn apply(&self, mut rows: Vec<Row>) -> Vec<Row> {
+        for r in &mut rows {
+            r.services.retain(|s| {
+                (self.services.is_empty() || self.services.contains(&s.name))
+                    && self.state_ok(s.state())
+            });
+        }
+        match self.services_only() {
+            true => rows.retain(|r| !r.services.is_empty()),
+            false => rows.retain(|r| self.state_ok(r.status)),
+        }
+        rows
+    }
+}
+
+impl Service {
+    /// Its status as an environment's is worded: one with no VM was never built or started.
+    fn state(&self) -> Status {
+        match self.status.as_deref() {
+            Some("running") => Status::Running,
+            Some(_) => Status::Stopped,
+            None => Status::NotBuilt,
+        }
+    }
 }
 
 /// One environment the workspace's config declares: where its state goes, and the compose
@@ -560,8 +614,9 @@ pub(crate) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
 /// Render one row per environment and a `NAME/SERVICE` row per declared secondary service.
 /// A declaration without state has dashes for its VM name, creator, last boot and usage.
 /// Service rows have no creator, last boot or memory reading. `wide` shows full workspace
-/// paths instead of their shortest distinguishing suffixes.
-pub fn render(rows: &[Row], wide: bool) -> String {
+/// paths instead of their shortest distinguishing suffixes. With `services_only`, the
+/// environments' own rows are left out.
+pub fn render(rows: &[Row], wide: bool, services_only: bool) -> String {
     if rows.is_empty() {
         return "no dev environment state on this host\n".into();
     }
@@ -584,31 +639,34 @@ pub fn render(rows: &[Row], wide: bool) -> String {
             true => dash(),
             false => r.name.clone(),
         };
-        lines.push(vec![
-            name.clone(),
-            workspace.clone(),
-            environment.clone(),
-            r.status.label().into(),
-            match not_built {
-                true => dash(),
-                false => r
-                    .created_by
-                    .as_deref()
-                    .map(short_creator)
-                    .unwrap_or_default(),
-            },
-            match not_built {
-                true => dash(),
-                false => r.age_secs.map(crate::vms::fmt_uptime).unwrap_or_default(),
-            },
-            crate::vms::mem_cell(r.mem_used_bytes, r.mem.as_deref()),
-            fmt_size(r.size_bytes),
-            r.flags
-                .iter()
-                .map(|f| f.label())
-                .collect::<Vec<_>>()
-                .join(", "),
-        ]);
+        // Filtered down to some of its services, an environment's own row is left out.
+        if !services_only {
+            lines.push(vec![
+                name.clone(),
+                workspace.clone(),
+                environment.clone(),
+                r.status.label().into(),
+                match not_built {
+                    true => dash(),
+                    false => r
+                        .created_by
+                        .as_deref()
+                        .map(short_creator)
+                        .unwrap_or_default(),
+                },
+                match not_built {
+                    true => dash(),
+                    false => r.age_secs.map(crate::vms::fmt_uptime).unwrap_or_default(),
+                },
+                crate::vms::mem_cell(r.mem_used_bytes, r.mem.as_deref()),
+                fmt_size(r.size_bytes),
+                r.flags
+                    .iter()
+                    .map(|f| f.label())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ]);
+        }
         for s in &r.services {
             lines.push(vec![
                 format!("{name}/{}", s.name),
@@ -960,6 +1018,88 @@ mod tests {
     /// What `names::resolve` does, against [`index`] and `base`.
     fn resolver(base: &Path) -> impl Fn(&str) -> Result<Option<PathBuf>> + '_ {
         move |word| crate::names::resolve_in(&index(base), base, word)
+    }
+
+    #[test]
+    fn the_filter_keeps_by_state_and_by_service_alone() {
+        let t = scratch("filter");
+        let base = row(&t.0.join("app-1"), &[], false, false);
+        let service = |name: &str, status: Option<&str>| Service {
+            name: name.into(),
+            status: status.map(Into::into),
+            dir: t.0.join(format!("app-1/svc-{name}")),
+            age_secs: None,
+            size_bytes: None,
+        };
+        let env = |name: &str, status: Status, services: Vec<Service>| Row {
+            name: name.into(),
+            status,
+            services,
+            ..base.clone()
+        };
+        let rows = vec![
+            env(
+                "app",
+                Status::Running,
+                vec![
+                    service("runner", Some("running")),
+                    service("db", Some("stopped")),
+                    service("cache", None),
+                ],
+            ),
+            env(
+                "app-ci",
+                Status::Stopped,
+                vec![service("runner", Some("stopped"))],
+            ),
+            env("app-task", Status::NeverBooted, vec![]),
+        ];
+        let kept = |f: Filter| -> Vec<String> {
+            f.apply(rows.clone())
+                .iter()
+                .flat_map(|r| {
+                    std::iter::once(r.name.clone())
+                        .chain(r.services.iter().map(|s| format!("{}/{}", r.name, s.name)))
+                })
+                .collect()
+        };
+        let states = |states: &[Status]| Filter {
+            states: states.to_vec(),
+            ..Filter::default()
+        };
+        // A state keeps the environments in it, and of their services those in it too.
+        assert_eq!(kept(states(Status::RUNNING)), ["app", "app/runner"]);
+        assert_eq!(
+            kept(states(Status::STOPPED)),
+            ["app-ci", "app-ci/runner", "app-task"]
+        );
+        assert_eq!(kept(states(&[Status::NotBuilt])), Vec::<String>::new());
+        // Services keep those services alone, any of the names, under their environment.
+        let services = |names: &[&str], states: &[Status]| Filter {
+            services: names.iter().map(|n| n.to_string()).collect(),
+            states: states.to_vec(),
+        };
+        let f = services(&["runner", "cache"], &[]);
+        assert!(f.services_only());
+        assert_eq!(
+            kept(f),
+            ["app", "app/runner", "app/cache", "app-ci", "app-ci/runner"]
+        );
+        assert_eq!(
+            kept(services(&["runner"], Status::STOPPED)),
+            ["app-ci", "app-ci/runner"]
+        );
+        assert_eq!(
+            kept(services(&["cache"], &[Status::NotBuilt])),
+            ["app", "app/cache"]
+        );
+        // The table leaves the environments' own lines out.
+        let shown = render(&services(&["runner"], &[]).apply(rows.clone()), false, true);
+        assert!(
+            shown.contains("app/runner") && shown.contains("app-ci/runner"),
+            "{shown}"
+        );
+        assert!(!shown.lines().any(|l| l.starts_with("app ")), "{shown}");
     }
 
     /// A state dir with a `dev.json` recording `workspace`, as `after_boot` writes one.
@@ -1531,7 +1671,7 @@ mod tests {
             row.age_secs = row.age_secs.map(|_| 7200);
         }
 
-        let out = render(&rows, true);
+        let out = render(&rows, true, false);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("NAME"), "{out}");
         assert!(
@@ -1565,7 +1705,7 @@ mod tests {
             "{out}"
         );
         assert_eq!(
-            render(&[], false),
+            render(&[], false, false),
             "no dev environment state on this host\n"
         );
     }
