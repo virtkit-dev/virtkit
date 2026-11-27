@@ -1130,6 +1130,6 @@ Use `vk dev COMMAND --help` for individual options.
 | `stop [NAME…]`, `down` | Stop the environment and publishers, or named services or environments of this workspace; `--timeout SECONDS`. |
 | `storage list`, `storage reset NAME` | Inspect storage or destroy a durable item's data. |
 | `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. `NAME` selects a stopped environment in this workspace. Use `vk reset NAME` for a stopped dev environment with a valid identity and no run recipe in any workspace. |
-| `list` | List this workspace's environments and secondary compose services. Use `--all` for host-wide state, `--wide` for full paths, `--no-sizes` to skip disk usage, or `--json`. |
+| `list`, `ls` | List this workspace's environments and secondary compose services. Use `--all` for host-wide state, `--wide` for full paths, `--no-sizes` to skip disk usage, or `--json`. |
 | `gc [NAME…]` | Remove stopped state of this workspace's environments. With no names, remove this workspace's environment. `--all-stale` (host-wide, no names) and `--yes`. For a stopped environment with a valid recorded identity and no run recipe, [`vk delete NAME`](../README.md#manage-vms) also removes its state, from any workspace. |
 | `schema` | Print the configuration JSON Schema. |

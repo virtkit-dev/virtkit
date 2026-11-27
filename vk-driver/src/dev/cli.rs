@@ -443,6 +443,7 @@ enum DevAction {
     /// and disk usage. MEM shows the running VM's whole process tree over its configured
     /// memory (`1.2G/8G`), as in `vk list`. A stopped VM shows `-`. `--no-sizes` skips disk
     /// usage. Flags identify missing workspaces and state directories without a recorded boot.
+    #[command(visible_alias = "ls")]
     List {
         /// list dev state directories across all workspaces
         #[arg(long, short = 'a')]
@@ -2022,6 +2023,10 @@ mod tests {
         assert!(matches!(
             parse(&["vk", "dev", "list", "--no-sizes"]).action,
             DevAction::List { no_sizes: true, .. }
+        ));
+        assert!(matches!(
+            parse(&["vk", "dev", "ls", "-a"]).action,
+            DevAction::List { all: true, .. }
         ));
     }
 

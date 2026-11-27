@@ -4,6 +4,10 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk dev ls`** lists dev environments, as `vk dev list` does.
+
 ## [0.118.0] - 2026-11-27
 
 ### Added
