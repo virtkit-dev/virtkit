@@ -1094,12 +1094,69 @@ fn stage_uuid(stage_key: &str) -> [u8; 16] {
         .expect("fingerprint is a canonical UUID")
 }
 
-/// Where an export is written before it is published at `out`: a `.tmp` sibling, so the
-/// rename that publishes it stays on one filesystem.
-fn export_tmp_path(out: &Path) -> PathBuf {
+/// Where an export is written before it is published at `out`: inside the build's `scratch`
+/// when that sits beside `out` — so the rename that publishes it stays on one filesystem, and
+/// an export the build does not finish goes with the scratch — else a `.tmp` sibling.
+fn export_tmp_path(out: &Path, scratch: &Path) -> PathBuf {
+    let beside = std::path::absolute(out)
+        .ok()
+        .is_some_and(|abs| abs.parent() == scratch.parent());
+    match (beside, out.file_name()) {
+        (true, Some(name)) => {
+            let mut s = std::ffi::OsString::from("export-");
+            s.push(name);
+            scratch.join(s)
+        }
+        _ => sibling_tmp_path(out),
+    }
+}
+
+/// `out` with `.tmp` appended: where an export is staged when the build's scratch is not
+/// beside it, and where a `vk` before the scratch-staged export left an unfinished one.
+fn sibling_tmp_path(out: &Path) -> PathBuf {
     let mut s = out.as_os_str().to_os_string();
     s.push(".tmp");
     PathBuf::from(s)
+}
+
+/// A build's scratch dir, claimed for as long as this lives: its lock held (see
+/// [`claim_scratch`]), registered for removal should a signal end the process, and removed
+/// when this drops — the build finished, failed, or panicked. It holds everything an
+/// unfinished build leaves in the caller's directory: the stage images and the export not
+/// yet published (see [`export_tmp_path`]). The steps the build finished are in the build
+/// cache already, committed as they finished, so nothing in it is worth keeping.
+struct ScratchGuard {
+    path: PathBuf,
+    // Dropped after `drop` has removed the dir: the lock keeps a sweep off it meanwhile.
+    _on_signal: crate::termclean::Registration,
+    _owner: vk_fs::LockFile,
+}
+
+impl ScratchGuard {
+    fn claim(path: &Path) -> Result<Self> {
+        let owner = claim_scratch(path)?;
+        let on_signal = crate::termclean::remove_on_signal(path, std::os::fd::AsFd::as_fd(&owner));
+        Ok(Self {
+            path: path.to_path_buf(),
+            _on_signal: on_signal,
+            _owner: owner,
+        })
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path); // best-effort
+    }
+}
+
+/// After a build's scratch is gone: say what became of an unfinished one.
+fn after_unfinished(failed: bool) {
+    if failed {
+        crate::quiet::enote!(
+            "virtkit: removed the unfinished build's files; the steps it finished stay in the build cache"
+        );
+    }
 }
 
 /// Publish the image exported to `tmp` as `out`: stamp its content-freshness UUID (the
@@ -1238,10 +1295,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     // Claim ours for the length of the build, so a concurrent sweep (another build starting
     // beside us) can tell it is live without having to interpret our pid. After the resolve
     // above, so its failure leaves no scratch dir behind.
-    let scratch_owner = claim_scratch(&scratch)?;
-    // A SIGTERM or SIGINT ends the process without running the removal at the end.
-    let _scratch_on_signal =
-        crate::termclean::remove_on_signal(&scratch, std::os::fd::AsFd::as_fd(&scratch_owner));
+    let scratch_guard = ScratchGuard::claim(&scratch)?;
     let channels = egress_channels(opts, &scratch)?;
     // Live build overview (Docker/buildkit-style): a dashboard in a terminal, plain `#N`
     // lines otherwise. The drivers populate it (which stages/steps run) once they know the
@@ -1319,10 +1373,10 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
         if let Some(out) = out {
             progress.export_start(0);
             let t_export = Instant::now();
-            let tmp = export_tmp_path(out);
-            // Clear a leftover tmp from an interrupted export; a real failure resurfaces
-            // when `export_ext4` recreates the file.
-            let _ = std::fs::remove_file(&tmp);
+            let tmp = export_tmp_path(out, &scratch);
+            // Clear a leftover tmp from an interrupted export of an earlier `vk`; a real
+            // failure resurfaces when `export_ext4` creates the file.
+            let _ = std::fs::remove_file(sibling_tmp_path(out));
             let image = ex.export_ext4(fs, &tmp, opts.out_format)?;
             timings.record(Phase::Export, "", t_export.elapsed());
             progress.export_done(0);
@@ -1358,7 +1412,8 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     }
     // After the dashboard froze, so it is safe to print.
     print_audit_summaries(opts, &channels);
-    let _ = std::fs::remove_dir_all(&scratch); // best-effort scratch cleanup
+    drop(scratch_guard);
+    after_unfinished(result.is_err());
     let built = result?;
     let srcs = inputs
         .iter()
@@ -1457,9 +1512,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
         sweep_stale_scratch(parent, SCRATCH_PREFIX);
     }
     // As in `build_backend`: hold the scratch's own lock for the whole build.
-    let scratch_owner = claim_scratch(&scratch)?;
-    let _scratch_on_signal =
-        crate::termclean::remove_on_signal(&scratch, std::os::fd::AsFd::as_fd(&scratch_owner));
+    let scratch_guard = ScratchGuard::claim(&scratch)?;
     let channels = egress_channels(opts, &scratch)?;
     let mut mv = make_microvm(
         opts,
@@ -1799,10 +1852,10 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
                         .context("internal: target stage not committed")?;
                     progress.export_start(export_i);
                     let t_export = Instant::now();
-                    let tmp = export_tmp_path(out);
-                    // Clear a leftover tmp from an interrupted export; a real failure
-                    // resurfaces when `export_ext4` recreates the file.
-                    let _ = std::fs::remove_file(&tmp);
+                    let tmp = export_tmp_path(out, &scratch);
+                    // Clear a leftover tmp from an interrupted export of an earlier `vk`; a
+                    // real failure resurfaces when `export_ext4` creates the file.
+                    let _ = std::fs::remove_file(sibling_tmp_path(out));
                     let image = mv
                         .export_ext4(fs, &tmp, opts.out_format)
                         .with_context(|| format!("target {:?}", t.label))?;
@@ -1837,7 +1890,8 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     }
     // After the dashboard froze, so it is safe to print.
     print_audit_summaries(opts, &channels);
-    let _ = std::fs::remove_dir_all(&scratch); // best-effort scratch cleanup
+    drop(scratch_guard);
+    after_unfinished(result.is_err());
     let built = result?;
     for u in &units {
         for t in &u.targets {
@@ -4848,6 +4902,82 @@ mod tests {
     /// compute the same `<pid>-<seq>` name and one of them would fail to claim it. The nonce
     /// makes the name unique without asking who anyone is, so same pid and same seq still means
     /// a different dir.
+    /// What a build into `dir` left there besides `keep`: scratch dirs, staged exports.
+    fn leftovers_in(dir: &Path, keep: &[&str]) -> Vec<String> {
+        let mut left: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !keep.contains(&n.as_str()))
+            .collect();
+        left.sort();
+        left
+    }
+
+    fn host_opts(dockerfile: PathBuf, out: PathBuf) -> Options {
+        Options {
+            dockerfiles: vec![dockerfile],
+            target: None,
+            stage_guests: Default::default(),
+            contexts: vec![],
+            build_contexts: Vec::new(),
+            out: Some(out),
+            out_disk: None,
+            print_plan: false,
+            kernel: None,
+            agent: None,
+            cache: crate::build::CacheDest::Configured(crate::build::CacheOpts {
+                registry: Some("none".into()),
+                insecure: false,
+                auth: Default::default(),
+            }),
+            base_registry: None,
+            build_cache: BuildCache::default(),
+            journal: false,
+            tmp_tmpfs: false,
+            build_args: vec![],
+            net: BuildNet::None,
+            audit: false,
+            record: None,
+            require_cached: false,
+            build_jobs: None,
+            debug: false,
+            progress_sink: None,
+            out_format: ImageFormat::Raw,
+        }
+    }
+
+    // An unfinished build leaves nothing in the caller's directory: its scratch and the
+    // export it had staged there go whether it fails or succeeds, and an `.tmp` sibling an
+    // earlier `vk` left from an interrupted export goes with the next build.
+    #[test]
+    fn a_build_leaves_no_scratch_or_staged_export_behind() {
+        let dir = tmpdir("no-leftovers");
+        std::fs::write(dir.join("ok"), b"x").unwrap();
+        std::fs::write(dir.join("Dockerfile"), "FROM scratch\nCOPY ok /ok\n").unwrap();
+        std::fs::write(dir.join("Broken"), "FROM scratch\nCOPY missing /m\n").unwrap();
+        let keep = ["ok", "Dockerfile", "Broken"];
+
+        let err = build_host(&host_opts(dir.join("Broken"), dir.join("root.ext4")));
+        assert!(err.is_err(), "the COPY of a missing file fails the build");
+        assert_eq!(leftovers_in(&dir, &keep), Vec::<String>::new());
+
+        std::fs::write(
+            dir.join("root.ext4.tmp"),
+            b"an earlier vk's unfinished export",
+        )
+        .unwrap();
+        build_host(&host_opts(dir.join("Dockerfile"), dir.join("root.ext4"))).unwrap();
+        assert_eq!(
+            leftovers_in(&dir, &keep),
+            [
+                "root.ext4".to_string(),
+                config_sidecar(Path::new("root.ext4")).display().to_string()
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn two_builds_never_compute_the_same_scratch_name() {
         let out = Path::new("./test.ext4");
@@ -7685,11 +7815,18 @@ ENTRYPOINT run me
         let dir = tmpdir("publish-export");
         std::fs::write(dir.join("Dockerfile"), "FROM scratch\nCOPY Dockerfile /d\n").unwrap();
         let out = dir.join("root.ext4");
-        let tmp = export_tmp_path(&out);
+        let scratch = dir.join(".build-1-0-x");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let tmp = export_tmp_path(&out, &scratch);
         assert_eq!(
             tmp,
+            scratch.join("export-root.ext4"),
+            "an export is staged in the scratch beside `out`"
+        );
+        assert_eq!(
+            export_tmp_path(&out, &dir.join("elsewhere/.build-1-0-x")),
             dir.join("root.ext4.tmp"),
-            "export tmp is an `.tmp` sibling"
+            "and as an `.tmp` sibling when the scratch is elsewhere"
         );
         // Build a real ext4 to stand in for a freshly exported tmp.
         build_host(&Options {

@@ -17,6 +17,13 @@ All notable changes to virtkit will be documented in this file.
 - **`vk delete` and `vk dev gc` say how much disk space they freed**: what the deleted
   files actually took on disk, so a sparse image counts what it held, not its length.
 
+### Fixed
+
+- **A build that fails leaves no half-written image behind.** The image a build was
+  writing goes with the rest of its unfinished files, where it used to stay beside the
+  VM's state as a `.tmp` file until the next build of that VM; one left by an earlier
+  `vk` goes with the next build.
+
 ## [0.118.0] - 2026-11-27
 
 ### Added
