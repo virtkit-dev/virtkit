@@ -12,6 +12,32 @@ All notable changes to virtkit will be documented in this file.
   Downloads support a single byte range here and over S3. Git can clone an uploaded
   repository over dumb HTTP. CI jobs can use `/files/` and `job/<alias>` through `registry.vk`.
 
+### Changed
+
+- Remove `webdav` from the registry config. `vk-registry` warns at startup and ignores
+  the key. A later release will reject it.
+- The hub no longer shows whether a registry serves WebDAV.
+
+### Removed
+
+- **`vk-registry` no longer serves WebDAV (`/dav/`).**
+  - sccache's cache moves to its S3 backend on the same files: replace
+    `SCCACHE_WEBDAV_ENDPOINT=<registry>/dav/files/<dir>` with
+    `SCCACHE_ENDPOINT=<registry>/s3`, `SCCACHE_BUCKET=<dir>` and `SCCACHE_REGION=auto`
+    (the endpoint's path below the bucket goes in `SCCACHE_S3_KEY_PREFIX`), and give the
+    registry's bearer token or key as both `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`
+    (a shared username and password cannot sign S3 requests). In a CI
+    job behind `registry.vk`, set `SCCACHE_ENDPOINT=$VK_REGISTRY/s3`, `SCCACHE_BUCKET=job`,
+    `SCCACHE_S3_KEY_PREFIX=<alias>`, `SCCACHE_REGION=auto` and
+    `SCCACHE_S3_NO_CREDENTIALS=true` instead. Cached entries carry over.
+  - Fetch or delete a file at `/files/<dir>/<name>` with the same credentials and grants.
+    Use `DELETE` to remove the name. `/files/sha256/<hex>` reads a file tagged with its
+    own digest. WebDAV did not create that tag automatically.
+  - To write one name, use `PUT /s3/<dir>/<name>`. To tag the file by digest as well,
+    use `vk registry put --dir <dir>` or `PUT /files/<dir>/<name>`.
+  - Listings, `MKCOL` and the read-only `/dav/repos/` view have no replacement: `/v2/` and
+    `/browse` cover the store's repositories.
+
 ## [0.117.1] - 2026-11-26
 
 ### Changed

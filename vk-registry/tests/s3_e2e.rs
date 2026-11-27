@@ -1,6 +1,6 @@
 //! The S3 view over real HTTP, as sccache uses it: an object written and read back under a
 //! SigV4 signature whose secret is the registry credential, a missing key a 404, the same
-//! object seen by WebDAV, and anything but GetObject, HeadObject and PutObject refused.
+//! object seen at `/files/`, and anything but GetObject, HeadObject and PutObject refused.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,7 +35,7 @@ fn tmp(tag: &str) -> std::path::PathBuf {
 }
 
 /// Start a shared-bearer registry that also accepts hub tokens.
-async fn serve(dir: &std::path::Path, webdav: bool, s3: bool) -> (String, Signer, Arc<Store>) {
+async fn serve(dir: &std::path::Path, s3: bool) -> (String, Signer, Arc<Store>) {
     let signer = Signer::generate(&dir.join("token-key")).unwrap();
     let store = Arc::new(Store::new(dir.join("store")).unwrap());
     let state = Arc::new(ServerState {
@@ -46,7 +46,6 @@ async fn serve(dir: &std::path::Path, webdav: bool, s3: bool) -> (String, Signer
             token: BEARER.to_string(),
         }),
         tls: None,
-        webdav,
         s3,
         tokens: Default::default(),
         handover: Default::default(),
@@ -155,8 +154,7 @@ const UNSIGNED: &str = "UNSIGNED-PAYLOAD";
 #[tokio::test]
 async fn sccache_reads_and_writes_through_the_s3_view() {
     let dir = tmp("rw");
-    // WebDAV off: the S3 view still reaches the files area, `/dav/` does not.
-    let (base, _, store) = serve(&dir, false, true).await;
+    let (base, _, store) = serve(&dir, true).await;
     let c = reqwest::Client::new();
     let put = |path: &'static str, body: &'static [u8], payload: String| {
         signed(&c, reqwest::Method::PUT, &base, path, BEARER, &payload).body(body)
@@ -234,9 +232,9 @@ async fn sccache_reads_and_writes_through_the_s3_view() {
         .send()
         .await
         .unwrap();
-    assert_eq!(dav.status(), 404, "WebDAV is off");
+    assert_eq!(dav.status(), 404, "there is no WebDAV view");
 
-    // A read-only store refuses the write as S3 does, with WebDAV's retry hint kept.
+    // A read-only store refuses the write as S3 does, with the server's retry hint kept.
     store.set_read_only(true);
     let busy = put(probe, b"later", UNSIGNED.into()).send().await.unwrap();
     assert_eq!(busy.status(), 503);
@@ -253,11 +251,11 @@ async fn sccache_reads_and_writes_through_the_s3_view() {
 #[tokio::test]
 async fn the_s3_view_refuses_what_it_does_not_serve() {
     let dir = tmp("refuse");
-    let (base, signer, _) = serve(&dir, true, true).await;
+    let (base, signer, _) = serve(&dir, true).await;
     let c = reqwest::Client::new();
     let path = "/s3/cache/k";
 
-    // WebDAV checks a bearer supplied on an unsigned request.
+    // The server checks a bearer supplied on an unsigned request.
     let plain = format!("{base}/s3/cache/plain");
     let put = c
         .put(&plain)
@@ -431,22 +429,22 @@ async fn the_s3_view_refuses_what_it_does_not_serve() {
         assert!(resp.text().await.unwrap().contains("NotImplemented"));
     }
 
-    // WebDAV reads the object written through S3.
-    let dav = c
-        .get(format!("{base}/dav/files/cache/k"))
+    // `/files/` reads the object written through S3.
+    let file = c
+        .get(format!("{base}/files/cache/k"))
         .bearer_auth(BEARER)
         .send()
         .await
         .unwrap();
-    assert_eq!(dav.status(), 200);
-    assert_eq!(dav.text().await.unwrap(), "x");
+    assert_eq!(file.status(), 200);
+    assert_eq!(file.text().await.unwrap(), "x");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn the_s3_view_can_be_turned_off() {
     let dir = tmp("off");
-    let (base, _, _) = serve(&dir, true, false).await;
+    let (base, _, _) = serve(&dir, false).await;
     let c = reqwest::Client::new();
     let resp = signed(
         &c,
@@ -542,15 +540,15 @@ async fn an_api_key_signs_and_a_session_cookie_does_not() {
     .unwrap();
     assert_eq!(elsewhere.status(), 403, "the key's scope still applies");
 
-    // An admin's session cookie authorizes the WebDAV view, never the S3 one.
+    // An admin's session cookie authorizes `/files/`, never the S3 view.
     let cookie = format!("__Host-vk_session={session}");
-    let dav = c
-        .get(format!("{base}/dav/files/cache/k"))
+    let file = c
+        .get(format!("{base}/files/cache/k"))
         .header("cookie", &cookie)
         .send()
         .await
         .unwrap();
-    assert_eq!(dav.status(), 200);
+    assert_eq!(file.status(), 200);
     let s3 = c
         .get(format!("{base}{path}"))
         .header("cookie", &cookie)

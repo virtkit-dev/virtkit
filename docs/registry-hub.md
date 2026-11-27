@@ -1,7 +1,7 @@
 # A registry the hub manages (design)
 
 Status: **in progress**. Implemented: migration steps 1 (registration and monitoring), 2 in
-part (gc schedule and windows, read-only, the `gc` command; not WebDAV steering, nor the
+part (gc schedule and windows, read-only, the `gc` command; not the
 `delete-tag` and `delete-repo` commands) and 3 in part (an update on trial to a release the hub
 holds, one registry at a time; rollouts do not cover registries yet) and 4 in part (namespaces
 and job tokens, 4a and 4b; see [its own section](#step-4-namespaces-and-job-tokens)). The rest
@@ -84,7 +84,7 @@ has no jobs, runner or admission.
 
 **Registry → hub**
 
-- inventory, when it changes: version, listen address and TLS, mode, WebDAV, the S3 view,
+- inventory, when it changes: version, listen address and TLS, mode, the S3 view,
   upstreams, store filesystem and size, a hash of its effective config, what `[hub] allow`
   lists and whether updates must be signed; later, as an optional field, TLS certificate
   expiry;
@@ -107,7 +107,6 @@ has no jobs, runner or admission.
     to a registry whose `[hub] allow` lists `gc`, which takes it only then;
   - whether writes are accepted (read-only for maintenance: a client's pushes, uploads and
     deletions are refused, but the pull-through relay still caches what a read fetches);
-    later, whether WebDAV is on;
   - the token-signing keys, the revocation list, and the key table (see below);
   - each repository's caption;
 - commands, journaled before they run so each runs at most once, with an ID and an expiry:
@@ -169,7 +168,7 @@ scopes. No request waits on the hub.
 
 ### Keys presented directly
 
-Some clients cannot follow the token flow: an `sccache` on `/dav/files/`, `curl`. For them the
+Some clients cannot follow the token flow: an `sccache` on `/s3/`, `curl`. For them the
 hub sends a **key table** in desired state: per hub API key allowed to talk to this registry,
 `sha256(secret)`, owner, name, scopes and expiry, no secret. The registry checks a bearer or Basic key
 against it in memory, as `accounts.db`'s `api_keys` does today. It is a cache of the hub's
@@ -202,7 +201,7 @@ Credentials that exist today keep their semantics: an API key's scope is still a
 repository or an explicit `prefix/*` subtree, and `write` implies `read`. A hub token
 carries prefix grants instead, cut at a path component as `prefix/*` is: `images` covers
 `images/app` but not `images2`. A prefix grant covers every kind of reference under its
-prefix alike: repositories, plain files under `/dav/files/` (as `files/<dir>`, as today),
+prefix alike: repositories, plain files under `/files/` and `/s3/` (as `files/<dir>`),
 and locks and failure memos, whose names take the form `<prefix>:<key>` (see
 [step 4](#step-4-namespaces-and-job-tokens)). Converting existing keys to prefix grants, if
 ever, belongs to the import into managed mode.
@@ -312,8 +311,8 @@ alone. Client changes are listed below.
 | 5. Managed mode | `vk-hub registries import`, then `mode = "managed"` | people sign in through the hub; imported `vkr_` keys keep working, and new keys come from the hub | restore `mode = "accounts"`: `accounts.db` is archived, not deleted, but holds nothing created on the hub since the import |
 | 6. Locks on the hub | to be designed | — | — |
 
-Steps 1 to 3 are partly implemented; the reference below covers them. WebDAV steering,
-`delete-tag` and `delete-repo` (step 2), and rollouts across registries (step 3) remain
+The reference below covers step 1 and the implemented parts of steps 2 and 3.
+`delete-tag` and `delete-repo` (step 2) and rollouts across registries (step 3) remain
 proposed. Step 4 is partly implemented ([its own
 section](#step-4-namespaces-and-job-tokens)), steps 5 and 6 are proposed; steps 1 to 3 do not
 depend on them, so a registry may stay at step 3.
@@ -361,7 +360,7 @@ TLS connection), then speaks `vk_hub_proto::registry`'s messages, version 1. `vk
 hub no longer knows stops dialing and says to `leave` and `join` again.
 
 **Monitoring.** The registry sends its inventory (version and binary sha256, listen address
-and TLS, mode, WebDAV, the S3 view, upstream prefixes, store filesystem size, config hash,
+and TLS, mode, the S3 view, upstream prefixes, store filesystem size, config hash,
 `[hub] allow` list and signature requirement for updates) on connect and when it changes.
 Heartbeats follow the hub's interval and report open connections, the connection limit,
 uploads in flight, build-once locks held and free space. After each gc and every 10 minutes,
@@ -373,7 +372,7 @@ covers applied state and work in progress. The hub keeps the latest of each for
 the newest one, and again after a restart:
 
 - `read_only` (`vk-hub registries read-only <id> on|off|default`): refuse writes — pushes,
-  uploads, WebDAV writes, deletions — after authentication, with 503 and `Retry-After`, while
+  uploads, plain-file writes, deletions — after authentication, with 503 and `Retry-After`, while
   reads, sign-ins, key and caption management, the lock service and the pull-through relay's
   caching go on;
 - `gc` (`vk-hub registries gc-schedule <id> --every 1d [--retention-days 30] [--grace-days 1]
@@ -488,7 +487,7 @@ namespace ci-build     path = "ci-build/{gitlab}/{project_id}/{protection}/{scop
 - **What a prefix covers.** A namespace's path covers every kind of reference beneath it,
   cut at a path component (`images` does not cover `images2`):
   - repositories `<path>` and `<path>/…`;
-  - plain files `/dav/files/<path>/…`, which the registry already treats as the
+  - plain files `/files/<path>/…` and `/s3/<path>/…`, which the registry treats as the
     repositories `files/<path>/…`;
   - lock and failure-memo names `<path>:<key>`.
 - **Subjects** select a job by project (`*`, `projects <path glob>`, or `project-id <n>`),
@@ -670,8 +669,8 @@ though within them it can claim protection.
 
 ### 4b: registry access from inside a job
 
-- **The proxy.** When it injects a job token, the credential proxy forwards `/lock/` and
-  `/dav/files/` as well as `/v2/`. With the node's credential it keeps refusing anything
+- **The proxy.** When it injects a job token, the credential proxy forwards `/lock/`,
+  `/files/` and `/s3/` as well as `/v2/`. With the node's credential it keeps refusing anything
   outside `/v2/`, since that credential is not scoped. The proxy filters no namespace
   itself: the registry enforces the token.
   - It sets no response timeout of its own: `/lock/acquire` long-polls for up to an hour by
@@ -708,7 +707,7 @@ though within them it can claim protection.
   ```
 
   - The proxy maps `job/<alias>` at the start of an OCI path (`/v2/job/<alias>/…`), a plain
-    file's (`/dav/files/job/<alias>/…`) and a lock name's path part
+    file's (`/files/job/<alias>/…`, `/s3/job/<alias>/…`) and a lock name's path part
     (`name=job/<alias>/…:<key>`, decoded as the registry decodes it). The mapped URL goes
     through the proxy's checks again. Any other path is forwarded as it is; `job/…` naming no
     alias of the job is refused with 403 and not forwarded.
@@ -716,8 +715,6 @@ though within them it can claim protection.
     reaches the registry as it is.
   - Only requests are mapped. The registry answers with real names, an upload's `Location`
     among them, which the proxy forwards unchanged, so a client continues on the real path.
-    A `PROPFIND`'s hrefs are mapped back to the alias, since a WebDAV client resolves a
-    listing against the root it asked for.
   - No namespace's path may start with `job`. The hub refuses an alias while one stored
     before that rule has such a path, and gives no job any alias until it moves.
   - The hub sends a job's areas (`JobRegistry.areas`) only to a node announcing
@@ -731,12 +728,10 @@ though within them it can claim protection.
     `task-cache=rwl`;
   - `VK_REGISTRY_AREAS`, the same under its older name.
 - **In-job tools.** task-rs takes `vk: http://registry.vk/job/task-cache` as its cache:
-  entries under the alias and lock names `job/task-cache/<namespace>:<key>`. sccache uses
-  `$VK_REGISTRY/dav/files/job/<alias>` as its WebDAV endpoint (the alias in the endpoint, not
-  in `key_prefix`, so it never creates `/dav/files/job/` itself), or the same files over S3:
-  `SCCACHE_ENDPOINT=$VK_REGISTRY/s3 SCCACHE_BUCKET=job SCCACHE_S3_KEY_PREFIX=<alias>
-  SCCACHE_REGION=auto SCCACHE_S3_NO_CREDENTIALS=true` (sccache needs a region, any will do).
-  Neither holds a credential.
+  entries under the alias and lock names `job/task-cache/<namespace>:<key>`. For sccache,
+  set `SCCACHE_ENDPOINT=$VK_REGISTRY/s3 SCCACHE_BUCKET=job SCCACHE_S3_KEY_PREFIX=<alias>
+  SCCACHE_REGION=auto SCCACHE_S3_NO_CREDENTIALS=true`. `auto` supplies the required region.
+  The proxy supplies the credential.
 - **Build caches.** A job's builds cache per project, protection and scope in `ci-build`, and
   a namespace may give chosen refs a scope of their own: see the
   [build caches design](build-cache-design.md).
@@ -866,7 +861,7 @@ secret can go.
   "job-or-node"`, which the hub names to every node taking tokens of its own (`"job"` to older
   ones): a placed job's guest gets the job's token only, none or expired refused; a
   gitlab-runner job's guest gets the guest token through `registry.vk`, on the paths a job's
-  token reaches (`/v2/`, `/lock/`, `/dav/files/`, `/s3/`), read again for each request so a
+  token reaches (`/v2/`, `/lock/`, `/files/`, `/s3/`), read again for each request so a
   renewal reaches a running job, and a proxy refusing everything while the node holds none. `"job"`
   keeps refusing a job without a token. Removing the node revokes both.
 
@@ -923,7 +918,7 @@ retention_days = 2
    - the URL bound at registry enrollment, and `set-url`.
 5. The registry's checks:
    - `[hub] tokens` and the token principal;
-   - grants on `/v2/`, `/dav/files/` and `/lock/`;
+   - grants on `/v2/`, plain files and `/lock/`;
    - the pipeline check, and locks and memos bounded by the token's lifetime;
    - no whole-store lookup when mounting for a token;
    - retention by prefix in gc, from `[[gc.prefix]]`, and from the hub when `[hub] allow`
@@ -931,7 +926,7 @@ retention_days = 2
 6. Minting in `place()`, and `JobStart`'s field: token, grants and cache repositories.
 7. The node: `guest_credential`, and the CI cache in the repository `JobStart` names, with
    the job's token.
-8. The proxy forwarding `/lock/` and `/dav/files/` under a job token, and the two variables
+8. The proxy forwarding `/lock/` and plain files under a job token, and the two variables
    (4b).
 9. `vk-pipeline/` cache keys, and captures under `services/` with the job's token (4c).
 10. End-to-end tests in `tests/gitlab/fleet.sh`:

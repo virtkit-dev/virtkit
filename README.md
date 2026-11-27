@@ -997,18 +997,13 @@ is useful when several runners need a shared OCI store, pull-through cache, buil
 coordination, or a shared compiler cache. Its lease and heartbeat protocol prevents runners
 from independently building the same content while a healthy peer is already doing so.
 
-The whole store is also served over WebDAV under `/dav/`, behind the same TLS and
-credentials as the rest of the server: `/dav/repos/` is a read-only view of every
-repository's tags, manifests and blobs, and `/dav/files/` is a plain-file area where an
-`sccache` pointed at `/dav/files/<dir>` lets jobs in throwaway microVMs reuse each other's
-compiled units. In accounts mode, a key with `write:files/<dir>/*` fills the cache and one
-with `read:files/<dir>/*` only reads it. Cached files expire under `vk-registry gc`'s tag
-retention like any other tag, unless their manifest keeps or expires them. Set
-`webdav = false` in the server config to disable WebDAV; the S3 view below stays on.
-
-Machines without WebDAV setup can share the same cache through sccache's S3 backend. Each
-top-level directory is a bucket. Use the registry credential for both AWS keys. Set
-`s3 = false` to disable S3.
+Plain files use the registry's TLS and credentials. `/files/<dir>/<name>` supports reads
+(including a single byte range), writes and deletions. With sccache's S3 backend at `/s3`,
+jobs in disposable microVMs can reuse compiled units. Each top-level directory is a bucket.
+Use the registry's bearer token or key as both AWS keys. A shared username and password
+cannot sign S3 requests. In accounts mode, `write:files/<dir>/*` can populate the cache
+and `read:files/<dir>/*` gives read-only access. `vk-registry gc` applies the same tag
+retention and manifest keep or expiry rules as for other tags. Set `s3 = false` to disable S3.
 
 ```sh
 SCCACHE_BUCKET=cache SCCACHE_ENDPOINT=https://<registry>/s3 SCCACHE_REGION=auto \
@@ -1049,7 +1044,7 @@ See [`docs/registry-hub.md`](docs/registry-hub.md).
 | --- | --- |
 | `vk` | Host CLI, VMM, image builder, userspace network, compose runner, and GitLab executor. It embeds the default guest kernel and `vk-agent`. |
 | `vk-agent` | Guest PID 1 and command server. It configures mounts, networking, hostname, shared directories, optional SSH, and host-driven execution over vsock. |
-| `vk-registry` | Optional OCI-distribution server with a pull-through cache, a WebDAV view of the store with a plain-file area for compiler caches, and build-once locking. |
+| `vk-registry` | Optional OCI-distribution server with a pull-through cache, plain files for compiler caches (over S3) and artifacts, and build-once locking. |
 | `vk-hub` | Experimental hub for a fleet of `vk node` hosts, and a web UI for the VMs on this machine: `vk-hub local` serves it on loopback. See the [fleet design](docs/fleet-design.md) and [prototype reference](docs/fleet-prototype.md). |
 | `vk-gitlab` | Experimental GitLab runner for a `vk-hub` fleet: takes jobs from GitLab and has the hub run each on a `vk node`. See [GitLab dispatch](docs/gitlab-dispatch.md). |
 | `vk-runnerctl` | Optional root-side helper that adjusts GitLab runner concurrency within an administrator-configured range. |

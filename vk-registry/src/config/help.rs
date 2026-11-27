@@ -94,12 +94,12 @@ const KEYS: &[Key] = &[
     Key {
         table: Table::Top,
         name: "webdav",
-        help: "enable /dav/; false returns 404 [default: true]",
+        help: "ignored, with a warning: the WebDAV view (/dav/) was removed",
     },
     Key {
         table: Table::Top,
         name: "s3",
-        help: "serve /s3/<bucket>/<key>, sccache's S3 cache over /dav/files/; false returns 404 [default: true]",
+        help: "serve /s3/<bucket>/<key> for sccache over the registry's plain files; false disables the S3 route [default: true]",
     },
     Key {
         table: Table::Top,
@@ -239,7 +239,7 @@ const KEYS: &[Key] = &[
         table: Table::GcPrefix,
         name: "path",
         help: "a repository prefix: its repositories, path/…, and\n\
-               the files under /dav/files/path/",
+               the files under /files/path/",
     },
     Key {
         table: Table::GcPrefix,

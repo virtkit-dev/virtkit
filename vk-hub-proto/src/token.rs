@@ -8,8 +8,8 @@
 //!
 //! A grant's prefix covers every kind of reference beneath it alike:
 //! - repositories `<prefix>` and `<prefix>/…`;
-//! - plain files under `/dav/files/<prefix>/…`, which the registry stores as the repositories
-//!   `files/<prefix>/…`;
+//! - plain files under `/files/<prefix>/…` and `/s3/<prefix>/…`, which the registry stores as
+//!   the repositories `files/<prefix>/…`;
 //! - lock and failure-memo names `<prefix>:<key>`, or `<prefix>/…:<key>`.
 
 use serde::{Deserialize, Serialize};
@@ -48,7 +48,7 @@ pub const MAX_TTL_SECS: u64 = 7 * 24 * 3600;
 /// The longest `sub` or `pipeline` may be.
 pub const MAX_LABEL_LEN: usize = 128;
 
-/// Where the files of `/dav/files/` are stored as repositories.
+/// Where plain files (`/files/`, `/s3/`) are stored as repositories.
 pub const FILES_REPO: &str = "files";
 
 /// The first path component of a job's aliases on its guest registry proxy: `job/<alias>`

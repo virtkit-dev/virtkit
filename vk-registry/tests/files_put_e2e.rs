@@ -49,7 +49,6 @@ fn serve(dir: &std::path::Path) -> (String, Arc<Store>, Signer) {
             token: "s3cret".to_string(),
         }),
         tls: None,
-        webdav: false,
         s3: true,
         tokens: Default::default(),
         handover: Default::default(),

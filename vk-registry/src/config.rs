@@ -83,11 +83,8 @@ pub struct ServerConfig {
     /// `[oidc]`, required in `mode = "accounts"` — it is the only login path that mode
     /// has.
     pub oidc: Option<OidcSpec>,
-    /// Enable `/dav/` (default: true). When disabled, requests return 404 after auth; the
-    /// objects already stored under `files/` stay reachable over `/v2/` (and over `/s3/`
-    /// unless `s3` is off) and expire under `gc` like any tag.
-    pub webdav: bool,
-    /// Serve `/s3/<bucket>/<key>`, the S3 view of `/dav/files/` (default: true).
+    /// Serve `/s3/<bucket>/<key>`, the S3 view of the plain files `/files/` serves
+    /// (default: true).
     pub s3: bool,
     /// Connections served at once; past it, new ones wait in the listen backlog.
     pub max_connections: usize,
@@ -258,7 +255,7 @@ struct FileConfig {
     accounts_db: Option<PathBuf>,
     /// `false` to bind no admin socket, a path to move it, `true` for the default one.
     admin_socket: Option<FileAdminSocket>,
-    /// Enable `/dav/`; defaults to true.
+    /// Accept this legacy setting so existing configs still load. Warn when it is present.
     webdav: Option<bool>,
     /// Enable `/s3/`; defaults to true.
     s3: Option<bool>,
@@ -382,7 +379,6 @@ impl ServerConfig {
             accounts_db: None,
             admin_socket: AdminSocket::Unset,
             oidc: None,
-            webdav: true,
             s3: true,
             max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             max_connections_per_client: crate::DEFAULT_MAX_CONNECTIONS_PER_CLIENT,
@@ -448,12 +444,13 @@ impl ServerConfig {
             tokens,
             update_drain_minutes,
         } = &self.hub;
+        // Keep `webdav=true` in the hash input for registries that used the old default.
         let mut described = format!(
-            "{mode} tls={tls} webdav={} upstreams={upstreams:?} max={}/{} hub=HubSettings {{ \
+            "{mode} tls={tls} webdav=true upstreams={upstreams:?} max={}/{} hub=HubSettings {{ \
              allow: {allow:?}, release_keys: {release_keys:?}, require_signed: \
              {require_signed:?}, allow_downgrade: {allow_downgrade:?}, min_retention_days: \
              {min_retention_days:?}, min_grace_days: {min_grace_days:?} }}",
-            self.webdav, self.max_connections, self.max_connections_per_client
+            self.max_connections, self.max_connections_per_client
         );
         if *tokens {
             described.push_str(" tokens=true");
@@ -474,7 +471,6 @@ impl ServerConfig {
             listen: self.addr.to_string(),
             tls,
             mode,
-            webdav: self.webdav,
             s3: self.s3,
             upstreams,
             max_connections: self.max_connections,
@@ -630,6 +626,9 @@ impl ServerConfig {
     /// neither names one.
     pub fn load(path: &Path, addr: Option<SocketAddr>, root: Option<PathBuf>) -> Result<Self> {
         let f = read_file(path)?;
+        if f.webdav.is_some() {
+            eprintln!("{}", webdav_ignored(path));
+        }
         // Parsed even when a flag outranks it: a typo in the key is worth an error rather
         // than silence, and the caller may have passed no flag on the next run.
         let file_addr = parse_addr(f.addr)?;
@@ -679,7 +678,6 @@ impl ServerConfig {
                 client_secret_file: o.client_secret_file,
                 public_url: o.public_url,
             }),
-            webdav: f.webdav.unwrap_or(true),
             s3: f.s3.unwrap_or(true),
             max_connections: f.max_connections.unwrap_or(crate::DEFAULT_MAX_CONNECTIONS),
             max_connections_per_client: f
@@ -963,12 +961,20 @@ impl ServerConfig {
             locks: LockManager::new(),
             auth,
             tls: None,
-            webdav: self.webdav,
             s3: self.s3,
             tokens: Default::default(),
             handover: Default::default(),
         })
     }
+}
+
+fn webdav_ignored(path: &Path) -> String {
+    format!(
+        "vk-registry: WARNING: {}: `webdav` is ignored and will be refused by a later release: \
+         the WebDAV view (/dav/) was removed. Plain files are served at /files/, sccache's cache \
+         at /s3/ (`s3 = false` turns that off). Remove the key.",
+        path.display()
+    )
 }
 
 /// How long a relay waits to connect to an upstream.
@@ -1865,7 +1871,8 @@ mod tests {
         assert_ne!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
     }
 
-    /// The S3 view is on unless `s3 = false`, and only turning it off changes the config hash.
+    /// Of the two view settings, only `s3 = false` changes the default config hash.
+    /// Either legacy `webdav` value loads with S3 enabled by default.
     #[test]
     fn the_s3_view_is_on_unless_turned_off() {
         let dir = std::env::temp_dir().join(format!("vk-regserve-s3-{}", std::process::id()));
@@ -1879,6 +1886,14 @@ mod tests {
         assert!(load("").s3);
         assert!(load("s3 = true\n").s3);
         assert!(!load("s3 = false\n").s3);
+        for webdav in ["webdav = false\n", "webdav = true\n"] {
+            let cfg = load(webdav);
+            assert!(cfg.s3, "{webdav}");
+            assert_eq!(cfg.hub_facts().config_hash, "e3609a2059e9c15e", "{webdav}");
+        }
+        assert!(
+            webdav_ignored(Path::new("/etc/r.toml")).contains("/etc/r.toml: `webdav` is ignored")
+        );
         let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), "/s".into());
         assert_eq!(cfg.hub_facts().config_hash, "e3609a2059e9c15e");
         assert!(cfg.hub_facts().s3, "the hub is told");

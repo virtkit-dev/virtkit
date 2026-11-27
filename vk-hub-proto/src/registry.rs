@@ -137,6 +137,8 @@ pub struct Inventory {
     pub tls: bool,
     /// `shared-secret` or `accounts`.
     pub mode: String,
+    /// Current registries send `false` for compatibility with hubs that require this field.
+    #[serde(default)]
     pub webdav: bool,
     /// The pull-through upstreams' prefixes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

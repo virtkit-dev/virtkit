@@ -6,8 +6,8 @@ services behind one listener:
 - a content-addressed OCI store shared by all runners;
 - a pull-through cache for upstream registries;
 - a leased lock service that coordinates build-once work across runners; and
-- a WebDAV view of the store, with a plain-file area for build caches such as
-  `sccache`, backed by the same blob pool.
+- plain files for build caches such as `sccache` (over S3) and for install media and other
+  artifacts (`/files/`), backed by the same blob pool.
 
 The server is intended to run on a dedicated host or as a user service. Local virtkit use
 does not require it: `vk` uses the same `Store` implementation directly for its default
@@ -21,8 +21,8 @@ scope.
 ## Architecture
 
 The `vk-registry` crate contains both the reusable store library and the server binary.
-The library provides the store, OCI routes, pull-through relay, build lock service, WebDAV
-view, and authentication. In accounts mode it also provides OIDC login, browser, upload, and local
+The library provides the store, OCI routes, pull-through relay, build lock service, plain
+files, and authentication. In accounts mode it also provides OIDC login, browser, upload, and local
 administration surfaces.
 
 The binary provides `serve`, `status`, `gc`, `install-service`, `accounts`, and `update`.
@@ -50,8 +50,8 @@ Repository names and tags are metadata over that shared blob pool.
                                 (for the default store, see "The default store")
 ```
 
-The plain-file area `/dav/files/` uses the same pool: each object is a tag on a raw-file
-manifest in a `files/` repository, with its bytes stored as a blob. See "WebDAV view".
+Plain files use the same pool: each object is a tag on a raw-file manifest in a `files/`
+repository, with its bytes stored as a blob. See "Plain files".
 
 The `sha256` and `zstd` directories are two physical encodings of the same logical
 namespace. A digest always identifies the uncompressed bytes. Deduplication is therefore
@@ -110,14 +110,14 @@ rollback invalidates the session. A failed installation attempts to remove the s
 
 The blocking pool handles blob and manifest reads with their membership checks, manifest
 pushes and deletes, batched manifest probes, storage of relayed manifests, `/browse` pages,
-manual upload storage, admin tag deletion and WebDAV downloads. A slow repository lookup
+manual upload storage, admin tag deletion and plain-file downloads. A slow repository lookup
 or a store lock wait leaves the runtime worker free to read other connections.
 
 Each store limits work that may wait on its lock to 64 blocking tasks. The limit covers
 manifest pushes, deletes and probes, relayed manifest storage, manual upload storage,
-admin tag deletion, upload finalization, relayed blob promotion, WebDAV file promotion,
-`MKCOL`, `DELETE` and file puts. Other lock waiters await a slot without occupying a thread,
-leaving blocking threads available for upload chunks and WebDAV reads during `gc`. Each
+admin tag deletion, upload finalization, relayed blob promotion, plain-file promotion and
+deletion, and file puts. Other lock waiters await a slot without occupying a thread,
+leaving blocking threads available for upload chunks and plain-file reads during `gc`. Each
 task keeps its slot until it finishes, even if the request is dropped. Upload-session
 bookkeeping and OCI tag listings run on the runtime and take no store lock. A tag listing
 reads and sorts the entries in one repository's tags directory.
@@ -226,7 +226,7 @@ has a membership record, or when the principal may read another repository that 
 The second rule preserves cross-repository deduplication without disclosing bytes the
 principal could not already fetch. The common pull path is one membership lookup; only a
 miss searches the repositories the principal may read, the `files/` tree last, so a digest
-an image repository holds is found without listing the WebDAV directories. A manifest
+an image repository holds is found without listing the plain files' directories. A manifest
 `PUT` lists readable repositories only if a reference needs a cross-repository check. For a
 hub token, the search is limited to `<prefix>` and `files/<prefix>` for each read grant.
 For users and API keys, one blob-pool lookup skips the search if the digest is absent.
@@ -439,30 +439,23 @@ Registries advertise the route to their hub in their inventory.
 
 ### Plain-file reads and deletions
 
-`GET`, `HEAD` and `DELETE` on `/files/<dir>/<name>` address the tag `files/<dir>:<name>`,
-including files written over S3. The “WebDAV view” path rules apply, except that the leaf
-may be any valid tag up to 255 bytes, including `tags`. A directory takes precedence over
-a tag at the same path. `/files/sha256/<sha256>` serves only a layer with that digest.
-
-Before lookup, the path or its parent must grant `Read` for a read or `Write` for a
-deletion. Otherwise the registry returns 403. An unreadable resolved object returns 404.
-Deletion also requires `Write` on the resolved repository.
-
-Successful reads use WebDAV's file headers and advertise `Accept-Ranges: bytes`. `GET`
-returns 206 for a satisfiable single range (`bytes=<first>-[<last>]` or `bytes=-<n>`).
-An unsatisfiable range returns 416. Multiple ranges, a malformed range or `If-Range`
-yield the whole file. `HEAD` describes the whole file. For a ranged `GET` on a zstd
-frame, decoding starts at the beginning of the frame.
-
-Reads and deletions drain request bodies before replying, up to 4 GiB. A body declared
-larger or found to exceed that limit gets 413. `DELETE` removes only the named tag
-(204, or 404 if absent). Other tags, including a separate digest tag, remain subject
-to gc. A directory or a tag for anything other than a raw file returns 409.
-
-Reads ignore `If-None-Match` and `If-Modified-Since` and process `Range` normally.
-`If-Match` and `If-Unmodified-Since` return 501. `DELETE` returns 501 for any of the
-four. Reads and deletions return 400 for the PUT-only `under=` parameter. Other query
-parameters are ignored, including Git's dumb HTTP probe `info/refs?service=…`.
+`GET`, `HEAD` and `DELETE` on `/files/<dir>/<name>` act on the object `files/<dir>:<name>` as
+`/s3/` serves it (see "Plain files" for the rules both follow, except that `<name>` may be any
+tag a file put writes, `tags` included, and a leaf as long as a component may be): a file put
+there, `/files/sha256/<sha256>` for one by digest, which serves only a file whose bytes hash to
+that digest, or an object written over S3. A read needs `Read` on the repository the path
+resolves to, a deletion `Write` there; a caller holding the action on neither the path's own
+name nor its parent's is 403 before anything is looked up, and an object it may not read is
+otherwise 404. A read answers as "Plain files" describes, with `Accept-Ranges: bytes`; a `GET`'s
+single byte range (`bytes=<first>-[<last>]`, `bytes=-<n>`) is served as a 206, one starting past
+the end is 416, and several ranges, an `If-Range` or a malformed one get the whole object; a
+`HEAD` always describes the whole object. A stored zstd frame is decoded from its start up to
+the range. Every request's body is read through before the answer. `DELETE` drops only that tag
+(204, 404 when absent): the file stays reachable by digest and under any other name until gc
+expires them; a directory or a tag that is not a raw file is 409. Preconditions are not
+evaluated: a read ignores `If-None-Match` and `If-Modified-Since`, and is 501 with `If-Match` or
+`If-Unmodified-Since`; a `DELETE` with any of the four is 501. Queries are ignored, git's dumb HTTP probe `info/refs?service=…` among them,
+except `under=`, which is a put's and refused with 400.
 
 ## Build-once lock service
 
@@ -590,152 +583,99 @@ The normal build-once sequence for content key `K` is:
 5. Build and push on a miss, or record the failure.
 6. Release the lease.
 
-## WebDAV view (`/dav/`)
+## Plain files (`/files/`, `/s3/`)
 
-The whole store is reachable over WebDAV under one root, through the registry's existing
-listener, TLS and client auth, with the permission model the OCI API enforces. WebDAV is
-enabled by default. Set `webdav = false` to disable it: `/dav/` requests return 404 after
-authentication, and the server logs this setting at startup.
+A plain file is a named object over the pool. A path's directories are a repository under
+`files/` and its leaf a tag on a single-layer raw-file manifest, the shape `/upload` and a
+file put write: `sccache/a/b/abcdef` is the tag `abcdef` of the repository
+`files/sccache/a/b`, and its bytes are the layer blob. An object therefore dedups,
+compresses and is collected like any other content, and is reachable over `/v2/` and
+`/browse` under that name. `/files/<path>` reads and deletes it ("Plain-file reads and
+deletions"), `PUT /files/<dir>/<name>` stores a file under two tags ("Streamed file puts"),
+and `/s3/<bucket>/<key>` reads and writes it as one S3 object (below). Directories are
+implicit: there is no listing and no way to create or remove one.
 
-The verb set is what opendal's `webdav` service issues — the client behind `sccache`, `oli`
-and other opendal-based tools: `PROPFIND` at `Depth` 0 and 1, `GET`, `HEAD`, `PUT`, `MKCOL`, `DELETE`
-and `OPTIONS`. `Depth: infinity` is refused with 403, as RFC 4918 allows, and a missing
-`Depth` is served as 0, what opendal means by omitting it, where RFC 4918 reads it as
-infinity. `COPY`, `MOVE`, `LOCK` and `PROPPATCH` are 405. No client XML is parsed: a `PROPFIND`
-body of up to 64 KiB is drained and ignored, `allprop` being both what the client sends and
-what an empty body means; a larger one is 413.
+File grants use the same repository names as `/v2/`. An S3 `PUT` needs `Write` on the
+parent repository. `PUT /files/` also needs `Write` on the digest repository,
+`files/sha256` by default. A writer scoped to one directory can therefore store a single
+name over S3.
 
-```text
-/dav/                                 repos/  files/
-/dav/repos/<name>/                    tags/  manifests/  blobs/  (+ nested repositories)
-/dav/repos/<name>/tags/<tag>          the manifest the tag resolves to, with its media type
-/dav/repos/<name>/manifests/<hex>     that manifest
-/dav/repos/<name>/blobs/<hex>         the blob's canonical bytes; a stored zstd frame is decoded
-/dav/files/<dir>/<path…>              plain files: repositories and tags under files/, read-write
-```
+Before lookup, `GET` and `HEAD` check `Read`, and `DELETE` checks `Write`, on the path's
+repository name or its parent. If neither grants the action, the registry returns 403.
+After lookup, an unreadable object appears absent even to `DELETE`, which also needs
+`Write` on the resolved repository. An S3 `PUT` onto a directory or a non-file tag, or
+below a tag, reveals the conflict even when the writer cannot read that name.
 
-**`repos/` is a read-only view, not an export.** The disk tree is not what a client wants:
-a stored blob may be a zstd frame, a tag file holds a digest rather than a manifest, and the
-blob pool is readable per repository, not as one directory. So tags and manifests download
-as the manifest bytes with their media type and blobs as their canonical bytes, through the
-same handlers `/v2/` uses and under the same authorization — `Read` on the repository, and
-membership for anything addressed by digest. The tree is derived from the list of
-repositories the principal may read, never from a `read_dir` of `repos/`: a repository the
-principal cannot read is a 404, as `/browse` answers, and a scope such as `read:team-a/*`
-lists `team-a/` and nothing beside it. A `files/` directory appears there as the repository
-it is, under the same grant. Blobs download with `Content-Disposition: attachment`, as
-`files/` objects do. Every write verb there is 405: an OCI write verifies
-a digest, records membership and holds the store lock, and a DAV client cannot supply a
-manifest's media type. Those go through `/v2/`. A listing of `blobs/` carries each member's
-canonical length, which for a zstd-stored blob is one `open` and a frame-header read; a
-repository of chunked bundles lists thousands of members, so that listing is an
-interactive operation and never on a CI path.
-
-**`files/` is a directory tree over the pool.** A path's directories are a repository under
-`files/` and its leaf a tag on a single-layer raw-file manifest, the shape `/upload` writes:
-`/dav/files/sccache/a/b/abcdef` is the tag `abcdef` of the repository `files/sccache/a/b`,
-and its bytes are the layer blob. An object therefore dedups, compresses and is collected
-like any other content, and is reachable over `/v2/` and `/browse` under that name.
-
-Each resource authorizes as the repository it is or is a tag of, the name `/v2/` checks for
-the same content: `GET`, `HEAD` and `PROPFIND` are reads, `PUT`, `MKCOL` and `DELETE`
-writes. A `PUT` needs `Write` on its parent repository, a `MKCOL` on the one it creates, and
-the other verbs on whichever the path resolves to; a caller holding the action on neither the
-path's own name nor its parent's is 403 before anything is looked up. To reads and to
-`DELETE`, a directory or object the caller may not read is otherwise absent, from listings
-and when named. A write refused over a clash — a `PUT` onto a directory or a tag that is not
-a raw file, a `MKCOL` onto anything, either below a tag — answers 405 or 409 whether or not
-the caller may read the name it clashed with, and so reveals that the name exists. The key
-above
-authorizes as `files/sccache/a/b`, so a cache directory takes `write:files/sccache/*` or
-`read:files/sccache/*`, both covering `files/sccache` itself; an exact `files/sccache` covers
-only the objects directly in it. `OPTIONS` needs no grant. Nothing in the server knows what
-`sccache` is; it is a directory that a compiler cache happens to write to.
+The example key belongs to `files/sccache/a/b`. Both `write:files/sccache/*` and
+`read:files/sccache/*` cover `files/sccache` and its descendants. An exact `files/sccache`
+grant covers only objects directly in that repository. The registry treats `sccache` as
+an ordinary directory.
 
 Every component obeys the OCI name rules — `[A-Za-z0-9._-]`, at most 16 components counting
-`files`, `<dir>` and the leaf, none named `tags`, `manifests` or `blobs` — and anything else
-is 400. A tag whose manifest is not a raw file, an image pushed over `/v2/` into a `files/`
-repository, is absent to reads and a 409 to `PUT` and `DELETE`, so this view neither replaces
-nor removes it.
+`files`, the directories and the leaf, with `tags`, `manifests` and `blobs` reserved — for
+S3 keys. For `/files/` reads and deletions, only the directories count toward the repository
+depth limit. The leaf is a tag and may use any of those three names.
 
-| Verb on `files/` | Answer |
-|---|---|
-| `GET`, `HEAD` | 200 with the layer blob (`application/octet-stream`, `nosniff`, `Content-Disposition: attachment`, `Last-Modified` from the tag); a directory, a missing path, or an object's path with a trailing `/` is 404. A `GET` that serves the object refreshes the tag's mtime once it is an hour old — the use the gc's retention keys on — so `Last-Modified` and `getlastmodified` move forward on reads too; a `HEAD` refreshes nothing, neither the tag nor the layer blob |
-| `PUT` | streamed to `uploads/` and hashed on the way, then promoted into the pool and tied to the tag by a manifest under the shared store lock — 201 when the tag is new, 204 when it is replaced, the previous content left for the gc. Missing parent directories are created with it, where RFC 4918 answers 409. 413 past 4 GiB; 405 for directories, top-level names and paths ending in `/`; 409 below an object or onto a tag that is not a raw file |
-| `PROPFIND` | 207 for an object or a directory; at `Depth: 1` the nested directories and the objects follow it, each object with `getcontentlength` (the layer's canonical size) and `getlastmodified` (the tag's), which opendal requires; an object is listed, and answers, only when a `GET` would serve it; 404 when absent |
-| `MKCOL` | 201, creating an empty repository (a `tags/` with nothing in it) and its missing ancestors, a top-level directory included; 405 when the path is already a directory or a tag; 409 when a tag is above it; 415 with a request body, as RFC 4918 allows |
-| `DELETE` | 204 for an object (the tag goes; the bytes wait for the gc) or an empty directory; 403 for a directory with members — a tag, a nested directory, or any entry that is not the repository's layout; 409 for one holding fresh records other than its deleted objects' (see below) or for a tag that is not a raw file; 404 when absent or unreadable to the caller; 503 when the store lock stays taken (see below) |
-| `OPTIONS` | `DAV: 1` and the verbs that resource serves: the `files/` list below `/dav/files/`, the read-only one at `/dav/`, `/dav/files/` and throughout `/dav/repos/`; every other verb is 405 with the same list |
+S3 requests and `/files/` reads and deletions split on raw `/` before decoding `%XX` in
+each component as UTF-8. `+` stays literal. Invalid names return 400, including decoded
+separators, `.`, `..`, empty components, components over 255 bytes, control characters,
+malformed escapes and invalid UTF-8. `PUT /files/` validates the literal path and limits
+the repository name to 255 bytes and the tag to 128.
 
-Every refusal reads the request body through first, and so does every `DELETE`, up to the
-4 GiB object cap (past it, 413); only a declared `Content-Length` over the cap is refused at
-once. A status sent with
-request bytes still unread closes the socket with a reset, and `sccache` takes a reset on its startup probe as
-an unwritable store and runs the whole build read-only. A read-only key makes that probe
-fail with 403, which the client reports as read-only mode: an untrusted pipeline consumes
-the cache without writing to it. Since a writer with `Write` on a directory owns its
-content, give write access only to trusted pipelines (protected branches), hand everything
-else a read-only key, and use one directory per trust level when that is not enough.
+A non-file tag, such as an image pushed into `files/` over `/v2/`, is absent to file reads.
+An S3 `PUT` or a `/files/` `DELETE` returns 409 there. `PUT /files/` can replace it.
+When credentials are required, an unauthenticated client gets a 401 challenge at `/files/`
+and 403 `AccessDenied` at an enabled S3 object route. Neither redirects to login.
 
-A directory's `DELETE` removes only leftovers: what a deleted object leaves behind — its
-raw-file manifest's sidecar and the membership markers of its layer and of the shared empty
-config — and any other record older than the default gc grace window of one day. A fresh
-sidecar of any other manifest may be pulled by digest, and the gc roots it while its blob is
-that fresh; a fresh marker no raw-file sidecar there accounts for may be a `/v2/` push that
-has uploaded its blobs and not yet its manifest. Either keeps the directory, with a 409, until
-it ages past the window, so a marker whose layer lives on in another repository after the gc
-swept the manifest does not keep it forever. The removal holds the store lock exclusive,
-lists every directory strictly, and unlinks only the entries it saw before a `remove_dir` of
-each directory. The lock is tried rather than waited for, with backoff, releasing the
-namespace lock below between attempts so the other `files/` writes proceed; after 30 s of
-shared holders or a running gc, the answer is 503.
+A read serves the layer as `application/octet-stream` with `nosniff` and
+`Content-Disposition: attachment`. A directory, a missing path or an object with a trailing
+`/` returns 404 on file lookup. `Last-Modified` reports the tag's mtime before the read.
+A successful `GET` refreshes that time for gc if the tag is more than an hour old.
+`HEAD` leaves both the tag and the layer blob untouched.
 
-`PUT`, `MKCOL` and `DELETE` under `files/` hold one process-local lock across their checks
-and namespace changes. `PUT` rechecks its path after staging, so `MKCOL` and `PUT` of one
-path cannot both succeed. `/v2/` pushes into `files/` do not take this lock. Reads,
-listings, `PUT`'s promotion, `MKCOL` and `DELETE` run on the blocking pool. A `Depth: 1`
-listing uses memory proportional to the collection's members.
+An S3 `PUT` hashes the body as it streams to `uploads/`. Under the shared store lock, it
+promotes the blob and tags its manifest, creating missing parents and leaving replaced
+content for gc. A bucket alone, a directory, a trailing `/`, a path below a tag or a
+non-file tag cannot be an upload target.
 
-Paths are split on raw `/` before each component is percent-decoded on its own — `%XX`
-escapes only, `+` being itself, and the result UTF-8 — so `%2F` cannot smuggle a separator;
-`.`, `..`, empty, over-long (255 bytes) and control-byte components, malformed escapes,
-invalid UTF-8, and more than 18 components below the area — a 16-component repository name
-and `blobs/<hex>` — are refused; under `files/` the 16-component name bound, `files`
-included, refuses a path first.
-Hrefs in a 207 are rebuilt from the decoded
-components, percent-encoded, with a trailing slash on a collection. `/dav/` is not a human
-path, so an unauthenticated client gets the 401 challenge rather than a login redirect.
+The object handler drains refused requests and `DELETE` bodies up to 4 GiB. A declared
+`Content-Length` over that cap returns 413 immediately. A streamed body returns 413 when
+it crosses the cap. Earlier checks, including authentication, can refuse a request
+without draining it. Unread request bytes can cause a reset that hides the status from
+the client. A read-only key can fetch cache entries and gets 403 on the sccache probe
+write. Give write access only to trusted pipelines, such as protected branches. Give
+other pipelines read-only keys and use separate directories for separate trust levels.
 
-**Enumeration** is the one disclosure a listing makes beyond what the caller named. A
-`Depth: 1` on `/dav/`, `/dav/repos/`, `/dav/files/` or a path component above repositories
-shows only what the principal may read, and on a server with no credential configured at
-all it is refused with 403, for the reason `/browse` does not exist in shared-secret mode:
-a catalog is not something anyone who can reach the port gets for free. `Depth: 0` there,
-which is what opendal's parent walk asks, always answers.
+S3 promotion and `/files/` deletion run their final path checks and namespace changes
+under both a process-local lock and the store's cross-process namespace lock. An S3
+`PUT` rechecks after staging, so competing S3 writes cannot make one path both a
+directory and an object. `/v2/` pushes and `PUT /files/` take no namespace lock.
+Reads, S3 promotion and deletion run on the blocking pool.
 
 ### Lifecycle
 
 An object is a tag, so `gc` expires it as it expires every tag: dropped once idle past the
-retention window, its blobs swept once unreferenced and past the grace window, both windows
-store-wide, unless its manifest keeps or expires it ("Garbage collection and reporting"). A
-WebDAV `PUT` writes none of those annotations; `vk registry put --keep|--ttl` does. Like an
-`/upload` or a `/v2/` push, `vk registry put` takes no WebDAV namespace lock, so it can tag
-an object under a name a collection already holds. Idleness is the tag's mtime, which a
-`PUT` sets and a `GET` refreshes once it is an hour old, so a read-only pipeline's hits keep
-an entry alive as a writer's do. There is no per-directory policy and no size cap; a
-replaced or deleted object frees no disk until the next `gc`. A staging file a crashed `PUT`
-left in `uploads/` goes with the idle uploads.
+applicable retention window, subject to manifest keep and expiry annotations and
+`[[gc.prefix]]` rules. See "Retention by prefix" and "Garbage collection and reporting".
+GC sweeps unreferenced blobs after the grace window. S3 writes no retention annotations.
+`vk registry put --keep|--ttl` does.
+
+Like `/upload` and `/v2/` pushes, file puts take no namespace lock. A file put can create
+a tag with the same name as a directory. File lookup finds the directory first. A `PUT`
+sets the tag's mtime. A successful `GET` refreshes it after more than an hour, so hits
+from read-only pipelines also keep an entry alive. There is no write-time quota per cache
+directory. Replacement and deletion reclaim blob space only when gc sweeps the bytes.
+GC removes staging files left by crashed uploads with other idle files in `uploads/`.
 
 ## S3 view for sccache (`/s3/`)
 
 sccache's S3 backend (OpenDAL's path-style `s3` service) can read, stat and write cache
 objects at `/s3/<bucket>/<key>` with `GET`, `HEAD` and single-request `PUT`. Each object is
-stored as a plain file visible to `vk registry get`, `/browse` and gc. The corresponding
-paths are `/files/<bucket>/<key>` and `/dav/files/<bucket>/<key>`. Only the `/files/`
-view requires a matching digest for reads under `sha256`. Both `GET` and `HEAD` accept
-a single byte range, including `HEAD` as in S3's `HeadObject`. An unsatisfiable range
-returns 416 (`InvalidRange`). S3 defaults on even with WebDAV disabled. Set `s3 = false`
-to disable it.
+a tag in the plain-file store, visible to `/browse` and gc. Read it at
+`/files/<bucket>/<key>`, or with `vk registry get` when its name is a valid CLI reference.
+A read by digest also checks that the layer matches the digest tag. S3 `GET` and `HEAD`
+both support a single byte range. `/files/` supports ranges on `GET`. An unsatisfiable
+S3 range returns 416 `InvalidRange`. S3 defaults on. Set `s3 = false` to disable it.
 
 The service root, bucket operations, other methods and nonempty queries (listings, presigned
 URLs, multipart and sub-resources) return 501 `NotImplemented`. So do `Content-MD5`,
@@ -743,7 +683,8 @@ streaming payloads (`STREAMING-…`), a `Content-Encoding` other than `identity`
 included), `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`,
 `Content-Range`, and `x-amz-*` headers other than `x-amz-date` and `x-amz-content-sha256`.
 The store ignores preconditions, writes whole objects verbatim and keeps no content coding
-to return on a read. A refused signed upload has its body read through as a WebDAV refusal
+to return on a read. After verifying the signature, S3 admission drains a refused
+upload's body as the plain-file handler
 does, with the same 413 past the object cap.
 
 Only SigV4 requires `x-amz-content-sha256`. Other than a `STREAMING-…` marker, a value must
@@ -763,10 +704,11 @@ sequence of ASCII letters, digits and hyphens. The date must be within 15 minute
 server clock. A `PUT` that supplies a SHA-256 in place of `UNSIGNED-PAYLOAD` must match it
 before publication. A mismatch returns 400 `XAmzContentSHA256Mismatch`.
 
-The registry strips cookies from S3 requests. It authenticates signed requests with
-`Authorization: Bearer <access key>` and checks Bearer or Basic credentials on unsigned
-requests. Access without credentials requires an open registry. The same grants apply as
-on `/dav/files/<bucket>/<key>`, including `write:files/<bucket>/*` and hub grants.
+The registry strips cookies and serves a signed request as one carrying
+`Authorization: Bearer <access key>`: the credential is checked as on any route, then the
+object's grants as "Plain files" describes them, including
+`write:files/<bucket>/*` and hub grants. Requests without `Authorization` get the anonymous
+permissions. Bearer or Basic credentials on unsigned requests are checked the same way.
 For example, sccache can use `SCCACHE_S3_NO_CREDENTIALS=true` with a proxy that injects the
 job's bearer token. Shared Basic credentials cannot serve as access keys. A shared bearer
 containing a comma cannot sign because commas separate the SigV4 authorization fields.
@@ -899,7 +841,7 @@ aborts the pass before deleting anything. A child that does not read as a manife
 an index names, or anything larger than a manifest may be — is kept and references nothing,
 so no push can stop collection.
 
-The `/dav/files/` objects are tags and blobs under `files/` and need no pass of their own:
+Plain files are tags and blobs under `files/` and need no pass of their own:
 `gc` and `status` treat them as the repositories they are.
 
 ## Management by a hub
@@ -940,8 +882,8 @@ leave` under a running `serve` does the same, noticed at the next heartbeat or r
 five minutes.
 
 A token is answered by its grants alone: path prefixes with read, write and lock rights. A
-prefix covers the repositories at and under it and the plain files under
-`/dav/files/<prefix>/`; the pages, uploads and settings are refused to a token. Mounting a
+prefix covers the repositories at and under it and the plain files under `/files/<prefix>/`
+and `/s3/<prefix>/`; the pages, uploads and settings are refused to a token. Mounting a
 manifest's references for a token skips the store-wide existence check, so neither the
 answer nor its timing says whether the store holds a digest outside the token's grants.
 
@@ -983,10 +925,9 @@ networking.
 
 The runner's credential is not scoped, so the proxy lends it for `/v2/` only. Under
 `[registry] guest_credential = "job"` it lends a hub-placed job's own token instead, whose
-grants this registry enforces ([Hub tokens](#hub-tokens)). The proxy also forwards `/lock/`,
-`/files/`, `/dav/files/` and `/s3/`. Under `/files/` it allows GET, HEAD, PUT and DELETE.
-WebDAV also allows PROPFIND, MKCOL and OPTIONS. MOVE and COPY would name the proxy in
-`Destination`. A job without a token,
+grants this registry enforces ([Hub tokens](#hub-tokens)), and forwards `/lock/`, `/files/`
+and `/s3/` too; under `/files/` only GET, HEAD, PUT and DELETE pass, so no MOVE or COPY names
+the proxy in its `Destination`. A job without a token,
 a gitlab-runner job included, gets a proxy that refuses everything.
 
 A `vk dev` environment with `[dev.cache] shared` gets a proxy over its shared caches instead:
@@ -996,7 +937,7 @@ a bearer token made for that run and with [host-shared locks](#locks-of-a-local-
 shared cache is an area: its name `<alias>` is the prefix `dev/<alias>`, the same for every
 environment using the store. The token is not scoped, so the proxy does the confining: it
 forwards the ping, the manifests and blobs of repositories under an area's prefix, S3 object
-`GET`, `HEAD` and single-request `PUT` under one (the store serves `/s3/` with WebDAV off),
+`GET`, `HEAD` and single-request `PUT` under one,
 with the headers the [S3 view](#s3-view-for-sccache-s3) admits, and `/lock/acquire`, `renew`
 and `release` whose every name is under one — by alias (`job/<alias>`) or by real name — and
 refuses the rest. That confines names only: a shared-secret credential reads any blob or
@@ -1057,12 +998,12 @@ when that is still below `max_connections` plus 256. The unit `install-service` 
   each entry costs about five files — the tag, the manifest sidecar, the layer's membership
   marker and the pool's manifest and layer blobs, the last two shared with identical
   entries. An account's `/v2/` membership lookup (`readable_through`) can reach those
-  directories on a miss for a digest the store holds. Store-wide walks for `/dav/repos/`
-  prefix lookups and listings, `/browse`, `status` and `gc` also visit them. A hub token
+  directories on a miss for a digest the store holds. `/browse`, `status` and `gc` also
+  visit them. A hub token
   searches only its granted trees, including `files/<prefix>`.
 - The `files/` area trusts its writers: a stored compiler-cache entry is linked into every
   project computing the same key, so write access belongs to trusted pipelines only (see
-  "WebDAV view").
+  "Plain files").
 - The store directory must be writable only by trusted local users. Requests can follow
   symlinks in parent directories under `repos/files/`; checks reject only a symlink at the
   final path component. Preventing this requires descriptor-relative path resolution.
@@ -1074,6 +1015,6 @@ when that is still below `max_connections` plus 256. The unit `install-service` 
 - The server has no durable request audit log. Administrative changes are logged to stderr:
   `accounts admin: <peer>:` identifies the admin socket peer; `accounts web: <identity>:`
   identifies the session for browse and settings changes (tag deletion, API key minting and
-  revocation, captions, uploads). Writes through `/v2/` and WebDAV, including tag removal
+  revocation, captions, uploads). Writes through `/v2/`, `/files/` and `/s3/`, including tag removal
   and replacement, are not audited.
 - OIDC trusts platform roots only and caches discovery until restart.

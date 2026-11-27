@@ -118,7 +118,7 @@ pub(crate) async fn route(
 ) -> anyhow::Result<Response<Body>> {
     use crate::objects;
     let href = req.uri().path().to_string();
-    let Some((segs, collection)) =
+    let Some((segs, trailing_slash)) =
         objects::split(rest).filter(|(segs, _)| objects::valid_plain_file(&segs.join("/")))
     else {
         let resp = crate::error_response(StatusCode::BAD_REQUEST, "NAME_INVALID", &href);
@@ -135,7 +135,7 @@ pub(crate) async fn route(
     }
     if put {
         let expected = req.extensions().get::<PayloadSha256>().map(|p| p.0.clone());
-        return objects::put(state, segs, collection, &href, expected, req).await;
+        return objects::put(state, segs, trailing_slash, &href, expected, req).await;
     }
     let head = *req.method() == Method::HEAD;
     let range = objects::range_asked(req.headers());
@@ -148,7 +148,7 @@ pub(crate) async fn route(
             authz,
             store,
             &segs,
-            collection,
+            trailing_slash,
             &href,
             objects::Read {
                 head,

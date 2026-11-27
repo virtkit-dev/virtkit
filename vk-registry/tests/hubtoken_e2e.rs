@@ -89,8 +89,7 @@ fn shared_with(
         locks: LockManager::new(),
         auth: vk_registry::Authenticator::Shared(auth),
         tls: None,
-        webdav: true,
-        s3: false,
+        s3: true,
         tokens: Default::default(),
         handover: Default::default(),
     });
@@ -200,88 +199,64 @@ async fn a_token_is_answered_by_its_grants_alone() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Under `/dav/files/`, a token writes and reads only under its grants, and a listing shows
-/// only what it may read.
+/// A token writes plain files over S3 and reads and deletes them at `/files/` only under its
+/// grants.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_token_reaches_only_its_grants_files() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let dir = tmp("dav");
+    let dir = tmp("files");
     std::fs::create_dir_all(&dir).unwrap();
     let (state, signer) = shared(&dir);
     let url = spawn(state);
     let http = reqwest::Client::new();
     let token = signer.sign(claims(AUD, 600, None)).unwrap();
     let put = |path: &str, auth: &str, body: &'static str| {
-        http.put(format!("{url}/dav/files/{path}"))
+        http.put(format!("{url}/s3/{path}"))
             .bearer_auth(auth.to_string())
             .body(body)
             .send()
     };
+    let get = |path: &str| {
+        http.get(format!("{url}/files/{path}"))
+            .bearer_auth(&token)
+            .send()
+    };
     // Seeded with the mode's secret: one file the token may read, one it may not.
-    assert!(
-        put("images/notes.txt", "s3cret", "shared")
-            .await
-            .unwrap()
-            .status()
-            .is_success()
-    );
-    assert!(
-        put("p/gl/43/secret.txt", "s3cret", "other project")
-            .await
-            .unwrap()
-            .status()
-            .is_success()
-    );
+    for (path, body) in [
+        ("images/notes.txt", "shared"),
+        ("p/gl/43/secret.txt", "other project"),
+    ] {
+        let r = put(path, "s3cret", body).await.unwrap();
+        assert!(r.status().is_success(), "{path}: {}", r.status());
+    }
 
     let r = put("p/gl/42/out.txt", &token, "mine").await.unwrap();
     assert!(r.status().is_success(), "{}", r.status());
-    let r = http
-        .get(format!("{url}/dav/files/p/gl/42/out.txt"))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap();
+    let r = get("p/gl/42/out.txt").await.unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(r.text().await.unwrap(), "mine");
-    assert_eq!(
-        put("p/gl/43/out.txt", &token, "not mine")
-            .await
-            .unwrap()
-            .status(),
-        403
-    );
-    assert_eq!(
-        put("images/out.txt", &token, "read only")
-            .await
-            .unwrap()
-            .status(),
-        403
-    );
-    let r = http
-        .get(format!("{url}/dav/files/p/gl/43/secret.txt"))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 403);
-
-    let propfind = |path: &str| {
-        http.request(
-            reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
-            format!("{url}/dav/files/{path}"),
-        )
-        .bearer_auth(&token)
-        .header("depth", "1")
-        .send()
+    let r = get("images/notes.txt").await.unwrap();
+    assert_eq!(r.status(), 200, "a read grant reads");
+    for (path, body) in [
+        ("p/gl/43/out.txt", "not mine"),
+        ("images/out.txt", "read only"),
+    ] {
+        assert_eq!(
+            put(path, &token, body).await.unwrap().status(),
+            403,
+            "{path}"
+        );
+    }
+    assert_eq!(get("p/gl/43/secret.txt").await.unwrap().status(), 403);
+    let delete = |path: &str| {
+        http.delete(format!("{url}/files/{path}"))
+            .bearer_auth(&token)
+            .send()
     };
-    let r = propfind("").await.unwrap();
-    assert_eq!(r.status(), 207);
-    let listing = r.text().await.unwrap();
-    assert!(listing.contains("/dav/files/images/"), "{listing}");
-    assert!(!listing.contains("/dav/files/p/"), "{listing}");
-    let r = propfind("p/gl/42/").await.unwrap();
-    assert_eq!(r.status(), 207);
-    assert!(r.text().await.unwrap().contains("out.txt"));
+    assert_eq!(delete("images/notes.txt").await.unwrap().status(), 403);
+    assert_eq!(delete("p/gl/43/secret.txt").await.unwrap().status(), 403);
+    assert_eq!(delete("p/gl/42/out.txt").await.unwrap().status(), 204);
+    assert_eq!(get("p/gl/42/out.txt").await.unwrap().status(), 404);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -564,7 +539,7 @@ async fn a_revoked_subject_s_token_is_refused() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Blob HEAD requests skip 1,024 WebDAV shards outside the token's grants and still
+/// Blob HEAD requests skip 1,024 plain-file shards outside the token's grants and still
 /// find a layer held by another readable repository.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tokens_blob_probe_does_not_walk_the_rest_of_the_store() {

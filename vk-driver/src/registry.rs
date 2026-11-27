@@ -995,7 +995,7 @@ async fn fetch_bundle_async(rg: &Registry, name: &str, tag: &str) -> Result<Opti
 
 /// A plain file the registry holds: one blob under a single-layer manifest whose layer is a
 /// `vk_registry::RAW_FILE_MEDIA_TYPE` — what [`put_raw_file`], the registry's `/upload` form
-/// and its WebDAV `files/` area all write.
+/// and its plain files (`/files/`, `/s3/`) all write.
 pub struct RawFile {
     /// The file's sha256 hex, which is its blob's digest.
     pub sha256: String,
@@ -7016,7 +7016,6 @@ pub(crate) mod tests {
             locks: vk_registry::lock::LockManager::new(),
             auth: vk_registry::Authenticator::Shared(auth),
             tls: None,
-            webdav: true,
             s3: false,
             tokens: Default::default(),
             handover: Default::default(),
@@ -7064,7 +7063,6 @@ pub(crate) mod tests {
             locks: vk_registry::lock::LockManager::new(),
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
-            webdav: true,
             s3: false,
             tokens: Default::default(),
             handover: Default::default(),
@@ -7088,7 +7086,7 @@ pub(crate) mod tests {
 
     /// A raw file put over HTTP: streamed up once in several chunks, tagged in two
     /// repositories (the second mounting the first's blob), read back whole from either, and
-    /// stored as the raw file the registry's WebDAV view serves, with its retention.
+    /// stored as the raw file the registry serves at `/files/`, with its retention.
     #[test]
     fn a_raw_file_round_trips_through_a_real_registry() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -7100,7 +7098,6 @@ pub(crate) mod tests {
             locks: vk_registry::lock::LockManager::new(),
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
-            webdav: true,
             s3: false,
             tokens: Default::default(),
             handover: Default::default(),
@@ -7214,7 +7211,6 @@ pub(crate) mod tests {
             locks: vk_registry::lock::LockManager::new(),
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
-            webdav: true,
             s3: false,
             tokens: Default::default(),
             handover: Default::default(),
@@ -7557,7 +7553,6 @@ pub(crate) mod tests {
             locks: vk_registry::lock::LockManager::new(),
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
-            webdav: true,
             s3: false,
             tokens: Default::default(),
             handover: Default::default(),
@@ -8313,7 +8308,6 @@ pub(crate) mod tests {
             locks: vk_registry::lock::LockManager::new(),
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
-            webdav: true,
             s3: false,
             tokens: Default::default(),
             handover: Default::default(),
@@ -8355,7 +8349,6 @@ pub(crate) mod tests {
             locks: vk_registry::lock::LockManager::new(),
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
-            webdav: true,
             s3: false,
             tokens: Default::default(),
             handover: Default::default(),
@@ -8392,7 +8385,6 @@ pub(crate) mod tests {
             locks: vk_registry::lock::LockManager::new(),
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
-            webdav: true,
             s3: false,
             tokens: Default::default(),
             handover: Default::default(),

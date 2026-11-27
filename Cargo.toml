@@ -198,7 +198,7 @@ http-body-util = "0.1"
 # Both dependencies are already in the tree via oci-client and reqwest.
 http = "1"
 tower-service = "0.3"
-# IMF-fixdate for the registry's WebDAV `Last-Modified`/`getlastmodified`; already in the tree
+# IMF-fixdate for the registry's plain-file `Last-Modified`; already in the tree
 # via hyper.
 httpdate = "1"
 bytes = "1.9"

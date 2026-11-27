@@ -987,7 +987,7 @@ enum NamespacesCmd {
         #[arg(long, value_name = "DAYS")]
         retention_days: Option<u64>,
         /// What jobs reach the path by on their guest registry proxy, as job/<ALIAS> under
-        /// /v2/ and /dav/files/ and in lock names: one repository name component, as task-cache
+        /// /v2/, /files/ and /s3/ and in lock names: one repository name component, as task-cache
         #[arg(long, value_name = "ALIAS")]
         alias: Option<String>,
         /// A ref glob whose jobs get a {scope} of their own instead of sharing `all`, as main or
@@ -4304,7 +4304,6 @@ fn render_registry(
             format!("{}{}", i.listen, if i.tls { " (TLS)" } else { "" }),
         );
         field("store", i.store.clone());
-        field("webdav", i.webdav.to_string());
         field("s3", i.s3.to_string());
         field(
             "the hub may",

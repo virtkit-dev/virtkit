@@ -449,7 +449,7 @@ async fn serve(
     // Reject PUT's `under=` so a request cannot silently address files outside that prefix.
     // Ignore other queries for Git's dumb HTTP probe, `info/refs?service=…`.
     let under = crate::query_param(req.uri().query().unwrap_or_default(), "under");
-    let Some((segs, collection)) = objects::split(rest)
+    let Some((segs, trailing_slash)) = objects::split(rest)
         .filter(|(segs, _)| objects::valid_file(segs))
         .filter(|_| under.is_none())
     else {
@@ -497,7 +497,7 @@ async fn serve(
             &state.store,
             authz,
             "a plain-file deletion",
-            move |store, authz| objects::delete(store, authz, &segs, collection, &href),
+            move |store, authz| objects::delete(store, authz, &segs, trailing_slash, &href),
         )
         .await;
     }
@@ -512,7 +512,7 @@ async fn serve(
             authz,
             store,
             &segs,
-            collection,
+            trailing_slash,
             &href,
             objects::Read {
                 head,

@@ -507,7 +507,6 @@ fn status(h: &mut Html, v: &RegistryView, now: u64) {
                     None => size,
                 },
             );
-            kv(h, "WebDAV", if i.webdav { "on" } else { "off" });
             kv(h, "S3 (sccache)", if i.s3 { "on" } else { "off" });
             kv_node(
                 h,

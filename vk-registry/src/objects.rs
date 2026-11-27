@@ -1,6 +1,5 @@
-//! Named plain files: the objects `/files/`, `/s3/` and `/dav/files/` serve, stored in the
-//! OCI pool.
-//! An object's path is `<dir…>/<leaf>`; it lives in the repository `files/<dir…>` as the tag
+//! Named plain files: the objects `/files/` and `/s3/` serve, stored in the OCI pool. An
+//! object's path is `<dir…>/<leaf>`; it lives in the repository `files/<dir…>` as the tag
 //! `<leaf>` on a single-layer raw-file manifest, as `/upload` and `PUT /files/` write one,
 //! whose layer holds the file's bytes. A path is authorized as the repository it names, so
 //! `files/<dir>/*` covers a whole tree. Objects expire under gc's tag retention and
@@ -26,7 +25,7 @@ use crate::staging::{DrainError, Staging, drain_into};
 use crate::{Authz, Body, ServerState, Store, accounts, error_response};
 
 /// The repository every object lives under.
-pub(crate) const FILES_REPO: &str = "files";
+const FILES_REPO: &str = "files";
 
 /// Maximum object size, checked both against Content-Length and while streaming.
 const MAX_OBJECT: u64 = 4 << 30;
@@ -45,14 +44,14 @@ static NAMESPACE: Mutex<()> = Mutex::new(());
 
 /// The namespace held, in this process and against any other serving the store: a registry
 /// and the release it hands over to serve it together for a while.
-pub(crate) struct Namespace {
+struct Namespace {
     _process: std::sync::MutexGuard<'static, ()>,
     _store: crate::LockGuard,
 }
 
 /// Hold [`NAMESPACE`], then the store's namespace lock. Accept a poisoned mutex: it guards
 /// no data that a panic could leave inconsistent.
-pub(crate) fn namespace(store: &Store) -> Result<Namespace> {
+fn namespace(store: &Store) -> Result<Namespace> {
     let process = NAMESPACE.lock().unwrap_or_else(PoisonError::into_inner);
     Ok(Namespace {
         _process: process,
@@ -61,7 +60,7 @@ pub(crate) fn namespace(store: &Store) -> Result<Namespace> {
 }
 
 /// What an object path names once the store has been looked at.
-pub(crate) enum Node {
+enum Node {
     /// A repository under `files/`, or a path component above one: a directory.
     Dir(String),
     /// A tag on a raw-file manifest: an object.
@@ -73,20 +72,18 @@ pub(crate) enum Node {
 }
 
 /// An object's tag and what its manifest says about the layer.
-pub(crate) struct Object {
-    pub(crate) repo: String,
-    pub(crate) tag: String,
+struct Object {
+    repo: String,
+    tag: String,
     /// the layer blob's hex
-    pub(crate) layer: String,
-    /// the layer's canonical length
-    pub(crate) size: u64,
+    layer: String,
     /// the tag's mtime
-    pub(crate) modified: SystemTime,
+    modified: SystemTime,
 }
 
 impl Node {
     /// The repository this node authorizes as.
-    pub(crate) fn repo(&self) -> &str {
+    fn repo(&self) -> &str {
         match self {
             Node::Dir(r) | Node::Foreign(r) => r,
             Node::Object(o) => &o.repo,
@@ -102,7 +99,7 @@ pub(crate) fn split(rest: &str) -> Option<(Vec<String>, bool)> {
     if rest.is_empty() {
         return Some((Vec::new(), true));
     }
-    let (rest, collection) = match rest.strip_suffix('/') {
+    let (rest, trailing_slash) = match rest.strip_suffix('/') {
         Some(r) => (r, true),
         None => (rest, false),
     };
@@ -113,7 +110,7 @@ pub(crate) fn split(rest: &str) -> Option<(Vec<String>, bool)> {
         .split('/')
         .map(|raw| decode_segment(raw).filter(|s| valid_segment(s)))
         .collect::<Option<Vec<_>>>()?;
-    Some((segments, collection))
+    Some((segments, trailing_slash))
 }
 
 /// Percent-decode one path component: `%XX` escapes only, `+` being itself in a path, and
@@ -175,7 +172,7 @@ pub(crate) fn valid_file(segs: &[String]) -> bool {
 }
 
 /// The repository a run of path components names: `files/<segs…>`.
-pub(crate) fn repo_name(segs: &[String]) -> String {
+fn repo_name(segs: &[String]) -> String {
     let mut name = String::from(FILES_REPO);
     for s in segs {
         name.push('/');
@@ -185,7 +182,7 @@ pub(crate) fn repo_name(segs: &[String]) -> String {
 }
 
 /// The repository and tag an object at `segs` would have: the last component is the tag.
-pub(crate) fn object_of(segs: &[String]) -> Option<(String, &str)> {
+fn object_of(segs: &[String]) -> Option<(String, &str)> {
     let (leaf, parents) = segs.split_last()?;
     (!parents.is_empty()).then(|| (repo_name(parents), leaf.as_str()))
 }
@@ -193,7 +190,7 @@ pub(crate) fn object_of(segs: &[String]) -> Option<(String, &str)> {
 /// What is at `segs`: a directory, an object, a foreign tag, or nothing. A directory is any
 /// path under `repos/files/` that is one — a repository, or the parent a nested repository's
 /// name created — so the tree reads as the client wrote it.
-pub(crate) fn resolve(store: &Store, segs: &[String]) -> Result<Option<Node>> {
+fn resolve(store: &Store, segs: &[String]) -> Result<Option<Node>> {
     let dir = repo_name(segs);
     if store.repo_dir_exists(&dir) {
         return Ok(Some(Node::Dir(dir)));
@@ -209,20 +206,20 @@ pub(crate) fn resolve(store: &Store, segs: &[String]) -> Result<Option<Node>> {
         None => None,
     };
     Ok(Some(match layer {
-        Some((layer, size)) => Node::Object(Object {
+        Some((layer, _)) => Node::Object(Object {
             repo,
             tag: tag.to_string(),
             layer,
-            size,
             modified,
         }),
         None => Node::Foreign(repo),
     }))
 }
 
-/// Writing below a tag would create a directory that hides the tag in [`resolve`].
-/// Top-level names are reserved for directories.
-pub(crate) fn under_object(store: &Store, segs: &[String]) -> Result<bool> {
+/// Whether an ancestor of `segs` is a tag. Writing below one would make its path a directory
+/// too, and [`resolve`] would then find the directory and hide the tag. A top-level name is
+/// always a directory.
+fn under_object(store: &Store, segs: &[String]) -> Result<bool> {
     for n in 2..segs.len() {
         if matches!(
             resolve(store, &segs[..n])?,
@@ -235,7 +232,7 @@ pub(crate) fn under_object(store: &Store, segs: &[String]) -> Result<bool> {
 }
 
 /// Whether this caller may `action` on `repo`.
-pub(crate) fn allowed(authz: &Authz<'_>, action: accounts::Action, repo: &str) -> bool {
+fn allowed(authz: &Authz<'_>, action: accounts::Action, repo: &str) -> bool {
     crate::authorize_or_forbidden(authz, action, repo).is_none()
 }
 
@@ -259,15 +256,15 @@ pub(crate) fn admits(
 /// Resolve `segs` for a caller that may act on it: `None` when nothing is there, when the
 /// path ends in a slash but names an object, or when the caller may not `action` on the
 /// repository it resolved to — absent, as far as that caller can tell.
-pub(crate) fn resolve_for(
+fn resolve_for(
     store: &Store,
     authz: &Authz<'_>,
     action: accounts::Action,
     segs: &[String],
-    collection: bool,
+    trailing_slash: bool,
 ) -> Result<Option<Node>> {
     Ok(resolve(store, segs)?.filter(|node| {
-        !(collection && !matches!(node, Node::Dir(_))) && allowed(authz, action, node.repo())
+        !(trailing_slash && !matches!(node, Node::Dir(_))) && allowed(authz, action, node.repo())
     }))
 }
 
@@ -301,14 +298,14 @@ pub(crate) fn get(
     authz: &Authz<'_>,
     store: &Store,
     segs: &[String],
-    collection: bool,
+    trailing_slash: bool,
     href: &str,
     read: Read<'_>,
 ) -> Result<Response<Body>> {
     let Read { head, range, layer } = read;
     // A directory has no body to serve.
     let Some(Node::Object(obj)) =
-        resolve_for(store, authz, accounts::Action::Read, segs, collection)?
+        resolve_for(store, authz, accounts::Action::Read, segs, trailing_slash)?
     else {
         return Ok(not_found(href));
     };
@@ -508,11 +505,7 @@ impl<R: std::io::Read> std::io::Read for Skip<R> {
 /// Why `segs` cannot take an object, re-checked under [`NAMESPACE`] before the tag is
 /// written: a top-level name or a directory is 405, a foreign tag there or any tag above
 /// it 409. `None` when the `PUT` may proceed.
-pub(crate) fn put_refusal(
-    store: &Store,
-    segs: &[String],
-    href: &str,
-) -> Result<Option<Response<Body>>> {
+fn put_refusal(store: &Store, segs: &[String], href: &str) -> Result<Option<Response<Body>>> {
     if object_of(segs).is_none() {
         return Ok(Some(not_an_object(href)));
     }
@@ -532,7 +525,7 @@ pub(crate) fn put_refusal(
 pub(crate) async fn put(
     state: &ServerState,
     segs: Vec<String>,
-    collection: bool,
+    trailing_slash: bool,
     href: &str,
     expected: Option<String>,
     req: Request<Incoming>,
@@ -542,7 +535,7 @@ pub(crate) async fn put(
         return Ok(too_big(href));
     }
     // A path ending in a slash names a directory, which takes no object.
-    if collection {
+    if trailing_slash {
         return drain_then(req, not_an_object(href), href).await;
     }
     // Refused before the body is staged when the answer is already known; checked again
@@ -633,11 +626,12 @@ pub(crate) fn delete(
     store: &Store,
     authz: &Authz<'_>,
     segs: &[String],
-    collection: bool,
+    trailing_slash: bool,
     href: &str,
 ) -> Result<Response<Body>> {
     let _namespace = namespace(store)?;
-    let Some(node) = resolve_for(store, authz, accounts::Action::Read, segs, collection)? else {
+    let Some(node) = resolve_for(store, authz, accounts::Action::Read, segs, trailing_slash)?
+    else {
         return Ok(not_found(href));
     };
     if !allowed(authz, accounts::Action::Write, node.repo()) {
@@ -692,7 +686,7 @@ pub(crate) async fn drain_then(
 
 /// 409 for a write below an object, or onto a tag this view does not serve: its parent is
 /// not a directory, or the resource is not a plain file.
-pub(crate) fn parent_is_object(href: &str) -> Response<Body> {
+fn parent_is_object(href: &str) -> Response<Body> {
     error_response(StatusCode::CONFLICT, "DENIED", href)
 }
 
@@ -701,11 +695,11 @@ fn not_an_object(href: &str) -> Response<Body> {
     error_response(StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED", href)
 }
 
-pub(crate) fn not_found(href: &str) -> Response<Body> {
+fn not_found(href: &str) -> Response<Body> {
     error_response(StatusCode::NOT_FOUND, "NOT_FOUND", href)
 }
 
-pub(crate) fn created() -> Response<Body> {
+fn created() -> Response<Body> {
     Response::builder()
         .status(StatusCode::CREATED)
         .header(CONTENT_LENGTH, "0")
@@ -713,7 +707,7 @@ pub(crate) fn created() -> Response<Body> {
         .expect("building a 201")
 }
 
-pub(crate) fn no_content() -> Response<Body> {
+fn no_content() -> Response<Body> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(crate::body_of(bytes::Bytes::new()))
@@ -722,7 +716,7 @@ pub(crate) fn no_content() -> Response<Body> {
 
 /// Format an RFC 1123 HTTP date. `httpdate` panics outside 1970 to 9999, so a time outside
 /// that range is clamped into it.
-pub(crate) fn http_date(t: SystemTime) -> String {
+fn http_date(t: SystemTime) -> String {
     const LAST: Duration = Duration::from_secs(253_402_300_799);
     let since = t
         .duration_since(SystemTime::UNIX_EPOCH)
