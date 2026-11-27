@@ -169,8 +169,17 @@ pub struct AreaUsage {
 pub struct Evicted {
     pub prefix: String,
     pub cap: u64,
-    /// `Ok(None)` when the area does not exist or another process holds its `evict.lock`.
-    pub outcome: Result<Option<EvictReport>>,
+    pub outcome: Result<Eviction>,
+}
+
+/// An area's eviction pass, or why there was none.
+#[derive(Debug)]
+pub enum Eviction {
+    /// The area does not exist yet.
+    Absent,
+    /// Another process holds `evict.lock`, or this instance opened the area for inspection.
+    Elsewhere,
+    Done(EvictReport),
 }
 
 impl Areas {
@@ -237,9 +246,12 @@ impl Areas {
             .map(|a| Evicted {
                 prefix: a.binding.prefix.clone(),
                 cap: a.binding.cap,
-                outcome: a
-                    .store()
-                    .and_then(|s| Ok(s.map(|s| s.evict()).transpose()?.flatten())),
+                outcome: a.store().and_then(|s| {
+                    let Some(s) = s else {
+                        return Ok(Eviction::Absent);
+                    };
+                    Ok(s.evict()?.map_or(Eviction::Elsewhere, Eviction::Done))
+                }),
             })
             .collect()
     }

@@ -719,15 +719,25 @@ impl Link {
         );
         let started = Instant::now();
         let report = tokio::task::spawn_blocking(move || {
-            store.gc(
+            let report = store.gc(
                 Duration::from_secs(retention_days.saturating_mul(86_400)),
                 Duration::from_secs(grace_days.saturating_mul(86_400)),
                 dry_run,
-            )
+            );
+            let flat = if dry_run {
+                (0, Vec::new())
+            } else {
+                evict_flat(&store)
+            };
+            report.map(|r| (r, flat))
         })
         .await
         .map_err(anyhow::Error::from)
         .and_then(|r| r);
+        let (report, flat_freed, flat_errors) = match report {
+            Ok((r, (freed, errors))) => (Ok(r), freed, errors),
+            Err(e) => (Err(e), 0, Vec::new()),
+        };
         eprintln!(
             "vk-registry: hub: {}",
             gc_outcome(&report, dry_run, started.elapsed())
@@ -740,10 +750,10 @@ impl Link {
                 tags_dropped: r.tags_dropped as u64,
                 manifests_dropped: r.manifests_dropped as u64,
                 blobs_dropped: r.blobs_dropped as u64,
-                bytes_freed: r.bytes_freed,
+                bytes_freed: r.bytes_freed + flat_freed,
                 uploads_dropped: r.uploads_dropped as u64,
                 blobs_leased: r.blobs_leased as u64,
-                error: None,
+                error: (!flat_errors.is_empty()).then(|| flat_errors.join("; ")),
             },
             Err(e) => GcRun {
                 command,
@@ -760,9 +770,15 @@ impl Link {
     /// Count the store again, as `vk-registry status` does.
     async fn refresh_usage(&self) {
         let store = self.state.store.clone();
-        match tokio::task::spawn_blocking(move || store.stats()).await {
-            Ok(Ok(stats)) => {
-                *self.usage.lock().unwrap_or_else(|e| e.into_inner()) = Some(usage_of(&stats));
+        match tokio::task::spawn_blocking(move || {
+            store
+                .stats()
+                .map(|stats| usage_of(&stats, store.flat().usage()))
+        })
+        .await
+        {
+            Ok(Ok(usage)) => {
+                *self.usage.lock().unwrap_or_else(|e| e.into_inner()) = Some(usage);
                 self.changed.notify_one();
             }
             Ok(Err(e)) => eprintln!("vk-registry: hub: counting the store: {e:#}"),
@@ -860,7 +876,30 @@ fn gc_outcome(report: &Result<crate::GcReport>, dry_run: bool, took: Duration) -
     }
 }
 
-fn usage_of(s: &crate::StoreStats) -> Usage {
+/// Log objects and bytes evicted per store and any errors. Return freed bytes and errors
+/// for the hub's gc report.
+fn evict_flat(store: &crate::Store) -> (u64, Vec<String>) {
+    let (mut freed, mut errors) = (0, Vec::new());
+    for e in store.flat().evict() {
+        match e.outcome {
+            Ok(crate::flat::Eviction::Done(r)) => {
+                eprintln!(
+                    "vk-registry: hub: gc: flat {}: evicted {} object(s), {} bytes",
+                    e.prefix, r.evicted, r.freed
+                );
+                freed += r.freed;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("vk-registry: hub: gc: flat {}: {err:#}", e.prefix);
+                errors.push(format!("flat {}: {err:#}", e.prefix));
+            }
+        }
+    }
+    (freed, errors)
+}
+
+fn usage_of(s: &crate::StoreStats, flat: Vec<crate::flat::AreaUsage>) -> Usage {
     let mut repos: Vec<_> = s
         .repos
         .iter()
@@ -880,6 +919,25 @@ fn usage_of(s: &crate::StoreStats) -> Usage {
         tags: s.total_tags as u64,
         manifests: s.total_manifests as u64,
         repos,
+        flat: flat
+            .into_iter()
+            .filter_map(|a| match a.usage {
+                Ok(u) => {
+                    let u = u.unwrap_or_default();
+                    Some(vk_hub_proto::registry::FlatUsage {
+                        prefix: a.prefix,
+                        objects: u.objects,
+                        bytes: u.bytes,
+                        cap: a.cap,
+                    })
+                }
+                Err(e) => {
+                    eprintln!("vk-registry: hub: counting flat {}: {e:#}", a.prefix);
+                    None
+                }
+            })
+            .take(vk_hub_proto::registry::MAX_NAMES)
+            .collect(),
     }
 }
 

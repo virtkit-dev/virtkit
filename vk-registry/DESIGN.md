@@ -899,6 +899,23 @@ so no push can stop collection.
 Plain files are tags and blobs under `files/` and need no pass of their own:
 `gc` and `status` treat them as the repositories they are.
 
+Flat stores (`[[flat]]`) have separate usage totals and eviction. For an existing registry,
+`status --config` lists each configured prefix's object count, size and cap. It opens only
+existing areas and counts a missing area as empty. Opening an area for inspection reaps
+abandoned uploads without evicting objects.
+
+After collecting repositories, `gc --config` attempts an eviction pass on each existing flat
+store. A pass evicts objects when the store is over cap and reaps abandoned uploads even
+below cap. The command reports stores left to another process and fails on eviction errors.
+A running `serve` normally holds `evict.lock` and checks the cap at one-second intervals.
+A dry run reports flat usage or counting errors and skips flat eviction. A root supplied by
+`--root` or `VK_REGISTRY_ROOT` disables the config's `[[flat]]` bindings and `[[gc.prefix]]`
+windows.
+
+Hub-requested and scheduled gc also attempt flat eviction. When repository gc succeeds,
+the hub's report includes the bytes freed by flat eviction and any flat eviction errors.
+The registry sends up to 64 flat stores in `Usage.flat`. Older hubs ignore the field.
+
 ## Management by a hub
 
 A registry may enroll with a `vk-hub` (`vk-registry join`), which then sees its inventory,

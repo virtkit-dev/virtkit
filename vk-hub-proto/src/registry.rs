@@ -240,16 +240,34 @@ pub struct Usage {
     /// The largest repositories, at most [`MAX_REPOS`], by referenced size.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repos: Vec<RepoUsage>,
+    /// Usage by `[[flat]]` prefix, excluded from the totals above. At most [`MAX_NAMES`]
+    /// entries. Older registries omit this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flat: Vec<FlatUsage>,
 }
 
 impl Usage {
-    /// Truncate repositories to [`MAX_REPOS`] and apply [`display_safe`] to their names.
+    /// Keep at most [`MAX_REPOS`] repositories and [`MAX_NAMES`] flat stores. Apply
+    /// [`display_safe`] to repository names and flat store prefixes.
     pub fn make_display_safe(&mut self) {
         self.repos.truncate(MAX_REPOS);
         for r in &mut self.repos {
             r.name = display_safe(&r.name);
         }
+        self.flat.truncate(MAX_NAMES);
+        for f in &mut self.flat {
+            f.prefix = display_safe(&f.prefix);
+        }
     }
+}
+
+/// Object count, size and cap for a prefix below `files/`. Both sizes are in bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlatUsage {
+    pub prefix: String,
+    pub objects: u64,
+    pub bytes: u64,
+    pub cap: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -588,8 +606,22 @@ mod tests {
                     tags: 3,
                     bytes: 40,
                 }],
+                flat: vec![],
             }),
             r#"{"type":"usage","at":7,"blobs":5,"stored_bytes":50,"referenced_bytes":40,"tags":3,"manifests":4,"repos":[{"name":"r","tags":3,"bytes":40}]}"#,
+        );
+        pinned(
+            &RegistryMsg::Usage(Usage {
+                at: 7,
+                flat: vec![FlatUsage {
+                    prefix: "sccache".into(),
+                    objects: 2,
+                    bytes: 30,
+                    cap: 100,
+                }],
+                ..Usage::default()
+            }),
+            r#"{"type":"usage","at":7,"blobs":0,"stored_bytes":0,"referenced_bytes":0,"tags":0,"manifests":0,"flat":[{"prefix":"sccache","objects":2,"bytes":30,"cap":100}]}"#,
         );
         pinned(
             &RegistryMsg::Report(Report {
@@ -786,13 +818,20 @@ mod tests {
             tags: 1,
             bytes: 2,
         };
+        let flat = FlatUsage {
+            prefix: "f\u{1b}".into(),
+            ..FlatUsage::default()
+        };
         let mut u = Usage {
             repos: vec![repo; MAX_REPOS + 1],
+            flat: vec![flat; MAX_NAMES + 1],
             ..Usage::default()
         };
         u.make_display_safe();
         assert_eq!(u.repos.len(), MAX_REPOS);
         assert!(u.repos.iter().all(|r| r.name == "r"));
+        assert_eq!(u.flat.len(), MAX_NAMES);
+        assert!(u.flat.iter().all(|f| f.prefix == "f"));
     }
 
     #[test]

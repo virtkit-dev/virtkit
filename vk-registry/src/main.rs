@@ -725,10 +725,15 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Status { root, config } => vk_registry::status(
-            "vk-registry",
-            store_root(root, config, |name| std::env::var_os(name))?,
-        ),
+        Cmd::Status { root, config } => {
+            let (root, config) = selectors_with_env(root, config, |name| std::env::var_os(name));
+            let flat = vk_registry::ServerConfig::flat_of(config.as_deref(), root.as_deref())?;
+            vk_registry::status_with(
+                "vk-registry",
+                vk_registry::ServerConfig::root_of(config.as_deref(), root)?,
+                flat,
+            )
+        }
         Cmd::Gc {
             root,
             config,
@@ -737,8 +742,9 @@ async fn run(cli: Cli) -> Result<()> {
             dry_run,
         } => {
             let (root, config) = selectors_with_env(root, config, |name| std::env::var_os(name));
-            // The config's `[[gc.prefix]]` windows apply as they do under `serve`, on the
-            // store that config names.
+            // Use serve's `[[flat]]` bindings and `[[gc.prefix]]` retention windows only
+            // when the config supplies the root.
+            let flat = vk_registry::ServerConfig::flat_of(config.as_deref(), root.as_deref())?;
             let (root, windows, unapplied) =
                 vk_registry::ServerConfig::gc_store_of(config.as_deref(), root)?;
             if let (Some(config), 1..) = (&config, unapplied) {
@@ -760,6 +766,7 @@ async fn run(cli: Cli) -> Result<()> {
                 days(grace_days),
                 dry_run,
                 windows,
+                flat,
             )
         }
         // handled in `main`, before this dispatch

@@ -16,6 +16,8 @@ All notable changes to virtkit will be documented in this file.
   used entries when the bucket exceeds its cap. Use S3 to read or write entries and
   `/files/` to read or delete them. These routes stop serving earlier tags under the
   prefix. Their usual retention rules still apply.
+- See each flat store's object count, size and cap in `vk-registry status --config` and on
+  the hub. Both `vk-registry gc --config` and hub-run gc evict objects from stores over cap.
 
 ### Changed
 

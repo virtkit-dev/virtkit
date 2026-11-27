@@ -788,6 +788,22 @@ fn usage(h: &mut Html, v: &RegistryView) {
     );
     kv(h, "Counted", &crate::utc(u.at));
     end_section(h);
+    if !u.flat.is_empty() {
+        h.raw("<section><h2>Flat stores</h2><table class=\"grid\"><thead><tr>")
+            .raw("<th>prefix</th><th>objects</th><th>size</th><th>cap</th></tr></thead><tbody>");
+        for f in &u.flat {
+            h.raw("<tr><td>")
+                .node(&format!("files/{}", f.prefix))
+                .raw("</td><td>")
+                .text(f.objects.to_string())
+                .raw("</td><td>")
+                .text(pages::bytes(f.bytes))
+                .raw("</td><td>")
+                .text(pages::bytes(f.cap))
+                .raw("</td></tr>");
+        }
+        h.raw("</tbody></table></section>");
+    }
     if u.repos.is_empty() {
         return;
     }

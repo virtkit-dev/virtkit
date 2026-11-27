@@ -6618,10 +6618,11 @@ pub fn gc(
     grace: Duration,
     dry_run: bool,
 ) -> Result<()> {
-    gc_windows(cmd, root, retention, grace, dry_run, Vec::new())
+    gc_windows(cmd, root, retention, grace, dry_run, Vec::new(), Vec::new())
 }
 
-/// [`gc`], with retention windows of their own under prefixes (`[[gc.prefix]]`).
+/// [`gc`] with per-prefix retention windows (`[[gc.prefix]]`). For existing `[[flat]]`
+/// stores, dry runs report usage and live runs attempt eviction.
 pub fn gc_windows(
     cmd: &str,
     root: PathBuf,
@@ -6629,6 +6630,7 @@ pub fn gc_windows(
     grace: Duration,
     dry_run: bool,
     windows: Vec<PrefixWindow>,
+    flat: Vec<flat::FlatBinding>,
 ) -> Result<()> {
     gc_to(
         &mut std::io::stdout().lock(),
@@ -6636,6 +6638,7 @@ pub fn gc_windows(
         root,
         (retention, grace, dry_run),
         windows,
+        flat,
     )
 }
 
@@ -6647,6 +6650,7 @@ fn gc_to(
     root: PathBuf,
     (retention, grace, dry_run): (Duration, Duration, bool),
     windows: Vec<PrefixWindow>,
+    flat: Vec<flat::FlatBinding>,
 ) -> Result<()> {
     let Some(store) = Store::open(&root)? else {
         writeln!(
@@ -6679,6 +6683,56 @@ fn gc_to(
             r.bytes_leased as f64 / f64::from(1u32 << 20),
         )?;
     }
+    if flat.is_empty() {
+        return Ok(());
+    }
+    // Inspection disables background eviction during a dry run.
+    let usage = if dry_run {
+        flat::Use::Inspect
+    } else {
+        flat::Use::Collect
+    };
+    store.bind_flat(flat, usage)?;
+    let at = store.root.display();
+    if dry_run {
+        for a in store.flat().usage() {
+            let what = match a.usage {
+                Ok(Some(u)) => format!(
+                    "{} object(s), {} of its {} cap",
+                    u.objects,
+                    human_bytes(u.bytes),
+                    human_bytes(a.cap)
+                ),
+                Ok(None) => "not created yet".to_string(),
+                Err(e) => format!("{e:#}"),
+            };
+            writeln!(out, "{cmd}: gc {at}: flat {}: {what}", a.prefix)?;
+        }
+        return Ok(());
+    }
+    let mut failed = 0;
+    for e in store.flat().evict() {
+        let what = match e.outcome {
+            Ok(flat::Eviction::Done(r)) => format!(
+                "evicted {} object(s) ({}) to fit its {} cap",
+                r.evicted,
+                human_bytes(r.freed),
+                human_bytes(e.cap)
+            ),
+            Ok(flat::Eviction::Elsewhere) => {
+                "another process holds evict.lock (usually vk-registry serve)".to_string()
+            }
+            Ok(flat::Eviction::Absent) => "not created yet".to_string(),
+            Err(e) => {
+                failed += 1;
+                format!("{e:#}")
+            }
+        };
+        writeln!(out, "{cmd}: gc {at}: flat {}: {what}", e.prefix)?;
+    }
+    if failed > 0 {
+        bail!("{failed} flat store(s) could not be evicted");
+    }
     Ok(())
 }
 
@@ -6687,11 +6741,21 @@ fn gc_to(
 /// breakdown; see [`Store::stats`]. `cmd` is the command the caller was invoked as, so
 /// the report names the binary the operator actually typed.
 pub fn status(cmd: &str, root: PathBuf) -> Result<()> {
-    status_to(&mut std::io::stdout().lock(), cmd, root)
+    status_with(cmd, root, Vec::new())
 }
 
-/// [`status`] writing its report to `out` rather than stdout, so a test can read it back.
-fn status_to(out: &mut impl std::io::Write, cmd: &str, root: PathBuf) -> Result<()> {
+/// [`status`] with usage for the configured `[[flat]]` stores.
+pub fn status_with(cmd: &str, root: PathBuf, flat: Vec<flat::FlatBinding>) -> Result<()> {
+    status_to(&mut std::io::stdout().lock(), cmd, root, flat)
+}
+
+/// Write the [`status_with`] report to `out` so tests can inspect it.
+fn status_to(
+    out: &mut impl std::io::Write,
+    cmd: &str,
+    root: PathBuf,
+    flat: Vec<flat::FlatBinding>,
+) -> Result<()> {
     let Some(store) = Store::open(&root)? else {
         // Not an error: a host that has cached nothing has an empty store by definition,
         // and `--root` pointed at the wrong place reads as this too — which is why the
@@ -6760,6 +6824,31 @@ fn status_to(out: &mut impl std::io::Write, cmd: &str, root: PathBuf) -> Result<
         }
     } else {
         writeln!(out, "  No repositories.")?;
+    }
+    if !flat.is_empty() {
+        store.bind_flat(flat, flat::Use::Inspect)?;
+        writeln!(out)?;
+        writeln!(
+            out,
+            "  {:<40} {:>9} {:>11} {:>11}",
+            "FLAT STORE", "OBJECTS", "SIZE", "CAP"
+        )?;
+        for a in store.flat().usage() {
+            let name = format!("files/{}", a.prefix);
+            match a.usage {
+                Ok(u) => {
+                    let u = u.unwrap_or_default();
+                    writeln!(
+                        out,
+                        "  {name:<40} {:>9} {:>11} {:>11}",
+                        u.objects,
+                        human_bytes(u.bytes),
+                        human_bytes(a.cap)
+                    )?;
+                }
+                Err(e) => writeln!(out, "  {name:<40} {e:#}")?,
+            }
+        }
     }
     if unreferenced > 0 {
         writeln!(out)?;
@@ -7839,6 +7928,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A dry run reports flat usage without evicting objects. Live gc evicts over cap.
+    /// Status counts a missing area as empty. Neither command creates it.
+    #[test]
+    fn gc_evicts_and_status_reports_flat_stores() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-flatgc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Store::new(dir.clone()).unwrap();
+        let zero = Duration::from_secs(0);
+        let bindings = || {
+            vec![
+                flat::FlatBinding::new("cc", 1000),
+                flat::FlatBinding::new("unused", 1000),
+            ]
+        };
+        {
+            let fs = flatstore::FlatStore::open(&dir.join("flat/cc"), Default::default()).unwrap();
+            for k in ["a", "b", "c"] {
+                fs.put(k.as_bytes(), &mut &[0u8; 600][..]).unwrap();
+            }
+        }
+        let mut s = Vec::new();
+        status_to(&mut s, "vk-registry", dir.clone(), bindings()).unwrap();
+        let s = String::from_utf8(s).unwrap();
+        assert!(s.contains("FLAT STORE"), "{s}");
+        let row = |name: &str| {
+            s.lines()
+                .find(|l| l.trim_start().starts_with(name))
+                .unwrap_or_else(|| panic!("no {name} in {s}"))
+                .split_whitespace()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(row("files/cc"), "3 1.8 KiB 1000 B");
+        assert_eq!(row("files/unused"), "0 0 B 1000 B");
+        assert!(!dir.join("flat/unused").exists(), "status created the missing flat store");
+
+        let gc = |dry_run: bool| {
+            let mut g = Vec::new();
+            gc_to(
+                &mut g,
+                "vk-registry",
+                dir.clone(),
+                (zero, zero, dry_run),
+                Vec::new(),
+                bindings(),
+            )
+            .unwrap();
+            String::from_utf8(g).unwrap()
+        };
+        let g = gc(true);
+        assert!(
+            g.contains("flat cc: 3 object(s), 1.8 KiB of its 1000 B cap"),
+            "{g}"
+        );
+        assert!(g.contains("flat unused: not created yet"), "{g}");
+        let g = gc(false);
+        assert!(g.contains("flat cc: evicted 2 object(s)"), "{g}");
+        assert!(g.contains("flat unused: not created yet"), "{g}");
+        assert!(!dir.join("flat/unused").exists(), "gc created the missing flat store");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Every command-named line in `status`/`gc` output — the prefixes and the cleanup
     /// hint — carries the command the binary was invoked as, so the standalone binary never
     /// points an operator at a `vk registry` command it does not provide.
@@ -7853,9 +8005,17 @@ mod tests {
 
         let render = |cmd: &str| {
             let mut s = Vec::new();
-            status_to(&mut s, cmd, dir.clone()).unwrap();
+            status_to(&mut s, cmd, dir.clone(), Vec::new()).unwrap();
             let mut g = Vec::new();
-            gc_to(&mut g, cmd, dir.clone(), (zero, zero, true), Vec::new()).unwrap();
+            gc_to(
+                &mut g,
+                cmd,
+                dir.clone(),
+                (zero, zero, true),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
             (String::from_utf8(s).unwrap(), String::from_utf8(g).unwrap())
         };
 
