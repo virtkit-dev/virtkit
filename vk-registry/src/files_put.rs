@@ -266,10 +266,26 @@ pub(crate) async fn route(
     }
     let query = req.uri().query().unwrap_or_default();
     let under = crate::query_param(query, "under");
-    let Some((digests, repo, name)) = path
-        .strip_prefix(FILES_PATH)
-        .and_then(|rest| target(rest, under.as_deref()))
-    else {
+    let rest = path.strip_prefix(FILES_PATH).unwrap_or_default();
+    // Flat objects lack the manifest and digest tag a successful /files/ upload requires.
+    // Check the flat path before applying the tagged upload's name limits.
+    if under.is_none()
+        && objects::split(rest)
+            .filter(|(segs, slash)| !slash && objects::valid_file(segs))
+            .is_some_and(|(segs, _)| state.store.flat().find(&segs).is_some())
+    {
+        let mut resp = error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "UNSUPPORTED",
+            "use S3 to upload files to this flat store",
+        );
+        resp.headers_mut().insert(
+            hyper::header::ALLOW,
+            hyper::header::HeaderValue::from_static(FLAT_ALLOWED),
+        );
+        return Ok(resp);
+    }
+    let Some((digests, repo, name)) = target(rest, under.as_deref()) else {
         return Ok(error_response(
             StatusCode::BAD_REQUEST,
             "NAME_INVALID",
@@ -279,27 +295,6 @@ pub(crate) async fn route(
             ),
         ));
     };
-    // A direct /files/ upload must return a manifest and digest tag. Flat objects have neither.
-    if under.is_none() {
-        let segs: Vec<String> = repo
-            .split('/')
-            .skip(1)
-            .chain([name])
-            .map(str::to_string)
-            .collect();
-        if state.store.flat().find(&segs).is_some() {
-            let mut resp = error_response(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "UNSUPPORTED",
-                "use S3 to upload files to this flat store",
-            );
-            resp.headers_mut().insert(
-                hyper::header::ALLOW,
-                hyper::header::HeaderValue::from_static(FLAT_ALLOWED),
-            );
-            return Ok(resp);
-        }
-    }
     for r in [digests.as_str(), repo.as_str()] {
         if let Some(resp) = crate::authorize_or_forbidden(authz, accounts::Action::Write, r) {
             return Ok(resp);

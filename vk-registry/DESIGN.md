@@ -719,8 +719,9 @@ strictly below its prefix (`<prefix>/<anything>`):
 - Flat keys have no directories. `a/b` and `a/b/c` can both be objects. A trailing slash
   returns 404 on a read, 409 `InvalidRequest` on S3 `PUT`, and 400 `NAME_INVALID` on a
   direct `/files/` upload.
-- On a valid object path, direct `PUT /files/` returns 405 with `Allow: GET, HEAD, DELETE`.
-  Its response requires a manifest and digest tag. Uploads with `?under=` still use tags.
+- Direct `PUT /files/` returns 405 with `Allow: GET, HEAD, DELETE` for valid flat object
+  paths, including file names over 128 characters. A successful upload writes a digest
+  tag and returns the manifest digest. Uploads with `?under=` still use tags.
 - `/files/sha256/<hex>`, `/v2/`, `/browse` and tag GC do not see flat objects. Below a
   bound prefix, S3 and `/files/` look only in the flat store. Existing tags retain their
   GC policy. Unbinding leaves the flat store on disk for the operator to remove.

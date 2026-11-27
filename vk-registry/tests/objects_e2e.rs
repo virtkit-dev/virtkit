@@ -1137,6 +1137,27 @@ async fn a_bound_prefix_keeps_its_objects_in_a_flat_store() {
         .unwrap();
     assert_eq!(resp.status(), 405);
     assert_eq!(resp.headers()["allow"], "GET, HEAD, DELETE");
+    // Flat file names can exceed the 128-character upload limit.
+    let long = format!("sccache/{}", "l".repeat(129));
+    assert_eq!(put(&c, &url, &long, None, "l").await, 200);
+    let resp = c
+        .put(format!("{url}/files/{long}"))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 405);
+    assert_eq!(resp.headers()["allow"], "GET, HEAD, DELETE");
+    let resp = c.get(format!("{url}/files/{long}")).send().await.unwrap();
+    assert_eq!(resp.text().await.unwrap(), "l");
+    // A decoded space makes the file name invalid.
+    let resp = c
+        .put(format!("{url}/files/sccache/a%20b"))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
     let resp = c.delete(format!("{url}/files/{key}")).send().await.unwrap();
     assert_eq!(resp.status(), 204);
     assert!(!flat_object(&root, "sccache", key).exists());
