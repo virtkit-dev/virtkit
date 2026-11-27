@@ -196,7 +196,8 @@ const KEYS: &[Key] = &[
                \"gc\" (schedule and run gc), \"update\" (install a\n\
                release it holds; run serve under a supervisor that\n\
                restarts it, as a release that cannot reach the hub\n\
-               is ended) [default: nothing, only watch]",
+               is ended), \"flat\" (bind prefixes to flat stores\n\
+               besides [[flat]]) [default: nothing, only watch]",
     },
     Key {
         table: Table::Hub,

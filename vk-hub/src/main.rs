@@ -1358,6 +1358,15 @@ enum RegistriesCmd {
         #[arg(long, conflicts_with = "every")]
         off: bool,
     },
+    /// Bind a prefix below files/ to a flat store on the registry, or unbind it
+    ///
+    /// Needs `flat` in the registry's `[hub] allow` to bind; a prefix its own `[[flat]]`
+    /// binds, or one above or below it, is refused there and reported.
+    Flat {
+        id: String,
+        #[command(subcommand)]
+        edit: FlatCmd,
+    },
     /// Run gc on the registry now
     ///
     /// Needs `gc` in the registry's `[hub] allow`.
@@ -1417,6 +1426,28 @@ fn parse_mint_ttl(s: &str) -> Result<Duration, String> {
         Duration::from_secs(vk_hub_proto::token::MAX_TTL_SECS),
         "a token's lifetime",
     )
+}
+
+#[derive(Subcommand)]
+enum FlatCmd {
+    /// Set or update the flat store binding for objects below files/<prefix>
+    Set {
+        /// A directory below files/, such as an S3 bucket: `sccache`
+        prefix: String,
+        /// Size cap (<n>K, M, G or T). Above it, evict objects with the oldest recorded
+        /// timestamps first. Reads refresh timestamps at most once an hour.
+        #[arg(long, value_parser = parse_size)]
+        cap: u64,
+        /// Evict down to this percentage of the cap [default: 90]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
+        evict_to_percent: Option<u8>,
+        /// Sync each object before acknowledging it
+        #[arg(long)]
+        durable: bool,
+    },
+    /// Remove the hub binding and leave its files on disk. Objects use tags where no local
+    /// flat store binding applies.
+    Remove { prefix: String },
 }
 
 fn parse_gc_every(s: &str) -> Result<Duration, String> {
@@ -4181,6 +4212,23 @@ fn registries_blocking(client: &admin::Client, cmd: Option<RegistriesCmd>) -> Re
                 grace_days,
             });
             desired(&id, client.set_registry_gc(&id, gc)?);
+        }
+        Some(RegistriesCmd::Flat { id, edit }) => {
+            let edit = match edit {
+                FlatCmd::Set {
+                    prefix,
+                    cap,
+                    evict_to_percent,
+                    durable,
+                } => store::FlatEdit::Set(vk_hub_proto::registry::FlatSetting {
+                    prefix,
+                    cap,
+                    evict_to_percent,
+                    durable: durable.then_some(true),
+                }),
+                FlatCmd::Remove { prefix } => store::FlatEdit::Remove { prefix },
+            };
+            desired(&id, client.set_registry_flat(&id, edit)?);
         }
         Some(RegistriesCmd::Gc {
             id,

@@ -173,6 +173,10 @@ enum Call {
         id: String,
         gc: Option<GcPolicy>,
     },
+    SetRegistryFlat {
+        id: String,
+        edit: crate::store::FlatEdit,
+    },
     RegistryGc {
         id: String,
         retention_days: u64,
@@ -849,6 +853,9 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
         }
         Call::SetRegistryGc { id, gc } => {
             serde_json::to_value(crate::registries::gc_schedule(hub, &actor, &id, gc)?)?
+        }
+        Call::SetRegistryFlat { id, edit } => {
+            serde_json::to_value(crate::registries::flat(hub, &actor, &id, edit)?)?
         }
         Call::RegistryGc {
             id,
@@ -1621,6 +1628,17 @@ impl Client {
         self.call(Call::SetRegistryGc {
             id: id.to_string(),
             gc,
+        })
+    }
+
+    pub fn set_registry_flat(
+        &self,
+        id: &str,
+        edit: crate::store::FlatEdit,
+    ) -> Result<Option<RegistryDesired>> {
+        self.call(Call::SetRegistryFlat {
+            id: id.to_string(),
+            edit,
         })
     }
 
@@ -2846,6 +2864,31 @@ mod tests {
             assert_eq!(
                 client.set_registry_gc(&id, Some(gc)).unwrap().unwrap().gc,
                 Some(gc)
+            );
+            // Not reported as taking flat stores: nothing to bind, and nothing to remove.
+            let sccache = vk_hub_proto::registry::FlatSetting {
+                prefix: "sccache".into(),
+                cap: 1 << 30,
+                evict_to_percent: None,
+                durable: None,
+            };
+            let err = client
+                .set_registry_flat(&id, crate::store::FlatEdit::Set(sccache))
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("does not take flat stores"),
+                "{err:#}"
+            );
+            assert_eq!(
+                client
+                    .set_registry_flat(
+                        &id,
+                        crate::store::FlatEdit::Remove {
+                            prefix: "sccache".into()
+                        }
+                    )
+                    .unwrap(),
+                None
             );
             let command = client.registry_gc(&id, 7, 2, true).unwrap();
             assert!(client.update_registry(&id, "abcdabcd").is_err());

@@ -21,6 +21,10 @@ All notable changes to virtkit will be documented in this file.
 - The `sccache` shared cache used by `vk dev`, `vk run --shared-cache` and `dev.sh`
   dependency builds has its own size limit. `[gc] sccache_max` defaults to 10% of the
   cache filesystem, up to 50G. Entries cached as tags before the upgrade produce misses.
+- Bind, resize or unbind flat stores without restarting the registry. Use the registry's
+  page or `vk-hub registries flat <id> set <prefix> --cap 200G` to bind or resize a store.
+  Enable `flat` in the registry's `[hub] allow`. Local `[[flat]]` bindings take precedence
+  over overlapping hub requests.
 
 ### Changed
 

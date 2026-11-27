@@ -697,7 +697,10 @@ When usage exceeds the cap, the process holding `evict.lock` evicts the least re
 objects in the background, aiming for `evict_to` times the cap. A hit attempts to refresh
 the object's mtime when it is at least an hour old. Without `durable`, power loss can leave
 a partial object. sccache can detect a corrupt entry and treat it as a miss. The registry
-opens every bound store at startup and fails if any cannot be opened.
+opens every bound store at startup and fails if any cannot be opened. A hub with `flat` in
+the registry's `[hub] allow` may bind more prefixes while it serves, resize them and unbind
+them (see "Management by a hub"): a store whose prefix stays bound keeps its instance and
+index, and a store that fails to open leaves the bindings as they were.
 
 The key is the decoded path below `files/`. These routes use the flat store for keys
 strictly below its prefix (`<prefix>/<anything>`):
@@ -920,7 +923,8 @@ The registry sends up to 64 flat stores in `Usage.flat`. Older hubs ignore the f
 
 A registry may enroll with a `vk-hub` (`vk-registry join`), which then sees its inventory,
 load and usage and, within what `[hub] allow` lists, makes it read-only, schedules and runs
-its gc, and updates it on trial. The registry's authentication and its accounts database are
+its gc, binds prefixes to flat stores beside `[[flat]]`, which wins for any prefix it binds,
+above or below, and updates it on trial. The registry's authentication and its accounts database are
 not involved: the session is an outbound WebSocket to the hub, authenticated with the
 registry's own ed25519 key, and everything kept for it is under `<root>/hub/` (for the default
 store, see "The default store"). Read-only is

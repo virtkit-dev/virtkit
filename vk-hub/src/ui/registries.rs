@@ -9,7 +9,7 @@ use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
 use hyper::{Request, Response, StatusCode};
 use vk_hub_proto::Outcome;
-use vk_hub_proto::registry::GcPolicy;
+use vk_hub_proto::registry::{FlatSetting, GcPolicy};
 
 use super::fleet::FleetSite;
 use super::html::Html;
@@ -18,7 +18,8 @@ use super::{Auth, Body, Ui, actions, blocking, field, message, page, updates};
 use crate::egress::blocked::Instances;
 use crate::registries::{self as ops, RegistryView};
 use crate::store::{
-    NamespaceRow, NotEnrolled, Program, RegistryCommandRow, RegistryRow, Release, Role, TokenKeyRow,
+    FlatEdit, NamespaceRow, NotEnrolled, Program, RegistryCommandRow, RegistryRow, Release, Role,
+    TokenKeyRow,
 };
 use vk_hub_proto::registry::Operation;
 
@@ -602,10 +603,28 @@ fn steering(h: &mut Html, v: &RegistryView, releases: &[Release], auth: &Auth) {
         }
         kv_node(h, "Update", &text);
     }
+    let flat = desired.and_then(|d| d.flat.as_deref()).unwrap_or_default();
+    if !flat.is_empty() {
+        let text: Vec<String> = flat.iter().map(flat_text).collect();
+        kv_node(h, "Flat stores requested by the hub", &text.join("; "));
+    }
     if let Some(r) = report
         && !r.refused.is_empty()
     {
-        kv_node(h, "Not allowed by its config", &r.refused.join(", "));
+        kv_node(h, "Refused", &r.refused.join(", "));
+    }
+    if let Some(r) = report
+        && !r.flat_refused.is_empty()
+    {
+        kv_node(
+            h,
+            "Flat store requests refused",
+            &format!(
+                "{} (overlap with [[flat]], missing flat in [hub] allow, an invalid list, \
+                 or a store that could not open)",
+                r.flat_refused.join(", ")
+            ),
+        );
     }
     if let Some(d) = desired {
         let applied = report.and_then(|r| r.applied);
@@ -663,6 +682,22 @@ fn steering(h: &mut Html, v: &RegistryView, releases: &[Release], auth: &Auth) {
     now.html(&windows)
         .raw("<label><input type=\"checkbox\" name=\"dry_run\" value=\"1\"> dry run</label>");
     form(h, "gc-now", "Run gc now", &now);
+    h.raw("</div><div class=\"group\"><h3>Flat stores</h3>");
+    let mut set = Html::new();
+    set.raw("<label>prefix files/<input name=\"prefix\" required></label>")
+        .raw("<label>cap <input name=\"cap\" placeholder=\"50G\" required></label>")
+        .raw("<label>evict to <input type=\"number\" name=\"evict_to_percent\" min=\"0\" ")
+        .raw("max=\"100\" value=\"90\">%</label>")
+        .raw("<label><input type=\"checkbox\" name=\"durable\" value=\"1\"> durable</label>");
+    form(h, "flat-set", "Bind", &set);
+    for s in desired.and_then(|d| d.flat.as_deref()).unwrap_or_default() {
+        let mut remove = Html::new();
+        remove
+            .raw("<input type=\"hidden\" name=\"prefix\" value=\"")
+            .text(&s.prefix)
+            .raw("\">");
+        form(h, "flat-remove", &format!("Unbind {}", s.prefix), &remove);
+    }
     h.raw("</div><div class=\"group\"><h3>Update</h3>");
     updates::form(h, &KIND, &peer(v.clone(), None), releases, Some(&auth.csrf));
     h.raw(
@@ -760,6 +795,20 @@ fn see_other(location: &str) -> Response<Body> {
         HeaderValue::from_str(location).unwrap_or(HeaderValue::from_static(PATH)),
     );
     resp
+}
+
+fn flat_text(s: &FlatSetting) -> String {
+    format!(
+        "files/{}: {}, evicting to {}%{}",
+        s.prefix,
+        pages::bytes(s.cap),
+        s.evict_to_percent.unwrap_or(90),
+        if s.durable == Some(true) {
+            ", durable"
+        } else {
+            ""
+        }
+    )
 }
 
 fn policy_text(gc: GcPolicy) -> String {
@@ -861,6 +910,7 @@ enum Act {
         grace_days: u64,
         dry_run: bool,
     },
+    Flat(FlatEdit),
 }
 
 fn act(form: &[(String, String)]) -> Result<Act, &'static str> {
@@ -873,6 +923,31 @@ fn act(form: &[(String, String)]) -> Result<Act, &'static str> {
         "read-only" => Act::ReadOnly(Some(true)),
         "writable" => Act::ReadOnly(Some(false)),
         "read-only-default" => Act::ReadOnly(None),
+        "flat-set" => {
+            let prefix = field(form, "prefix").unwrap_or("").trim().to_string();
+            let cap = field(form, "cap")
+                .and_then(vk_hub_proto::registry::parse_size)
+                .filter(|n| *n > 0);
+            let evict_to_percent = match field(form, "evict_to_percent").map(str::trim) {
+                None | Some("") => None,
+                Some(v) => match v.parse::<u8>() {
+                    Ok(p) if p <= 100 => Some(p),
+                    _ => return Err("Refused. Evict to a percentage from 0 to 100."),
+                },
+            };
+            let Some(cap) = cap else {
+                return Err("Refused. The cap must be a size such as 50G.");
+            };
+            Act::Flat(FlatEdit::Set(FlatSetting {
+                prefix,
+                cap,
+                evict_to_percent,
+                durable: field(form, "durable").is_some().then_some(true),
+            }))
+        }
+        "flat-remove" => Act::Flat(FlatEdit::Remove {
+            prefix: field(form, "prefix").unwrap_or("").to_string(),
+        }),
         "gc-off" => Act::Schedule(None),
         "gc-schedule" => {
             let (Some(hours), Some(retention_days), Some(grace_days)) = (
@@ -937,6 +1012,7 @@ pub(super) async fn action(
         Ok(match act {
             Act::ReadOnly(r) => ops::read_only(&hub, &principal, &registry, r).map(|_| ()),
             Act::Schedule(s) => ops::gc_schedule(&hub, &principal, &registry, s).map(|_| ()),
+            Act::Flat(edit) => ops::flat(&hub, &principal, &registry, edit).map(|_| ()),
             Act::GcNow {
                 retention_days,
                 grace_days,

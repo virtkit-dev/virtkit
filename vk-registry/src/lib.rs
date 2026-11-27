@@ -3902,7 +3902,7 @@ pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
         bail!("{e:#}; the registry this release was to update serves on");
     }
     state.handover.gate.open();
-    hub::start(state.clone(), facts);
+    hub::start(state.clone(), facts)?;
     serve_limited(listener, state, limits).await
 }
 

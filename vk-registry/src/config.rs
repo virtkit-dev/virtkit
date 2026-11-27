@@ -436,16 +436,32 @@ impl ServerConfig {
         }
     }
 
-    /// The `[[flat]]` bindings `vk-registry status` and `gc` apply to the store they work on:
-    /// those of the config at `config`, unless an explicit `root` names another store.
+    /// With only a config path, `vk-registry status` and `gc` use its `[[flat]]` bindings
+    /// and, when `[hub] allow` lists `flat`, the hub's last valid request. Local bindings
+    /// take precedence. An explicit `root` skips both.
     pub fn flat_of(
         config: Option<&Path>,
         root: Option<&Path>,
     ) -> Result<Vec<crate::flat::FlatBinding>> {
-        match (config, root) {
-            (Some(path), None) => flat_bindings(read_file(path)?.flat),
-            _ => Ok(Vec::new()),
+        let (Some(path), None) = (config, root) else {
+            return Ok(Vec::new());
+        };
+        let f = read_file(path)?;
+        let own = flat_bindings(f.flat)?;
+        let allows = f.hub.is_some_and(|h| {
+            h.allow
+                .iter()
+                .any(|a| a == vk_hub_proto::registry::ALLOW_FLAT)
+        });
+        if !allows {
+            return Ok(own);
         }
+        let root = match f.root {
+            Some(r) => r,
+            None => crate::located_default_root()?,
+        };
+        let asked = crate::hub::asked_flat(&root);
+        Ok(crate::hub::flat_bindings(&own, true, asked.as_deref()).0)
     }
 
     /// The store `vk-registry gc` sweeps, as [`ServerConfig::root_of`] resolves it, and the
@@ -543,6 +559,7 @@ impl ServerConfig {
             max_connections: self.max_connections,
             settings: self.hub.clone(),
             gc_prefixes: self.gc_prefixes.clone(),
+            flat: self.flat.clone(),
             config_hash: vk_hub_proto::to_hex(&Sha256::digest(described.as_bytes()))[..16]
                 .to_string(),
         }
@@ -550,12 +567,12 @@ impl ServerConfig {
 
     /// `[hub] allow` names only what a hub can ask, and its release keys parse.
     fn check_hub(&self) -> Result<()> {
-        use vk_hub_proto::registry::{ALLOW_GC, ALLOW_READ_ONLY, ALLOW_UPDATE};
+        use vk_hub_proto::registry::{ALLOW_FLAT, ALLOW_GC, ALLOW_READ_ONLY, ALLOW_UPDATE};
         for what in &self.hub.allow {
-            if ![ALLOW_READ_ONLY, ALLOW_GC, ALLOW_UPDATE].contains(&what.as_str()) {
+            if ![ALLOW_READ_ONLY, ALLOW_GC, ALLOW_UPDATE, ALLOW_FLAT].contains(&what.as_str()) {
                 bail!(
                     "[hub] allow: {what:?} is not something the hub asks; expected \
-                     {ALLOW_READ_ONLY}, {ALLOW_GC} or {ALLOW_UPDATE}"
+                     {ALLOW_READ_ONLY}, {ALLOW_GC}, {ALLOW_UPDATE} or {ALLOW_FLAT}"
                 );
             }
         }

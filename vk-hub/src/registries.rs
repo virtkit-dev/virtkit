@@ -21,7 +21,8 @@ use vk_hub_proto::{HubMsg, RefusalCode};
 use crate::server::{Ending, Exported, HEARTBEAT, Hub, MISSED_HEARTBEATS, Reach};
 use crate::session::{HANDSHAKE_STEP, Peer, PeerKind, Refusal, Ws, turn_away};
 use crate::store::{
-    NotEnrolled, Program, RegistryChange, RegistryCommandRow, RegistryRow, RegistryWrite, Release,
+    FlatEdit, NotEnrolled, Program, RegistryChange, RegistryCommandRow, RegistryRow, RegistryWrite,
+    Release,
 };
 
 /// The gc windows `vk-hub registries gc` and `gc-schedule`, and the web UI's forms, default to.
@@ -451,6 +452,19 @@ pub fn read_only(
         id,
         RegistryChange {
             read_only: Some(read_only),
+            ..RegistryChange::default()
+        },
+    )
+}
+
+/// Bind or unbind a flat store on registry `id`.
+pub fn flat(hub: &Hub, actor: &str, id: &str, edit: FlatEdit) -> Result<Option<DesiredState>> {
+    set(
+        hub,
+        actor,
+        id,
+        RegistryChange {
+            flat: Some(edit),
             ..RegistryChange::default()
         },
     )

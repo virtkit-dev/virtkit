@@ -777,3 +777,61 @@ async fn an_update_lost_by_the_registry_is_settled() {
     releases::remove(&hub, "uid 0", &release.sha256).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Flat stores are bound only on a registry that takes them, each prefix once and apart from
+/// the others; a binding is replaced whole and removed whatever the registry takes now.
+#[test]
+fn flat_stores_are_set_on_a_registry_that_takes_them() {
+    use crate::store::{FlatEdit, RegistryWrite};
+    let hub = Hub::new(Arc::new(crate::store::Db::open_memory().unwrap()), None);
+    let id = super::tokens::enrolled_registry(&hub, "k");
+    let setting = |prefix: &str, cap| reg::FlatSetting {
+        prefix: prefix.into(),
+        cap,
+        evict_to_percent: None,
+        durable: None,
+    };
+    let set = |s| registries::flat(&hub, "op", &id, FlatEdit::Set(s));
+    let inventory = |allow: &[&str]| {
+        let inventory = Inventory {
+            hostname: "reg".into(),
+            flat: true,
+            allow: allow.iter().map(|a| a.to_string()).collect(),
+            ..Inventory::default()
+        };
+        hub.db
+            .record_registry(&id, RegistryWrite::Inventory(inventory), now_secs())
+            .unwrap();
+    };
+    assert!(set(setting("sccache", 1)).is_err(), "no inventory yet");
+    inventory(&[reg::ALLOW_GC]);
+    assert!(set(setting("sccache", 1)).is_err(), "flat not allowed");
+    inventory(&[reg::ALLOW_FLAT]);
+    let flat = |d: Option<reg::DesiredState>| d.unwrap().flat.unwrap();
+    assert_eq!(
+        flat(set(setting("sccache", 1)).unwrap()),
+        [setting("sccache", 1)]
+    );
+    assert_eq!(
+        flat(set(setting("sccache", 2)).unwrap()),
+        [setting("sccache", 2)],
+        "replaced"
+    );
+    assert_eq!(set(setting("sccache", 2)).unwrap(), None, "unchanged");
+    assert!(set(setting("sccache/x", 2)).is_err(), "overlapping");
+    assert!(set(setting("Bad", 2)).is_err());
+    flat(set(setting("cc", 3)).unwrap());
+    inventory(&[]);
+    let removed = registries::flat(
+        &hub,
+        "op",
+        &id,
+        FlatEdit::Remove {
+            prefix: "sccache".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(flat(removed), [setting("cc", 3)]);
+    let row = hub.db.registry(&id).unwrap().unwrap();
+    assert_eq!(row.desired.unwrap().flat.unwrap(), [setting("cc", 3)]);
+}

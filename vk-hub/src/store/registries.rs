@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail};
 use redb::{Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::registry::{
-    Command, DesiredState, GcPolicy, Heartbeat, Inventory, Operation, PrefixRetention, Report,
-    Usage,
+    ALLOW_FLAT, Command, DesiredState, FlatSetting, GcPolicy, Heartbeat, Inventory, Operation,
+    PrefixRetention, Report, Usage,
 };
 use vk_hub_proto::token::TokenKey;
 use vk_hub_proto::{CommandAck, Outcome, UpdatePhase};
@@ -203,6 +203,27 @@ pub enum RegistryEnrollment {
 pub struct RegistryChange {
     pub read_only: Option<Option<bool>>,
     pub gc: Option<Option<GcPolicy>>,
+    pub flat: Option<FlatEdit>,
+}
+
+/// A change to the flat stores the hub binds on a registry ([`DesiredState::flat`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "edit", rename_all = "snake_case")]
+pub enum FlatEdit {
+    /// Bind the setting's prefix with its settings, replacing those it had.
+    Set(FlatSetting),
+    /// Unbind `prefix`.
+    Remove { prefix: String },
+}
+
+impl RegistryRow {
+    /// Whether the registry takes flat stores from the hub: it says it does, and its
+    /// `[hub] allow` lists flat.
+    pub fn takes_flat(&self) -> bool {
+        self.inventory
+            .as_ref()
+            .is_some_and(|i| i.flat && i.allow.iter().any(|a| a == ALLOW_FLAT))
+    }
 }
 
 /// What a registry's session writes.
@@ -449,6 +470,37 @@ impl Db {
                     ),
                     None => "no scheduled gc".to_string(),
                 });
+            }
+            if let Some(edit) = change.flat {
+                let mut list = desired.flat.clone().unwrap_or_default();
+                match edit {
+                    FlatEdit::Set(s) => {
+                        // Bound only by a registry that takes it, and removable whatever it
+                        // takes now.
+                        if !row.takes_flat() {
+                            bail!(
+                                "registry {id} does not take flat stores from the hub: its \
+                                 inventory must advertise support and list {ALLOW_FLAT} in \
+                                 [hub] allow"
+                            );
+                        }
+                        said.push(format!("flat store {} of {} bytes", s.prefix, s.cap));
+                        match list.iter_mut().find(|o| o.prefix == s.prefix) {
+                            Some(o) => *o = s,
+                            None => list.push(s),
+                        }
+                        vk_hub_proto::registry::check_flat(&list).map_err(anyhow::Error::msg)?;
+                        desired.flat = Some(list);
+                    }
+                    FlatEdit::Remove { prefix } => {
+                        let had = list.len();
+                        list.retain(|o| o.prefix != prefix);
+                        if list.len() != had {
+                            said.push(format!("no flat store for {prefix}"));
+                            desired.flat = Some(list);
+                        }
+                    }
+                }
             }
             if desired == before {
                 return Ok((None, Vec::new()));

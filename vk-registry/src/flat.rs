@@ -36,9 +36,6 @@ use crate::{Authz, Body, accounts, error_response};
 /// The directory under the store root that holds the areas.
 const AREAS_DIR: &str = "flat";
 
-/// The first component no bound prefix may have: `/files/sha256/<hex>` names files by digest.
-const BY_DIGEST: &str = "sha256";
-
 /// The default of [`FlatBinding::evict_to`].
 pub const DEFAULT_EVICT_TO: f64 = 0.9;
 
@@ -66,6 +63,18 @@ impl FlatBinding {
         }
     }
 
+    /// A binding the hub asks for ([`vk_hub_proto::registry::DesiredState::flat`]).
+    pub fn of_setting(s: &vk_hub_proto::registry::FlatSetting) -> FlatBinding {
+        FlatBinding {
+            prefix: s.prefix.clone(),
+            cap: s.cap,
+            evict_to: s
+                .evict_to_percent
+                .map_or(DEFAULT_EVICT_TO, |p| f64::from(p) / 100.0),
+            durable: s.durable.unwrap_or(false),
+        }
+    }
+
     /// The area's directory name: `+` is in no repository name component.
     fn dir_name(&self) -> String {
         self.prefix.replace('/', "+")
@@ -78,11 +87,7 @@ impl FlatBinding {
 pub fn check(bindings: &[FlatBinding]) -> Result<()> {
     for (i, b) in bindings.iter().enumerate() {
         let p = &b.prefix;
-        if !vk_hub_proto::token::servable_prefix(p)
-            || p.split('/').next() == Some(BY_DIGEST)
-            || !crate::valid_name(&format!("files/{p}/x"))
-            || format!("files/{p}").len() > vk_hub_proto::token::MAX_PREFIX_LEN
-        {
+        if !vk_hub_proto::registry::valid_flat_prefix(p) {
             bail!(
                 "[[flat]] prefix = {p:?} is not a directory below files/ (lowercase \
                  components, at most {} in all with files/ and a leaf, not under sha256 or \
@@ -99,10 +104,9 @@ pub fn check(bindings: &[FlatBinding]) -> Result<()> {
                 b.evict_to
             );
         }
-        let under = |a: &str, b: &str| a == b || a.starts_with(&format!("{b}/"));
         if let Some(other) = bindings[..i]
             .iter()
-            .find(|o| under(p, &o.prefix) || under(&o.prefix, p))
+            .find(|o| vk_hub_proto::registry::flat_prefixes_overlap(p, &o.prefix))
         {
             bail!(
                 "[[flat]] prefix = {p:?} overlaps prefix = {:?}: an object can live in one \
@@ -114,21 +118,7 @@ pub fn check(bindings: &[FlatBinding]) -> Result<()> {
     Ok(())
 }
 
-/// A size: bytes, or a number with a binary `K`, `M`, `G` or `T` suffix (`"50G"`).
-pub fn parse_size(s: &str) -> Option<u64> {
-    let s = s.trim();
-    let (digits, shift) = match s.char_indices().last()? {
-        (i, 'K' | 'k') => (&s[..i], 10),
-        (i, 'M' | 'm') => (&s[..i], 20),
-        (i, 'G' | 'g') => (&s[..i], 30),
-        (i, 'T' | 't') => (&s[..i], 40),
-        _ => (s, 0),
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse::<u64>().ok()?.checked_mul(1 << shift)
-}
+pub use vk_hub_proto::registry::parse_size;
 
 /// How a process uses the areas it binds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

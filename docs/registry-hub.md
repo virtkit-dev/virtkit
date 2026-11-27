@@ -247,10 +247,12 @@ db is as of the import: users, keys and captions created on the hub since are no
 
 ## On the hub
 
-- A **Registries** page beside Nodes: state, version, disk, traffic, usage per repository,
-  last gc and its report, steering (schedule, windows, read-only), commands.
+- Open **Fleet → Storage** and select a registry. Its **Overview** shows connection state,
+  version, disk space, active connections and uploads, usage for the largest repositories and
+  individual flat stores, the last gc report and commands. Operators can change the gc
+  schedule and windows, read-only mode and flat stores there.
 - `vk-hub registries` (the list), `vk-hub registries show|remove`, `vk-hub registries
-  read-only|gc-schedule|gc|update`.
+  read-only|gc-schedule|flat|gc|update`.
 - Rollouts cover registries: `vk-hub release` holds `vk-registry` binaries as it holds `vk`,
   signed by the same off-hub key (`vk release-key sign --program vk-registry`). A registry
   whose `[hub] release_keys` names any key requires a signature by one of them (unless
@@ -378,13 +380,35 @@ the newest one, and again after a restart:
 - `gc` (`vk-hub registries gc-schedule <id> --every 1d [--retention-days 30] [--grace-days 1]
   | --off`, at most every 10 minutes): the registry runs gc itself on that schedule, as
   `vk-registry gc` does. It refuses windows below its floors (`[hub] min_retention_days`, 7
-  by default, and `min_grace_days`, 1).
+  by default, and `min_grace_days`, 1);
+- `flat` binds prefixes below `files/` to flat stores. Set the cap, eviction target and
+  durability with `vk-hub registries flat <id> set <prefix> --cap 200G [--evict-to-percent 90]
+  [--durable]`. Remove a binding with `vk-hub registries flat <id> remove <prefix>`.
+  Both actions are available on the registry's page. See `vk-registry/DESIGN.md`, “Flat stores”.
+
+  To set a binding, the registry must advertise `flat` and list it in `[hub] allow`.
+  Older registries omit the capability. Removal needs neither support nor permission.
+  Hub prefixes must be distinct and cannot nest. Local `[[flat]]` bindings take precedence.
+  For a valid, permitted list, the registry reports overlapping requests and binds the rest.
+
+  Changes take effect while serving. Eviction normally checks the cap once a second and
+  backs off for 30 seconds after an eviction error. Unbinding leaves files on disk.
+  Requests that already hold a store finish on it.
+
+  An omitted `flat` field, as sent by older hubs, keeps the last valid request. An empty list
+  clears all hub bindings. The registry refuses an invalid list in full and keeps the last
+  valid request. If a store cannot open, the previous bindings stay active and the registry
+  reports every requested prefix as refused. It retries before each ten-minute usage count.
+  At startup, an open failure stops `serve`, as it does for `[[flat]]`.
+  `vk-registry status --config` and `gc --config` read the same saved request as `serve`.
 
 Commands are `gc` (`vk-hub registries gc <id> [--retention-days N] [--grace-days N]
 [--dry-run]`, under the same floors) and `update`, each journaled by the registry so one
 redelivered after a reconnect is answered with its outcome rather than run again, and one a
 restart interrupted is reported failed. The registry applies a desired-state field or runs a
-command only when `[hub] allow` lists it (`read-only`, `gc`, `update`); anything else is
+command according to its local policy. Token keys and revocations require `[hub] tokens`.
+Prefix retention requires `gc`. A request for read-only mode, gc, updates or flat stores
+without the corresponding entry in `[hub] allow` is
 refused, and reported as refused. An enrolled registry with no `[hub]` table is watched and
 nothing more.
 
@@ -735,7 +759,8 @@ though within them it can claim protection.
   On the registry, bind the alias's namespace to a flat store, so its many small entries are
   plain files under one size cap rather than tags: for a namespace whose path is
   `sccache/{gitlab}/{project_id}/{protection}`, add `[[flat]] prefix = "sccache"` with a
-  `cap` to the registry's config and restart it. Every project's entries then share that cap,
+  `cap` to the registry's config and restart it, or, with `flat` in its `[hub] allow`,
+  `vk-hub registries flat <id> set sccache --cap 200G`. Every project's entries then share that cap,
   each under its own path. Entries cached before are not carried over.
 - **Build caches.** A job's builds cache per project, protection and scope in `ci-build`, and
   a namespace may give chosen refs a scope of their own: see the

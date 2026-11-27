@@ -102,7 +102,7 @@ pub use observed::{
 };
 pub use policy::{ConversionNote, PolicyRefused, policy_changes};
 pub use registries::{
-    RegistryChange, RegistryCommandRow, RegistryEnrollment, RegistryRow, RegistryWrite,
+    FlatEdit, RegistryChange, RegistryCommandRow, RegistryEnrollment, RegistryRow, RegistryWrite,
     normalize_registry_url, operation_name as registry_operation_name,
 };
 pub use relay_commands::{RelayCommandRow, relay_operation_name};

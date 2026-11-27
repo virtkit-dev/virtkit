@@ -171,6 +171,10 @@ pub struct Inventory {
     /// The hub reads this as false when an older registry omits the field.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub s3: bool,
+    /// Whether it takes flat store bindings from [`DesiredState::flat`]. The hub reads this
+    /// as false when an older registry omits the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flat: bool,
 }
 
 impl Inventory {
@@ -206,6 +210,8 @@ pub const ALLOW_READ_ONLY: &str = "read-only";
 pub const ALLOW_GC: &str = "gc";
 /// `[hub] allow`'s value letting the hub update the registry.
 pub const ALLOW_UPDATE: &str = "update";
+/// `[hub] allow`'s value letting the hub bind prefixes to flat stores.
+pub const ALLOW_FLAT: &str = "flat";
 
 /// The field a [`Report`] lists among those refused when the registry refused the hub's
 /// retention windows on prefixes.
@@ -240,8 +246,8 @@ pub struct Usage {
     /// The largest repositories, at most [`MAX_REPOS`], by referenced size.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repos: Vec<RepoUsage>,
-    /// Usage by `[[flat]]` prefix, excluded from the totals above. At most [`MAX_NAMES`]
-    /// entries. Older registries omit this field.
+    /// Usage by flat store prefix, the config's and the hub's, excluded from the totals above.
+    /// At most [`MAX_NAMES`] entries. Older registries omit this field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flat: Vec<FlatUsage>,
 }
@@ -299,6 +305,11 @@ pub struct Report {
     /// refused desired-state field needs ([`ALLOW_READ_ONLY`], [`ALLOW_GC`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<String>,
+    /// Prefixes whose requested bindings the registry refused. Local `[[flat]]` overlaps
+    /// are refused individually. Missing [`ALLOW_FLAT`], an invalid list or an open failure
+    /// refuses the whole request. An earlier binding can still serve a refused prefix.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flat_refused: Vec<String>,
 }
 
 impl Report {
@@ -307,6 +318,7 @@ impl Report {
     /// command is [`valid_id`] and its sha256 [`valid_sha256`].
     pub fn make_display_safe(&mut self) {
         safe_names(&mut self.refused);
+        safe_names(&mut self.flat_refused);
         if let Some(gc) = &mut self.last_gc {
             gc.command = gc.command.take().filter(|c| valid_id(c));
             gc.error = gc.error.as_deref().map(display_safe);
@@ -324,7 +336,8 @@ impl Report {
 
 /// The state the hub wants a registry in. Every field but `generation` is optional: one left
 /// out leaves the registry as its own config has it, except `gc`: the config has no gc
-/// schedule, so `None` leaves none.
+/// schedule, so `None` leaves none; and `token_keys`, `revoked_subjects` and `flat`, which keep
+/// what was sent last.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredState {
     pub generation: u64,
@@ -347,6 +360,93 @@ pub struct DesiredState {
     /// each until no token for it can be live; `None` leaves the registry's list as it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_subjects: Option<Vec<String>>,
+    /// Additional flat stores. Local `[[flat]]` bindings take precedence over equal, parent
+    /// and child prefixes. `None` keeps the last valid list. An empty list clears the hub's
+    /// bindings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flat: Option<Vec<FlatSetting>>,
+}
+
+/// A prefix below `files/` the hub binds to a flat store ([`DesiredState::flat`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlatSetting {
+    pub prefix: String,
+    /// The store's size cap in bytes.
+    pub cap: u64,
+    /// Evict down to this percentage of the cap; the registry's default (90) when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evict_to_percent: Option<u8>,
+    /// Sync each object before acknowledging it; off when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable: Option<bool>,
+}
+
+/// The most flat store bindings [`DesiredState::flat`] holds.
+pub const MAX_FLAT: usize = 64;
+
+/// A servable repository prefix outside `sha256`, the digest namespace under `/files/`.
+/// `files/<prefix>` may occupy at most 255 bytes. Including a leaf, the path may have
+/// at most 16 components.
+pub fn valid_flat_prefix(prefix: &str) -> bool {
+    crate::token::servable_prefix(prefix)
+        && prefix.split('/').next() != Some("sha256")
+        && prefix.split('/').count() <= crate::token::MAX_PREFIX_COMPONENTS - 2
+        && prefix.len() + "files/".len() <= crate::token::MAX_PREFIX_LEN
+}
+
+/// Whether two prefixes are equal or one is below the other, component-wise.
+pub fn flat_prefixes_overlap(a: &str, b: &str) -> bool {
+    let under = |a: &str, b: &str| a == b || a.strip_prefix(b).is_some_and(|r| r.starts_with('/'));
+    under(a, b) || under(b, a)
+}
+
+/// Accept up to [`MAX_FLAT`] nonoverlapping bindings. Each needs a [`valid_flat_prefix`],
+/// a positive cap and an eviction target of at most 100%.
+pub fn check_flat(settings: &[FlatSetting]) -> Result<(), String> {
+    if settings.len() > MAX_FLAT {
+        return Err(format!("more than {MAX_FLAT} flat stores"));
+    }
+    for (i, s) in settings.iter().enumerate() {
+        let p = display_safe(&s.prefix);
+        if !valid_flat_prefix(&s.prefix) {
+            return Err(format!(
+                "{p:?} is not a directory below files/ (lowercase components, at most 14, \
+                 not sha256)"
+            ));
+        }
+        if s.cap == 0 {
+            return Err(format!("{p:?} has a cap of 0 bytes"));
+        }
+        if s.evict_to_percent.is_some_and(|e| e > 100) {
+            return Err(format!("{p:?} evicts to more than 100% of its cap"));
+        }
+        if let Some(o) = settings[..i]
+            .iter()
+            .find(|o| flat_prefixes_overlap(&o.prefix, &s.prefix))
+        {
+            return Err(format!(
+                "{p:?} overlaps {:?}: an object can live in one store only",
+                display_safe(&o.prefix)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A size: bytes, or a number with a binary `K`, `M`, `G` or `T` suffix (`"50G"`).
+pub fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (digits, shift) = match s.char_indices().last()? {
+        (i, 'K' | 'k') => (&s[..i], 10),
+        (i, 'M' | 'm') => (&s[..i], 20),
+        (i, 'G' | 'g') => (&s[..i], 30),
+        (i, 'T' | 't') => (&s[..i], 40),
+        _ => (s, 0),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()?.checked_mul(1 << shift)
 }
 
 /// The most subjects [`DesiredState::revoked_subjects`] holds: a registry refuses a longer
@@ -504,6 +604,40 @@ mod tests {
         );
     }
 
+    /// Flat bindings are servable prefixes apart from one another.
+    #[test]
+    fn flat_settings_are_checked() {
+        let s = |p: &str| FlatSetting {
+            prefix: p.into(),
+            cap: 1,
+            evict_to_percent: None,
+            durable: None,
+        };
+        check_flat(&[s("sccache"), s("dev/sccache"), s("a"), s("ab")]).unwrap();
+        check_flat(&[s(&vec!["x"; 14].join("/"))]).unwrap();
+        for bad in [
+            vec![s("Bad")],
+            vec![s("files/x")],
+            vec![s("sha256")],
+            vec![s("a/tags")],
+            vec![s(&vec!["x"; 15].join("/"))],
+            vec![s("a"), s("a/b")],
+            vec![s("a/b"), s("a")],
+            vec![FlatSetting { cap: 0, ..s("a") }],
+            vec![FlatSetting {
+                evict_to_percent: Some(101),
+                ..s("a")
+            }],
+            (0..=MAX_FLAT).map(|i| s(&format!("p{i}"))).collect(),
+        ] {
+            assert!(check_flat(&bad).is_err(), "{bad:?}");
+        }
+        assert!(flat_prefixes_overlap("a/b", "a"));
+        assert!(!flat_prefixes_overlap("ab", "a"));
+        assert_eq!(parse_size("50G"), Some(50 << 30));
+        assert_eq!(parse_size("1.5G"), None);
+    }
+
     /// Pin every message's JSON for compatibility across peer versions.
     #[test]
     fn messages_keep_their_json() {
@@ -526,6 +660,7 @@ mod tests {
                 revokes_subjects: false,
                 files_put: false,
                 s3: false,
+                flat: false,
             }),
             r#"{"type":"inventory","hostname":"h","version":"0.89.0","sha256":"s","listen":"0.0.0.0:5000","tls":true,"mode":"accounts","webdav":false,"upstreams":["docker.io"],"store":"/srv","store_size_bytes":100,"config_hash":"c","allow":["gc"],"requires_signed":true}"#,
         );
@@ -541,6 +676,19 @@ mod tests {
                 ..Inventory::default()
             }),
             r#"{"type":"inventory","hostname":"h","version":"0.93.0","listen":"l","tls":false,"mode":"accounts","webdav":false,"store":"/srv","store_size_bytes":0,"config_hash":"c","requires_signed":false,"tokens":true}"#,
+        );
+        pinned(
+            &RegistryMsg::Inventory(Inventory {
+                hostname: "h".into(),
+                version: "0.118.0".into(),
+                listen: "l".into(),
+                mode: "accounts".into(),
+                store: "/srv".into(),
+                config_hash: "c".into(),
+                flat: true,
+                ..Inventory::default()
+            }),
+            r#"{"type":"inventory","hostname":"h","version":"0.118.0","listen":"l","tls":false,"mode":"accounts","webdav":false,"store":"/srv","store_size_bytes":0,"config_hash":"c","requires_signed":false,"flat":true}"#,
         );
         pinned(
             &RegistryMsg::Inventory(Inventory {
@@ -641,6 +789,7 @@ mod tests {
                     message: None,
                 }),
                 refused: vec![],
+                flat_refused: vec![],
             }),
             r#"{"type":"report","applied":4,"read_only":true,"gc":{"every_secs":86400,"retention_days":30,"grace_days":1},"update":{"command":"c","version":"0.89.0","sha256":"s","phase":"validating"}}"#,
         );
@@ -678,8 +827,38 @@ mod tests {
                 token_keys: None,
                 prefix_retention: None,
                 revoked_subjects: None,
+                flat: None,
             }),
             r#"{"type":"desired","generation":2,"read_only":false}"#,
+        );
+        pinned(
+            &HubRegistryMsg::Desired(DesiredState {
+                generation: 4,
+                flat: Some(vec![
+                    FlatSetting {
+                        prefix: "sccache".into(),
+                        cap: 50,
+                        evict_to_percent: Some(80),
+                        durable: Some(true),
+                    },
+                    FlatSetting {
+                        prefix: "cc".into(),
+                        cap: 9,
+                        evict_to_percent: None,
+                        durable: None,
+                    },
+                ]),
+                ..DesiredState::default()
+            }),
+            r#"{"type":"desired","generation":4,"flat":[{"prefix":"sccache","cap":50,"evict_to_percent":80,"durable":true},{"prefix":"cc","cap":9}]}"#,
+        );
+        pinned(
+            &RegistryMsg::Report(Report {
+                refused: vec!["flat".into()],
+                flat_refused: vec!["sccache".into()],
+                ..Report::default()
+            }),
+            r#"{"type":"report","read_only":false,"refused":["flat"],"flat_refused":["sccache"]}"#,
         );
         pinned(
             &HubRegistryMsg::Desired(DesiredState {
@@ -695,6 +874,7 @@ mod tests {
                     retention_days: 90,
                 }]),
                 revoked_subjects: Some(vec!["node:n".into()]),
+                flat: None,
             }),
             r#"{"type":"desired","generation":3,"token_keys":[{"kid":"k","public_key":"p"}],"prefix_retention":[{"prefix":"team/a","retention_days":90}],"revoked_subjects":["node:n"]}"#,
         );

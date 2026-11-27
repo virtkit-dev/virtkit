@@ -27,8 +27,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use vk_hub_proto::registry::{
-    ALLOW_GC, ALLOW_READ_ONLY, Command, DesiredState, GcPolicy, GcRun, Heartbeat, Inventory,
-    MAX_REVOKED_SUBJECTS, Operation, REFUSED_PREFIX_RETENTION, Report, Usage,
+    ALLOW_FLAT, ALLOW_GC, ALLOW_READ_ONLY, Command, DesiredState, FlatSetting, GcPolicy, GcRun,
+    Heartbeat, Inventory, MAX_REVOKED_SUBJECTS, Operation, REFUSED_PREFIX_RETENTION, Report, Usage,
 };
 use vk_hub_proto::{CommandAck, EnrollRequest, Outcome};
 use vk_peer::identity::Identity;
@@ -225,6 +225,9 @@ pub struct Facts {
     pub settings: HubSettings,
     /// `[[gc.prefix]]`: the windows the hub may lengthen, never shorten.
     pub gc_prefixes: Vec<GcPrefix>,
+    /// `[[flat]]`: the flat stores whose prefixes, and those above and below them, the hub may
+    /// not bind.
+    pub flat: Vec<crate::flat::FlatBinding>,
     pub config_hash: String,
 }
 
@@ -248,13 +251,20 @@ pub(crate) struct Link {
     /// Set while an update hands the registry to its release: the session is closed, and the
     /// state is the release's to change.
     handed_over: tokio::sync::watch::Sender<bool>,
+    /// Whether binding the flat stores last asked for failed, to report and retry.
+    flat_failed: Mutex<bool>,
+    /// Prefixes in the current request if its flat store list was invalid.
+    flat_invalid: Mutex<Vec<String>>,
+    /// Held while the flat stores are bound.
+    flat_binding: Mutex<()>,
 }
 
 /// Hold the hub link for as long as `serve` runs: wait for an enrollment if there is none,
 /// then apply what the hub last asked and keep a session with it.
-pub fn start(state: Arc<ServerState>, ctx: Facts) {
+pub fn start(state: Arc<ServerState>, ctx: Facts) -> Result<()> {
     restore_read_only(&dir(&state.store.root), &state, &ctx.settings);
     restore_prefix_windows(&dir(&state.store.root), &state, &ctx);
+    restore_flat(&dir(&state.store.root), &state, &ctx)?;
     restore_token_keys(&dir(&state.store.root), &state, &ctx);
     tokio::spawn(async move {
         let root = state.store.root.clone();
@@ -283,6 +293,7 @@ pub fn start(state: Arc<ServerState>, ctx: Facts) {
         tokio::spawn(count_usage(link.clone()));
         session::hold(link).await;
     });
+    Ok(())
 }
 
 /// Make the registry read-only again if the hub last asked so, before `serve` takes a
@@ -329,6 +340,62 @@ fn restore_prefix_windows(dir: &Path, state: &ServerState, ctx: &Facts) {
     state
         .store
         .set_prefix_windows(prefix_windows(ctx, applied.as_ref()).0);
+}
+
+/// Restore hub bindings before accepting connections, even when the hub is offline.
+/// An open failure stops startup, as for `[[flat]]`. Falling back to tags would hide
+/// intervening writes once the flat store opens.
+fn restore_flat(dir: &Path, state: &ServerState, ctx: &Facts) -> Result<()> {
+    let asked = last_asked(dir).and_then(|(_, applied)| applied?.flat);
+    if asked.as_ref().is_some_and(|a| !a.is_empty()) {
+        bind_flat(state, ctx, asked.as_deref())
+            .context("binding the flat stores the hub asked for")?;
+    }
+    Ok(())
+}
+
+/// The last valid flat store request from the hub this store is enrolled with.
+pub fn asked_flat(root: &Path) -> Option<Vec<FlatSetting>> {
+    last_asked(&dir(root)).and_then(|(_, applied)| applied?.flat)
+}
+
+/// Return local bindings followed by permitted hub bindings, and the refused hub prefixes.
+/// Refuse an invalid list in full. For a valid, permitted list, refuse only local overlaps.
+pub fn flat_bindings(
+    own: &[crate::flat::FlatBinding],
+    allows: bool,
+    asked: Option<&[FlatSetting]>,
+) -> (Vec<crate::flat::FlatBinding>, Vec<String>) {
+    let asked = asked.unwrap_or_default();
+    let mut bound = own.to_vec();
+    let mut refused = Vec::new();
+    // Only the hub can choose which entries to keep in an invalid list.
+    let valid = vk_hub_proto::registry::check_flat(asked).is_ok();
+    for s in asked {
+        let mine = own
+            .iter()
+            .any(|o| vk_hub_proto::registry::flat_prefixes_overlap(&o.prefix, &s.prefix));
+        if !allows || !valid || mine {
+            refused.push(s.prefix.clone());
+        } else {
+            bound.push(crate::flat::FlatBinding::of_setting(s));
+        }
+    }
+    (bound, refused)
+}
+
+/// Bind the config's flat stores and those `asked`, logging what is refused; on failure, the
+/// stores bound before stay.
+fn bind_flat(state: &ServerState, ctx: &Facts, asked: Option<&[FlatSetting]>) -> Result<()> {
+    let (bound, refused) = flat_bindings(&ctx.flat, ctx.settings.allows(ALLOW_FLAT), asked);
+    if !refused.is_empty() {
+        eprintln!(
+            "vk-registry: hub: flat store(s) refused: {}: flat is not in [hub] allow, the list \
+             is invalid, or [[flat]] binds the prefix or one above or below it",
+            refused.join(", ")
+        );
+    }
+    state.store.bind_flat(bound, crate::flat::Use::Serve)
 }
 
 /// Restore the hub's verification keys before `serve` accepts connections,
@@ -458,6 +525,9 @@ fn open(dir: &Path, state: &Arc<ServerState>, ctx: &Facts) -> Result<Option<Link
         usage: Mutex::new(None),
         gc_running: tokio::sync::Mutex::new(()),
         handed_over: tokio::sync::watch::channel(false).0,
+        flat_failed: Mutex::new(false),
+        flat_invalid: Mutex::new(Vec::new()),
+        flat_binding: Mutex::new(()),
     };
     // What the hub asked before a restart holds until it asks otherwise.
     let applied = link.persisted().applied.clone();
@@ -555,6 +625,7 @@ impl Link {
             );
         }
         self.state.store.set_read_only(read_only);
+        self.bind_flat();
         let (windows, refused) = prefix_windows(&self.ctx, Some(desired));
         if refused {
             eprintln!(
@@ -600,7 +671,28 @@ impl Link {
             desired.revoked_subjects = None;
         }
         if desired.revoked_subjects.is_none() {
-            desired.revoked_subjects = previous.and_then(|a| a.revoked_subjects);
+            desired.revoked_subjects = previous.as_ref().and_then(|a| a.revoked_subjects.clone());
+        }
+        // Older hubs omit flat stores. An omitted or invalid list preserves the last valid request.
+        let invalid = desired
+            .flat
+            .as_deref()
+            .filter(|f| vk_hub_proto::registry::check_flat(f).is_err());
+        let invalid: Vec<String> = invalid
+            .unwrap_or_default()
+            .iter()
+            .map(|s| s.prefix.clone())
+            .collect();
+        if !invalid.is_empty() {
+            eprintln!(
+                "vk-registry: hub: an invalid list of flat stores refused ({}); keeping the last",
+                invalid.join(", ")
+            );
+            desired.flat = None;
+        }
+        *self.flat_invalid.lock().unwrap_or_else(|e| e.into_inner()) = invalid;
+        if desired.flat.is_none() {
+            desired.flat = previous.and_then(|a| a.flat);
         }
         // Kept first, so what takes effect is what a restart applies again.
         self.update(|p| p.applied = Some(desired.clone()))?;
@@ -623,6 +715,26 @@ impl Link {
                 refused.push(REFUSED_PREFIX_RETENTION.to_string());
             }
         }
+        let asked = p.applied.as_ref().and_then(|d| d.flat.as_deref());
+        let (_, mut flat_refused) = flat_bindings(&self.ctx.flat, self.allows(ALLOW_FLAT), asked);
+        // Report the whole request as refused even if earlier bindings still serve some prefixes.
+        if *self.flat_failed.lock().unwrap_or_else(|e| e.into_inner()) {
+            flat_refused = asked
+                .unwrap_or_default()
+                .iter()
+                .map(|s| s.prefix.clone())
+                .collect();
+        }
+        flat_refused.extend(
+            self.flat_invalid
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned(),
+        );
+        if !flat_refused.is_empty() {
+            refused.push(ALLOW_FLAT.to_string());
+        }
         Report {
             applied: p.applied.as_ref().map(|d| d.generation),
             read_only: self.state.store.read_only(),
@@ -630,6 +742,7 @@ impl Link {
             last_gc: p.last_gc.clone(),
             update: p.update.clone(),
             refused,
+            flat_refused,
         }
     }
 
@@ -767,6 +880,40 @@ impl Link {
         run
     }
 
+    /// Bind the config's flat stores and those of the saved request, recording whether that
+    /// failed for the report and [`Link::retry_flat`].
+    fn bind_flat(&self) {
+        // The request is read under the lock, so a retry cannot publish one older than the
+        // binding before it.
+        let _binding = self.flat_binding.lock().unwrap_or_else(|e| e.into_inner());
+        let asked = self
+            .persisted()
+            .applied
+            .as_ref()
+            .and_then(|d| d.flat.clone());
+        let failed = match bind_flat(&self.state, &self.ctx, asked.as_deref()) {
+            Ok(()) => false,
+            Err(e) => {
+                eprintln!("vk-registry: hub: binding the flat stores the hub asked for: {e:#}");
+                true
+            }
+        };
+        let mut was = self.flat_failed.lock().unwrap_or_else(|e| e.into_inner());
+        if *was != failed {
+            *was = failed;
+            self.changed.notify_one();
+        }
+    }
+
+    /// Retry the saved request after a binding failure. The store may now be available.
+    async fn retry_flat(self: &Arc<Self>) {
+        if !*self.flat_failed.lock().unwrap_or_else(|e| e.into_inner()) {
+            return;
+        }
+        let link = Arc::clone(self);
+        let _ = tokio::task::spawn_blocking(move || link.bind_flat()).await;
+    }
+
     /// Count the store again, as `vk-registry status` does.
     async fn refresh_usage(&self) {
         let store = self.state.store.clone();
@@ -831,6 +978,7 @@ impl Link {
             revokes_subjects: true,
             files_put: true,
             s3: self.ctx.s3,
+            flat: true,
         }
     }
 
@@ -968,10 +1116,11 @@ async fn scheduled_gc(link: Arc<Link>) {
     }
 }
 
-/// Count the store for the hub every [`USAGE_EVERY`], as long as `serve` runs; the session
-/// sends each count when it is ready.
+/// Retry failed bindings before counting usage. The session sends the latest count.
+/// While `serve` runs, wait [`USAGE_EVERY`] between counts.
 async fn count_usage(link: Arc<Link>) {
     loop {
+        link.retry_flat().await;
         link.refresh_usage().await;
         tokio::time::sleep(USAGE_EVERY).await;
     }
@@ -1048,6 +1197,7 @@ mod tests {
             token_keys: None,
             prefix_retention: None,
             revoked_subjects: None,
+            flat: None,
         }
     }
 
@@ -1169,6 +1319,7 @@ mod tests {
                 token_keys: None,
                 prefix_retention: None,
                 revoked_subjects: None,
+                flat: None,
             })
             .unwrap();
         assert!(first.state.store.read_only());
@@ -1209,6 +1360,7 @@ mod tests {
             token_keys: None,
             prefix_retention: None,
             revoked_subjects: None,
+            flat: None,
         };
         link.apply_desired(read_only(1, false)).unwrap();
         assert!(link.report().refused.is_empty());
@@ -1293,6 +1445,7 @@ mod tests {
                 token_keys: None,
                 prefix_retention: None,
                 revoked_subjects: None,
+                flat: None,
             })
             .unwrap();
         let state = server_state(&root);
@@ -1336,6 +1489,7 @@ mod tests {
             token_keys: None,
             prefix_retention: None,
             revoked_subjects: None,
+            flat: None,
         };
         assert!(link.apply_desired(desired).is_err());
         mode(0o700).unwrap();
@@ -1486,6 +1640,112 @@ mod tests {
         assert!(windows(&state).is_empty(), "no windows from another hub");
     }
 
+    /// The flat stores the hub asks for are bound beside the config's, but for those its
+    /// `[[flat]]` covers; a hub saying nothing keeps them; they come back on restart; without
+    /// `flat` in `[hub] allow` none is bound and all are reported.
+    #[test]
+    fn flat_stores_the_hub_asks_for_are_bound_reported_and_restored() {
+        use crate::flat::FlatBinding;
+        let root = enrolled("flat");
+        let settings = HubSettings {
+            allow: vec![ALLOW_FLAT.into()],
+            ..HubSettings::default()
+        };
+        let ctx = Facts {
+            flat: vec![FlatBinding::new("dev/own", 100)],
+            ..facts(settings, Vec::new())
+        };
+        let state = server_state(&root);
+        state
+            .store
+            .bind_flat(ctx.flat.clone(), crate::flat::Use::Serve)
+            .unwrap();
+        let link = open(&dir(&root), &state, &ctx).unwrap().unwrap();
+        assert!(link.inventory().flat);
+        let setting = |prefix: &str, cap| FlatSetting {
+            prefix: prefix.into(),
+            cap,
+            evict_to_percent: Some(50),
+            durable: Some(true),
+        };
+        let bound = |state: &ServerState| -> Vec<(String, u64)> {
+            state
+                .store
+                .flat()
+                .usage()
+                .into_iter()
+                .map(|a| (a.prefix, a.cap))
+                .collect()
+        };
+        link.apply_desired(DesiredState {
+            generation: 1,
+            flat: Some(vec![setting("sccache", 7), setting("dev", 8)]),
+            ..DesiredState::default()
+        })
+        .unwrap();
+        let want = vec![("dev/own".to_string(), 100), ("sccache".to_string(), 7)];
+        assert_eq!(bound(&state), want);
+        let report = link.report();
+        assert_eq!(report.refused, vec![ALLOW_FLAT.to_string()]);
+        assert_eq!(report.flat_refused, vec!["dev".to_string()]);
+        link.apply_desired(DesiredState {
+            generation: 2,
+            ..DesiredState::default()
+        })
+        .unwrap();
+        assert_eq!(bound(&state), want, "a hub saying nothing unbinds nothing");
+
+        let restarted = server_state(&root);
+        restored(&restarted, &ctx);
+        assert_eq!(bound(&restarted), want);
+
+        // An invalid list is refused whole and the last one kept.
+        link.apply_desired(DesiredState {
+            generation: 3,
+            flat: Some(vec![setting("a", 1), setting("a/b", 1)]),
+            ..DesiredState::default()
+        })
+        .unwrap();
+        assert_eq!(bound(&state), want);
+        assert_eq!(link.report().flat_refused, ["dev", "a", "a/b"]);
+        // An open failure preserves the previous bindings and reports every requested prefix.
+        std::fs::write(root.join("flat/broken"), b"not a store").unwrap();
+        link.apply_desired(DesiredState {
+            generation: 4,
+            flat: Some(vec![setting("sccache", 7), setting("broken", 1)]),
+            ..DesiredState::default()
+        })
+        .unwrap();
+        assert_eq!(bound(&state), want, "the stores bound before stay");
+        assert_eq!(link.report().flat_refused, ["sccache", "broken"]);
+        assert!(restore_flat(&dir(&root), &server_state(&root), &ctx).is_err());
+
+        let link = open(&dir(&root), &state, &ctx).unwrap().unwrap();
+        link.apply_desired(DesiredState {
+            generation: 5,
+            flat: Some(Vec::new()),
+            ..DesiredState::default()
+        })
+        .unwrap();
+        assert!(link.report().flat_refused.is_empty());
+        assert_eq!(bound(&state), vec![("dev/own".to_string(), 100)]);
+
+        // Without `flat` in `[hub] allow`, the hub binds nothing.
+        let (bound, refused) = flat_bindings(&[], false, Some(&[setting("sccache", 7)]));
+        assert!(bound.is_empty());
+        assert_eq!(refused, vec!["sccache".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What `start` restores before serving, for flat stores.
+    fn restored(state: &ServerState, ctx: &Facts) {
+        state
+            .store
+            .bind_flat(ctx.flat.clone(), crate::flat::Use::Serve)
+            .unwrap();
+        restore_flat(&dir(&state.store.root), state, ctx).unwrap();
+    }
+
     fn facts(settings: HubSettings, gc_prefixes: Vec<GcPrefix>) -> Facts {
         Facts {
             listen: String::new(),
@@ -1496,6 +1756,7 @@ mod tests {
             max_connections: 1,
             settings,
             gc_prefixes,
+            flat: Vec::new(),
             config_hash: String::new(),
         }
     }
