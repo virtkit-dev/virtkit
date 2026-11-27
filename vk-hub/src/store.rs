@@ -94,8 +94,8 @@ pub use media::{
 #[cfg(test)]
 pub(crate) use media::{MAX_LINE, MAX_LOCATIONS, MAX_MEDIA};
 pub use namespaces::{
-    CI_BUILD, CI_CACHE, CI_PIPELINE, NamespaceRow, Nodes, NsGrant, PLACEHOLDERS, parse_grants,
-    prefix_retention, resolve, resolve_guest, resolve_node,
+    CI_BUILD, CI_CACHE, CI_PIPELINE, Expect, NamespaceChanged, NamespaceRow, Nodes, NsGrant,
+    PLACEHOLDERS, parse_grants, prefix_retention, resolve, resolve_guest, resolve_node,
 };
 pub use observed::{
     Coverages, MAX_OBSERVED_CONTACTS, ObservedFilter, ObservedSubject, ObservedUse, UNREPORTED,

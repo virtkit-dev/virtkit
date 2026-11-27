@@ -141,7 +141,7 @@ fn a_registry_taking_tokens_gets_keys_namespaces_and_retention() {
     assert_eq!(names, ["ci-build", "ci-cache", "ci-pipeline"]);
     // Removing the defaults does not bring them back.
     hub.db
-        .remove_namespace(&id, "ci-cache", "uid 0", 1)
+        .remove_namespace(&id, "ci-cache", None, "uid 0", 1)
         .unwrap();
     crate::tokens::sync_registry(&hub, &id).unwrap();
     assert_eq!(hub.db.namespaces(&id).unwrap().len(), 2);

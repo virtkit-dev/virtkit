@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Add, change and remove a registry's storage areas from its *Job access* tab on the hub, with
+  the same paths, aliases and access rules as `vk-hub namespaces add`.
+
 ### Fixed
 
 - Direct `/files/` uploads to size-capped cache directories now return 405 instead of 400

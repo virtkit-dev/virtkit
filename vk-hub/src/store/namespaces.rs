@@ -145,6 +145,12 @@ impl NsGrant {
             subject: Subject::parse(subject)?,
         })
     }
+
+    /// Use [`Subject::editable`] so [`NsGrant::parse`] reads back the same grant.
+    pub fn editable(&self) -> String {
+        let rights = rights_text(self.read, self.write, self.lock);
+        format!("{rights}:{}", self.subject.editable())
+    }
 }
 
 impl std::fmt::Display for NsGrant {
@@ -402,6 +408,12 @@ impl NamespaceRow {
             .split('/')
             .skip_while(|c| !c.contains('{'))
             .any(|c| !c.contains('{'))
+    }
+
+    /// Digest of the serialized row for [`Expect::Revision`].
+    pub fn revision(&self) -> String {
+        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        vk_hub_proto::to_hex(&Sha256::digest(&bytes)[..16])
     }
 
     /// The leading components of the path before any placeholder, which a retention covers;
@@ -819,6 +831,29 @@ pub fn defaults(now: u64) -> Vec<NamespaceRow> {
     ]
 }
 
+/// Precondition on the namespace of the same name, checked in the write transaction.
+#[derive(Clone, Copy, Debug)]
+pub enum Expect<'a> {
+    /// Create or replace the namespace.
+    Any,
+    /// Create only if absent.
+    Absent,
+    /// Replace only the row with this [`NamespaceRow::revision`].
+    Revision(&'a str),
+}
+
+/// The named namespace is present, absent or at a different revision than [`Expect`] allows.
+#[derive(Debug)]
+pub struct NamespaceChanged(pub String);
+
+impl std::fmt::Display for NamespaceChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NamespaceChanged {}
+
 pub(super) fn ns_range(registry: &str) -> (String, String) {
     (format!("{registry}/"), format!("{registry}0"))
 }
@@ -867,17 +902,19 @@ impl Db {
         actor: &str,
         now: u64,
     ) -> Result<()> {
-        self.put_namespace_with(registry, ns.clone(), false, actor, now)
+        self.put_namespace_with(registry, ns.clone(), false, Expect::Any, actor, now)
             .map(drop)
     }
 
-    /// Like [`Db::put_namespace`], but preserves existing isolated refs when `keep_isolate`:
-    /// older CLIs omit them. Reads them in the same transaction; returns the stored namespace.
+    /// Like [`Db::put_namespace`], but `keep_isolate` preserves refs omitted by older CLIs.
+    /// Read the refs and check `expect` in the write transaction. A failed precondition
+    /// returns [`NamespaceChanged`]. Success returns the stored namespace.
     pub fn put_namespace_with(
         &self,
         registry: &str,
         mut ns: NamespaceRow,
         keep_isolate: bool,
+        expect: Expect<'_>,
         actor: &str,
         now: u64,
     ) -> Result<NamespaceRow> {
@@ -892,6 +929,30 @@ impl Db {
                 .get(key.as_str())?
                 .map(|g| decode::<NamespaceRow>(g.value()))
                 .transpose()?;
+            match (expect, &old) {
+                (Expect::Absent, Some(_)) => {
+                    return Err(NamespaceChanged(format!(
+                        "a namespace named {} exists already",
+                        ns.name
+                    ))
+                    .into());
+                }
+                (Expect::Revision(_), None) => {
+                    return Err(NamespaceChanged(format!(
+                        "namespace {} was removed meanwhile",
+                        ns.name
+                    ))
+                    .into());
+                }
+                (Expect::Revision(r), Some(old)) if old.revision() != r => {
+                    return Err(NamespaceChanged(format!(
+                        "namespace {} was changed meanwhile",
+                        ns.name
+                    ))
+                    .into());
+                }
+                _ => {}
+            }
             if keep_isolate && let Some(old) = &old {
                 ns.isolate.clone_from(&old.isolate);
             }
@@ -944,18 +1005,31 @@ impl Db {
         Ok(out)
     }
 
-    /// Remove namespace `name` of registry `registry`, audited as `actor`'s; whether there was
-    /// one.
+    /// Remove namespace `name` from `registry` and audit the removal as `actor`. Return false
+    /// if absent, or [`NamespaceChanged`] if the stored [`NamespaceRow::revision`] differs
+    /// from the supplied revision.
     pub fn remove_namespace(
         &self,
         registry: &str,
         name: &str,
+        revision: Option<&str>,
         actor: &str,
         now: u64,
     ) -> Result<bool> {
         let txn = self.db.begin_write().context("starting a write")?;
         let key = format!("{registry}/{name}");
-        let removed = txn.open_table(NAMESPACES)?.remove(key.as_str())?.is_some();
+        let removed = {
+            let mut table = txn.open_table(NAMESPACES)?;
+            if let Some(want) = revision
+                && let Some(old) = table.get(key.as_str())?
+                && decode::<NamespaceRow>(old.value())?.revision() != want
+            {
+                return Err(
+                    NamespaceChanged(format!("namespace {name} was changed meanwhile")).into(),
+                );
+            }
+            table.remove(key.as_str())?.is_some()
+        };
         if removed {
             let event = format!("{actor} removed namespace {name}");
             append_audit(&txn, Some(registry), actor, &event, now)?;
@@ -1615,7 +1689,7 @@ mod tests {
         assert!(db.seed_namespaces(&held, 2).unwrap());
         assert_eq!(names(&held), ["mine"]);
         // Once: removed, it does not come back.
-        assert!(db.remove_namespace(&old, CI_BUILD, "u", 3).unwrap());
+        assert!(db.remove_namespace(&old, CI_BUILD, None, "u", 3).unwrap());
         assert!(!db.seed_namespaces(&old, 4).unwrap());
         assert!(names(&old).is_empty());
     }

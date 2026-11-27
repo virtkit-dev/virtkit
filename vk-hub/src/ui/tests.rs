@@ -9537,6 +9537,250 @@ async fn a_registry_page_shows_its_job_access_and_settings_in_tabs() {
     }
 }
 
+/// A form value as a browser encodes it.
+fn form_value(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b' ' => "+".to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Operators manage non-CI areas from Job access. Adds and edits use CLI validation
+/// and redisplay submitted values on validation errors. Stale revisions are refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_adds_changes_and_removes_storage_areas() {
+    use crate::tests::tokens::token_registry;
+    let (addr, hub, _keys) = start_fleet_keys("areas").await;
+    let origin = format!("http://{addr}");
+    let id = token_registry(&hub, "https://ok.example.com", "c1");
+    let tab = format!("/registry/{id}?tab=access");
+    let areas = format!("/registry/{id}/areas");
+    let form_tag = format!("action=\"{areas}\"");
+    // The browser sends empty values for these editable fields.
+    let put = |csrf: &str, fields: &[(&str, &str)]| {
+        let mut form = format!("_csrf={csrf}&op=put");
+        for k in ["path", "alias", "retention_days", "isolate", "grants"] {
+            if fields.iter().all(|(f, _)| *f != k) {
+                form.push_str(&format!("&{k}="));
+            }
+        }
+        for (k, v) in fields {
+            form.push_str(&format!("&{k}={}", form_value(v)));
+        }
+        form
+    };
+    let cache = [
+        ("new", "1"),
+        ("name", "cache"),
+        ("path", "cache/{gitlab}/{project_id}/{protection}"),
+        ("alias", "cache"),
+        (
+            "grants",
+            "rw:own project\r\nr:gitlab gl, projects wab/**\r\n",
+        ),
+    ];
+
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let body = get(addr, &tab, Some(&viewer)).await.body;
+    assert!(!body.contains(&form_tag), "{body}");
+    let reply = post_action(
+        addr,
+        &origin,
+        &viewer,
+        &areas,
+        &put(&viewer_csrf, &cache),
+        false,
+    )
+    .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let body = get(addr, &tab, Some(&operator)).await.body;
+    assert!(
+        body.contains(&form_tag) && body.contains("Add a storage area"),
+        "{body}"
+    );
+    // CI areas have no edit link.
+    assert!(!body.contains("edit=ci-"), "{body}");
+    let reply = post_action(addr, &origin, &operator, &areas, &put(&csrf, &cache), false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some(tab.as_str()));
+    let stored = hub
+        .db
+        .namespaces(&id)
+        .unwrap()
+        .into_iter()
+        .find(|n| n.name == "cache")
+        .unwrap();
+    assert_eq!(stored.alias.as_deref(), Some("cache"));
+    assert_eq!(stored.grants.len(), 2);
+    assert!(
+        stored.created_by.starts_with("ui session "),
+        "{}",
+        stored.created_by
+    );
+    audited(
+        &hub,
+        "added namespace cache at cache/{gitlab}/{project_id}/{protection}",
+    )
+    .await;
+
+    // A duplicate name returns the submitted values.
+    let reply = post_action(addr, &origin, &operator, &areas, &put(&csrf, &cache), false).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    for want in [
+        "a namespace named cache exists already",
+        "value=\"cache/{gitlab}/{project_id}/{protection}\"",
+        "r:gitlab gl, projects wab/**",
+    ] {
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    // CLI validation errors redisplay escaped input.
+    for (fields, want) in [
+        (
+            vec![
+                ("new", "1"),
+                ("name", "x"),
+                ("path", "{gitlab}/x"),
+                ("grants", "r:*"),
+            ],
+            "starts with a fixed component",
+        ),
+        (
+            vec![
+                ("new", "1"),
+                ("name", "<script>"),
+                ("path", "x"),
+                ("grants", "r:*"),
+            ],
+            "&lt;script&gt;",
+        ),
+        (
+            vec![
+                ("new", "1"),
+                ("name", "y"),
+                ("path", "y"),
+                ("grants", "rw:own project"),
+            ],
+            "`own project` needs {gitlab} and {project_id}",
+        ),
+        (
+            vec![
+                ("new", "1"),
+                ("name", "z"),
+                ("path", "z"),
+                ("alias", "cache"),
+                ("grants", "r:*"),
+            ],
+            "has the alias cache already",
+        ),
+    ] {
+        let reply = post_action(
+            addr,
+            &origin,
+            &operator,
+            &areas,
+            &put(&csrf, &fields),
+            false,
+        )
+        .await;
+        assert!(matches!(reply.status, 400 | 409), "{}", reply.body);
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+        assert!(!reply.body.contains("<script>"), "{}", reply.body);
+    }
+    // Posting a CI name directly is also refused.
+    let ci = [
+        ("name", "ci-cache"),
+        ("path", "ci-cache"),
+        ("grants", "r:*"),
+    ];
+    let reply = post_action(addr, &origin, &operator, &areas, &put(&csrf, &ci), false).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    // Missing fields must not clear stored values.
+    let partial = format!("_csrf={csrf}&op=put&name=cache&path=cache&grants=r:*");
+    let reply = post_action(addr, &origin, &operator, &areas, &partial, false).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(
+        reply.body.contains("the form is incomplete"),
+        "{}",
+        reply.body
+    );
+
+    // Submit the revision from the edit form.
+    let body = get(addr, &tab, Some(&operator)).await.body;
+    let edit = format!("/registry/{id}?tab=access&amp;edit=cache#area");
+    assert!(body.contains(&edit), "{body}");
+    let body = get(addr, &format!("{tab}&edit=cache"), Some(&operator))
+        .await
+        .body;
+    assert!(body.contains("<h2>Change cache</h2>"), "{body}");
+    let revision = hidden(&body, "revision");
+    assert_eq!(revision, stored.revision());
+    let change = [
+        ("name", "cache"),
+        ("revision", revision.as_str()),
+        ("path", "cache/{gitlab}/{project_id}/{protection}"),
+        ("grants", "rw:own project"),
+        ("retention_days", "14"),
+    ];
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        &areas,
+        &put(&csrf, &change),
+        false,
+    )
+    .await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let stored = hub.db.namespaces(&id).unwrap();
+    let changed = stored.iter().find(|n| n.name == "cache").unwrap();
+    assert_eq!((changed.grants.len(), changed.alias.as_deref()), (1, None));
+    assert_eq!(changed.retention_days, Some(14));
+    // Reusing the old revision must fail.
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        &areas,
+        &put(&csrf, &change),
+        false,
+    )
+    .await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.body.contains("was changed meanwhile"),
+        "{}",
+        reply.body
+    );
+
+    // Removal requires confirmation.
+    let revision = changed.revision();
+    let remove = format!("_csrf={csrf}&op=remove&name=cache&revision={revision}");
+    let reply = post_action(addr, &origin, &operator, &areas, &remove, false).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(reply.body.contains("Yes, remove"), "{}", reply.body);
+    let answer = format!(
+        "{remove}&nonce={}&confirm=yes",
+        hidden(&reply.body, "nonce")
+    );
+    let reply = post_action(addr, &origin, &operator, &areas, &answer, false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert!(
+        hub.db
+            .namespaces(&id)
+            .unwrap()
+            .iter()
+            .all(|n| n.name != "cache")
+    );
+    audited(&hub, "removed namespace cache").await;
+}
+
 /// `/gitlab` lists the GitLab servers, `/keys` the API keys; Connections' old addresses lead
 /// to them, and those of the capacity policy's and a project's pages to theirs.
 #[tokio::test(flavor = "multi_thread")]

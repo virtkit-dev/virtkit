@@ -21,8 +21,8 @@ use vk_hub_proto::{HubMsg, RefusalCode};
 use crate::server::{Ending, Exported, HEARTBEAT, Hub, MISSED_HEARTBEATS, Reach};
 use crate::session::{HANDSHAKE_STEP, Peer, PeerKind, Refusal, Ws, turn_away};
 use crate::store::{
-    FlatEdit, NotEnrolled, Program, RegistryChange, RegistryCommandRow, RegistryRow, RegistryWrite,
-    Release,
+    Expect, FlatEdit, NotEnrolled, Program, RegistryChange, RegistryCommandRow, RegistryRow,
+    RegistryWrite, Release,
 };
 
 /// The gc windows `vk-hub registries gc` and `gc-schedule`, and the web UI's forms, default to.
@@ -701,32 +701,41 @@ pub fn put_namespace(
     id: &str,
     ns: &crate::store::NamespaceRow,
 ) -> Result<()> {
-    put_namespace_with(hub, actor, id, ns.clone(), false).map(drop)
+    put_namespace_with(hub, actor, id, ns.clone(), false, Expect::Any).map(drop)
 }
 
-/// Like [`put_namespace`], but preserves existing isolated refs when `keep_isolate`
-/// ([`crate::store::Db::put_namespace_with`]). Returns the stored namespace.
+/// Like [`put_namespace`], with the write precondition `expect`. When `keep_isolate` is set,
+/// preserve the stored isolated refs. Return the stored namespace
+/// ([`crate::store::Db::put_namespace_with`]).
 pub fn put_namespace_with(
     hub: &Hub,
     actor: &str,
     id: &str,
     ns: crate::store::NamespaceRow,
     keep_isolate: bool,
+    expect: Expect<'_>,
 ) -> Result<crate::store::NamespaceRow> {
     let ns = hub
         .db
-        .put_namespace_with(id, ns, keep_isolate, actor, crate::now_secs())?;
+        .put_namespace_with(id, ns, keep_isolate, expect, actor, crate::now_secs())?;
     sync_after_namespaces(hub, id);
     hub.changed(id);
     crate::settings::steer(hub);
     Ok(ns)
 }
 
-/// Remove namespace `name` of registry `id` as `actor`; whether there was one.
-pub fn remove_namespace(hub: &Hub, actor: &str, id: &str, name: &str) -> Result<bool> {
+/// Remove namespace `name` from registry `id` as `actor`. Return false if absent.
+/// A supplied revision must match the stored row.
+pub fn remove_namespace(
+    hub: &Hub,
+    actor: &str,
+    id: &str,
+    name: &str,
+    revision: Option<&str>,
+) -> Result<bool> {
     let removed = hub
         .db
-        .remove_namespace(id, name, actor, crate::now_secs())?;
+        .remove_namespace(id, name, revision, actor, crate::now_secs())?;
     if removed {
         sync_after_namespaces(hub, id);
         hub.changed(id);

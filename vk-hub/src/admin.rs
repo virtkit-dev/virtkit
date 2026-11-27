@@ -921,7 +921,14 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
                 created_at: crate::now_secs(),
                 created_by: actor.clone(),
             };
-            let ns = crate::registries::put_namespace_with(hub, &actor, &id, ns, keep_isolate)?;
+            let ns = crate::registries::put_namespace_with(
+                hub,
+                &actor,
+                &id,
+                ns,
+                keep_isolate,
+                crate::store::Expect::Any,
+            )?;
             eprintln!(
                 "vk-hub: admin: {actor} set namespace {} of registry {}",
                 vk_hub_proto::display_safe(&ns.name),
@@ -930,7 +937,7 @@ pub(crate) fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::V
             serde_json::to_value(ns)?
         }
         Call::RemoveNamespace { id, name } => {
-            let removed = crate::registries::remove_namespace(hub, &actor, &id, &name)?;
+            let removed = crate::registries::remove_namespace(hub, &actor, &id, &name, None)?;
             if removed {
                 eprintln!(
                     "vk-hub: admin: {actor} removed namespace {} of registry {}",

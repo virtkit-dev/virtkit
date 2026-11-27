@@ -207,7 +207,7 @@ pub(super) async fn list(auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
 
 /// A registry page's views: `/registry/<id>`, `?tab=access` and `?tab=settings`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Tab {
+pub(super) enum Tab {
     /// What it reports, what the hub asks of it, its usage and commands.
     Overview,
     /// Its storage areas: who may read, publish and coordinate builds there.
@@ -223,14 +223,35 @@ impl Tab {
         (Tab::Settings, "?tab=settings", "Settings"),
     ];
 
-    fn of(query: Option<&str>) -> Self {
-        let form = super::decode_form(query.unwrap_or("").as_bytes());
-        match field(&form, "tab") {
+    fn of(query: &[(String, String)]) -> Self {
+        match field(query, "tab") {
             Some("access") => Tab::Access,
             Some("settings") => Tab::Settings,
             _ => Tab::Overview,
         }
     }
+}
+
+/// Render the registry hostname and tabs, marking `here` as current.
+pub(super) fn heading(h: &mut Html, id: &str, hostname: &str, here: Tab) {
+    h.raw("<h1>").node(hostname).raw("</h1>");
+    h.raw("<nav class=\"tabs\" aria-label=\"Registry views\">");
+    for (t, suffix, label) in Tab::ALL {
+        h.raw("<a href=\"")
+            .raw(DETAIL_PREFIX)
+            .text(id)
+            .raw(suffix)
+            .raw("\"")
+            .raw(if t == here {
+                " aria-current=\"page\""
+            } else {
+                ""
+            })
+            .raw(">")
+            .raw(label)
+            .raw("</a>");
+    }
+    h.raw("</nav>");
 }
 
 /// `/registry/<id>[?tab=…]`.
@@ -240,7 +261,8 @@ pub(super) async fn detail(
     auth: &Auth,
     ui: &Ui,
 ) -> Result<Response<Body>> {
-    let tab = Tab::of(query);
+    let query = super::decode_form(query.unwrap_or("").as_bytes());
+    let tab = Tab::of(&query);
     let hub = ui.hub.clone();
     let wanted = id.to_string();
     let Some((view, commands, namespaces, keys, instances, releases, nodes)) =
@@ -272,24 +294,7 @@ pub(super) async fn detail(
     };
     let now = crate::now_secs();
     let mut main = Html::new();
-    main.raw("<h1>").node(&view.row.hostname).raw("</h1>");
-    main.raw("<nav class=\"tabs\" aria-label=\"Registry views\">");
-    for (t, suffix, label) in Tab::ALL {
-        main.raw("<a href=\"")
-            .raw(DETAIL_PREFIX)
-            .text(&view.id)
-            .raw(suffix)
-            .raw("\"")
-            .raw(if t == tab {
-                " aria-current=\"page\""
-            } else {
-                ""
-            })
-            .raw(">")
-            .raw(label)
-            .raw("</a>");
-    }
-    main.raw("</nav>");
+    heading(&mut main, &view.id, &view.row.hostname, tab);
     match tab {
         Tab::Overview => {
             status(&mut main, &view, now);
@@ -297,7 +302,17 @@ pub(super) async fn detail(
             usage(&mut main, &view);
             commands_table(&mut main, &view, &commands, now);
         }
-        Tab::Access => access(&mut main, &view, &namespaces, instances.as_deref(), &nodes),
+        Tab::Access => {
+            let operator = (auth.session.role >= Role::Operator).then_some(auth);
+            access(
+                &mut main,
+                &view,
+                &namespaces,
+                instances.as_deref(),
+                &nodes,
+                operator.map(|auth| (auth, field(&query, "edit"))),
+            );
+        }
         Tab::Settings => settings(&mut main, &view, &namespaces, &keys, now),
     }
     let here = format!("{DETAIL_PREFIX}{id}");
@@ -312,13 +327,14 @@ pub(super) async fn detail(
 /// The Job access tab: the registry's storage areas, those the hub keeps for CI folded away,
 /// and what keeps jobs from getting access, when something does; access rules name their GitLab
 /// instance by the hub's `instances` ([`super::access::who`]) and their nodes by `nodes`, (ID,
-/// hostname).
+/// hostname). Operators can add an area or use `edit` to change or remove a non-CI area.
 fn access(
     h: &mut Html,
     v: &RegistryView,
     namespaces: &[NamespaceRow],
     instances: Instances<&str>,
     nodes: &[(String, String)],
+    operator: Option<(&Auth, Option<&str>)>,
 ) {
     if !v.row.takes_tokens() {
         h.raw("<p class=\"callout\">Jobs get no access here, because the registry does not take ")
@@ -355,24 +371,53 @@ fn access(
     let (managed, own): (Vec<_>, Vec<_>) = areas.iter().partition(|a| a.managed);
     h.raw("<section><h2>Storage areas</h2><p class=\"sub\">Each is a part of the registry. ")
         .raw("Jobs and nodes get access only where an access rule allows it.</p>");
+    let editable = operator.is_some().then_some(v.id.as_str());
     if own.is_empty() {
         h.raw("<p class=\"empty\">None besides the ones kept for CI. ")
-            .raw("<code>vk-hub namespaces add</code> declares one.</p>");
+            .raw("An operator adds one here, or with <code>vk-hub namespaces add</code>.</p>");
     } else {
-        areas_table(h, &own);
+        areas_table(h, &own, editable);
     }
     if !managed.is_empty() {
         h.raw("<details class=\"fold\"><summary>Managed by CI <span class=\"sub\">· CI caches, ")
             .raw("per-pipeline storage and build caches</span></summary>");
-        areas_table(h, &managed);
-        h.raw("</details>");
+        areas_table(h, &managed, None);
+        h.raw("<p class=\"sub\">Use <code>vk-hub namespaces add</code> to set a CI area or ")
+            .raw("<code>vk-hub namespaces remove</code> to remove it.</p>")
+            .raw("</details>");
+    }
+    if let Some((auth, edit)) = operator {
+        match edit.and_then(|name| {
+            namespaces
+                .iter()
+                .find(|n| n.name == name && !super::areas::managed(name))
+        }) {
+            Some(ns) => {
+                h.raw("<section id=\"area\"><h2>Change ")
+                    .text(&ns.name)
+                    .raw("</h2>");
+                super::areas::editor(h, &v.id, &super::areas::Draft::of_row(ns), auth);
+                super::areas::remove_form(h, &v.id, ns, auth);
+                h.raw("<p><a href=\"")
+                    .raw(DETAIL_PREFIX)
+                    .text(&v.id)
+                    .raw("?tab=access\">Cancel</a></p></section>");
+            }
+            None => {
+                h.raw("<details class=\"upload\" id=\"area\"><summary class=\"button\">")
+                    .raw("Add a storage area</summary>");
+                super::areas::editor(h, &v.id, &super::areas::Draft::blank(), auth);
+                h.raw("</details>");
+            }
+        }
     }
     h.raw("</section><p><a href=\"/audit?category=all&amp;node=")
         .text(&v.id)
         .raw("\">Access history in the audit log</a></p>");
 }
 
-fn areas_table(h: &mut Html, areas: &[&super::access::Area]) {
+/// Link each area to its edit form when `editable` supplies a registry ID.
+fn areas_table(h: &mut Html, areas: &[&super::access::Area], editable: Option<&str>) {
     h.raw("<table class=\"grid\"><thead><tr>");
     header_cells(h, &["AREA", "WHO CAN READ", "WHO CAN PUBLISH"]);
     h.raw("</tr></thead><tbody>");
@@ -382,6 +427,14 @@ fn areas_table(h: &mut Html, areas: &[&super::access::Area]) {
             .raw("</strong><div class=\"sub\"><code>")
             .text(&a.path)
             .raw("</code></div>");
+        if let Some(id) = editable {
+            h.raw("<div class=\"sub\"><a href=\"")
+                .raw(DETAIL_PREFIX)
+                .text(id)
+                .raw("?tab=access&amp;edit=")
+                .text(super::jobs::percent_encode(&a.name))
+                .raw("#area\">Edit</a></div>");
+        }
         if !a.isolated.is_empty() {
             h.raw("<div class=\"sub\">Kept apart for refs matching ")
                 .text(a.isolated.join(" "))
@@ -787,7 +840,7 @@ pub(super) fn updatables(hub: &crate::server::Hub) -> Result<Vec<updates::Peer>>
 }
 
 /// A redirect to the hub's own `location`.
-fn see_other(location: &str) -> Response<Body> {
+pub(super) fn see_other(location: &str) -> Response<Body> {
     let mut resp = Response::new(Body::default());
     *resp.status_mut() = StatusCode::SEE_OTHER;
     resp.headers_mut().insert(

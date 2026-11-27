@@ -1107,10 +1107,17 @@ the hub asks of it. *Job access* (`?tab=access`) lists its storage areas, each w
 read and who may publish there in plain words ("Projects under wab/ [gl], protected branches and
 tags only · can coordinate builds"), rules for nodes after those for jobs ("Every node",
 "Node build-01"). The instance is omitted while it is the hub's only one;
-rules bound to none show `[every server]` while it has several. The two areas kept for CI, `ci-cache`
-and `ci-pipeline`, are folded under *Managed by CI*. It says when cleanup after inactivity
+rules bound to none show `[every server]` while it has several. The areas kept for CI, `ci-cache`,
+`ci-pipeline` and `ci-build`, are folded under *Managed by CI*. It says when cleanup after inactivity
 does not apply, because the registry's `[hub] allow` lacks `gc` or the registry refused a
-window, and links to the registry's audit log. *Settings* (`?tab=settings`) shows the bound
+window, and links to the registry's audit log. Operators choose *Add a storage area* to enter
+its name, path, alias, cleanup days, access rules and refs to keep apart. Adds and edits use
+the syntax and checks of `namespaces add`. Each non-CI area's *Edit* link opens the forms to
+change or remove it. CI areas can only be managed from the CLI.
+
+The forms post to `/registry/<id>/areas`. Removal requires confirmation. A change or removal
+must match the revision shown on the page. The registry's audit log records each successful
+operation under the session's principal. *Settings* (`?tab=settings`) shows the bound
 address and, per signing key the registry was sent, whether it signs the registry's tokens,
 awaits being applied, or was replaced and is kept while its tokens may be live.
 

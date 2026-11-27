@@ -203,6 +203,25 @@ impl std::fmt::Display for Subject {
     }
 }
 
+impl Subject {
+    /// Use [`Display`](std::fmt::Display) if it fits the 512-byte limit. Otherwise,
+    /// bare commas and singular `project` give the shortest spelling of the same subject,
+    /// so it still fits if the original input did.
+    pub fn editable(&self) -> String {
+        let text = self.to_string();
+        if text.len() <= MAX_SUBJECT {
+            return text;
+        }
+        text.split(", ")
+            .map(|t| match t.strip_prefix("projects ") {
+                Some(glob) => format!("project {glob}"),
+                None => t.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
 pub(crate) fn check_glob(glob: &str) -> Result<(), String> {
     if glob.is_empty() || glob.len() > 255 || glob.contains(char::is_whitespace) {
         return Err(format!("{glob:?} is not a glob"));

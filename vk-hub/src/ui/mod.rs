@@ -65,6 +65,7 @@ use crate::store::{self, Role, UiSession};
 
 mod access;
 mod actions;
+mod areas;
 mod assets;
 mod body;
 mod clients;
@@ -471,6 +472,8 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                     fleet::rollout_action(req, ui, site, id).await
                 } else if let Some(id) = registries::action_target(&path) {
                     registries::action(req, ui, site, id).await
+                } else if let Some(id) = areas::action_target(&path) {
+                    areas::action(req, ui, site, id).await
                 } else if let Some(id) = relays::action_target(&path) {
                     relays::action(req, ui, site, id).await
                 } else if path == hub::ACTION_PATH {
