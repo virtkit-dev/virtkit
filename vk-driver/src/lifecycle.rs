@@ -1342,10 +1342,7 @@ pub fn delete(refs: &[OsString], force: bool, yes: bool, dry_run: bool, o: Opts)
     }
     match gate {
         Gate::Refuse => {
-            eprint!(
-                "vk delete would:\n{list}vk: nothing was deleted: not on a terminal to ask, \
-                 so pass --yes (or --force)\n"
-            );
+            eprint!("vk delete would:\n{list}vk: nothing was deleted: --yes deletes it\n");
             return exit(false);
         }
         Gate::Ask => {
