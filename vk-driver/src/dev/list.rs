@@ -818,6 +818,7 @@ pub fn remove(selected: &[Row], index: &crate::names::Index) -> Result<String> {
         }
         crate::publish::stop_all_quietly(&row.dir, PUBLISH_STOP);
         let names = index.lock()?;
+        let freed = crate::dev::storage::disk_usage(&row.dir);
         std::fs::remove_dir_all(&row.dir)
             .with_context(|| format!("removing {}", row.dir.display()))?;
         if let Err(e) = index.release_locked(&row.dir) {
@@ -826,9 +827,9 @@ pub fn remove(selected: &[Row], index: &crate::names::Index) -> Result<String> {
         drop(names);
         drop(lock);
         out.push_str(&format!(
-            "removed {} ({})\n",
+            "removed {} ({} freed)\n",
             row.name,
-            fmt_size(row.size_bytes)
+            fmt_bytes(freed)
         ));
     }
     Ok(out)

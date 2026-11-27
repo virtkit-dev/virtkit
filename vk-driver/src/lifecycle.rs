@@ -1237,9 +1237,14 @@ fn remove(p: &Planned, lock: Option<&LockFile>) -> Result<String> {
             // Its names go under the index lock, held across the removal as `vk dev gc`
             // holds it, so a run that makes the dir again meanwhile keeps the name it claims.
             let _names = idx.lock()?;
+            let freed = crate::dev::storage::disk_usage(&t.dir);
             remove_tree(&t.dir, lock)?;
             idx.release_locked(&t.dir)?;
-            Ok(format!("removed {}\n", t.name))
+            Ok(format!(
+                "removed {} ({} freed)\n",
+                t.name,
+                crate::usage::fmt_bytes(freed)
+            ))
         }
         Removal::Forget => {
             // Through the held state dir, so one put in its place meanwhile loses nothing.
@@ -1265,9 +1270,14 @@ fn remove(p: &Planned, lock: Option<&LockFile>) -> Result<String> {
             // The dir planned on and locked, through the held state dir, only while its name
             // still leads there.
             let name = service_dir(t);
+            let freed = crate::dev::storage::disk_usage(&t.dir.join(&name));
             let done = vk_fs::remove_tree_in(lock.as_fd(), OsStr::new(&name), svc.as_fd())?;
             kept(&t.dir, &done)?;
-            Ok(format!("removed {}\n", t.shown()))
+            Ok(format!(
+                "removed {} ({} freed)\n",
+                t.shown(),
+                crate::usage::fmt_bytes(freed)
+            ))
         }
     }
 }

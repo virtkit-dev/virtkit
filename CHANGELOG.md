@@ -12,6 +12,11 @@ All notable changes to virtkit will be documented in this file.
   services of this workspace. Like `vk delete`, it lists what goes and asks first, and
   `-y`/`--yes` or `-f`/`--force` answer for you.
 
+### Changed
+
+- **`vk delete` and `vk dev gc` say how much disk space they freed**: what the deleted
+  files actually took on disk, so a sparse image counts what it held, not its length.
+
 ## [0.118.0] - 2026-11-27
 
 ### Added

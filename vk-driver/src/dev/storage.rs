@@ -282,6 +282,39 @@ fn dir_size_to(path: &Path, depth: u32) -> u64 {
         .sum()
 }
 
+/// What `path` takes on disk, a directory's whole tree: the blocks allocated, so a sparse
+/// image counts what it holds rather than its length, and a file linked twice counts once.
+/// What removing it frees. Symlinks count as themselves; best-effort like [`dir_size`].
+pub(crate) fn disk_usage(path: &Path) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    disk_usage_to(path, SIZE_MAX_DEPTH, &mut seen)
+}
+
+fn disk_usage_to(path: &Path, depth: u32, seen: &mut std::collections::HashSet<(u64, u64)>) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let Some(depth) = depth.checked_sub(1) else {
+        return 0;
+    };
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !seen.insert((meta.dev(), meta.ino())) {
+        return 0;
+    }
+    // `st_blocks` is in 512-byte units whatever the filesystem's block size.
+    let own = meta.blocks() * 512;
+    if !meta.is_dir() {
+        return own;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return own;
+    };
+    own + entries
+        .flatten()
+        .map(|e| disk_usage_to(&e.path(), depth, seen))
+        .sum::<u64>()
+}
+
 /// `vk dev storage list` as text: one line per item.
 pub fn render(items: &[Item], running: &Running) -> String {
     if items.is_empty() {
@@ -535,6 +568,22 @@ mod tests {
         std::fs::create_dir_all(dir.join("repo/.virtkit")).unwrap();
         std::fs::create_dir_all(dir.join("state")).unwrap();
         TmpDir(dir)
+    }
+
+    #[test]
+    fn disk_usage_counts_allocated_blocks_and_each_file_once() {
+        let t = scratch("du");
+        let dir = t.0.join("state");
+        // 1 GiB long, nothing written: a hole that takes no blocks.
+        let sparse = std::fs::File::create(dir.join("sparse.img")).unwrap();
+        sparse.set_len(1 << 30).unwrap();
+        std::fs::write(dir.join("data"), vec![7u8; 64 * 1024]).unwrap();
+        std::fs::hard_link(dir.join("data"), dir.join("data-link")).unwrap();
+        let used = disk_usage(&dir);
+        assert!(dir_size(&dir) >= 1 << 30, "the length counts the hole");
+        // The 64 KiB written once, plus directory and metadata blocks: far below the length.
+        assert!((64 * 1024..1 << 20).contains(&used), "{used}");
+        assert_eq!(disk_usage(&dir.join("absent")), 0);
     }
 
     /// A workspace whose compose file declares one of each backing an item is derived from,
