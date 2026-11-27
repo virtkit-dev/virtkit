@@ -2745,6 +2745,7 @@ mod tests {
             name: name.into(),
             state: state.into(),
             ip: ip.into(),
+            ..Default::default()
         };
         // Success with a message: the unit lines and then the message land on stdout, with
         // nothing on stderr.

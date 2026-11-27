@@ -2899,6 +2899,7 @@ pub(crate) mod tests {
             name: name.into(),
             state: state.into(),
             ip: ip.into(),
+            ..Default::default()
         }
     }
 

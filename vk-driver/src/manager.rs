@@ -184,14 +184,7 @@ impl Manager {
         names.sort();
         let units = names
             .iter()
-            .map(|n| {
-                let st = u.get_mut(n).unwrap();
-                UnitStatus {
-                    name: n.clone(),
-                    state: state_of(st).into(),
-                    ip: st.svc.ip.clone(),
-                }
-            })
+            .map(|n| unit_status(n, u.get_mut(n).unwrap()))
             .collect();
         Reply::list(units)
     }
@@ -199,11 +192,7 @@ impl Manager {
     fn status(&self, name: &str) -> Reply {
         let mut u = self.units_guard();
         match u.get_mut(name) {
-            Some(st) => Reply::list(vec![UnitStatus {
-                name: name.into(),
-                state: state_of(st).into(),
-                ip: st.svc.ip.clone(),
-            }]),
+            Some(st) => Reply::list(vec![unit_status(name, st)]),
             None => Reply::err(format!("no such unit {name:?}")),
         }
     }
@@ -772,6 +761,28 @@ fn unit_addr(dir: &Path) -> SocketAddr {
 /// exited (e.g. the service crashed) so the reported state reflects reality; a child
 /// whose status can't be read is conservatively reported "running" (and left for a
 /// later poll to reap).
+/// What `list` and `status` report of the unit `name`: its state and address, and — for
+/// `vk list`'s row — its VMM's pid while it runs, the memory it boots with and its image.
+fn unit_status(name: &str, st: &mut UnitState) -> UnitStatus {
+    let state = state_of(st);
+    UnitStatus {
+        name: name.into(),
+        state: state.into(),
+        ip: st.svc.ip.clone(),
+        pid: st.child.as_ref().map(Child::id),
+        mem: Some(
+            st.svc
+                .mem
+                .clone()
+                .unwrap_or_else(|| crate::units::DEFAULT_MEM.into()),
+        ),
+        image: Some(match &st.unit.source {
+            crate::compose::Source::Image(reference) => reference.clone(),
+            _ => name.into(),
+        }),
+    }
+}
+
 fn state_of(st: &mut UnitState) -> &'static str {
     match st.child.as_mut().map(Child::try_wait) {
         Some(Ok(None)) | Some(Err(_)) => "running",
@@ -1228,6 +1239,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no such unit"), "{err}");
+    }
+
+    #[test]
+    fn a_unit_reports_its_vmm_memory_and_image_for_vk_list() {
+        let mgr = manager_over_two_units();
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        mgr.units_guard().get_mut("cache").unwrap().child = Some(child);
+        let list = mgr.list();
+        let by = |n: &str| list.units.iter().find(|u| u.name == n).unwrap().clone();
+        let cache = by("cache");
+        assert_eq!((cache.state.as_str(), cache.pid), ("running", Some(pid)));
+        assert_eq!(cache.mem.as_deref(), Some(crate::units::DEFAULT_MEM));
+        assert_eq!(
+            cache.image.as_deref(),
+            Some("redis:7"),
+            "an image: unit names its image"
+        );
+        let db = by("db");
+        assert_eq!((db.state.as_str(), db.pid), ("stopped", None));
+        assert_eq!(
+            db.image.as_deref(),
+            Some("db"),
+            "a build: unit goes by its service name"
+        );
+        mgr.stop_all();
     }
 
     /// Point `cache` at a VMM stand-in that exits with `code` right away, as a guest that

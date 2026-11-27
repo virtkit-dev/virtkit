@@ -44,12 +44,22 @@ pub enum Request {
     },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct UnitStatus {
     pub name: String,
     /// "running" | "stopped"
     pub state: String,
     pub ip: String,
+    /// the running unit's VMM process; absent when stopped, or from a manager that predates it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// the memory size the unit boots with, as a `--mem` token (`1G`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem: Option<String>,
+    /// what the unit boots: its image reference, else its service name, as the primary's
+    /// own image is named
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

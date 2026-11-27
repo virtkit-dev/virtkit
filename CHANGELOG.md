@@ -18,6 +18,9 @@ All notable changes to virtkit will be documented in this file.
   files actually took on disk, so a sparse image counts what it held, not its length.
 - **`vk delete` lists what each dev environment holds on disk** — persistent storage, boot
   image, what an unfinished build left — so storage about to go is plain to see.
+- **A running compose service's `vk list` row shows its PID, uptime, memory and image**,
+  as the primary's does; it used to show `-` for all four. A VM started by an earlier `vk`
+  shows them once it restarts.
 
 ### Fixed
 

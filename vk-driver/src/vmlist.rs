@@ -214,17 +214,22 @@ pub fn rows_with(
             if !unit.is_some_and(|u| u.state != STOPPED) && !booted(&dir) {
                 continue;
             }
+            // Its VMM, as its manager reports it; one that predates that reports none.
+            let pid = unit.and_then(|u| u.pid);
+            let ours = pid.and_then(|p| i32::try_from(p).ok());
             out.push(Row {
                 name: format!("{name}/{}", s.name),
                 kind: Kind::Service,
                 status: unit.map_or_else(|| "-".into(), |u| u.state.clone()),
                 parent: Some(name.clone()),
                 primary_dir: e.state_dir.clone(),
-                pid: None,
-                uptime_secs: None,
-                mem_used_bytes: None,
-                mem: None,
-                image: None,
+                pid,
+                uptime_secs: ours
+                    .and_then(crate::usage::proc_age)
+                    .map(|age| age.as_secs()),
+                mem_used_bytes: ours.and_then(crate::usage::tree_resident),
+                mem: unit.and_then(|u| u.mem.clone()),
+                image: unit.and_then(|u| u.image.clone()),
                 project: e.project_dir.clone(),
                 environment: l.environment.clone(),
                 state_dir: dir,
@@ -438,6 +443,7 @@ mod tests {
             name: name.into(),
             state: state.into(),
             ip: "10.0.0.5/24".into(),
+            ..Default::default()
         }
     }
 
@@ -464,6 +470,41 @@ mod tests {
 
     fn names(rows: &[Row]) -> Vec<&str> {
         rows.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_running_service_shows_its_vmm_memory_and_image() {
+        let app = entry("/s/app", "/w/app", 10, &["runner", "db"]);
+        // A live process stands in for the runner's VMM.
+        let runner = UnitStatus {
+            pid: Some(std::process::id()),
+            mem: Some("2G".into()),
+            image: Some("gitlab/gitlab-runner:v17".into()),
+            ..unit("runner", "running")
+        };
+        let rows = rows(
+            &[live(
+                &app,
+                "app",
+                Kind::Dev,
+                vec![runner, unit("db", "running")],
+            )],
+            &[],
+            160,
+        );
+        let by = |n: &str| rows.iter().find(|r| r.name == n).unwrap();
+        let r = by("app/runner");
+        assert_eq!(r.pid, Some(std::process::id()));
+        assert!(r.uptime_secs.is_some());
+        assert!(r.mem_used_bytes.is_some_and(|b| b > 0));
+        assert_eq!(r.mem.as_deref(), Some("2G"));
+        assert_eq!(r.image.as_deref(), Some("gitlab/gitlab-runner:v17"));
+        // A manager that predates these reports none: the row says nothing it cannot know.
+        let db = by("app/db");
+        assert_eq!(
+            (db.pid, db.mem_used_bytes, &db.mem, &db.image),
+            (None, None, &None, &None)
+        );
     }
 
     #[test]

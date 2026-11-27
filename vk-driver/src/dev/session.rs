@@ -1617,6 +1617,7 @@ mod tests {
             name: "db".into(),
             state: state.into(),
             ip: "10.0.0.2/24".into(),
+            ..Default::default()
         }
     }
 
