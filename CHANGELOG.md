@@ -56,6 +56,10 @@ All notable changes to virtkit will be documented in this file.
   task's throwaway VM is removed too, where an interrupted task used to leave it behind.
 - **`vk gc` removes what builds and tasks killed outright left behind**: a build's
   scratch, a half-written image, a task's throwaway VM. They show as "unfinished builds".
+- **`vk delete` removes a dev environment that never finished booting** — the leftover
+  of an interrupted task or first boot — where it only forgot its name and left the
+  directory, which `vk list` then showed again. Any directory directly under vk's own
+  state base is vk's to delete; only one elsewhere, a `--state-dir` of yours, is kept.
 
 ## [0.118.0] - 2026-11-27
 

@@ -714,10 +714,12 @@ when assigning names. `--tidy` takes no REF or other stop option.
 workspace and recorded config, or the run recipe, working directory and any recorded
 `--config`. If the primary is already down, `vk restart` starts it.
 
-`vk delete` (aliases `rm`, `remove`) removes a directory directly under the dev state base
-if it holds a recorded dev identity and no run recipe. It removes a directory directly
-under the run state base if `vk` marked it when allocating it. In other directories it
-removes only the name, `run.json` and `.virtkit-last.json`.
+`vk delete` (aliases `rm`, `remove`) removes whole a directory directly under vk's own
+state base — `$XDG_STATE_HOME/virtkit` (`~/.local/state/virtkit` when unset): a dev
+environment's directly under its `dev/`, booted or not, unless it holds a run recipe; a
+run's directly under its `run/`. Any other directory, such as a `vk run --state-dir` of
+yours, may hold your files: `vk delete` removes only its name, `run.json` and
+`.virtkit-last.json`.
 
 For a running VM, `--force` stops it first. To delete a declared service's `svc-<name>/`,
 stop its VM first, even with `--force`, then use `vk delete NAME/SERVICE`.

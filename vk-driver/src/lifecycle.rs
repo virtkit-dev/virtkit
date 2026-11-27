@@ -354,23 +354,26 @@ pub fn plan_delete(
     Ok((stop, removal))
 }
 
-/// A dev directory must be directly under the dev base and pass [`crate::dev::list::owned`]. A run directory
-/// must be directly under the run base and contain a regular [`crate::names::MADE`] file.
-/// Other directories may contain user files.
+/// Whether `t`'s state dir is one `vk` made, which `vk delete` removes whole: a dev
+/// environment's directly under the dev base, a run's directly under the run base, whatever
+/// they hold — a boot that never finished is vk's as much as one that did — but a dev dir
+/// that also holds a run's recipe. A directory anywhere else is a `--state-dir` of the
+/// user's, which may hold their files: it is only forgotten.
 fn made(t: &Target) -> bool {
-    let (base, owned) = match t.kind {
-        Kind::Dev => (
-            crate::dev::plan::dev_state_base(),
-            crate::dev::list::owned(&t.dir).is_ok(),
-        ),
-        _ => (
-            crate::names::run_base(),
-            std::fs::symlink_metadata(t.dir.join(crate::names::MADE)).is_ok_and(|m| m.is_file()),
-        ),
+    // A dev dir that also holds a run's recipe is that run's `--state-dir` too: not vk's alone.
+    in_own_base(&t.dir, t.kind)
+        && (t.kind != Kind::Dev || !t.dir.join(crate::names::RECIPE).exists())
+}
+
+/// Whether `dir` sits directly under the state base `vk` keeps VMs of `kind` in.
+pub(crate) fn in_own_base(dir: &Path, kind: Kind) -> bool {
+    let base = match kind {
+        Kind::Dev => crate::dev::plan::dev_state_base(),
+        _ => crate::names::run_base(),
     };
-    let parent = vms::canonical(&t.dir).parent().map(Path::to_path_buf);
+    let parent = vms::canonical(dir).parent().map(Path::to_path_buf);
     let base = base.ok().map(|b| vms::canonical(&b));
-    parent.is_some() && parent == base && owned
+    parent.is_some() && parent == base
 }
 
 /// Whether `path` exists; an error, not `false`, when that cannot be told.
@@ -1014,8 +1017,8 @@ impl Removal {
                 size_of(&t.dir)
             ),
             Removal::Forget => format!(
-                "forget {name}: its name, {} and {} go; its state dir {dir}, not known to be \
-                 one vk made, stays",
+                "forget {name}: its name, {} and {} go; its state dir {dir}, a --state-dir \
+                 outside vk's own, stays",
                 crate::names::RECIPE,
                 vms::LAST
             ),
@@ -1702,7 +1705,7 @@ mod tests {
             "{forget}"
         );
         assert!(
-            forget.contains("/s/app, not known to be one vk made, stays"),
+            forget.contains("/s/app, a --state-dir outside vk's own, stays"),
             "{forget}"
         );
         let dev = target(Kind::Dev, None);
@@ -2101,11 +2104,11 @@ mod tests {
         assert!(!dir.join("svc-db").exists());
     }
 
-    /// A `dev.json` that does not read as an identity is no proof that a dir is a dev
-    /// environment's: deleting the run that used it, then the dir by its own name, only
-    /// forgets them. One that reads, with no run's recipe beside it, goes whole.
+    /// A dir in the dev base that holds a run's recipe is that run's, and only forgotten.
+    /// Once the recipe is gone, it is a dev environment's, whose dir goes whole whatever its
+    /// `dev.json` says: a boot that never finished is vk's as much as one that did.
     #[test]
-    fn a_dev_dir_goes_whole_only_with_the_identity_it_recorded() {
+    fn a_dev_dir_goes_whole_once_no_run_claims_it() {
         let homes = crate::dev::testutil::Homes::new("rm-devjson");
         let dir = crate::dev::plan::dev_state_base().unwrap().join("scratch");
         std::fs::create_dir_all(dir.join("editor")).unwrap();
@@ -2116,14 +2119,10 @@ mod tests {
         let p = plan_one(&os("app"), false).unwrap();
         assert_eq!(p.removal, Removal::Forget);
         drop(p);
-        let all = [os("app"), os("scratch")];
-        for r in &all {
-            assert!(deleted(std::slice::from_ref(r)));
-            assert!(dir.join("editor").is_dir());
-        }
+        assert!(deleted(&[os("app")]));
+        assert!(dir.join("editor").is_dir());
         assert!(!dir.join(crate::names::RECIPE).exists());
-        let identity = serde_json::json!({ "digest": "d", "booted_secs": 0, "manifest": {} });
-        std::fs::write(dir.join("dev.json"), identity.to_string()).unwrap();
+        // `dev.json` still does not read as an identity.
         assert_eq!(
             plan_one(&os("scratch"), false).unwrap().removal,
             Removal::DevDir
@@ -2132,8 +2131,8 @@ mod tests {
         assert!(!dir.exists());
     }
 
-    /// A state dir `vk` made goes whole; any other only loses its name, recipe and last
-    /// registration. A failure to remove either keeps the name.
+    /// A state dir in vk's run base goes whole, marked as made by vk or not; any other only
+    /// loses its name, recipe and last registration. A failure to remove either keeps the name.
     #[test]
     fn delete_removes_only_what_vk_made() {
         let homes = crate::dev::testutil::Homes::new("rm-own");
@@ -2154,17 +2153,15 @@ mod tests {
             kind: Kind::Run,
             service: None,
         };
-        assert!(super::made(&run(&made)));
-        assert!(!super::made(&run(&unmarked)) && !super::made(&run(&mine)));
+        assert!(super::made(&run(&made)) && super::made(&run(&unmarked)));
+        assert!(!super::made(&run(&mine)));
         let refs = [os("made"), os("unmarked"), os("mine")];
         assert!(deleted(&refs));
         let idx = crate::names::Index::open().unwrap();
-        assert!(!made.exists());
-        for d in [&unmarked, &mine] {
-            assert!(d.join("notes.txt").exists());
-            assert!(!d.join(crate::names::RECIPE).exists() && !d.join(vms::LAST).exists());
-            assert_eq!(idx.name_of(d), None);
-        }
+        assert!(!made.exists() && !unmarked.exists());
+        assert!(mine.join("notes.txt").exists());
+        assert!(!mine.join(crate::names::RECIPE).exists() && !mine.join(vms::LAST).exists());
+        assert_eq!(idx.name_of(&mine), None);
         // A recipe that cannot be removed leaves the name it is known by.
         std::fs::create_dir(mine.join(crate::names::RECIPE)).unwrap();
         homes.name(&mine, "mine");

@@ -160,7 +160,8 @@ pub struct Row {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     pub flags: Vec<Flag>,
-    /// whether the directory passes the ownership check for deletion ([`owned`])
+    /// whether `vk delete` removes the directory whole: it holds no run's recipe (every row
+    /// is of the dev base, see [`crate::lifecycle::in_own_base`])
     pub deletable: bool,
     /// Declared secondary compose services, one table row each. Omitted from host-wide listings.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -621,7 +622,8 @@ fn row(dir: &Path, running: &[Running], with_sizes: bool, with_flags: bool) -> R
         disk_bytes: with_sizes.then(|| crate::dev::storage::disk_usage(dir)),
         pid: live.and_then(|r| r.pid),
         flags,
-        deletable: owned(dir).is_ok(),
+        // Every row is of the dev base, where `vk delete` removes a dir that no run claims.
+        deletable: !dir.join(crate::names::RECIPE).exists(),
         services: Vec::new(),
     }
 }
@@ -1359,7 +1361,6 @@ mod tests {
         assert_eq!(status, [Some("stopped"), None]);
         assert_eq!(rows[1].status, Status::NotBuilt);
         assert_eq!(rows[1].name, "shop-ci-cccc");
-        assert!(!rows[1].deletable);
         assert!(rows[1].services.iter().all(|s| s.status.is_none()));
         assert!(rows[2].services.is_empty());
         let out = render(&rows, false, &|_| true, &offer());
@@ -1610,11 +1611,12 @@ mod tests {
         assert_eq!(rows[0].workspace, None);
         assert_eq!(rows[0].booted_secs, None);
         assert!(rows[0].stale());
-        assert!(!rows[0].deletable);
+        // A boot that never finished left vk's own dir: `vk delete` removes it whole.
+        assert!(rows[0].deletable);
     }
 
-    /// `vk delete` removes whole only a directory that recorded its boot and holds no run's
-    /// recipe beside it; the row says so with the same check.
+    /// `vk delete` removes whole a dev directory that holds no run's recipe, booted or not;
+    /// the row says so with the same check.
     #[test]
     fn only_a_directory_that_is_a_dev_environment_s_alone_is_deletable() {
         let tmp = scratch("deletable");

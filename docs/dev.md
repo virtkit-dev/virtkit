@@ -771,8 +771,8 @@ directory's name also works, including any leading `.` or `-`
 (e.g. `app-3f9c0d1e2a4b5c6d`, shown as `dir_name` in `vk dev list --json`). A task's leftover
 state uses only its directory name, and records no workspace: `vk dev gc --all-stale`
 removes it once stopped.
-For a stopped environment, `vk delete NAME` removes the directory only if it holds a
-valid recorded identity and no run recipe. If `NAME` identifies two different directories,
+For a stopped environment, `vk delete NAME` removes its directory whole, booted or not,
+unless the directory also holds a run recipe. If `NAME` identifies two different directories,
 use the other name of the environment you want. The `MEM` column
 shows what a running environment's VM holds on the host now over the size it
 booted with (`1.2G/8G`), the same figure `vk list` reports; a stopped
@@ -1148,5 +1148,5 @@ Use `vk dev COMMAND --help` for individual options.
 | `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. `NAME` selects a stopped environment in this workspace. Use `vk reset NAME` for a stopped dev environment with a valid identity and no run recipe in any workspace. |
 | `list`, `ls` | List this workspace's environments and secondary compose services: NAME, STATUS, PID, MEM, ON_DISK, CREATED_BY, and FLAGS when one is flagged. Use `--all` for host-wide state, `--columns` to pick columns (`+workspace,+last_boot` adds, `all` shows every one), `--detail` for a full record per environment (as `vk list --detail` prints it), `--wide` for full paths, `--no-sizes` to skip disk usage, or `--json`. |
 | `delete [NAME…]`, `rm`, `remove` | Delete the environment, or named environments or services of this workspace, as `vk delete` does: lists what goes and asks; `-y`, `-f` (stop first), `-n`. |
-| `gc [NAME…]` | Remove stopped state of this workspace's environments. With no names, remove this workspace's environment. `--all-stale` (host-wide, no names) and `--yes`. For a stopped environment with a valid recorded identity and no run recipe, [`vk delete NAME`](../README.md#manage-vms) also removes its state, from any workspace. |
+| `gc [NAME…]` | Remove stopped state of this workspace's environments. With no names, remove this workspace's environment. `--all-stale` (host-wide, no names) and `--yes`. [`vk delete NAME`](../README.md#manage-vms) also removes a stopped environment's state, from any workspace. |
 | `schema` | Print the configuration JSON Schema. |
