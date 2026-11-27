@@ -31,6 +31,9 @@ All notable changes to virtkit will be documented in this file.
   shows them once it restarts.
 - **Sizes read as memory does in `vk list`, `vk dev list`, `vk dev storage list`, `vk delete`
   and `vk dev gc`**: `10.5G`, `780M`, `64K`, where disk sizes read `10.5 GiB`.
+- **`vk list --running` keeps only the VMs that are up.** In 0.118.0 it also kept VMs
+  starting or stopping; `--active` keeps all three now, `--running` matching the STATUS
+  column's `running`.
 
 ### Fixed
 

@@ -230,7 +230,7 @@ impl Filter {
             let env = r.name.clone();
             r.services.retain(|s| {
                 (self.services.is_empty() || self.services.contains(&s.name))
-                    && self.state_ok(s.state())
+                    && (self.states.is_empty() || s.state().is_some_and(|st| self.state_ok(st)))
                     && (picked
                         || self
                             .words
@@ -245,11 +245,14 @@ impl Filter {
 
 impl Service {
     /// Its status as an environment's is worded: one with no VM was never built or started.
-    fn state(&self) -> Status {
+    /// `None` when its state is unknown (its running environment's manager could not be
+    /// asked): it then matches no state, as a `-` service of `vk list` does.
+    fn state(&self) -> Option<Status> {
         match self.status.as_deref() {
-            Some("running") => Status::Running,
-            Some(_) => Status::Stopped,
-            None => Status::NotBuilt,
+            Some("running") => Some(Status::Running),
+            Some("stopped") => Some(Status::Stopped),
+            Some(_) => None,
+            None => Some(Status::NotBuilt),
         }
     }
 }
@@ -1084,7 +1087,6 @@ mod tests {
             name: name.into(),
             status: status.map(Into::into),
             dir: t.0.join(format!("app-1/svc-{name}")),
-            age_secs: None,
             size_bytes: None,
         };
         let env = |name: &str, status: Status, services: Vec<Service>| Row {
@@ -1110,6 +1112,12 @@ mod tests {
                 vec![service("runner", Some("stopped"))],
             ),
             env("app-task", Status::NeverBooted, vec![]),
+            // Its manager could not be asked: its service is neither running nor stopped.
+            env(
+                "app-down",
+                Status::Running,
+                vec![service("web", Some("unknown"))],
+            ),
         ];
         let kept = |f: Filter| -> Vec<String> {
             f.apply(rows.clone())
@@ -1126,7 +1134,10 @@ mod tests {
         };
         // A state keeps what is in it: an environment by its own, a service by its own — a
         // stopped service of a running environment listed without its environment's line.
-        assert_eq!(kept(states(Status::RUNNING)), ["app", "app/runner"]);
+        assert_eq!(
+            kept(states(Status::RUNNING)),
+            ["app", "app/runner", "app-down"]
+        );
         let stopped = states(Status::STOPPED);
         assert_eq!(
             kept(stopped.clone()),
@@ -1193,7 +1204,13 @@ mod tests {
         assert!(kept(names(vec![Pattern::Name("db".into())])).is_empty());
         assert_eq!(
             kept(names(vec![Pattern::Glob("app-*".into())])),
-            ["app-ci", "app-ci/runner", "app-task"]
+            [
+                "app-ci",
+                "app-ci/runner",
+                "app-task",
+                "app-down",
+                "app-down/web"
+            ]
         );
         // The rest narrows what they pick: `--active` keeps what has a live process.
         assert_eq!(
@@ -1201,8 +1218,10 @@ mod tests {
                 states: Status::ACTIVE.to_vec(),
                 ..words(&["app*"])
             }),
-            ["app", "app/runner"]
+            ["app", "app/runner", "app-down"]
         );
+        // A service whose state is unknown matches no state.
+        assert!(!kept(states(Status::STOPPED)).contains(&"app-down/web".to_string()));
     }
 
     /// A state dir with a `dev.json` recording `workspace`, as `after_boot` writes one.
@@ -1271,7 +1290,7 @@ mod tests {
         assert!(!rows[1].deletable);
         assert!(rows[1].services.iter().all(|s| s.status.is_none()));
         assert!(rows[2].services.is_empty());
-        let out = render(&rows, false);
+        let out = render(&rows, false, &|_| true);
         assert!(out.lines().any(|l| l.starts_with("shop-aaaa/db ")), "{out}");
         assert_eq!(serde_json::to_value(Status::NotBuilt).unwrap(), "not-built");
     }
@@ -1305,7 +1324,7 @@ mod tests {
         }];
         let rows = with_services(Vec::new(), &declared, false, &|_| None);
         assert_eq!(rows[0].name, "shop-bbbb");
-        let out = render(&rows, false);
+        let out = render(&rows, false, &|_| true);
         let lines: Vec<&str> = out.lines().skip(1).collect();
         assert!(
             lines[0].starts_with("-  ") && lines[0].contains("not built"),
@@ -1380,7 +1399,7 @@ mod tests {
         assert_eq!(statuses(up, &reported), [s("running"), s("stopped"), None]);
         assert_eq!(statuses(&[], &reported), [s("stopped"), s("stopped"), None]);
         let rows = with_services(scan(&base, up, false).unwrap(), &declared, false, &reported);
-        let out = render(&rows, false);
+        let out = render(&rows, false, &|_| true);
         let db = out
             .lines()
             .find(|l| l.starts_with("shop-aaaa/db "))

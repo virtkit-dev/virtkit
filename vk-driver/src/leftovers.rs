@@ -64,7 +64,10 @@ fn collect_in(dir: &Path, dry_run: bool, now: SystemTime, out: &mut Collected) {
                     && let Ok(idx) = crate::names::Index::open()
                     && let Err(e) = idx.release(dir)
                 {
-                    eprintln!("vk: warning: forgetting the name of {}: {e:#}", dir.display());
+                    eprintln!(
+                        "vk: warning: forgetting the name of {}: {e:#}",
+                        dir.display()
+                    );
                 }
                 out.dirs += 1;
                 out.bytes = out.bytes.saturating_add(bytes);

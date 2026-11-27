@@ -2068,7 +2068,11 @@ mod tests {
         assert!(dir.join("svc-db/data").exists());
         drop(run);
         let lock = hold(&p).unwrap().unwrap();
-        assert_eq!(remove(&p, Some(lock)).unwrap(), "removed app/db\n");
+        let removed = remove(&p, Some(lock)).unwrap();
+        assert!(
+            removed.starts_with("removed app/db (") && removed.ends_with(" freed)\n"),
+            "{removed}"
+        );
         assert!(!dir.join("svc-db").exists() && dir.join("svc-notes/data").exists());
         // A link where the service's directory would be is left, and what it leads to.
         std::os::unix::fs::symlink(plain.join("svc-notes"), dir.join("svc-link")).unwrap();

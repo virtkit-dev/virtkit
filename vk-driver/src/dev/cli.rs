@@ -1783,11 +1783,11 @@ fn delete_refs(
         return Ok(vec![name.to_os_string()]);
     }
     // Resolved as a stop resolves them: services that exist, never one only `up` makes.
-    let (_, picks) = picks(Verb::Stop, targets, plan, g).map_err(|e| {
-        match e.downcast_ref::<super::targets::Outside>() {
-            Some(o) => refuse_outside(&o.0, "vk delete"),
-            None => fail(&e, 2),
-        }
+    let (_, picks) = picks(Verb::Stop, targets, plan, g).map_err(|e| match e
+        .downcast_ref::<super::targets::Outside>()
+    {
+        Some(o) => refuse_outside(&o.0, "vk delete"),
+        None => fail(&e, 2),
     })?;
     Ok(picks
         .into_iter()
@@ -2300,7 +2300,14 @@ mod tests {
                 rows.iter().find(|r| r["dir_name"] == name).cloned()
             };
 
-            let here = rows(dev_list(&cwd, Some((Some(&cwd), None)), true, true, false));
+            let here = rows(dev_list(
+                &cwd,
+                Some((Some(&cwd), None)),
+                true,
+                true,
+                false,
+                &crate::dev::list::Filter::default(),
+            ));
             assert_eq!(here.len(), 3, "{here:#?}");
             let dev = by_dir(&here, &state("dev")).unwrap();
             assert_eq!(dev["status"], "stopped");
@@ -2320,7 +2327,15 @@ mod tests {
             );
             assert!(dev["name"].is_string(), "{dev}");
             assert!(e2e.get("size_bytes").is_none(), "{e2e}");
-            let table = dev_list(&cwd, Some((Some(&cwd), None)), false, false, false).unwrap();
+            let table = dev_list(
+                &cwd,
+                Some((Some(&cwd), None)),
+                false,
+                false,
+                false,
+                &crate::dev::list::Filter::default(),
+            )
+            .unwrap();
             assert!(
                 table
                     .lines()
@@ -2355,7 +2370,15 @@ mod tests {
             ] {
                 let scope = Some((Some(cwd.as_path()), Some(config.as_path())));
                 assert_eq!(
-                    dev_list(&cwd, scope, true, false, false).unwrap_err(),
+                    dev_list(
+                        &cwd,
+                        scope,
+                        true,
+                        false,
+                        false,
+                        &crate::dev::list::Filter::default()
+                    )
+                    .unwrap_err(),
                     exit_code(2),
                     "{}",
                     config.display()
@@ -2376,7 +2399,14 @@ mod tests {
             std::os::unix::fs::symlink("real.yaml", cwd.join("linked.yaml")).unwrap();
             let linked = at("linked.toml", &compose("linked.yaml"));
             let scope = Some((Some(cwd.as_path()), Some(linked.as_path())));
-            let listed = rows(dev_list(&cwd, scope, true, false, false));
+            let listed = rows(dev_list(
+                &cwd,
+                scope,
+                true,
+                false,
+                false,
+                &crate::dev::list::Filter::default(),
+            ));
             let dev = by_dir(&listed, &state("dev")).unwrap();
             assert_eq!(dev["services"][0]["name"], "db", "{dev}");
 
@@ -2384,10 +2414,25 @@ mod tests {
             std::fs::create_dir_all(&nowhere).unwrap();
             std::env::set_current_dir(&nowhere).unwrap();
             assert_eq!(
-                dev_list(&nowhere, Some((None, None)), true, false, false).unwrap_err(),
+                dev_list(
+                    &nowhere,
+                    Some((None, None)),
+                    true,
+                    false,
+                    false,
+                    &crate::dev::list::Filter::default()
+                )
+                .unwrap_err(),
                 exit_code(NO_WORKSPACE_EXIT)
             );
-            let all = rows(dev_list(&nowhere, None, true, false, false));
+            let all = rows(dev_list(
+                &nowhere,
+                None,
+                true,
+                false,
+                false,
+                &crate::dev::list::Filter::default(),
+            ));
             assert_eq!(all.len(), 4, "{all:#?}");
             assert!(by_dir(&all, &base.join("other")).is_some());
             assert!(by_dir(&all, &base.join("stray")).is_some());

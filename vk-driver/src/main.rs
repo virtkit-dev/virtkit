@@ -9233,13 +9233,13 @@ mod tests {
         assert_eq!(seen, Some(here.clone()));
         let cli = Cli::try_parse_from(["vk", "list", "-r"]).unwrap();
         let Cmd::List {
-            target, recursive, ..
+            refs, recursive, ..
         } = cli.cmd
         else {
             panic!("not list");
         };
         assert_eq!(
-            vms::selector_of(target.as_deref(), recursive).unwrap(),
+            vms::selector_of(refs.first().map(|r| r.as_os_str()), recursive).unwrap(),
             here
         );
         assert_eq!(vms::selector_of(None, false).unwrap(), None);

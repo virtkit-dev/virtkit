@@ -108,12 +108,6 @@ fn status_cell(r: &Row) -> String {
     cell
 }
 
-/// Whether a VM with this status is on its way up or down: `--running` keeps it.
-fn on_its_way(status: &str) -> bool {
-    use crate::vmstate::State;
-    status == State::Starting.label() || status == State::Stopping.label()
-}
-
 /// A running primary and its current measurements.
 pub struct Live<'a> {
     pub entry: &'a VmEntry,
@@ -389,7 +383,7 @@ impl Word {
     /// Whether this word names the row `r`, whose VM's own row is `vm` (`r` itself for a VM).
     fn names(&self, r: &Row, vm: &Row) -> bool {
         match self {
-            Word::Pattern(p) => p.matches(&r.name) || p.matches(&vm.name),
+            Word::Pattern(p) => p.matches(&r.name) || p.matches(&vm.name) || dir_alias(p, r, vm),
             Word::Dir { dir, below } => {
                 crate::vms::canonical(&vm.state_dir) == *dir
                     || vm
@@ -405,6 +399,22 @@ impl Word {
                     })
             }
         }
+    }
+}
+
+/// Whether the exact name `p` names `r` by its VM's state dir's own name, as every VM command
+/// takes it (`shop-3f9c0d1e2a4b5c6d`, `shop-3f9c0d1e2a4b5c6d/db`); never through a glob, which
+/// `<name>-<digest>` would make match too much.
+fn dir_alias(p: &crate::namematch::Pattern, r: &Row, vm: &Row) -> bool {
+    let crate::namematch::Pattern::Name(n) = p else {
+        return false;
+    };
+    let Some(dir) = vm.state_dir.file_name().and_then(|d| d.to_str()) else {
+        return false;
+    };
+    match service_of(r) {
+        None => n == dir,
+        Some(service) => n == dir || *n == format!("{dir}/{service}"),
     }
 }
 
@@ -436,6 +446,7 @@ impl Filter {
             || !self.states.is_empty()
             || self.kind.is_some()
             || self.problems
+            || self.service.is_some()
             || !self.services.is_empty()
             || self.workspace.is_some()
     }
@@ -862,12 +873,13 @@ mod tests {
             below,
             ..Filter::default()
         };
+        // `other` shares `app`'s project.
         assert_eq!(
             keep(workspace("/w/app", false)),
-            ["app", "app/db", "app/web"]
+            ["app", "app/db", "app/web", "other", "other/db"]
         );
         assert!(keep(workspace("/w", false)).is_empty());
-        assert_eq!(keep(workspace("/w", true)).len(), 3);
+        assert_eq!(keep(workspace("/w", true)).len(), 5);
         assert_eq!(
             keep(Filter {
                 kind: Some(Kind::Service),
@@ -918,9 +930,9 @@ mod tests {
             3,
             "its state dir"
         );
-        assert_eq!(keep(words(&[dir("/w/app", false)])).len(), 3, "its project");
+        assert_eq!(keep(words(&[dir("/w/app", false)])).len(), 5, "its project");
         assert!(keep(words(&[dir("/w", false)])).is_empty());
-        assert_eq!(keep(words(&[dir("/w", true)])).len(), 3);
+        assert_eq!(keep(words(&[dir("/w", true)])).len(), 5);
     }
 
     /// Non-UTF-8 paths retain the recipe's byte representation in JSON.

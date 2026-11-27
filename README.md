@@ -638,7 +638,9 @@ In the table, a running primary's MEM shows the resident memory of its process t
 boot size (`--mem`). The tree includes the guest, its service VMs, the switch and forwards.
 Proportional usage counts shared pages once. When it is unavailable, resident usage can
 count shared pages more than once. An unknown half shows `-`. The whole cell shows `-`
-when both halves are unknown and on all service and stopped rows.
+when both halves are unknown and on stopped rows. A running service's row shows its own
+VM's memory over the size it boots with; that memory is part of its primary's figure too,
+so the rows do not add up to a total.
 
 IMAGE identifies the Dockerfile and target stage, compose primary or image ref. PUBLISHED
 shows each host port held by `vk publish ensure` on the row of the VM that dials the target.

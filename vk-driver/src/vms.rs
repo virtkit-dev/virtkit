@@ -1110,7 +1110,7 @@ fn list_word(arg: &std::ffi::OsStr, below: bool) -> Result<crate::vmlist::Word> 
 /// Render the selected rows in the requested format. A single match still defaults to
 /// the table.
 pub fn list_report(opts: ListOpts) -> Result<String> {
-    use crate::vmlist::{Filter, Kind, Known, Live};
+    use crate::vmlist::{Kind, Known, Live};
     use crate::vmstate::Standing;
     check_fields(&opts.fields)?;
     let mut filter = opts.filter;
@@ -1282,7 +1282,7 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
             eprintln!("vk: {}: {why}", r.name);
         }
     }
-    let unfiltered = filter == Filter::default();
+    let unfiltered = !filter.narrows();
     // An unfiltered host-wide listing also counts abandoned or dangling names and dead
     // registrations without a listed VM.
     let marked = rows.iter().filter(|r| r.stale_record).count();
@@ -1301,10 +1301,20 @@ pub fn list_report(opts: ListOpts) -> Result<String> {
         return Ok(details(&rows, &all, &live, stale));
     }
     if rows.is_empty() {
-        return Ok(match target.is_none() && unfiltered {
-            true => "no vk VMs\n".to_string(),
-            false => "no matching vk VM\n".to_string(),
-        });
+        return Ok(
+            match (opts.words.as_slice(), target.is_none() && unfiltered) {
+                ([], true) => "no vk VMs\n".to_string(),
+                ([], false) => "no matching vk VM\n".to_string(),
+                (words, _) => format!(
+                    "no matching vk VM for {}\n",
+                    words
+                        .iter()
+                        .map(|w| w.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+            },
+        );
     }
     // `tilde` matches against a canonical `project_dir`, so canonicalize `$HOME` as well;
     // only the narrow table folds it.
@@ -3586,7 +3596,7 @@ PUBLISHED     -
             service: Some("db".into()),
             ..Filter::default()
         };
-        let only_db: Vec<_> = rows.iter().filter(|r| filter.keeps(r)).cloned().collect();
+        let only_db: Vec<_> = filter.apply(rows.clone());
         let text = details(&only_db, &rows, &live, false);
         assert!(
             text.starts_with(
@@ -3646,7 +3656,7 @@ PUBLISHED     -
             kind: Some(Kind::Run),
             ..Filter::default()
         };
-        let runs: Vec<_> = all.iter().filter(|r| filter.keeps(r)).cloned().collect();
+        let runs: Vec<_> = filter.apply(all.clone());
         assert_eq!(runs.len(), 2);
         assert_eq!(details(&runs, &all, &[], false), text);
         // A service whose primary is not listed keeps its record, even beside another
@@ -4656,7 +4666,7 @@ PUBLISHED     -
 
         fn list(target: Option<&OsStr>, filter: Filter, fields: &[&str], json: bool) -> String {
             list_report(ListOpts {
-                target: target.map(OsStr::to_os_string),
+                words: target.map(OsStr::to_os_string).into_iter().collect(),
                 fields: fields.iter().map(|f| f.to_string()).collect(),
                 json,
                 filter,
@@ -4667,14 +4677,14 @@ PUBLISHED     -
 
         fn stopped_only() -> Filter {
             Filter {
-                stopped: true,
+                states: crate::vmlist::State::STOPPED.to_vec(),
                 ..Filter::default()
             }
         }
 
         fn detail(target: &OsStr) -> String {
             list_report(ListOpts {
-                target: Some(target.to_os_string()),
+                words: vec![target.to_os_string()],
                 detail: true,
                 ..ListOpts::default()
             })
@@ -4783,8 +4793,9 @@ PUBLISHED     -
             );
             let err = report(&["stale"], false).unwrap_err().to_string();
             assert!(err.contains("pass --stale"), "{err}");
+            // What upstream's `--running` kept: every VM with a live process.
             let running = Filter {
-                running: true,
+                states: crate::vmlist::State::ACTIVE.to_vec(),
                 ..Filter::default()
             };
             assert_eq!(list(None, running, &["name"], false), "app\n");
@@ -4886,8 +4897,9 @@ PUBLISHED     -
             assert_eq!(recipe.contexts, std::slice::from_ref(&odd));
             assert_eq!(recipe.build_contexts, [("extra".to_string(), odd.clone())]);
             assert_eq!(recipe.root_ext4, odd.join("root.ext4"));
+            // What upstream's `--running` kept: every VM with a live process.
             let running = Filter {
-                running: true,
+                states: crate::vmlist::State::ACTIVE.to_vec(),
                 ..Filter::default()
             };
             assert_eq!(list(None, running, &["name"], false), "odd\n");
@@ -4907,8 +4919,9 @@ PUBLISHED     -
             let idx = crate::names::Index::open().unwrap();
             assert!(idx.provisional().claim_exact(&dir, "boot").unwrap());
             crate::vmstate::starting(&dir);
+            // What upstream's `--running` kept: every VM with a live process.
             let running = Filter {
-                running: true,
+                states: crate::vmlist::State::ACTIVE.to_vec(),
                 ..Filter::default()
             };
             let fields = ["name", "status", "attention"];
