@@ -738,8 +738,8 @@ pub fn render(rows: &[Row], wide: bool, line: &dyn Fn(&Row) -> bool) -> String {
             "WORKSPACE",
             "ENV",
             "STATUS",
-            "CREATED BY",
-            "LAST BOOT",
+            "CREATED_BY",
+            "LAST_BOOT",
             "MEM",
             "ON_DISK",
             "FLAGS",
@@ -785,11 +785,12 @@ pub(super) fn fmt_size(size: Option<u64>) -> String {
 /// commit hash would double the column's width without telling the reader anything a
 /// `vk dev status` would not.
 fn short_creator(created_by: &str) -> String {
+    // One word, as every cell of the table is: `vk 0.117.1` reads `vk-0.117.1`.
     created_by
         .split_whitespace()
         .take(2)
         .collect::<Vec<_>>()
-        .join(" ")
+        .join("-")
 }
 
 /// Which rows a `gc` takes: the ones named, plus — under `--all-stale` — every one whose
@@ -1777,7 +1778,7 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("NAME"), "{out}");
         assert!(
-            lines[0].contains("CREATED BY  LAST BOOT  MEM      ON_DISK  FLAGS"),
+            lines[0].contains("CREATED_BY  LAST_BOOT  MEM      ON_DISK  FLAGS"),
             "{out}"
         );
         // The running row is the only one holding memory: what its tree holds now over the
@@ -1787,7 +1788,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            lines[2].contains("stopped") && lines[2].contains("vk 0.62.0"),
+            lines[2].contains("stopped") && lines[2].contains("vk-0.62.0"),
             "{out}"
         );
         // A stopped environment holds nothing, and the column says so rather than guessing

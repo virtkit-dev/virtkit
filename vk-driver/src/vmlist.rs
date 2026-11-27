@@ -494,7 +494,7 @@ pub fn render(rows: &[Row], home: Option<&Path>, wide: bool, stale: bool) -> Str
         "NAME", "KIND", "STATUS", "PID", "UPTIME", "MEM", "IMAGE", "PROJECT",
     ];
     if wide {
-        headers.push("EXEC ADDRESS");
+        headers.push("EXEC_ADDRESS");
     }
     headers.push("PUBLISHED");
     if stale {
@@ -1038,7 +1038,7 @@ mod tests {
                 .lines()
                 .next()
                 .unwrap()
-                .contains("EXEC ADDRESS")
+                .contains("EXEC_ADDRESS")
         );
     }
 }

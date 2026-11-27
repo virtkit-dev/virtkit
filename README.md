@@ -644,7 +644,7 @@ IMAGE identifies the Dockerfile and target stage, compose primary or image ref. 
 shows each host port held by `vk publish ensure` on the row of the VM that dials the target.
 It shows `listen->to`, with `@NAME` for a service and `(unconfirmed)` if the publisher's
 liveness could not be checked. The table abbreviates `$HOME` to `~`. `--wide` (`-w`) shows
-the full project path and adds EXEC ADDRESS. It conflicts with `--detail`, `--json` and `--field`.
+the full project path and adds EXEC_ADDRESS. It conflicts with `--detail`, `--json` and `--field`.
 
 **Naming a VM.** `vk list` accepts references to VMs in any listed state. `vk atop` also accepts recorded jobs.
 

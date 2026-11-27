@@ -2714,7 +2714,7 @@ enum Cmd {
         /// records untouched.
         #[arg(long)]
         problems: bool,
-        /// the full table: the project path in full, and EXEC ADDRESS
+        /// the full table: the project path in full, and EXEC_ADDRESS
         #[arg(short = 'w', long, conflicts_with_all = ["json", "field"])]
         wide: bool,
         /// show detailed VM records
