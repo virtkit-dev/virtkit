@@ -8,6 +8,8 @@ All notable changes to virtkit will be documented in this file.
 
 - Direct `/files/` uploads to size-capped cache directories now return 405 instead of 400
   for otherwise valid file names over 128 characters. The error directs callers to S3.
+- Other `vk` processes, including `vk gc`, can enforce their own limits on the
+  `sccache` shared cache even when a process serves it with `[gc] sccache_max = "none"`.
 
 ## [0.118.0] - 2026-11-27
 

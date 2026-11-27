@@ -36,6 +36,9 @@ use crate::{Authz, Body, accounts, error_response};
 /// The directory under the store root that holds the areas.
 const AREAS_DIR: &str = "flat";
 
+/// Marks a binding with no size limit. An uncapped store leaves eviction to a capped peer.
+pub const UNCAPPED: u64 = u64::MAX;
+
 /// The default of [`FlatBinding::evict_to`].
 pub const DEFAULT_EVICT_TO: f64 = 0.9;
 
@@ -290,11 +293,11 @@ impl Area {
         Ok(Some(store))
     }
 
-    /// Inspection opens new instances without a cap.
+    /// Inspection opens new instances without a cap, as does an [`UNCAPPED`] binding.
     fn policy(&self) -> Policy {
         let b = &self.binding;
         Policy {
-            cap: (self.usage != Use::Inspect).then_some(b.cap),
+            cap: (self.usage != Use::Inspect && b.cap != UNCAPPED).then_some(b.cap),
             evict_to: b.evict_to,
             durable: b.durable,
         }
@@ -312,11 +315,16 @@ impl Area {
         Ok(())
     }
 
-    /// Report the open store's cap if it has one, otherwise the binding's cap.
-    /// Another binding in this process may have changed the store's cap.
+    /// Report the open store's current cap, which another binding in this process can change.
+    /// For an uncapped store, inspection reports the binding's cap and other uses report
+    /// [`UNCAPPED`]. If the store is absent or failed to open, report the binding's cap.
     fn cap(&self, store: &Result<Option<Arc<FlatStore>>>) -> u64 {
         match store {
-            Ok(Some(s)) => s.policy().cap.unwrap_or(self.binding.cap),
+            Ok(Some(s)) => match s.policy().cap {
+                Some(cap) => cap,
+                None if self.usage == Use::Inspect => self.binding.cap,
+                None => UNCAPPED,
+            },
             _ => self.binding.cap,
         }
     }
@@ -627,6 +635,39 @@ mod tests {
         let bad = vec![FlatBinding::new("a", 1), FlatBinding::new("b", 1)];
         assert!(Areas::new(&dir, bad, Use::Serve).is_err());
         assert_eq!(store.policy().cap, Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_uncapped_binding_leaves_eviction_to_a_capped_peer() {
+        let dir = crate::testtmp::root().join("flat-uncapped");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let areas = Areas::new(&dir, vec![FlatBinding::new("a", UNCAPPED)], Use::Serve).unwrap();
+        let store = areas.areas[0].serving().unwrap();
+        assert_eq!(store.policy().cap, None);
+        for k in ["k1", "k2", "k3"] {
+            store.put(k.as_bytes(), &mut &[0u8; 100][..]).unwrap();
+        }
+        // Wait past the interval when a capped instance would try to take the role.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert!(!store.is_evictor());
+        let peer = FlatStore::open(
+            &areas.areas[0].root,
+            Options {
+                cap: Some(150),
+                evict_to: 1.0,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert!(peer.evict().unwrap().is_some(), "the peer takes the role");
+        assert!(peer.usage().unwrap().bytes <= 150);
+        // Another binding in this process reports the cap in force.
+        let capped = Areas::new(&dir, vec![FlatBinding::new("a", 1)], Use::Collect).unwrap();
+        assert_eq!(capped.usage()[0].cap, 1);
+        areas.areas[0].apply().unwrap();
+        assert_eq!(capped.usage()[0].cap, UNCAPPED, "the cap in force");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

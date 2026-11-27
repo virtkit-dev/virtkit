@@ -49,7 +49,9 @@ pub fn flat_bindings(
 ) -> Result<Vec<vk_registry::flat::FlatBinding>> {
     let space = crate::usage::fs_space(root)
         .with_context(|| format!("sizing the filesystem of {}", root.display()))?;
-    let cap = gc.sccache_max(space.total).unwrap_or(u64::MAX).max(1);
+    let cap = gc
+        .sccache_max(space.total)
+        .map_or(vk_registry::flat::UNCAPPED, |c| c.max(1));
     Ok(vec![vk_registry::flat::FlatBinding::new(
         &area(FLAT_ALIAS).prefix,
         cap,

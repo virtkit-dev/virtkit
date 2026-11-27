@@ -343,7 +343,8 @@ for other shared caches.
 
 A `vk` serving `sccache` checks the limit in the background. `vk gc` can evict
 when the area's eviction lock is free. The process holding the lock applies its
-own limit. Above it, eviction targets 90% of the limit, oldest recorded use
+own limit. With `sccache_max = "none"`, `vk` leaves the lock to a capped process.
+When usage exceeds the limit, eviction targets 90% of the limit, oldest recorded use
 first. A hit can refresh an object's timestamp once it is at least an hour old.
 
 A lookup for an object cached only as a tag returns a miss. The old tags remain
