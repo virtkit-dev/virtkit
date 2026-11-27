@@ -316,6 +316,47 @@ fn flat_bindings(entries: Vec<FileFlat>) -> Result<Vec<crate::flat::FlatBinding>
     Ok(bindings)
 }
 
+/// A config's `[[flat]]` bindings and, when `[hub] allow` lists `flat`, the hub's last
+/// valid request for the store at `root`. Local bindings take precedence.
+fn flat_of(
+    own: Vec<FileFlat>,
+    hub: Option<FileHub>,
+    root: &Path,
+) -> Result<Vec<crate::flat::FlatBinding>> {
+    let own = flat_bindings(own)?;
+    let allows = hub.is_some_and(|h| {
+        h.allow
+            .iter()
+            .any(|a| a == vk_hub_proto::registry::ALLOW_FLAT)
+    });
+    if !allows {
+        return Ok(own);
+    }
+    let asked = crate::hub::asked_flat(root);
+    Ok(crate::hub::flat_bindings(&own, true, asked.as_deref()).0)
+}
+
+/// What `vk-registry gc` sweeps ([`ServerConfig::gc_store_of`]).
+#[derive(Debug, PartialEq)]
+pub struct GcStore {
+    pub root: PathBuf,
+    pub windows: Vec<crate::PrefixWindow>,
+    /// Number of config windows skipped for an explicit root.
+    pub unapplied: usize,
+    pub flat: Vec<crate::flat::FlatBinding>,
+}
+
+impl GcStore {
+    fn bare(root: PathBuf) -> Self {
+        GcStore {
+            root,
+            windows: Vec::new(),
+            unapplied: 0,
+            flat: Vec::new(),
+        }
+    }
+}
+
 /// `[gc]`: only its `[[gc.prefix]]` entries, for now.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -436,45 +477,34 @@ impl ServerConfig {
         }
     }
 
-    /// With only a config path, `vk-registry status` and `gc` use its `[[flat]]` bindings
-    /// and, when `[hub] allow` lists `flat`, the hub's last valid request. Local bindings
-    /// take precedence. An explicit `root` skips both.
-    pub fn flat_of(
+    /// Resolve the `vk-registry status` root as [`ServerConfig::root_of`] does.
+    /// An explicit `root` skips the config and returns no bindings. Otherwise a single
+    /// config read supplies `[[flat]]` even if `root` is omitted. When `[hub] allow`
+    /// lists `flat`, local bindings take precedence over the hub's last valid request.
+    pub fn status_store_of(
         config: Option<&Path>,
-        root: Option<&Path>,
-    ) -> Result<Vec<crate::flat::FlatBinding>> {
-        let (Some(path), None) = (config, root) else {
-            return Ok(Vec::new());
+        root: Option<PathBuf>,
+    ) -> Result<(PathBuf, Vec<crate::flat::FlatBinding>)> {
+        let (Some(path), None) = (config, &root) else {
+            return Ok((Self::root_of(None, root)?, Vec::new()));
         };
         let f = read_file(path)?;
-        let own = flat_bindings(f.flat)?;
-        let allows = f.hub.is_some_and(|h| {
-            h.allow
-                .iter()
-                .any(|a| a == vk_hub_proto::registry::ALLOW_FLAT)
-        });
-        if !allows {
-            return Ok(own);
-        }
         let root = match f.root {
             Some(r) => r,
             None => crate::located_default_root()?,
         };
-        let asked = crate::hub::asked_flat(&root);
-        Ok(crate::hub::flat_bindings(&own, true, asked.as_deref()).0)
+        let flat = flat_of(f.flat, f.hub, &root)?;
+        Ok((root, flat))
     }
 
-    /// The store `vk-registry gc` sweeps, as [`ServerConfig::root_of`] resolves it, and the
-    /// `[[gc.prefix]]` windows of the config at `config` when the root comes through it: an
-    /// explicit `root` is another store, which that config's windows say nothing of. Only
-    /// `[gc]` is checked, as `root_of` reads only the root. The third value counts the
-    /// config's windows left unapplied because of an explicit `root`.
-    pub fn gc_store_of(
-        config: Option<&Path>,
-        root: Option<PathBuf>,
-    ) -> Result<(PathBuf, Vec<crate::PrefixWindow>, usize)> {
+    /// Resolve the `vk-registry gc` root and flat bindings as
+    /// [`ServerConfig::status_store_of`] does, with `[[gc.prefix]]` windows from the same
+    /// config read. After parsing, only windows and bindings are validated. An explicit
+    /// `root` skips the config's policy but still reads the file, when supplied, to count
+    /// skipped windows.
+    pub fn gc_store_of(config: Option<&Path>, root: Option<PathBuf>) -> Result<GcStore> {
         let Some(path) = config else {
-            return Ok((Self::root_of(None, root)?, Vec::new(), 0));
+            return Ok(GcStore::bare(Self::root_of(None, root)?));
         };
         if let Some(root) = root {
             // Read only to say what is left out: an explicit root never needed the file, so
@@ -483,7 +513,10 @@ impl ServerConfig {
                 .ok()
                 .and_then(|f| f.gc)
                 .map_or(0, |g| g.prefix.len());
-            return Ok((root, Vec::new(), unapplied));
+            return Ok(GcStore {
+                unapplied,
+                ..GcStore::bare(root)
+            });
         }
         let f = read_file(path)?;
         let prefixes = f.gc.map(|g| g.prefix).unwrap_or_default();
@@ -492,11 +525,13 @@ impl ServerConfig {
             Some(r) => r,
             None => crate::located_default_root()?,
         };
-        Ok((
+        let flat = flat_of(f.flat, f.hub, &root)?;
+        Ok(GcStore {
             root,
-            prefixes.iter().map(crate::PrefixWindow::from).collect(),
-            0,
-        ))
+            windows: prefixes.iter().map(crate::PrefixWindow::from).collect(),
+            unapplied: 0,
+            flat,
+        })
     }
 
     /// What a hub managing the registry is told it is, and may do to it.
@@ -1934,16 +1969,24 @@ mod tests {
             ]
         );
         assert_eq!(
-            ServerConfig::flat_of(Some(&p), None).unwrap(),
+            ServerConfig::status_store_of(Some(&p), None).unwrap().1,
             cfg.flat,
             "the store the config names"
         );
+        assert_eq!(
+            ServerConfig::gc_store_of(Some(&p), None).unwrap().flat,
+            cfg.flat
+        );
+        assert_eq!(
+            ServerConfig::status_store_of(Some(&p), Some(dir.clone())).unwrap(),
+            (dir.clone(), Vec::new())
+        );
         assert!(
-            ServerConfig::flat_of(Some(&p), Some(&dir))
+            ServerConfig::gc_store_of(Some(&p), Some(dir.clone()))
                 .unwrap()
+                .flat
                 .is_empty()
         );
-        assert!(ServerConfig::flat_of(None, None).unwrap().is_empty());
         let hash = cfg.hub_facts().config_hash;
         assert_ne!(hash, "e3609a2059e9c15e");
         let swapped = "[[flat]]\nprefix = \"dev/cc\"\ncap = 1024\nevict_to = 0.5\n\
@@ -1986,11 +2029,11 @@ mod tests {
         };
         write("[[gc.prefix]]\npath = \"ci\"\nretention_days = 2\n");
         assert!(ServerConfig::load(&path, None, None).is_err());
-        let (root, windows, unapplied) = ServerConfig::gc_store_of(Some(&path), None).unwrap();
-        assert_eq!(unapplied, 0);
-        assert_eq!(root, store);
+        let gc = ServerConfig::gc_store_of(Some(&path), None).unwrap();
+        assert_eq!(gc.unapplied, 0);
+        assert_eq!(gc.root, store);
         assert_eq!(
-            windows,
+            gc.windows,
             vec![crate::PrefixWindow::from(&GcPrefix {
                 path: "ci".into(),
                 retention_days: 2
@@ -1999,12 +2042,15 @@ mod tests {
         let other = dir.join("other");
         assert_eq!(
             ServerConfig::gc_store_of(Some(&path), Some(other.clone())).unwrap(),
-            (other.clone(), Vec::new(), 1),
+            GcStore {
+                unapplied: 1,
+                ..GcStore::bare(other.clone())
+            },
             "an explicit root is another store"
         );
         assert_eq!(
             ServerConfig::gc_store_of(None, Some(other.clone())).unwrap(),
-            (other, Vec::new(), 0)
+            GcStore::bare(other)
         );
         write("[[gc.prefix]]\npath = \"ci\"\nretention_days = 0\n");
         assert!(ServerConfig::gc_store_of(Some(&path), None).is_err());

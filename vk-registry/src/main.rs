@@ -727,12 +727,8 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Status { root, config } => {
             let (root, config) = selectors_with_env(root, config, |name| std::env::var_os(name));
-            let flat = vk_registry::ServerConfig::flat_of(config.as_deref(), root.as_deref())?;
-            vk_registry::status_with(
-                "vk-registry",
-                vk_registry::ServerConfig::root_of(config.as_deref(), root)?,
-                flat,
-            )
+            let (root, flat) = vk_registry::ServerConfig::status_store_of(config.as_deref(), root)?;
+            vk_registry::status_with("vk-registry", root, flat)
         }
         Cmd::Gc {
             root,
@@ -744,9 +740,12 @@ async fn run(cli: Cli) -> Result<()> {
             let (root, config) = selectors_with_env(root, config, |name| std::env::var_os(name));
             // Use serve's `[[flat]]` bindings and `[[gc.prefix]]` retention windows only
             // when the config supplies the root.
-            let flat = vk_registry::ServerConfig::flat_of(config.as_deref(), root.as_deref())?;
-            let (root, windows, unapplied) =
-                vk_registry::ServerConfig::gc_store_of(config.as_deref(), root)?;
+            let vk_registry::config::GcStore {
+                root,
+                windows,
+                unapplied,
+                flat,
+            } = vk_registry::ServerConfig::gc_store_of(config.as_deref(), root)?;
             if let (Some(config), 1..) = (&config, unapplied) {
                 eprintln!(
                     "vk-registry gc: note: the {unapplied} [[gc.prefix]] window(s) of {} are \
