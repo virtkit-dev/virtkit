@@ -137,7 +137,7 @@ sweep_gone_checkouts() {
 lock_state_dir() {
   while :; do
     mkdir -p "$STATE_DIR"
-    exec 9>"$STATE_DIR/dev.lock" || continue
+    exec 9>"$STATE_DIR/dev.lock" || { [ -d "$STATE_DIR" ] && exit 1; continue; }
     flock -w 600 9 || {
       echo "dev.sh: timed out waiting for another dev.sh to release the VM lock" >&2
       exit 1
