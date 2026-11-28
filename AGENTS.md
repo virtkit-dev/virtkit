@@ -216,8 +216,9 @@ also deletes the stopped VMs of this repository's checkouts that no longer exist
 (`0` keeps the VM until it is stopped), and `VK_DEV_CMD_TIMEOUT` caps each cargo command
 (default one hour, `0` for no limit). When the `vk` on `PATH` can lend shared caches
 (`vk check --feature shared-cache`), cargo compiles through sccache, cached in that `vk`'s
-`sccache` shared cache: checkouts using the same store can reuse matching dependency
-builds, while the workspace's own crates still compile incrementally, uncached.
+`sccache` shared cache. With `SCCACHE_ALLOW_INCREMENTAL=cache`, checkouts using the same
+store can reuse matching builds of dependencies and workspace crates. A cache hit leaves
+local incremental state untouched, so the next edit to that crate can take longer to build.
 `VK_DEV_SCCACHE=0` turns it off; `./build.sh` never uses it, for fast and release builds
 alike. Turning it on or off restarts the VM only once no other `dev.sh` command uses it.
 Use `./build.sh --fast` only when an executable is actually needed for runtime testing.

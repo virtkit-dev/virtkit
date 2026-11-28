@@ -64,6 +64,26 @@
         muslCC = "${muslPkgs.stdenv.cc}/bin/${muslPkgs.stdenv.cc.targetPrefix}cc";
         muslAR = "${muslPkgs.stdenv.cc.bintools.bintools}/bin/${muslPkgs.stdenv.cc.targetPrefix}ar";
 
+        # dev.sh uses SCCACHE_ALLOW_INCREMENTAL=cache, available since sccache 0.20.
+        # Build 0.20.1 from source until nixpkgs provides that version or later.
+        sccache =
+          if pkgs.lib.versionAtLeast pkgs.sccache.version "0.20.1" then
+            pkgs.sccache
+          else
+            pkgs.sccache.overrideAttrs (finalAttrs: old: {
+              version = "0.20.1";
+              src = pkgs.fetchFromGitHub {
+                owner = "mozilla";
+                repo = "sccache";
+                rev = "v${finalAttrs.version}";
+                hash = "sha256-zuPOjAfWUy/uifUZfcmVcIefH93JwcqFiaJBVvtSZPQ=";
+              };
+              cargoHash = "sha256-nhYw1Pl2V72TH7JG/o6oi4MNaWHIt1hJclJn9UkWvXc=";
+              # cargoSetupHook sets AWS_LC_SYS_USE_SYSTEM=1 without providing AWS-LC.
+              # Let aws-lc-sys 0.47 build its copy to avoid a panic in the sccache 0.20.1 build.
+              preBuild = (old.preBuild or "") + "export AWS_LC_SYS_USE_SYSTEM=0\n";
+            });
+
         # The build tools. busybox supplies the `sh` that build.sh's
         # `docker run ... sh -c "$BUILD_CMD"` invokes.
         buildTools = with pkgs; [

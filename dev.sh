@@ -454,14 +454,16 @@ fi
 flock -s 8
 exec 9>&-
 
-# Checkouts using the same shared cache store can reuse matching dependency builds. sccache
-# skips incremental builds, so workspace crates keep their incremental rebuilds. Cargo omits
-# RUSTC_WRAPPER from unit fingerprints, and no build script in this tree tracks it, so
-# build.sh, which never uses sccache, still reuses target/ with these commands.
+# Checkouts sharing a store can reuse matching dependency and incremental workspace builds.
+# A hit leaves local incremental state untouched, so the next edit can take longer to build.
+# New entries from edited crates share the store's size cap with dependencies.
+# Cargo excludes RUSTC_WRAPPER from unit fingerprints, and no build script here tracks it.
+# This lets build.sh reuse target/ even though it runs without sccache.
 case " $shape " in
   *" --shared-cache sccache "*)
     DEV_ENV+=(
       RUSTC_WRAPPER=sccache
+      SCCACHE_ALLOW_INCREMENTAL=cache
       SCCACHE_ENDPOINT=http://registry.vk/s3
       SCCACHE_BUCKET=job
       SCCACHE_S3_KEY_PREFIX=sccache

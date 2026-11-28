@@ -295,12 +295,14 @@ SCCACHE_S3_USE_SSL = "false"
 RUSTC_WRAPPER = "sccache"
 ```
 
-sccache does not cache a crate compiled incrementally: it runs rustc on it
-uncached. Cargo compiles only the workspace's own crates incrementally in the dev
-profile, so dependencies are cached as they are and your crates keep incremental
-rebuilds. `CARGO_INCREMENTAL=0` caches your crates too, which pays off in a fresh
-checkout or a worktree, at the cost of recompiling a whole crate on every edit to
-it.
+By default, sccache skips incremental builds. In Cargo's dev profile these
+include workspace crates and path dependencies. Set
+`SCCACHE_ALLOW_INCREMENTAL = "cache"` (sccache 0.20+) so a fresh checkout or
+worktree can reuse their builds. A hit leaves local incremental state untouched,
+so the next edit can take longer to build. If a rustc incremental compilation
+bug produces a bad rlib, the cache shares it too. Rebuild with
+`SCCACHE_RECACHE=1`. Setting `CARGO_INCREMENTAL=0` also allows caching, but
+each edit then rebuilds the whole crate.
 
 The proxy supplies the registry credential, so the guest needs no AWS keys. Each
 shared cache the environment names serves object `GET`, `HEAD` and single-request `PUT`;
