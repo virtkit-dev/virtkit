@@ -409,17 +409,23 @@ fn run_args(
 }
 
 /// Where an ephemeral task's VM keeps its sockets and scratch:
-/// `<readable>{-env}-task-<name>-<token>`, a sibling of the environment's own directory,
-/// created here and removed by the caller once the run ends.
+/// `<readable>{-env}-task-<name>-<token>`, a sibling of the environment's own directory.
+/// The caller removes the task directory after the run.
 ///
 /// Named with a random token, not this pid, so a leaked directory is never adopted by a
 /// later run the OS gives the same pid.
 fn task_state_dir(plan: &Plan, task: &crate::dev::plan::TaskPlan) -> Result<PathBuf> {
+    // A commit hook can run before the first environment creates the shared base.
+    let base = plan
+        .state_dir
+        .parent()
+        .with_context(|| format!("{} has no parent directory", plan.state_dir.display()))?;
+    crate::statefile::create_dir_all(base)?;
     for _ in 0..8 {
         // Eight hex digits: the directory name goes into the VM's vsock socket path, which
         // must stay under the 108-byte `sun_path` limit; the full token would overrun it.
         let token: String = generation_token().chars().take(8).collect();
-        let name = crate::dev::plan::task_state_dir_name(plan, &task.name, &token)?;
+        let name = crate::dev::plan::task_state_dir_name(plan, base, &task.name, &token)?;
         let dir = plan.state_dir.with_file_name(name);
         // Fails if anything is already there, symlink included, so this run's directory is
         // one it made itself.
@@ -3942,6 +3948,37 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn an_ephemeral_task_creates_the_state_base_it_sits_in() {
+        let t = scratch("task-state-base");
+        let mut plan = plan_in(&t.0);
+        plan.state_dir = t.0.join("new/env");
+        let task = crate::dev::plan::TaskPlan {
+            name: "pre-commit".into(),
+            argv: vec!["true".into()],
+            env: vec![],
+            policy: crate::dev::config::Policy::Ephemeral,
+            environment: "hook".into(),
+            reuse: "hook".into(),
+            checkout: CheckoutMode::Shared,
+        };
+        let dir = task_state_dir(&plan, &task).unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(dir.parent(), plan.state_dir.parent());
+        assert_eq!(
+            std::fs::metadata(t.0.join("new"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(
+            !plan.state_dir.exists(),
+            "the environment's own directory is left alone"
+        );
     }
 
     #[test]

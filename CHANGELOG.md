@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `vk dev task` can run in an ephemeral VM before the first `vk dev` environment
+  starts, including from a commit hook.
+
 ## [0.118.1] - 2026-11-28
 
 ### Added

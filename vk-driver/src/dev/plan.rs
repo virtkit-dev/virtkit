@@ -1068,12 +1068,13 @@ pub(crate) fn derived_state_dir(workspace: &Path, environment: &str) -> Result<P
     Ok(base.join(name))
 }
 
-/// Name of an ephemeral task's state directory, beside the environment's directory.
-pub(super) fn task_state_dir_name(plan: &Plan, task_name: &str, token: &str) -> Result<String> {
-    let base = plan
-        .state_dir
-        .parent()
-        .with_context(|| format!("{} has no parent directory", plan.state_dir.display()))?;
+/// Name of an ephemeral task's state directory in `base`, the environment directory's parent.
+pub(super) fn task_state_dir_name(
+    plan: &Plan,
+    base: &Path,
+    task_name: &str,
+    token: &str,
+) -> Result<String> {
     // Non-alphanumerics folded away, so the name is one ASCII byte per character here too.
     let name: String = task_name
         .chars()
