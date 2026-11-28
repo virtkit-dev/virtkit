@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.118.1] - 2026-11-28
+
 ### Added
 
 - Add, change and remove a registry's storage areas from its *Job access* tab on the hub, with
@@ -6054,7 +6056,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.118.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.118.1...HEAD
+[0.118.1]: https://github.com/virtkit-dev/virtkit/compare/v0.118.0...v0.118.1
 [0.118.0]: https://github.com/virtkit-dev/virtkit/compare/v0.117.1...v0.118.0
 [0.117.1]: https://github.com/virtkit-dev/virtkit/compare/v0.117.0...v0.117.1
 [0.117.0]: https://github.com/virtkit-dev/virtkit/compare/v0.116.1...v0.117.0
